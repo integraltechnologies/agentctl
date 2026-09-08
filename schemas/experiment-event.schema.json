@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExperimentEvent",
+  "type": "object",
+  "properties": {
+    "boundary": {
+      "$ref": "#/$defs/ExperimentBoundary"
+    },
+    "boundary_id": {
+      "type": "string"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/EvidenceId"
+      }
+    },
+    "experiment_id": {
+      "$ref": "#/$defs/ExperimentId"
+    },
+    "job_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/JobId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "metrics": {
+      "description": "Finite JSON numbers only. NaN is represented by a NAN_METRIC boundary.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "number",
+        "format": "double"
+      }
+    },
+    "summary": {
+      "type": "string"
+    },
+    "timestamp_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "version": {
+      "$ref": "#/$defs/ProtocolVersion"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "experiment_id",
+    "timestamp_ms",
+    "boundary_id",
+    "boundary",
+    "metrics",
+    "evidence",
+    "summary"
+  ],
+  "$defs": {
+    "EvidenceId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "ExperimentBoundary": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "PROCESS_EXIT"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "CRASH"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "NO_PROGRESS"
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "timeout_ms"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "NAN_METRIC"
+            },
+            "metric": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "metric"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "EPOCH_COMPLETE"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "comparison": {
+              "$ref": "#/$defs/MetricComparison"
+            },
+            "kind": {
+              "type": "string",
+              "const": "METRIC_THRESHOLD"
+            },
+            "metric": {
+              "type": "string"
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "metric",
+            "comparison",
+            "value"
+          ]
+        }
+      ]
+    },
+    "ExperimentId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "JobId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "MetricComparison": {
+      "type": "string",
+      "enum": [
+        "LESS_THAN",
+        "LESS_THAN_OR_EQUAL",
+        "GREATER_THAN",
+        "GREATER_THAN_OR_EQUAL"
+      ]
+    },
+    "ProtocolVersion": {
+      "description": "Required on every top-level document. Unsupported versions fail deserialization.",
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    }
+  }
+}

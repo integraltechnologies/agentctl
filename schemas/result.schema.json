@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ResultPacket",
+  "type": "object",
+  "properties": {
+    "changed_entities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/GraphEntityId"
+      }
+    },
+    "changed_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/EvidenceId"
+      }
+    },
+    "executor_job_id": {
+      "$ref": "#/$defs/JobId"
+    },
+    "failure": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FailureInfo"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "notes": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "$ref": "#/$defs/ResultStatus"
+    },
+    "task_id": {
+      "$ref": "#/$defs/TaskId"
+    },
+    "version": {
+      "$ref": "#/$defs/ProtocolVersion"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "task_id",
+    "executor_job_id",
+    "status",
+    "changed_paths",
+    "changed_entities",
+    "evidence"
+  ],
+  "$defs": {
+    "EvidenceId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "FailureInfo": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "summary"
+      ]
+    },
+    "GraphEntityId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "JobId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "ProtocolVersion": {
+      "description": "Required on every top-level document. Unsupported versions fail deserialization.",
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    },
+    "ResultStatus": {
+      "type": "string",
+      "enum": [
+        "SUCCEEDED",
+        "FAILED",
+        "BLOCKED"
+      ]
+    },
+    "TaskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

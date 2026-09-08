@@ -1,0 +1,248 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VerificationPacket",
+  "type": "object",
+  "properties": {
+    "decision": {
+      "$ref": "#/$defs/VerificationDecision"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/EvidenceId"
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/VerificationFinding"
+      }
+    },
+    "invariant_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notes": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "requirement_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "target": {
+      "$ref": "#/$defs/VerificationTarget"
+    },
+    "verification_id": {
+      "$ref": "#/$defs/VerificationId"
+    },
+    "verifier_job_id": {
+      "description": "A fresh verifier job, distinct from every executor job in the target.",
+      "$ref": "#/$defs/JobId"
+    },
+    "version": {
+      "$ref": "#/$defs/ProtocolVersion"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "verification_id",
+    "target",
+    "verifier_job_id",
+    "decision",
+    "findings",
+    "evidence",
+    "requirement_refs",
+    "invariant_refs"
+  ],
+  "$defs": {
+    "EvidenceId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "FindingSeverity": {
+      "type": "string",
+      "enum": [
+        "INFO",
+        "WARNING",
+        "ERROR",
+        "CRITICAL"
+      ]
+    },
+    "GraphEntityId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "JobId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "LocationRef": {
+      "type": "object",
+      "properties": {
+        "graph_entity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphEntityId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "line": {
+          "description": "One-based line, only meaningful when a path is supplied.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PlanId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "ProtocolVersion": {
+      "description": "Required on every top-level document. Unsupported versions fail deserialization.",
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    },
+    "TaskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "VerificationDecision": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "REJECT",
+        "BLOCKED"
+      ]
+    },
+    "VerificationFinding": {
+      "type": "object",
+      "properties": {
+        "invariant_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocationRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "problem": {
+          "type": "string"
+        },
+        "requirement_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "severity": {
+          "$ref": "#/$defs/FindingSeverity"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "severity",
+        "requirement_refs",
+        "invariant_refs",
+        "problem"
+      ]
+    },
+    "VerificationId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "VerificationTarget": {
+      "description": "The discriminator and ID type cannot disagree about the verification scope.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "executor_job_id": {
+              "$ref": "#/$defs/JobId"
+            },
+            "scope": {
+              "type": "string",
+              "const": "PACKET"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "scope",
+            "task_id",
+            "executor_job_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "executor_job_ids": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/JobId"
+              }
+            },
+            "plan_id": {
+              "$ref": "#/$defs/PlanId"
+            },
+            "scope": {
+              "type": "string",
+              "const": "INTEGRATION"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "scope",
+            "plan_id",
+            "executor_job_ids"
+          ]
+        }
+      ]
+    }
+  }
+}

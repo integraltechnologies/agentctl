@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskPacket",
+  "type": "object",
+  "properties": {
+    "definition_of_done": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TaskId"
+      }
+    },
+    "graph_entities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/GraphEntityId"
+      }
+    },
+    "invariant_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "objective": {
+      "type": "string"
+    },
+    "read_scope": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ScopePath"
+      }
+    },
+    "task_id": {
+      "$ref": "#/$defs/TaskId"
+    },
+    "verification": {
+      "$ref": "#/$defs/VerificationRequirements"
+    },
+    "version": {
+      "$ref": "#/$defs/ProtocolVersion"
+    },
+    "write_scope": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ScopePath"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "task_id",
+    "objective",
+    "read_scope",
+    "write_scope",
+    "graph_entities",
+    "invariant_refs",
+    "dependencies",
+    "definition_of_done",
+    "verification"
+  ],
+  "$defs": {
+    "GraphEntityId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "ProtocolVersion": {
+      "description": "Required on every top-level document. Unsupported versions fail deserialization.",
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    },
+    "ScopePath": {
+      "description": "A normalized repository-relative file or directory subtree. No glob syntax.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "FILE"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "DIRECTORY"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path"
+          ]
+        }
+      ]
+    },
+    "TaskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "VerificationRequirements": {
+      "description": "Requirements are compact references to canonical checks, not embedded scripts.",
+      "type": "object",
+      "properties": {
+        "evidence_required": {
+          "type": "boolean"
+        },
+        "requirement_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requirement_refs",
+        "evidence_required"
+      ]
+    }
+  }
+}

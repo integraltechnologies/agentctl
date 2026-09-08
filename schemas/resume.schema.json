@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ResumePacket",
+  "type": "object",
+  "properties": {
+    "active_task": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ActiveTask"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "completed_tasks": {
+      "description": "Completed means VERIFIED, never merely executor-finished.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TaskId"
+      }
+    },
+    "latest_verification": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/VerificationId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "next_action": {
+      "type": "string"
+    },
+    "pending_tasks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TaskId"
+      }
+    },
+    "phase": {
+      "$ref": "#/$defs/ResumePhase"
+    },
+    "plan_id": {
+      "$ref": "#/$defs/PlanId"
+    },
+    "source_state": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SourceStateRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "version": {
+      "$ref": "#/$defs/ProtocolVersion"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "plan_id",
+    "phase",
+    "completed_tasks",
+    "pending_tasks",
+    "next_action"
+  ],
+  "$defs": {
+    "ActiveTask": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/TaskState"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "state"
+      ]
+    },
+    "PlanId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "ProtocolVersion": {
+      "description": "Required on every top-level document. Unsupported versions fail deserialization.",
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    },
+    "ResumePhase": {
+      "type": "string",
+      "enum": [
+        "PLANNING",
+        "EXECUTING",
+        "PACKET_VERIFICATION",
+        "INTEGRATION_VERIFICATION",
+        "BLOCKED",
+        "COMPLETE"
+      ]
+    },
+    "SourceStateRef": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "string"
+        },
+        "worktree_diff_hash": {
+          "description": "Algorithm-prefixed digest identifying dirty worktree content, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "revision"
+      ]
+    },
+    "TaskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "TaskState": {
+      "type": "string",
+      "enum": [
+        "PLANNED",
+        "READY",
+        "EXECUTING",
+        "AWAITING_VERIFICATION",
+        "VERIFYING",
+        "VERIFIED",
+        "REJECTED",
+        "BLOCKED"
+      ]
+    },
+    "VerificationId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

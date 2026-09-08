@@ -1,0 +1,248 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExperimentSpec",
+  "type": "object",
+  "properties": {
+    "command": {
+      "$ref": "#/$defs/CommandSpec"
+    },
+    "decision_boundaries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/BoundaryDefinition"
+      }
+    },
+    "experiment_id": {
+      "$ref": "#/$defs/ExperimentId"
+    },
+    "input_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "metric_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "output_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "source_state": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SourceStateRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "version": {
+      "$ref": "#/$defs/ProtocolVersion"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "experiment_id",
+    "command",
+    "input_refs",
+    "metric_refs",
+    "output_refs",
+    "decision_boundaries"
+  ],
+  "$defs": {
+    "BoundaryDefinition": {
+      "type": "object",
+      "properties": {
+        "boundary_id": {
+          "type": "string"
+        },
+        "condition": {
+          "$ref": "#/$defs/ExperimentBoundary"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "boundary_id",
+        "condition"
+      ]
+    },
+    "CommandSpec": {
+      "description": "Structured argv; consumers must not implicitly join this into a shell command.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "program": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "program",
+        "args",
+        "cwd"
+      ]
+    },
+    "ExperimentBoundary": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "PROCESS_EXIT"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "CRASH"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "NO_PROGRESS"
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "timeout_ms"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "NAN_METRIC"
+            },
+            "metric": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "metric"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "EPOCH_COMPLETE"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "comparison": {
+              "$ref": "#/$defs/MetricComparison"
+            },
+            "kind": {
+              "type": "string",
+              "const": "METRIC_THRESHOLD"
+            },
+            "metric": {
+              "type": "string"
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "metric",
+            "comparison",
+            "value"
+          ]
+        }
+      ]
+    },
+    "ExperimentId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "MetricComparison": {
+      "type": "string",
+      "enum": [
+        "LESS_THAN",
+        "LESS_THAN_OR_EQUAL",
+        "GREATER_THAN",
+        "GREATER_THAN_OR_EQUAL"
+      ]
+    },
+    "ProtocolVersion": {
+      "description": "Required on every top-level document. Unsupported versions fail deserialization.",
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    },
+    "SourceStateRef": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "string"
+        },
+        "worktree_diff_hash": {
+          "description": "Algorithm-prefixed digest identifying dirty worktree content, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "revision"
+      ]
+    }
+  }
+}

@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProbeSnapshot",
+  "type": "object",
+  "properties": {
+    "blocker": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "context": {
+      "$ref": "#/$defs/EventContext"
+    },
+    "current_command": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CommandSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "current_step": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "current_target": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LocationRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "current_tool": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "current_verification_check": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "idle_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "last_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "phase": {
+      "type": "string"
+    },
+    "timestamp_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "version": {
+      "$ref": "#/$defs/ProtocolVersion"
+    },
+    "waiting_on": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TaskId"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "timestamp_ms",
+    "context",
+    "phase",
+    "elapsed_ms",
+    "idle_ms",
+    "waiting_on"
+  ],
+  "$defs": {
+    "AgentId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "AgentRole": {
+      "type": "string",
+      "enum": [
+        "PLANNER",
+        "EXECUTOR",
+        "VERIFIER"
+      ]
+    },
+    "CommandSpec": {
+      "description": "Structured argv; consumers must not implicitly join this into a shell command.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "program": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "program",
+        "args",
+        "cwd"
+      ]
+    },
+    "EventContext": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "job_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "packet_id": {
+          "description": "In v1 a task is a TaskPacket; when both IDs are present they must agree.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plan_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlanId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "role": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentRole"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "GraphEntityId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "JobId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "LocationRef": {
+      "type": "object",
+      "properties": {
+        "graph_entity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphEntityId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "line": {
+          "description": "One-based line, only meaningful when a path is supplied.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PlanId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "ProtocolVersion": {
+      "description": "Required on every top-level document. Unsupported versions fail deserialization.",
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    },
+    "ProviderMetadata": {
+      "description": "Opaque adapter metadata; roles and protocol semantics never depend on these strings.",
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider"
+      ]
+    },
+    "TaskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

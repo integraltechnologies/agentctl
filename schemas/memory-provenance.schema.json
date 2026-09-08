@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryProvenance",
+  "type": "object",
+  "properties": {
+    "author_job_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/JobId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/EvidenceId"
+      }
+    },
+    "source_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "trust_class": {
+      "$ref": "#/$defs/MemoryTrustClass"
+    },
+    "version": {
+      "$ref": "#/$defs/ProtocolVersion"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "trust_class",
+    "source_refs",
+    "evidence"
+  ],
+  "$defs": {
+    "EvidenceId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "JobId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "MemoryTrustClass": {
+      "type": "string",
+      "enum": [
+        "CANONICAL",
+        "DERIVED",
+        "OBSERVED",
+        "AGENT_NOTE"
+      ]
+    },
+    "ProtocolVersion": {
+      "description": "Required on every top-level document. Unsupported versions fail deserialization.",
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    }
+  }
+}

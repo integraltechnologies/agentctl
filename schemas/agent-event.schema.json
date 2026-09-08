@@ -1,0 +1,924 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentEvent",
+  "type": "object",
+  "properties": {
+    "context": {
+      "$ref": "#/$defs/EventContext"
+    },
+    "event": {
+      "$ref": "#/$defs/AgentEventKind"
+    },
+    "event_id": {
+      "type": "string"
+    },
+    "timestamp_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "version": {
+      "$ref": "#/$defs/ProtocolVersion"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "event_id",
+    "timestamp_ms",
+    "context",
+    "event"
+  ],
+  "$defs": {
+    "AgentEventKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "AGENT_STARTED"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "AGENT_FINISHED"
+            },
+            "state": {
+              "$ref": "#/$defs/JobState"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "TASK_PACKET_LOADED"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "task_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "PLAN_STEP_STARTED"
+            },
+            "step": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "step"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "FILE_READ"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "entity": {
+              "$ref": "#/$defs/GraphEntityId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "SYMBOL_READ"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "entity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "FILE_EDITED"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "invocation_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "TOOL_STARTED"
+            },
+            "tool": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "invocation_id",
+            "tool"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EvidenceId"
+              }
+            },
+            "invocation_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "TOOL_FINISHED"
+            },
+            "succeeded": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "invocation_id",
+            "succeeded",
+            "evidence"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "command": {
+              "$ref": "#/$defs/CommandSpec"
+            },
+            "invocation_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "COMMAND_STARTED"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "invocation_id",
+            "command"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EvidenceId"
+              }
+            },
+            "exit_status": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "invocation_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "COMMAND_FINISHED"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "invocation_id",
+            "exit_status",
+            "evidence"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "VERIFICATION_STARTED"
+            },
+            "target": {
+              "$ref": "#/$defs/VerificationTarget"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "target"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "VERIFICATION_CHECK_STARTED"
+            },
+            "requirement_ref": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "requirement_ref"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "finding": {
+              "$ref": "#/$defs/VerificationFinding"
+            },
+            "kind": {
+              "type": "string",
+              "const": "VERIFICATION_FINDING_CREATED"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "finding"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "WAITING_ON_DEPENDENCY"
+            },
+            "task_ids": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TaskId"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "task_ids"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "boundary": {
+              "$ref": "#/$defs/ExperimentEvent"
+            },
+            "kind": {
+              "type": "string",
+              "const": "EXPERIMENT_BOUNDARY"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "boundary"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "TOKEN_USAGE_OBSERVED"
+            },
+            "usage": {
+              "$ref": "#/$defs/TokenUsageEvent"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "usage"
+          ]
+        }
+      ]
+    },
+    "AgentId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "AgentRole": {
+      "type": "string",
+      "enum": [
+        "PLANNER",
+        "EXECUTOR",
+        "VERIFIER"
+      ]
+    },
+    "CommandSpec": {
+      "description": "Structured argv; consumers must not implicitly join this into a shell command.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "program": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "program",
+        "args",
+        "cwd"
+      ]
+    },
+    "EventContext": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "job_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "packet_id": {
+          "description": "In v1 a task is a TaskPacket; when both IDs are present they must agree.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plan_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlanId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "role": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentRole"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "EvidenceId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "ExperimentBoundary": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "PROCESS_EXIT"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "CRASH"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "NO_PROGRESS"
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "timeout_ms"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "NAN_METRIC"
+            },
+            "metric": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "metric"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "EPOCH_COMPLETE"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "comparison": {
+              "$ref": "#/$defs/MetricComparison"
+            },
+            "kind": {
+              "type": "string",
+              "const": "METRIC_THRESHOLD"
+            },
+            "metric": {
+              "type": "string"
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "metric",
+            "comparison",
+            "value"
+          ]
+        }
+      ]
+    },
+    "ExperimentEvent": {
+      "type": "object",
+      "properties": {
+        "boundary": {
+          "$ref": "#/$defs/ExperimentBoundary"
+        },
+        "boundary_id": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EvidenceId"
+          }
+        },
+        "experiment_id": {
+          "$ref": "#/$defs/ExperimentId"
+        },
+        "job_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "metrics": {
+          "description": "Finite JSON numbers only. NaN is represented by a NAN_METRIC boundary.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "summary": {
+          "type": "string"
+        },
+        "timestamp_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "experiment_id",
+        "timestamp_ms",
+        "boundary_id",
+        "boundary",
+        "metrics",
+        "evidence",
+        "summary"
+      ]
+    },
+    "ExperimentId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "FindingSeverity": {
+      "type": "string",
+      "enum": [
+        "INFO",
+        "WARNING",
+        "ERROR",
+        "CRITICAL"
+      ]
+    },
+    "GraphEntityId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "JobId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "JobState": {
+      "type": "string",
+      "enum": [
+        "QUEUED",
+        "RUNNING",
+        "WAITING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED"
+      ]
+    },
+    "LocationRef": {
+      "type": "object",
+      "properties": {
+        "graph_entity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphEntityId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "line": {
+          "description": "One-based line, only meaningful when a path is supplied.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "MetricComparison": {
+      "type": "string",
+      "enum": [
+        "LESS_THAN",
+        "LESS_THAN_OR_EQUAL",
+        "GREATER_THAN",
+        "GREATER_THAN_OR_EQUAL"
+      ]
+    },
+    "PlanId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "ProtocolVersion": {
+      "description": "Required on every top-level document. Unsupported versions fail deserialization.",
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    },
+    "ProviderMetadata": {
+      "description": "Opaque adapter metadata; roles and protocol semantics never depend on these strings.",
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider"
+      ]
+    },
+    "TaskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "TokenUsageEvent": {
+      "description": "Per-observation deltas. Optional subcounts may overlap; do not sum them blindly.",
+      "type": "object",
+      "properties": {
+        "cached_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "context": {
+          "$ref": "#/$defs/EventContext"
+        },
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "provenance": {
+          "$ref": "#/$defs/TokenUsageProvenance"
+        },
+        "reasoning_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "timestamp_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "timestamp_ms",
+        "context",
+        "provenance"
+      ]
+    },
+    "TokenUsageProvenance": {
+      "type": "string",
+      "enum": [
+        "EXACT",
+        "ESTIMATED",
+        "UNKNOWN"
+      ]
+    },
+    "VerificationFinding": {
+      "type": "object",
+      "properties": {
+        "invariant_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocationRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "problem": {
+          "type": "string"
+        },
+        "requirement_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "severity": {
+          "$ref": "#/$defs/FindingSeverity"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "severity",
+        "requirement_refs",
+        "invariant_refs",
+        "problem"
+      ]
+    },
+    "VerificationTarget": {
+      "description": "The discriminator and ID type cannot disagree about the verification scope.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "executor_job_id": {
+              "$ref": "#/$defs/JobId"
+            },
+            "scope": {
+              "type": "string",
+              "const": "PACKET"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "scope",
+            "task_id",
+            "executor_job_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "executor_job_ids": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/JobId"
+              }
+            },
+            "plan_id": {
+              "$ref": "#/$defs/PlanId"
+            },
+            "scope": {
+              "type": "string",
+              "const": "INTEGRATION"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "scope",
+            "plan_id",
+            "executor_job_ids"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvidenceRecord",
+  "type": "object",
+  "properties": {
+    "command": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CommandSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evidence_id": {
+      "$ref": "#/$defs/EvidenceId"
+    },
+    "exit_status": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int32"
+    },
+    "finished_at_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "full_log_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_state": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SourceStateRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "started_at_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "stderr_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "stdout_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "version": {
+      "$ref": "#/$defs/ProtocolVersion"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "evidence_id",
+    "started_at_ms",
+    "summary"
+  ],
+  "$defs": {
+    "CommandSpec": {
+      "description": "Structured argv; consumers must not implicitly join this into a shell command.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "program": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "program",
+        "args",
+        "cwd"
+      ]
+    },
+    "EvidenceId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "ProtocolVersion": {
+      "description": "Required on every top-level document. Unsupported versions fail deserialization.",
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    },
+    "SourceStateRef": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "string"
+        },
+        "worktree_diff_hash": {
+          "description": "Algorithm-prefixed digest identifying dirty worktree content, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "revision"
+      ]
+    }
+  }
+}

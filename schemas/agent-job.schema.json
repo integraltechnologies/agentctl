@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentJob",
+  "type": "object",
+  "properties": {
+    "agent_id": {
+      "$ref": "#/$defs/AgentId"
+    },
+    "created_at_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "finished_at_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "job_id": {
+      "$ref": "#/$defs/JobId"
+    },
+    "plan_id": {
+      "$ref": "#/$defs/PlanId"
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProviderMetadata"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "role": {
+      "$ref": "#/$defs/AgentRole"
+    },
+    "started_at_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "state": {
+      "$ref": "#/$defs/JobState"
+    },
+    "task_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "version": {
+      "$ref": "#/$defs/ProtocolVersion"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "job_id",
+    "agent_id",
+    "role",
+    "plan_id",
+    "state",
+    "created_at_ms"
+  ],
+  "$defs": {
+    "AgentId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "AgentRole": {
+      "type": "string",
+      "enum": [
+        "PLANNER",
+        "EXECUTOR",
+        "VERIFIER"
+      ]
+    },
+    "JobId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "JobState": {
+      "type": "string",
+      "enum": [
+        "QUEUED",
+        "RUNNING",
+        "WAITING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED"
+      ]
+    },
+    "PlanId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "ProtocolVersion": {
+      "description": "Required on every top-level document. Unsupported versions fail deserialization.",
+      "type": "string",
+      "enum": [
+        "1"
+      ]
+    },
+    "ProviderMetadata": {
+      "description": "Opaque adapter metadata; roles and protocol semantics never depend on these strings.",
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider"
+      ]
+    },
+    "TaskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}
