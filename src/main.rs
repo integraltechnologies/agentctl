@@ -16,7 +16,13 @@ Usage:
   agentctl repo index [--status] [--json]
   agentctl code <symbol|search|file|locate|refs|callers|tests> <query> [--limit N] [--json]
   agentctl code <context|impact|neighbors> <query> [--limit N] [--depth N] [--neighbors N] [--tests N] [--json]
+    context also accepts --memory-canonical N --memory-facts N --memory-notes N --memory-bytes N
   agentctl state status [--json]
+  agentctl memory add --trust <canonical|agent-note> --kind KIND --content TEXT [--job ID] [--symbol ID] [--invariant KEY] [--key KEY] [--workspace] [--supersedes ID] [--json]
+  agentctl memory <show|links|derive|observe|promote|reject> <id-or-symbol> [--json]
+  agentctl memory supersede <old-id> --with <new-id> [--json]
+  agentctl memory <list|stale|policy> [--trust CLASS] [--kind KIND] [--task ID] [--evidence ID] [--symbol ID] [--all|--status STATUS] [--include-stale] [--all-workspaces] [--recent] [--limit N] [--json]
+  agentctl memory search <text> [filters] [--json]
   agentctl events list [--repo ID] [--task ID] [--job ID] [--limit N] [--json]
 
 Schema output defaults to schemas/. Validation checks structure and document
@@ -47,7 +53,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         | ["repo", ..]
         | ["state", ..]
         | ["events", ..]
-        | ["code", ..]) => agentctl::local::cli::run(local)?,
+        | ["code", ..]
+        | ["memory", ..]) => agentctl::local::cli::run(local)?,
         _ => return Err(format!("invalid arguments\n\n{HELP}").into()),
     }
     Ok(())

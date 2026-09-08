@@ -12,6 +12,17 @@ pub const MAX_FILES: usize = 20_000;
 
 /// Deterministic, workspace-local discovery. Never traverses symlink directories.
 pub fn discover(root: &Path) -> Result<Vec<String>> {
+    discover_selected(root, None)
+}
+
+/// Apply the same discovery policy to one supporting path without scanning other subtrees.
+pub(crate) fn contains_source(root: &Path, path: &str) -> Result<bool> {
+    Ok(discover_selected(root, Some(path.to_string()))?
+        .iter()
+        .any(|p| p == path))
+}
+
+fn discover_selected(root: &Path, selected: Option<String>) -> Result<Vec<String>> {
     let protected = if root.join(".agentctl").try_exists()? {
         ProjectConfig::load(root)?
             .protected
@@ -45,6 +56,14 @@ pub fn discover(root: &Path) -> Result<Vec<String>> {
                 .ok()
                 .and_then(Path::to_str)
                 .unwrap_or("");
+            if selected.as_ref().is_some_and(|path| {
+                relative != path
+                    && !path
+                        .strip_prefix(relative)
+                        .is_some_and(|tail| tail.starts_with('/'))
+            }) {
+                return false;
+            }
             if protected.iter().any(|p| {
                 relative == p || relative.strip_prefix(p).is_some_and(|s| s.starts_with('/'))
             }) {
@@ -109,7 +128,7 @@ pub fn discover(root: &Path) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-pub(super) fn read(root: &Path, path: &str) -> Result<(String, String)> {
+pub(crate) fn read(root: &Path, path: &str) -> Result<(String, String)> {
     crate::validation::repo_path(path)?;
     let mut absolute = root.to_path_buf();
     for component in Path::new(path).components() {

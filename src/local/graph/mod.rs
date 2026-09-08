@@ -218,7 +218,7 @@ impl Store {
     }
 }
 
-fn checked_workspace(store: &Store, start: &Path) -> Result<RepositoryInfo> {
+pub(super) fn checked_workspace(store: &Store, start: &Path) -> Result<RepositoryInfo> {
     let info = RepositoryInfo::discover(start)?;
     let registered = store.workspace(&info.workspace_id)?.ok_or_else(|| {
         Error::Invalid("workspace is not registered; run agentctl repo init".into())

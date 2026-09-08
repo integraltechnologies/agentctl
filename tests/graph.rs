@@ -910,6 +910,7 @@ fn future_graph_database_version_is_rejected() {
 }
 
 fn restore_v2_schema(f: &Fixture) {
+    f.sql().execute_batch("DROP TABLE memory_links; DROP TABLE memory_fts; DROP TABLE memory_entries; DELETE FROM schema_migrations WHERE version=4;").unwrap();
     // v3 is strictly additive: removing only its tables/history restores the
     // accepted v2 schema, leaving real repository, workspace, plan and journal rows.
     f.sql().execute_batch("DROP TABLE graph_edges; DROP TABLE graph_entities; DROP TABLE indexed_files; DROP TABLE graph_indexes; DELETE FROM schema_migrations WHERE version=3; PRAGMA user_version=2;").unwrap();
@@ -949,7 +950,7 @@ fn accepted_v2_migration_is_additive_and_preserves_payloads_and_history() {
     assert!(Store::read_only(&f.database, 5000).is_err());
     for _ in 0..2 {
         let store = f.store();
-        assert_eq!(store.status().unwrap().schema_version, 3);
+        assert_eq!(store.status().unwrap().schema_version, DATABASE_VERSION);
         assert_eq!(store.tasks(&info.repository_id, None).unwrap().len(), 2);
         assert_eq!(before, legacy_rows(&f));
     }

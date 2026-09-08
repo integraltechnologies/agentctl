@@ -59,6 +59,25 @@ pub struct StoredTask {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum JournalEntry {
+    MemoryCreated {
+        memory_id: super::memory::MemoryId,
+        trust: MemoryTrustClass,
+        actor: String,
+    },
+    MemoryPromoted {
+        original: super::memory::MemoryId,
+        canonical: super::memory::MemoryId,
+        actor: String,
+    },
+    MemorySuperseded {
+        original: super::memory::MemoryId,
+        replacement: super::memory::MemoryId,
+        actor: String,
+    },
+    MemoryRejected {
+        memory_id: super::memory::MemoryId,
+        actor: String,
+    },
     IndexCompleted {
         stats: super::graph::IndexStats,
     },

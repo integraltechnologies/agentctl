@@ -1,4 +1,4 @@
-# Architecture contract — Stage 2, preserving protocol v1 and Stage 1 ownership
+# Architecture contract — Stage 3, preserving protocol v1 and Stage 1/2 foundations
 
 ## Ownership and roles
 
@@ -114,8 +114,8 @@ Memory provenance distinguishes CANONICAL (explicitly governed authority), DERIV
 (computed from referenced sources), OBSERVED (recorded evidence), and AGENT_NOTE
 (agent-authored suggestions). Agent notes require author attribution. AGENT_NOTE must
 never silently acquire canonical authority through retrieval, summarization, or reuse;
-promotion requires a future explicit, auditable policy decision. There is no persistence
-or promotion operation in this stage.
+promotion requires an explicit, auditable policy decision. Stage 0 only defines this
+contract; Stage 3 supplies persistence and explicit promotion without changing the schema.
 
 Agent events describe observable actions: starts/finishes, loaded packets, steps,
 files/symbols, tools/commands, checks/findings, dependencies, experiments, and token
@@ -145,7 +145,7 @@ job detachment, decisions, retries, and execution are future responsibilities.
 | Scope | Default path | Contents |
 | --- | --- | --- |
 | Machine configuration | `~/.config/agentctl/` | Stable cross-repository workflow policy |
-| Durable machine-local data | `~/.local/share/agentctl/` | Canonical repository/task/job/evidence/event state; derived code graph; future memory/resume state |
+| Durable machine-local data | `~/.local/share/agentctl/` | Canonical repository/task/job/evidence/event/memory state; derived code graph; future resume state |
 | Reconstructible cache | `~/.cache/agentctl/` | Disposable derived data; never the only copy of canonical state |
 | Project configuration | `repo/.agentctl/project.toml` | Product invariants, architecture constraints, repo commands, protected-data rules, canonical verification definitions |
 | Task packet | Managed protocol document | Current bounded work delta and references |
@@ -216,9 +216,9 @@ No remote is required; remote names/URLs are opaque, refreshable metadata.
 
 - Repeated discovery of a workspace and remote changes preserve both IDs.
 - Main and linked worktrees share one repository ID, but have different workspace IDs.
-  Repository-level plan/task ownership is shared; future project identity, engineering
-  memory, architecture decisions, and repository-level graph identity can use this same
-  repository key. Shared memory and orchestration remain future work.
+  Repository-level plan/task ownership and Stage 3 durable engineering memory are shared.
+  Repository-level graph IDs reuse the same repository key, while concrete graph rows
+  remain workspace-specific. Orchestration remains future work.
 - Independent clones remain distinct logical repositories, even with identical commits
   and remote URLs. Matching directory basenames imply neither identity.
 - Moving a primary repository normally moves its common and per-worktree Git directories,
@@ -502,4 +502,131 @@ freshness observation timestamps and measured indexing durations naturally vary.
 `impact` requires one unambiguous symbol and traverses known incoming structural edges,
 excluding ownership containment. It reports known dependents, not everything a change
 will break. `refs`/`callers` only report resolved endpoints; absent edges are not proof of
-independence. Stage 3 must respect these precision, coverage, freshness, and scope limits.
+independence. Memory respects these precision, coverage, freshness, and scope limits.
+
+## Shared engineering memory: authority and history
+
+Stage 3 adds local `MemoryEntry`/`MemoryView` types, not new Stage 0 wire contracts.
+An entry has an opaque random `memory:<128-bit hex>` ID, RepositoryId, optional WorkspaceId,
+creation workspace/time, kind, bounded text, actor, unchanged Stage 0 MemoryProvenance,
+origin, optional opaque provider metadata, typed links, and optional derivation/observed
+source. The view adds ACTIVE/SUPERSEDED/REJECTED status, update time, replacement ID,
+validity explanation, and unresolved graph/file links. Kinds are invariant, architecture
+decision, constraint, finding, observation, limitation, task/experiment conclusion, note,
+or other. Kind does not confer trust.
+Content is limited to 8 KiB, actor labels to 128 bytes, links to 64, and complete stored
+metadata to 64 KiB. Oversized input/observations fail explicitly instead of being silently
+truncated or interpreted.
+
+- CANONICAL requires explicit creation or promotion. Authority is a local action, not
+  authenticated identity or proof of correctness. No inference or query changes trust.
+- AGENT_NOTE requires a registered author job, preserving Stage 0 attribution rules.
+  Its job/plan/task references and opaque provider/model metadata are copied as provenance.
+  It is fallible, even when DURABLE means its validity does not depend on file layout.
+- DERIVED can only be created mechanically from an unambiguous indexed symbol, signature,
+  and the first twelve syntactic outgoing relations. Target spellings are not semantic
+  dependency assertions. The entry records supporting graph IDs, file/hash/backend
+  provenance, workspace, and `graph-memory-1` derivation version.
+- OBSERVED can only be constructed from registered EvidenceRecord metadata. It preserves
+  the evidence ID and exact optional SourceStateRef, exit state, timestamp, and recorded
+  summary. HISTORICAL means what that evidence reported, not current validity or a verified
+  general engineering claim. Commands and logs are never executed or fetched.
+
+Promotion creates a new CANONICAL entry linked to the original memory. It preserves
+origin/actor/author/provider/evidence/derivation provenance and ownership, adding the
+explicit promotion actor to source references and the audit event. The original remains
+unchanged. Inactive or stale-derived items cannot be promoted. A promoted source-bound
+fact becomes an explicitly accepted durable decision; provenance still shows its basis.
+Rejection and supersession retain payloads. Supersession requires distinct active entries
+with identical trust, kind, scope, and canonical key; cycles and implicit trust changes
+are impossible through these transitions. Creation with `--supersedes` atomically retires
+the old entry and inserts its replacement. Direct supersession records the replacement
+on the historical view; entries themselves are immutable.
+
+Active repository-scoped canonical keys are unique when supplied. `config:` is reserved.
+Exact whitespace-normalized content with the same repository/scope/trust/kind and
+derivation/observation basis is also unique while active. Collisions fail explicitly;
+there is no fuzzy merge or contradiction detector. Multiple distinct relevant decisions
+remain visible, rather than silently picking a winner.
+
+## Ownership, links, and validity
+
+Durable decisions default to RepositoryId, shared by all linked worktrees. Temporary notes
+may opt into WorkspaceId; derived facts always do, and observations inherit evidence
+location. Repository entries plus current-workspace entries are the default query scope.
+Explicit all-workspace history may expose other workspaces, but cannot call their derived
+facts fresh or silently promote/mutate them from this checkout. Independent clones stay
+separate; moved primary repositories may get new local IDs and receive no automatic memory
+relocation. No remote is required. Those accepted Stage 1 rules remain unchanged.
+
+Typed links cover graph entity, normalized file path, task, plan, job, evidence, invariant,
+full Git commit ID, memory, and exact tag. Durable database targets must exist in the same
+repository when created. Graph targets must exist in the current workspace index. File
+paths can intentionally refer to planned or historical files; invariant references are
+opaque keys, and commit links validate full object-ID syntax without resolving Git objects.
+Graph/file references are historical links, not cascading foreign keys: a rename or graph
+deletion cannot delete a canonical decision. Missing links are exposed as unresolved on
+inspection. A link alone does not turn a decision or hypothesis into source-bound truth.
+
+Derived validity checks only its supporting paths: current indexed hash/backend with no
+diagnostic, current file hash, parser/index/derivation version, supporting entity presence,
+and originating workspace must match. Targeted discovery reuses Stage 2 ignore/protected/
+symlink/size policy while pruning unrelated subtrees; hashes are cached within a candidate
+batch. Unrelated file edits do not invalidate the fact. Changed/deleted/excluded/unreadable
+support or old versions yield STALE even before reindexing. Stale items stay inspectable
+but are excluded by default. Filesystem checks are sequential observations, not an atomic
+snapshot or exact evidence binding. Human decisions and notes are not hash-invalidated;
+evidence observations remain historical after source changes. Future derivations that
+claim cross-file resolution must record all target-dependent support, not just a caller.
+
+## Persistence, policy, and bounded retrieval
+
+Transactional migration 4 adds `memory_entries`, `memory_links`, and bundled SQLite FTS5
+`memory_fts` (plus its internal tables), without altering earlier payloads or graph IDs.
+Repository/workspace foreign keys and retrieval/link/active-key indexes constrain ownership
+and support selective queries. Immutable-history triggers reject payload edits/deletes and
+link edits/deletes. Status transitions, new rows, FTS tokens, links, and aggregate local
+MEMORY_CREATED/PROMOTED/SUPERSEDED/REJECTED journal events commit in one IMMEDIATE transaction.
+Audit failure rolls everything back. The accepted AgentEvent schema is untouched. Reads
+emit no events; validity is computed, not a read-triggered persistent mutation. Read-only
+opens require the current schema; migration conflict/future-version rejection remain intact.
+
+Project TOML remains the sole authority for its invariants, architecture, commands,
+protected paths, and verification policy. Memory exposes read-only CANONICAL/PROJECT_CONFIG
+projections with source path, workspace, and a BLAKE3 fingerprint of validated normalized
+config—not stored copies. Editing project.toml immediately changes the projection. Different
+worktrees can expose different branch policies; they do not overwrite shared repository
+decisions. Reserved projection keys cannot be promoted, rejected, or superseded as stored
+MemoryIds. There is no import/export/synchronization framework.
+
+FTS indexes normalized content and tags: camelCase/acronyms, snake_case, punctuation, and
+case are normalized; all requested lexical tokens must match. Typed link filters match
+any supplied link and combine with text/trust/kind/status/scope filters. Ranking is trust
+(CANONICAL, then OBSERVED/DERIVED, then AGENT_NOTE), exact phrase, newest creation time,
+then ID. `recent` skips phrase preference, not trust priority. Queries read a SQLite
+snapshot, fetch bounded candidates, and validate only those—not the whole history in Rust
+or the entire source tree. Limits: 1–100 entries, at most 64 link filters, 512 search bytes/
+32 tokens, and at most `min(limit*10,1000)` checked candidates. Truncation reports both
+result overflow and candidate exhaustion; narrow filters when stale candidates dominate.
+Policy is separate, bounded to ten matching projections (or the smaller result limit),
+2048 characters each, with explicit item/content truncation. There is no pagination yet.
+
+`code context` wraps the accepted ContextPacket with a memory section; graph nodes and
+Stage 0 schemas do not change. `memory_for_code` uses bounded primary/neighbor/test entity
+and file links plus lexical query matches. `memory_for_task` uses task ID, graph IDs,
+invariant refs, and bounded objective tokens; evidence-bearing entries linked to these
+remain discoverable. This supports future resume knowledge, not resume orchestration.
+Context unions linked/text matches, favors trust then recency/ID, and also offers live
+project policy. Relevant stored canonical decisions precede unfiltered policy projections.
+Defaults are three canonical items, three observed/derived facts, one note, and 4096 bytes;
+hard bounds are 10/10/5 items and 256–16384 bytes of compact serialized memory JSON.
+Summaries are capped at 384 characters, with truncation flags and IDs for full inspection.
+Inactive/stale facts never silently enter default context. Memory cannot overwhelm the
+graph packet or become authority just by being recent.
+
+Content is untrusted data, never commands, config patches, or instructions to this program.
+There is no authentication, autonomous extraction, semantic contradiction resolution,
+embeddings, network, provider adapter, planner/executor/verifier runtime, scheduler, or
+Stage 4 functionality. Registered evidence is reported faithfully, not independently
+verified by this layer. Mechanical extraction is intentionally narrow; other knowledge
+uses explicit canonical decisions or attributed lower-trust notes.

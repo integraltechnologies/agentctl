@@ -33,6 +33,17 @@ pub fn run(args: &[&str]) -> Result<()> {
             )
         }
         ["doctor"] => doctor(&paths, json_mode),
+        ["memory", command, rest @ ..] => {
+            let config = load_machine(&paths)?;
+            let mut store = if ["add", "derive", "observe", "promote", "supersede", "reject"]
+                .contains(command)
+            {
+                Store::open(&paths.database, config.busy_timeout_ms)?
+            } else {
+                Store::read_only(&paths.database, config.busy_timeout_ms)?
+            };
+            super::memory::cli::run(&mut store, command, rest, json_mode)
+        }
         graph @ (["repo", "index", ..] | ["code", ..]) => {
             let config = load_machine(&paths)?;
             let mut store = if graph == ["repo", "index"] {

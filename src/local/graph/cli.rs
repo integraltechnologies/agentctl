@@ -63,6 +63,7 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
         ["code", command, query, flags @ ..] => {
             let context = ["context", "impact", "neighbors"].contains(command);
             let mut limits = ContextLimits::default();
+            let mut memory_limits = crate::local::memory::MemoryLimits::default();
             let mut limit = if context { limits.primary } else { 20 };
             require(flags.len() % 2 == 0, "query flags need numeric values")?;
             let mut seen = BTreeSet::new();
@@ -76,6 +77,12 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
                     "--depth" if context => limits.depth = number,
                     "--neighbors" if context => limits.neighbors = number,
                     "--tests" if context => limits.tests = number,
+                    "--memory-canonical" if *command == "context" => {
+                        memory_limits.canonical = number
+                    }
+                    "--memory-facts" if *command == "context" => memory_limits.facts = number,
+                    "--memory-notes" if *command == "context" => memory_limits.notes = number,
+                    "--memory-bytes" if *command == "context" => memory_limits.bytes = number,
                     _ => return Err(Error::Invalid(format!("unknown query flag {}", flag[0]))),
                 }
             }
@@ -162,6 +169,30 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
                         result.truncated,
                         result.meaning
                     ));
+                    if *command == "context" {
+                        let memory = store.memory_for_code(&root, &result, memory_limits)?;
+                        for m in &memory.items {
+                            lines.push(format!(
+                                "memory [{} {:?}] {}: {}",
+                                serde_json::to_string(&m.trust)?.trim_matches('"'),
+                                m.validity,
+                                m.id,
+                                m.content
+                            ));
+                        }
+                        if memory.truncated {
+                            lines.push(
+                                "Memory is bounded/truncated; use memory show/search for details."
+                                    .into(),
+                            );
+                        }
+                        let human = human_results(&result.freshness, lines);
+                        let combined = crate::local::memory::CodeContextWithMemory {
+                            graph: result,
+                            memory,
+                        };
+                        return output(json, &combined, &human);
+                    }
                     output(json, &result, &human_results(&result.freshness, lines))
                 }
                 _ => Err(Error::Invalid(

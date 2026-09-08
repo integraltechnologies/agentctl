@@ -17,7 +17,7 @@ It will support detached engineering and ML jobs, observable progress, and `agen
 a btop-like TUI with a rolling token-usage graph. Roles are provider-neutral;
 provider/model identities are optional opaque metadata for future adapters.
 
-## Stage 2
+## Stage 3
 
 This repository currently provides one Rust 2024 crate with a library and a tiny CLI:
 
@@ -32,10 +32,13 @@ This repository currently provides one Rust 2024 crate with a library and a tiny
 - Incremental file-level extraction, hash-checked queries, deterministic code location,
   bounded graph context, and known structural impact. Linked worktrees have isolated
   source-specific graph state under their shared repository identity.
+- Provider-neutral engineering memory with explicit trust/provenance, typed links,
+  immutable promotion/supersession history, deterministic FTS5 search, live project-policy
+  projections, and bounded code/TaskPacket memory context.
 
 The accepted Stage 0 protocol and all 13 public schemas remain unchanged.
 
-It does **not** implement LSP, shared-memory retrieval/persistence, provider adapters or integrations, agent launching,
+It does **not** implement LSP, provider adapters or integrations, agent launching,
 orchestration, autonomous loops, daemons, an experiment runner, token collection,
 `agenttop`/TUI, MCP, web UI, remote services, networking, embeddings, or a vector DB.
 
@@ -127,6 +130,80 @@ links indicate lexical containment, not proven coverage. No macro expansion, dyn
 dispatch, cross-file resolution, C adapter, embeddings, or provider calls are implemented.
 Indexing skips ignored files, symlinks, nested repositories, common build/dependency trees,
 and project `deny_read` paths. See the architecture contract for limits and guarantees.
+
+## Shared engineering memory
+
+Memory belongs to a logical repository by default, so linked worktrees share durable
+decisions without copying rows. `--workspace` scopes a temporary note/decision to the
+current checkout. Source-derived facts and workspace evidence observations retain their
+concrete workspace. Other workspaces' entries are hidden unless `--all-workspaces` is
+explicit; another workspace's derived fact is never declared fresh in this one.
+
+```sh
+agentctl memory add --trust canonical --kind architecture-decision \
+  --content 'Fuzzy vehicle identity matches require explicit confirmation.' \
+  --key vehicle:confirmation --symbol resolve_candidate --invariant KD-VEHICLE-004
+agentctl memory add --trust agent-note --kind finding --job job:executor-a \
+  --workspace --content 'Possible resolve_candidate singleton bypass.'
+agentctl memory derive confirm_vehicle --json
+agentctl memory observe evidence:1 --json
+agentctl memory search 'vehicle confirmation' --trust canonical --limit 10 --json
+agentctl memory list --symbol resolve_candidate --json
+agentctl memory list --task a --json
+agentctl memory show memory:ID --json
+agentctl memory links memory:ID --json
+agentctl memory promote memory:ID --actor reviewer --json
+agentctl memory supersede memory:OLD --with memory:NEW --json
+agentctl memory reject memory:ID --actor reviewer
+agentctl memory list --status superseded --include-stale --json
+agentctl memory stale --json
+agentctl memory policy --json
+agentctl code context resolve_candidate --memory-canonical 3 --memory-facts 3 \
+  --memory-notes 1 --memory-bytes 4096 --json
+```
+
+Replace illustrative IDs with registered records. Stage 0 requires an author job for
+AGENT_NOTE; register plans/jobs through the existing Store APIs first. There is no job
+launcher or invented CLI job creation. `observe` requires existing persisted evidence;
+it records an observation, never executes its command. `derive` mechanically summarizes
+one unambiguous indexed symbol's signature and bounded syntactic outgoing relations—no
+LLM prose or claims of compiler resolution. Free-form DERIVED/OBSERVED creation is refused.
+
+CANONICAL creation requires explicit `--trust canonical`. Promotion is also explicit:
+it creates a new canonical descendant, preserves original provenance and ownership scope,
+and leaves the original unchanged. Local journal events audit both actions; there is no
+authentication or automatic authority inference. Keyed canonical decisions are unique
+while active. To replace one atomically, use `memory add --trust canonical --key KEY
+--supersedes memory:OLD ...`; old content remains historical. `--all` includes inactive
+history; `--include-stale` separately includes stale derived facts. Normal reads exclude both.
+
+DERIVED freshness checks only supporting paths/hashes and graph/parser/derivation
+versions, honoring the graph's read exclusions. Source changes do not invalidate durable
+decisions or notes. OBSERVED remains historical, explicitly bound to the recorded evidence
+and source state, not a claim that today's checkout passes. Notes remain fallible even
+when their validity label is DURABLE (meaning not file-hash-bound).
+
+`.agentctl/project.toml` stays the sole source of truth for its policies. Invariants,
+architecture, commands, protected paths, and verification definitions appear as read-only
+CANONICAL/PROJECT_CONFIG projections with config fingerprints, never mutable database
+copies. Edit that file to change them; `config:` keys are reserved. Projections reflect
+the current worktree's config and may differ between branches. Search/list JSON separates
+`entries` and `policy`; item limits/truncation are explicit. Memory text is data, not
+instructions, and never changes config or launches commands.
+
+Search normalizes camelCase/snake_case and punctuation, requires all lexical tokens,
+and supports typed link, exact tag, kind, trust, status, and recency filters. Matching
+canonical entries rank ahead of observed/derived facts, then notes. Results and source
+checks are bounded; narrow filters if truncated. Code context adds only compact summaries
+with separate trust quotas and a compact-JSON byte budget; full provenance remains available
+through `memory show`. `Store::memory_for_task` provides the same bounded retrieval for
+future task/resume consumers, without implementing a runtime.
+
+SQLite migration 4 adds memory entries, typed links, and FTS5 to the existing machine
+database without rewriting tasks/jobs/events/graph data. No new dependency or service is
+required. Existing databases migrate on `init` or a writable open; read-only commands do
+not migrate. Independent clones and moved primary repositories retain Stage 1's distinct
+local identities; memory is not synchronized or relocated automatically.
 
 Rust types are canonical. Regenerate and review schemas whenever contracts change;
 tests fail if checked-in schemas drift. See [the architecture contract](docs/architecture.md)
