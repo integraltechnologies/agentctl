@@ -13,6 +13,9 @@ Usage:
   agentctl repo init [--json]
   agentctl repo status [--json]
   agentctl repo list [--json]
+  agentctl repo index [--status] [--json]
+  agentctl code <symbol|search|file|locate|refs|callers|tests> <query> [--limit N] [--json]
+  agentctl code <context|impact|neighbors> <query> [--limit N] [--depth N] [--neighbors N] [--tests N] [--json]
   agentctl state status [--json]
   agentctl events list [--repo ID] [--task ID] [--job ID] [--limit N] [--json]
 
@@ -39,9 +42,12 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             schema::validate_json(kind, &std::fs::read_to_string(file)?)?;
             println!("valid {kind}: {file}");
         }
-        local @ (["init", ..] | ["doctor", ..] | ["repo", ..] | ["state", ..] | ["events", ..]) => {
-            agentctl::local::cli::run(local)?
-        }
+        local @ (["init", ..]
+        | ["doctor", ..]
+        | ["repo", ..]
+        | ["state", ..]
+        | ["events", ..]
+        | ["code", ..]) => agentctl::local::cli::run(local)?,
         _ => return Err(format!("invalid arguments\n\n{HELP}").into()),
     }
     Ok(())

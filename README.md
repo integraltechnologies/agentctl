@@ -17,7 +17,7 @@ It will support detached engineering and ML jobs, observable progress, and `agen
 a btop-like TUI with a rolling token-usage graph. Roles are provider-neutral;
 provider/model identities are optional opaque metadata for future adapters.
 
-## Stage 1
+## Stage 2
 
 This repository currently provides one Rust 2024 crate with a library and a tiny CLI:
 
@@ -28,11 +28,14 @@ This repository currently provides one Rust 2024 crate with a library and a tiny
 - Typed machine/project TOML config, XDG paths, Git checkout registration and source-state inspection.
 - Local SQLite storage for immutable plans/tasks, job state, compact evidence metadata,
   and an append-only journal. State transitions and journal records commit atomically.
+- Persistent, content-hashed code graphs for Rust, Python, TypeScript/TSX, and JavaScript/JSX.
+- Incremental file-level extraction, hash-checked queries, deterministic code location,
+  bounded graph context, and known structural impact. Linked worktrees have isolated
+  source-specific graph state under their shared repository identity.
 
 The accepted Stage 0 protocol and all 13 public schemas remain unchanged.
 
-It does **not** implement repository indexing, graph parsing, Tree-sitter, LSP,
-shared-memory retrieval/persistence, provider adapters or integrations, agent launching,
+It does **not** implement LSP, shared-memory retrieval/persistence, provider adapters or integrations, agent launching,
 orchestration, autonomous loops, daemons, an experiment runner, token collection,
 `agenttop`/TUI, MCP, web UI, remote services, networking, embeddings, or a vector DB.
 
@@ -55,6 +58,13 @@ cargo run -- doctor --json
 cargo run -- repo init
 cargo run -- repo status --json
 cargo run -- repo list
+cargo run -- repo index --json
+cargo run -- repo index --status --json
+cargo run -- code symbol resolve_candidate --json
+cargo run -- code locate "vehicle confirmation" --limit 5 --json
+cargo run -- code context "vehicle confirmation" --limit 3 --depth 1 --neighbors 12 --tests 4 --json
+cargo run -- code impact 'qualified::symbol' --json
+cargo run -- code callers 'qualified::symbol' --json
 cargo run -- state status --json
 cargo run -- events list --limit 20 --json
 
@@ -88,6 +98,35 @@ one logical repository. Independent clones remain distinct, and no remote is req
 remote URLs are metadata only. Moving a primary repository normally creates new local
 IDs; robust relocation is deferred and old registrations remain inspectable. Git status
 and HEAD are observations, not an exact fingerprint of a dirty working tree.
+
+## Code intelligence
+
+Run `repo init`, then `repo index` in each workspace. The first pass extracts supported
+files; subsequent passes hash content and only reparse new/changed/version-invalid files.
+Deleted or newly ignored files lose their facts. A parse/read failure removes that file's
+old facts, persists a diagnostic, and makes indexing exit nonzero while committing useful
+results from other files. Database/journal failures roll back the entire update.
+
+`repo index --status` reports the indexed source observation, parser/backend versions,
+counts, stale paths, and failures. Every code query rechecks discovery and
+content hashes; stale snapshots are refused with a refresh instruction. Partial indexes
+can answer from successful files, prominently marked partial with failed-file counts.
+These are sequential filesystem observations, not exact diff/evidence bindings.
+
+`code symbol` performs exact name/qualified-name/ID lookup; `code search` searches name
+substrings; `code file` lists file entities. `code locate` ranks names, normalized
+snake_case/camelCase tokens, paths, containers, and compact signatures without an LLM.
+`code refs`, `code callers`, `code tests`, `code neighbors`, `code context`, and
+`code impact` expose bounded graph relationships. Ambiguous impact/relationship requests
+require a qualified name or graph ID. Empty searches are valid empty results.
+
+Tree-sitter provides syntax, not compiler or runtime truth. Imports and most calls remain
+explicitly unresolved; only unique same-module Rust `self::name` call/type/trait paths
+are resolved. Test entities recognize documented naming/attribute conventions, and test
+links indicate lexical containment, not proven coverage. No macro expansion, dynamic
+dispatch, cross-file resolution, C adapter, embeddings, or provider calls are implemented.
+Indexing skips ignored files, symlinks, nested repositories, common build/dependency trees,
+and project `deny_read` paths. See the architecture contract for limits and guarantees.
 
 Rust types are canonical. Regenerate and review schemas whenever contracts change;
 tests fail if checked-in schemas drift. See [the architecture contract](docs/architecture.md)

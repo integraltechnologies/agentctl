@@ -1,4 +1,4 @@
-# Architecture contract — Stage 1, preserving protocol v1
+# Architecture contract — Stage 2, preserving protocol v1 and Stage 1 ownership
 
 ## Ownership and roles
 
@@ -145,7 +145,7 @@ job detachment, decisions, retries, and execution are future responsibilities.
 | Scope | Default path | Contents |
 | --- | --- | --- |
 | Machine configuration | `~/.config/agentctl/` | Stable cross-repository workflow policy |
-| Durable machine-local data | `~/.local/share/agentctl/` | Canonical repository/task/job/evidence/event state; future graph/memory/resume state |
+| Durable machine-local data | `~/.local/share/agentctl/` | Canonical repository/task/job/evidence/event state; derived code graph; future memory/resume state |
 | Reconstructible cache | `~/.cache/agentctl/` | Disposable derived data; never the only copy of canonical state |
 | Project configuration | `repo/.agentctl/project.toml` | Product invariants, architecture constraints, repo commands, protected-data rules, canonical verification definitions |
 | Task packet | Managed protocol document | Current bounded work delta and references |
@@ -187,7 +187,7 @@ command_refs = ["unit"]
 Declaration keys are compact IDs. Verification command references must resolve to
 project commands; command working directories are repository-relative (`.` is allowed).
 Protected paths denote a path/subtree. These are declarations, not enforcement or
-execution in Stage 1. Future task execution must resolve canonical checks and cannot
+execution in Stage 1; Stage 2 discovery excludes `deny_read` paths. Future task execution must resolve canonical checks and cannot
 weaken protected-data or machine policy. Both config types reject unknown fields,
 missing required values, invalid contents, and unsupported versions with file context.
 
@@ -218,7 +218,7 @@ No remote is required; remote names/URLs are opaque, refreshable metadata.
 - Main and linked worktrees share one repository ID, but have different workspace IDs.
   Repository-level plan/task ownership is shared; future project identity, engineering
   memory, architecture decisions, and repository-level graph identity can use this same
-  repository key. No such Stage 2 systems are implemented here.
+  repository key. Shared memory and orchestration remain future work.
 - Independent clones remain distinct logical repositories, even with identical commits
   and remote URLs. Matching directory basenames imply neither identity.
 - Moving a primary repository normally moves its common and per-worktree Git directories,
@@ -260,7 +260,7 @@ filesystem that supports SQLite locking. Backups must capture a consistent SQLit
 snapshot, including committed WAL contents; copying only the main file while active
 is not a backup procedure.
 
-Database schema version 2 uses SQLite `application_id`, `user_version`, and a small
+Database schema version 3 uses SQLite `application_id`, `user_version`, and a small
 `schema_migrations` table. Migrations run in one transaction.
 Concurrent/repeated opens recheck the version inside the transaction. Future versions,
 foreign/unversioned nonempty databases, and missing migration metadata/required tables
@@ -349,6 +349,157 @@ Consumers must run both deserialization and semantic validation before accepting
 One crate contains the unchanged protocol foundation plus local paths/config, Git
 discovery, SQLite migration/storage, and CLI dispatch. Stage 1 adds `init`, `doctor`,
 repository init/status/list, state status, and event listing; status/list diagnostics
-support trailing `--json`. No graph implementation, provider adapter, scheduler,
+support trailing `--json`. Stage 2 adds the graph described below. No provider adapter, scheduler,
 network stack, daemon, TUI, ML runner, or agent loop is present. Future stages must
 preserve these ownership and verification boundaries.
+
+## Stage 2 backend decision and extraction boundary
+
+The bounded backend evaluation selected direct [Tree-sitter's Rust API](https://tree-sitter.github.io/tree-sitter/using-parsers/)
+with pinned Rust 0.24.2, Python 0.25.0, TypeScript/TSX 0.23.2, and JavaScript 0.25.0
+grammars, using Tree-sitter 0.25.10. Their package manifests declare MIT licenses;
+the lockfile pins the build. This reuses mature parsers with no runtime service or
+source execution. BLAKE3 supplies content hashing and `ignore` supplies Git-style walking.
+
+[Serena](https://github.com/oraios/serena) offers richer LSP-backed resolution but adds
+language-server processes/toolchains and a different runtime boundary. [Aider's repo map](https://aider.chat/docs/repomap.html)
+is a useful compact-context precedent, but its application-oriented ranking/runtime is
+not the storage/provenance API needed here. Unspecified CodeGraph/atlas-like products
+did not provide a concrete reusable local Rust API in this evaluation. Rust-native
+`syn` was available locally, but language-specific parser stacks would duplicate the
+multi-language boundary. No external graph service, compiler integration, or speculative
+parser-plugin system is introduced. The small internal extraction adapter turns parsed
+syntax into language-neutral entities/relations; the core never uses Tree-sitter nodes.
+
+Rust extraction covers inline/external module declarations, functions, methods, structs,
+unions/type aliases, enums, traits, impl containers, constants/statics, `use` statements,
+type references, calls outside opaque macros, and literal `#[test]` attributes. Python
+covers modules, classes, nested functions/methods, imports, bases, and calls. Functions
+named `test_*` in `test_*.py`/`*_test.py` files or `Test*` classes are test candidates.
+Decorated definitions retain their underlying declarations; decorators are not executed.
+TS/JS covers modules, functions, classes/methods, interfaces/type aliases/enums where
+applicable, arrow/function-valued variables, imports/re-exports, calls, and TS implements
+clauses. Literal `test`/`it` calls in `.test.`/`.spec.` files are test-convention candidates.
+These conventions do not certify framework binding, collectability, or execution.
+HTML, CSS, C, config/data files, and other unsupported extensions are omitted, not parsed
+as another language. A new language adds one concrete adapter and a backend version.
+
+## Graph ownership, identity, and provenance
+
+Existing Repository/Workspace registrations are the graph roots; their ownership keys
+are reused rather than duplicated as invented graph IDs. File, synthetic file-module,
+and symbol entities carry `GraphEntityId`, kind, name, lexical qualified name, parent,
+byte range (half-open), 1-based lines, optional Rust visibility, and a deterministic
+signature capped at 240 characters. No source blobs or generated prose are stored.
+Kinds distinguish file, module, function, method, type, enum, trait, constant, test, other.
+
+Entity IDs are domain-separated BLAKE3 hashes of logical repository ID, normalized path,
+language, kind, lexical qualified name, and duplicate-name occurrence ordinal. They do
+not depend on lines/content hashes, so ordinary body edits and line insertions preserve
+identity. Names are compacted to 160 characters; impl-header changes, renames/moves,
+kind/container changes, and reordering otherwise identical duplicate declarations can
+change identity. These are syntactic identities, not compiler USRs or relocation-proof IDs.
+Qualified names use `::` for lexical containers in all languages and include file context;
+they are not claims about language import paths. Edge IDs include source range/occurrence
+and are derivation-specific, not promised stable across edits.
+
+Every file-derived entity and edge includes repository ID, workspace ID, relative path,
+`blake3:<content digest>`, language, grammar/parser version, and extraction/index version.
+`indexed_files` stores the same supporting hash/backend (or no hash on a read failure).
+Edges are supported by their source file. Resolved targets are currently within that
+same file, so file-level invalidation cannot strand cross-file dependencies. A future
+cross-file resolver must track and invalidate target-dependent derivations too.
+
+IDs may coincide across linked workspaces when path/symbol identity agrees, but graph rows
+are keyed by **workspace plus entity ID**. Hashes, ranges, edges, HEAD observations, and
+freshness never leak between workspaces. Every public query requires a registered
+concrete workspace. There is no repository-wide merged source snapshot. Identical files
+are reused within a workspace, not yet deduplicated across workspaces; this is a deliberate
+cache-efficiency limitation, not a loss of source isolation. Clone/move identity semantics
+remain those of Stage 1.
+
+Relations are `CONTAINS`, `IMPORTS`, `CALLS`, `REFERENCES`, `IMPLEMENTS`,
+`TEST_RELATED_TO`, and `DEPENDS_ON` (external Rust modules/JS re-export syntax).
+Containment and test-to-lexical-container links have known endpoints. Only explicit
+Rust `self::name` paths to one compatible declaration in the same lexical module are
+resolved for calls/type references/trait implementations. All other extracted relations
+have `target = null` plus a compact syntactic target name. Bare names, imports, method
+dispatch, and Python/JS calls are never joined globally by name. Macro expansion, cfg
+evaluation, type checking, name rebinding, cross-file imports/calls, and semantic execution
+are absent. Related tests are lexical candidates, not proof they verify a symbol.
+
+## Incremental storage and freshness
+
+The additive v2→v3 migration creates four tables: `graph_indexes`, `indexed_files`,
+`graph_entities`, `graph_edges`. It changes no Stage 0 packets or existing stored payloads.
+Composite foreign keys constrain workspace ownership and cascade file-fact deletion;
+name, qualified-name, file, outgoing-edge, and incoming-edge indexes support lookup.
+Migration conflicts roll back without advancing the version. Read-only inspection still
+does not migrate. Graph updates use the existing IMMEDIATE transaction and append-only
+journal function; one `INDEX_COMPLETED` local event carries measurable aggregate counts,
+including failures, and workspace association. Detailed failures live in file status.
+No per-file success spam or speculative percentage events are emitted. Failed database
+transactions publish neither graph updates nor completion events.
+
+Each index pass discovers files in deterministic order and hashes their bytes. Matching
+hash plus parser/index version reuses existing rows without parsing. New/changed files
+replace their complete derivation; deleted, ignored, or newly excluded files cascade out.
+Parser/index version changes invalidate affected files (global index version changes
+invalidate all). A read, encoding, limit, or parse error deletes previous file facts and
+persists a diagnostic instead; failed files are retried on the next pass. Successful files
+still commit in a partial index, and the CLI returns nonzero. Discovery/policy failures
+or SQLite/journal failures roll back the whole pass. A final discovery/hash check rejects
+known mid-index changes rather than publishing a knowingly mixed observation.
+
+`repo index --status` reports last index time/source, expected index version, stored backend
+version counts, stale paths, failures, and graph sizes. File provenance contains exact backend
+versions. Queries re-discover and rehash current source in a single-use SQLite read
+snapshot; a new/changed/deleted/version-stale path refuses the entire query with refresh
+instructions. Partial but otherwise current indexes return only successful-file facts,
+with `fresh = false`, full failure count, and at most ten sampled diagnostics in query
+context. Status retains the full diagnostic lists. An empty, successfully indexed scope
+is valid. Filesystem checks are sequential observations, not atomic snapshots; external
+edits after checking are possible. HEAD/dirty are context, not the hash trust basis, and
+none of this establishes exact Stage 0 evidence/diff binding.
+
+Unchanged passes still pay discovery/content-read costs; parsing and row replacement
+scale with changed files. No mtime-only trust, persisted syntax trees, cross-workspace
+content cache, filesystem watcher, or background refresh is implemented.
+
+## Bounded discovery and context queries
+
+Discovery honors workspace `.gitignore`/`.ignore` rules, but not ancestor/global Git
+excludes, to avoid hidden machine-dependent scope. It excludes `.git`, `.agentctl`,
+symlinks, nested repositories, project `deny_read` paths, and `target`, `node_modules`,
+`.venv`, `vendor`, `dist`, `build`, `__pycache__` directories. Ignore-policy errors fail
+closed. Unsupported extensions are skipped; binary/NUL/non-UTF-8 supported sources are
+recorded as failures. Paths use Stage 0 normalized relative-path validation. Bounds are
+20,000 supported files, 100,000 visited entries, directory depth 64, 2 MiB per source,
+200,000 syntax nodes, extraction depth 128, 10,000 entities/20,000 edges per file, and a
+2-second parser cancellation budget. Limits are explicit failures, never silent truncation
+of file derivations. Per-file processing bounds memory instead of loading all sources.
+Sources are never executed; no package manager, build script, language server, network,
+LLM, provider runtime, or repository instruction is invoked. Symlink metadata checks
+and Unix NOFOLLOW/nonblocking source opens are conservative protections, not a sandbox
+against a concurrent process replacing ancestor directories.
+
+Exact/qualified/ID lookup, prefix/substring search, file lookup, incoming/outgoing typed
+relations, related tests, and bounded neighborhoods are reusable library APIs. `locate`
+streams stored entities and ranks exact symbol/ID matches (1000), normalized name tokens
+(100 each), container tokens (40), path tokens (25), signature tokens (5), with a one-point
+symbol-over-container preference; each token takes its strongest signal. CamelCase,
+acronyms, snake_case and punctuation are normalized deterministically. Ties use path,
+qualified name, then ID. Substring/lexical location is a streaming scan; no claim of
+sublinear full-text search is made. Exact and adjacency queries use SQLite indexes.
+
+`context` returns ranked primaries, bounded containers/neighbors/relations, lexical test
+candidates, ranges/signatures and provenance—not source concatenation. Defaults are five
+primaries, depth one, twenty neighbors/eighty relations and eight tests; hard limits are
+ten primaries, depth three, one hundred neighbors/four hundred relations, twenty tests.
+Ordinary result limits are 1–100, queries 1–512 bytes (location: at most 32 tokens).
+Count truncation is indicated. Graph/ranking data is deterministic for identical inputs;
+freshness observation timestamps and measured indexing durations naturally vary.
+`impact` requires one unambiguous symbol and traverses known incoming structural edges,
+excluding ownership containment. It reports known dependents, not everything a change
+will break. `refs`/`callers` only report resolved endpoints; absent edges are not proof of
+independence. Stage 3 must respect these precision, coverage, freshness, and scope limits.

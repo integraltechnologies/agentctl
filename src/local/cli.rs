@@ -33,6 +33,15 @@ pub fn run(args: &[&str]) -> Result<()> {
             )
         }
         ["doctor"] => doctor(&paths, json_mode),
+        graph @ (["repo", "index", ..] | ["code", ..]) => {
+            let config = load_machine(&paths)?;
+            let mut store = if graph == ["repo", "index"] {
+                Store::open(&paths.database, config.busy_timeout_ms)?
+            } else {
+                Store::read_only(&paths.database, config.busy_timeout_ms)?
+            };
+            super::graph::cli::run(&mut store, graph, json_mode)
+        }
         ["repo", "init"] => {
             let config = load_machine(&paths)?;
             let info = RepositoryInfo::discover(&env::current_dir()?)?;

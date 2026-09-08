@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod graph;
 mod migrations;
 pub mod paths;
 pub mod repository;

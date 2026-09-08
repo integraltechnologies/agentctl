@@ -59,6 +59,9 @@ pub struct StoredTask {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum JournalEntry {
+    IndexCompleted {
+        stats: super::graph::IndexStats,
+    },
     RepositoryObserved {
         /// Frozen v1 observation, retained verbatim across the identity migration.
         repository: serde_json::Value,
@@ -120,7 +123,7 @@ pub struct StateStatus {
 }
 
 pub struct Store {
-    connection: Connection,
+    pub(super) connection: Connection,
 }
 
 impl Store {
@@ -804,7 +807,7 @@ impl Store {
 }
 
 #[derive(Default)]
-struct Links {
+pub(super) struct Links {
     workspace_id: Option<WorkspaceId>,
     plan_id: Option<PlanId>,
     task_id: Option<TaskId>,
@@ -812,6 +815,12 @@ struct Links {
 }
 
 impl Links {
+    pub(super) fn workspace(id: WorkspaceId) -> Self {
+        Self {
+            workspace_id: Some(id),
+            ..Self::default()
+        }
+    }
     fn for_job(job: &AgentJob) -> Self {
         Self {
             workspace_id: None,
@@ -1070,7 +1079,7 @@ fn job(connection: &Connection, repo: &RepositoryId, id: &JobId) -> Result<Optio
     .transpose()
 }
 
-fn append(
+pub(super) fn append(
     connection: &Connection,
     repo: &RepositoryId,
     timestamp: u64,
