@@ -417,3 +417,42 @@ snapshots. No live provider model calls are needed for tests. Native sandbox tes
 separately runnable with `cargo test --locked -- --ignored` on a capable macOS host;
 they use fake executables/disposable repositories and opt-in installed native login-status
 checks, not paid model calls. Native login-status tests require locally logged-in CLIs.
+
+## Stage 6: observe and agenttop
+
+`agenttop` is a read-only, keyboard-driven terminal view of canonical engineering activity.
+Build both executables with `cargo build --locked`, then run `target/debug/agenttop`.
+It does not start workers, contact providers, index a checkout, or change engineering state.
+
+```sh
+agentctl observe snapshot --json
+agentctl observe sessions --json
+agentctl observe session <id> --json
+agentctl observe agents --json
+agentctl observe agent <id> --json # also: job <id>, tasks, task <id>, events
+agentctl observe usage --json
+agentctl observe usage provider <name> --json # also: task <id>, role <role>
+agenttop --once --width 100 --height 30 # text rendering; no interactive terminal needed
+```
+
+The top graph shows observed tokens/minute over ten minutes. Below it are the selected
+session's agent tree, TaskPacket DAG, selected worker/task probe and recent events.
+Use **q** to quit, **↑/↓** to select, **Tab** to switch agents/tasks, **Enter** to expand
+the probe, **s** to cycle sessions, **g** to cycle aggregate/provider/task/role graph
+filters, **r** to refresh and **?** for help. Narrow terminals switch panels instead of
+squeezing every column. Polling is read-only once per second.
+
+Progress is `N/M VERIFIED`, never a guessed percentage. Provider activity is
+`PROVIDER_EXECUTION` as a last-known phase, separately from `liveness: LIVE | UNKNOWN`.
+LIVE requires the current controller's owned-child poll to confirm that it has not exited;
+PID, lifecycle, timestamps and recent events cannot establish liveness. Separate CLI/TUI
+processes and restarted controllers have no such evidence and show `RUNNING/UNKNOWN`,
+without changing lifecycle. Elapsed time and event silence are not inferred model idle
+time. No heartbeat or persisted liveness is added; recovery still belongs to the runtime.
+
+Usage preserves EXACT/ESTIMATED/UNKNOWN provenance. Current adapters report at job return,
+so the graph shows receipt-time bursts, not inferred streaming generation. Missing usage
+is unknown, not zero; a partial known sum is labeled PARTIAL. No new estimator is added.
+Views are bounded recent history with explicit truncation warnings. Unowned legacy records
+remain uncertain. The local query API and TUI share one projection; no schema migration,
+provider transcript access, analytics warehouse or Stage 7+ behavior is introduced.

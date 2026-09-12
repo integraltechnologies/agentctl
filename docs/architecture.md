@@ -1012,6 +1012,80 @@ checkpoint can therefore require manual review rather than automatic continuatio
 Stage 1's journal carries lifecycle, diff/check, drift, blocking, cancellation and completion
 events, plus canonical token-usage events distinguishing EXACT/ESTIMATED/UNKNOWN. Runtime jobs
 retain provider/model/effort, input/output hashes, PID, phase, timestamps and failure reason.
-`run status`, read-only dry-run and provider inspection expose this foundation. Live tool/idle
-telemetry, token aggregation, artifact retention/GC, broader platform/auth support, managed
-parallel worktrees and agenttop are future work, not implied by these records.
+`run status`, read-only dry-run and provider inspection expose this foundation. Provider-internal
+tool/idle telemetry, artifact retention/GC, broader platform/auth support and managed
+parallel worktrees remain future work, not implied by these records.
+
+## Stage 6: local observability and agenttop
+
+`Store::observe(at_ms)` provides one bounded SQLite read-transaction projection shared by
+the `observe` JSON CLI and terminal client. It exposes presentation contracts, not table
+dumps: sessions and current plans, agent ownership/parentage, task DAGs, blockers, phases,
+timestamp inputs, compact events and usage deltas. Roles are strings at this boundary;
+packet and integration verifiers are distinguished without adding canonical protocol types.
+No observation grants a runtime capability, opens provider artifacts/configuration, discovers
+Git state, indexes sources, mutates lifecycle, or invokes a provider. The database stays v7;
+all 13 Stage 0 schemas and Stage 5 authorization/migration guards are unchanged.
+
+Queries retain at most 64 plans (active first), 512 recent runtime jobs, 4,096 tasks and
+2,048 recent journal entries; per-row JSON caps are 256 KiB for plans/runs and 64 KiB for
+jobs/events. Truncation is explicit; this is not exhaustive historical reporting. Missing,
+oversized or malformed metadata never causes ownership backfill. Unowned plans and legacy
+agents remain labeled separately. Agent trees use persisted parentage within a session,
+deterministic ordering, and cycle/orphan-safe traversal. A planner's issued request links
+its newly imported plan before a run exists; ownership-less historical runs are not repaired.
+
+Task lifecycle comes from canonical task rows; structural READY uses the existing PlanPacket
+transition/readiness rules. Unverified dependencies and stopped runtime/plan conditions are
+explicit blockers. Readiness is not a new authorization or live source-validity guarantee.
+Current-plan `N/M VERIFIED` excludes superseded attempts and is suppressed for incomplete
+task projections. Job success is separate from verifier PASS. Last events are ordered by
+journal sequence, not potentially out-of-order timestamps. Check events expose the known
+check identifier, not arbitrary shell arguments; raw errors are mapped to compact blocker
+categories. Provider internals remain unknown. Wall-clock elapsed/since-event values are
+derived without timer writes; silence is not evidence of idle model behavior or a dead process.
+
+Job lifecycle and liveness are independent. Activity `PROVIDER_EXECUTION` describes the
+last-known phase; it is not a claim that a process is currently running. Each projected
+agent explicitly has `liveness: LIVE | UNKNOWN` (missing legacy fields default to UNKNOWN).
+LIVE requires a current-controller registry entry bound to database/repository/workspace/
+session/agent/job and confirmation from its owned child handle. The native adapter supplies
+that evidence only after `Child::try_wait` reports no exit. Unsupported adapters default to
+no evidence. Evidence is point-in-time, valid between the existing controller polls; it is
+cleared before each poll/cancel and removed on completion/error/unwind. The registry is
+in-memory, creator-process-scoped, and never reconstructed from PID, timestamps or events.
+Terminal jobs are never projected LIVE. A separate `observe`/`agenttop` process, or a
+restarted controller without its original child handle, therefore reports RUNNING/UNKNOWN.
+Agent rows and probes display both dimensions; UNKNOWN has no healthy/live indicator.
+Observation does not write liveness or repair lifecycle. No daemon, heartbeat, migration,
+cross-process supervision or speculative DEAD/IDLE state is introduced.
+
+Usage reuses Stage 0 `TokenUsageEvent` deltas in the existing append-only journal. Observations
+are keyed by repository/journal sequence, with job/session/agent/role/provider/model dimensions
+joined from runtime ownership. Unknown dimensions stay absent. A total is the explicit total,
+or input + output only when both exist and addition does not overflow. Cached/reasoning
+subcounts are never added again. EXACT and ESTIMATED remain distinct; mixed known observations
+are MIXED, known sums with missing observations/unreported workers are PARTIAL, and no data
+or arithmetic overflow is UNKNOWN. The current implementation adds no token estimator.
+
+The rolling graph samples a trailing 60-second delta sum every 10 seconds over a 10-minute
+window (at most 61 points). Empty buckets are null, not zero. Out-of-order samples are sorted,
+duplicate observation IDs counted once, future timestamps excluded and arithmetic checked.
+Reopen reconstructs from events; new jobs do not subtract prior jobs' counters. No adapter
+feeds cumulative counters into this API: a future cumulative adapter must normalize resets
+per process/job before emitting canonical deltas. Native adapter counts arrive at job return,
+not continuously; planner jobs currently have no usage event. Receipt-time bursts are not
+interpolated across execution. Aggregate/provider/task-ID/role scopes are machine-wide across
+the bounded view (a repeated task ID matches all such tasks); Rust callers may additionally
+filter by session. No derived graph points are persisted and there is no provider polling.
+
+`agenttop` uses [Ratatui 0.29](https://docs.rs/ratatui/0.29.0/ratatui/) with its matching
+Crossterm backend. Rendering/navigation are separate from terminal I/O and use the same
+snapshot as JSON queries. The top rolling graph is followed by session, agent tree, task DAG,
+probe and recent-event regions. Tab changes selection panel, arrows select, Enter expands
+details, g cycles graph scopes, s cycles sessions, r refreshes, ? shows help and q/Esc quits.
+Small screens collapse panels or request resizing; no special font/mouse is required.
+An RAII guard restores raw/alternate-screen mode on normal errors/unwind. `--once` uses
+Ratatui's in-memory terminal backend for deterministic text rendering and automated tests.
+The loop polls keys at 250 ms and snapshots at 1 s, retaining the last snapshot with a stale
+warning on read errors/busy databases. No HTTP/server/GUI transport or analytics stack is added.

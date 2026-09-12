@@ -39,6 +39,12 @@ pub struct ProcessOutput {
 }
 pub trait RunningProcess {
     fn pid(&self) -> Option<u32>;
+    /// True only when the last poll directly confirmed the owned provider child
+    /// had not exited. Output-pending, a PID, or a successful launch is not enough.
+    /// Unsupported adapters conservatively provide no liveness evidence.
+    fn liveness_confirmed(&self) -> bool {
+        false
+    }
     fn poll(&mut self) -> Result<Option<ProcessOutput>>;
     fn cancel(&mut self) -> Result<()>;
 }
@@ -74,6 +80,7 @@ pub struct NativeProcess {
     timeout: u64,
     failure: Option<String>,
     reaped: bool,
+    live_child: bool,
     secrets: Vec<String>,
 }
 fn drain(mut stream: impl Read + Send + 'static) -> JoinHandle<std::io::Result<Vec<u8>>> {
@@ -170,6 +177,7 @@ impl NativeProcess {
             timeout: spec.timeout_ms,
             failure: None,
             reaped: false,
+            live_child: false,
             secrets,
         })
     }
@@ -188,21 +196,27 @@ impl NativeProcess {
     }
 }
 impl RunningProcess for NativeProcess {
+    fn liveness_confirmed(&self) -> bool {
+        self.live_child
+    }
     fn pid(&self) -> Option<u32> {
         Some(self.child.id())
     }
     fn cancel(&mut self) -> Result<()> {
+        self.live_child = false;
         self.failure = Some("cancelled".into());
         self.stop_family();
         Ok(())
     }
     fn poll(&mut self) -> Result<Option<ProcessOutput>> {
+        self.live_child = false;
         require(!self.reaped, "process output already collected")?;
         if self.started.elapsed().as_millis() >= self.timeout as u128 && self.failure.is_none() {
             self.failure = Some("timeout".into());
             self.stop_family();
         }
         let Some(status) = self.child.try_wait()? else {
+            self.live_child = true;
             return Ok(None);
         };
         // Remove any background descendants before accepting output/source state.
@@ -476,6 +490,23 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    #[ignore = "requires macOS sandbox capability outside a nested host sandbox"]
+    fn native_liveness_requires_owned_child_poll_and_is_cleared_on_exit() {
+        let f = Fixture::new();
+        let mut spec = f.spec(false);
+        spec.executable = "/bin/sleep".into();
+        spec.args = vec!["30".into()];
+        let mut child = NativeProcess::launch(&spec).unwrap();
+        assert!(!child.liveness_confirmed()); // spawn/PID alone is not evidence
+        assert!(child.poll().unwrap().is_none());
+        assert!(child.liveness_confirmed());
+        child.cancel().unwrap();
+        assert!(!child.liveness_confirmed());
+        finish(&mut child);
+        assert!(!child.liveness_confirmed());
     }
     #[test]
     #[ignore = "requires macOS sandbox capability outside a nested host sandbox"]

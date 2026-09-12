@@ -1455,6 +1455,704 @@ fn old_v7_runtime_metadata_remains_inspectable_without_silent_ownership_backfill
     assert_eq!(f.store().status().unwrap().schema_version, 7);
 }
 
+struct ObservedProcess {
+    inner: Box<dyn RunningProcess>,
+    database: PathBuf,
+    snapshots: Arc<Mutex<Vec<local::observe::Snapshot>>>,
+}
+
+// A real owned child waits on an open stdin pipe; no provider/model is invoked.
+struct LiveFixtureProcess {
+    child: std::process::Child,
+    gate: Arc<std::sync::atomic::AtomicU8>,
+    inner: Box<dyn RunningProcess>,
+    confirmed: bool,
+}
+impl RunningProcess for LiveFixtureProcess {
+    fn pid(&self) -> Option<u32> {
+        Some(self.child.id())
+    }
+    fn liveness_confirmed(&self) -> bool {
+        self.confirmed
+    }
+    fn poll(&mut self) -> local::Result<Option<ProcessOutput>> {
+        use std::sync::atomic::Ordering;
+        self.confirmed = false;
+        match self.gate.load(Ordering::Acquire) {
+            2 => panic!("fixture controller crash while provider child is attached"),
+            1 => {
+                let _ = self.child.kill();
+                self.child.wait()?;
+                self.inner.poll()
+            }
+            _ => {
+                assert!(self.child.try_wait()?.is_none());
+                self.confirmed = true;
+                Ok(None)
+            }
+        }
+    }
+    fn cancel(&mut self) -> local::Result<()> {
+        self.confirmed = false;
+        self.gate.store(1, std::sync::atomic::Ordering::Release);
+        self.child.kill()?;
+        Ok(())
+    }
+}
+impl Drop for LiveFixtureProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+struct LiveFixtureProvider {
+    fake: Fake,
+    gate: Arc<std::sync::atomic::AtomicU8>,
+    launched: bool,
+}
+impl ProviderAdapter for LiveFixtureProvider {
+    fn capabilities(&self) -> Capabilities {
+        self.fake.capabilities()
+    }
+    fn launch(
+        &mut self,
+        input: &JobInput,
+        spec: ProcessSpec,
+        config: &RoleConfig,
+    ) -> local::Result<Box<dyn RunningProcess>> {
+        let inner = self.fake.launch(input, spec, config)?;
+        if self.launched {
+            return Ok(inner);
+        }
+        self.launched = true;
+        let child = Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        Ok(Box::new(LiveFixtureProcess {
+            child,
+            inner,
+            gate: self.gate.clone(),
+            confirmed: false,
+        }))
+    }
+    fn collect(&self, output: &ProcessOutput) -> local::Result<Value> {
+        self.fake.collect(output)
+    }
+}
+struct LiveRun {
+    gate: Arc<std::sync::atomic::AtomicU8>,
+    thread: Option<std::thread::JoinHandle<local::Result<RunRecord>>>,
+}
+impl LiveRun {
+    fn start(f: &Fixture, p: &ExecutionPlan) -> Self {
+        let gate = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let child_gate = gate.clone();
+        let paths = f.paths.clone();
+        let root = f.root.clone();
+        let config = f.config.clone();
+        let plan = p.packet.plan_id.clone();
+        let thread = std::thread::spawn(move || {
+            let mut store = Store::open(&paths.database, 100).unwrap();
+            Runtime::new(
+                &mut store,
+                paths,
+                config,
+                BTreeMap::from([(
+                    "test".into(),
+                    Box::new(LiveFixtureProvider {
+                        fake: Fake {
+                            mode: Mode::Pass,
+                            seen: seen(),
+                        },
+                        gate: child_gate,
+                        launched: false,
+                    }) as Box<dyn ProviderAdapter>,
+                )]),
+            )
+            .unwrap()
+            .with_check_launcher(Box::new(Checks { fail: false }))
+            .run(&root, &plan)
+        });
+        Self {
+            gate,
+            thread: Some(thread),
+        }
+    }
+    fn join(mut self, outcome: u8) -> std::thread::Result<local::Result<RunRecord>> {
+        self.gate
+            .store(outcome, std::sync::atomic::Ordering::Release);
+        self.thread.take().unwrap().join()
+    }
+}
+impl Drop for LiveRun {
+    fn drop(&mut self) {
+        self.gate.store(1, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+fn wait_for_live(f: &Fixture) -> local::observe::Snapshot {
+    let store = Store::read_only(&f.paths.database, 100).unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        let snapshot = store.observe(local::now_ms().unwrap()).unwrap();
+        if snapshot
+            .agents
+            .iter()
+            .any(|a| a.liveness == local::observe::Liveness::Live)
+        {
+            return snapshot;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "current child did not become observable"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn observe_current_owned_child_is_live_but_separate_process_and_terminal_jobs_are_unknown() {
+    use local::observe::Liveness;
+    let f = Fixture::new();
+    let p = f.plan();
+    let run = LiveRun::start(&f, &p);
+    let snapshot = wait_for_live(&f);
+    let agent = snapshot
+        .agents
+        .iter()
+        .find(|a| a.liveness == Liveness::Live)
+        .unwrap();
+    assert_eq!(agent.state, "RUNNING");
+    assert_eq!(agent.activity, "PROVIDER_EXECUTION");
+    let cli_result = cli(&f, &["observe", "agent", &agent.id, "--json"]);
+    assert!(cli_result.status.success());
+    let value: Value = serde_json::from_slice(&cli_result.stdout).unwrap();
+    assert_eq!(value["state"], "RUNNING");
+    assert_eq!(value["liveness"], "UNKNOWN");
+    assert_eq!(value["activity"], "PROVIDER_EXECUTION");
+    let mut app = local::agenttop::App::new(snapshot.clone());
+    assert!(
+        local::agenttop::render_text(&app, 120, 40)
+            .unwrap()
+            .contains("RUNNING/LIVE")
+    );
+    app.inspect = true;
+    assert!(
+        local::agenttop::render_text(&app, 120, 40)
+            .unwrap()
+            .contains("Liveness LIVE")
+    );
+    run.join(1).unwrap().unwrap();
+    let completed = f.store().observe(local::now_ms().unwrap()).unwrap();
+    assert!(
+        completed
+            .agents
+            .iter()
+            .all(|a| a.state == "SUCCEEDED" && a.liveness == Liveness::Unknown)
+    );
+    let c = common::sql(&f.paths.database);
+    assert_eq!(
+        c.query_row::<i64, _, _>(
+            "SELECT count(*) FROM runtime_jobs WHERE record_json LIKE '%liveness%'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn observe_crash_reopen_ignores_pid_and_recent_events_alongside_another_live_session() {
+    use local::observe::Liveness;
+    let old = Fixture::new();
+    let plan = old.plan();
+    let crashed = LiveRun::start(&old, &plan);
+    let snapshot = wait_for_live(&old);
+    let stale = snapshot
+        .agents
+        .iter()
+        .find(|a| a.liveness == Liveness::Live)
+        .unwrap()
+        .clone();
+    assert!(crashed.join(2).is_err());
+    // Privileged fixture: even a PID known to be alive cannot establish identity.
+    let c = common::sql(&old.paths.database);
+    c.create_scalar_function(
+        "agentctl_runtime_authorized",
+        2,
+        rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS,
+        |_| Ok(true),
+    )
+    .unwrap();
+    c.execute(
+        "UPDATE runtime_jobs SET record_json=json_set(record_json,'$.pid',?1) WHERE job_id=?2",
+        rusqlite::params![std::process::id(), &stale.job_id],
+    )
+    .unwrap();
+    drop(c);
+    let store = Store::read_only(&old.paths.database, 100).unwrap();
+    let at = local::now_ms().unwrap();
+    let reopened = store.observe(at).unwrap();
+    let agent = reopened.agents.iter().find(|a| a.id == stale.id).unwrap();
+    assert_eq!(agent.state, "RUNNING");
+    assert_eq!(agent.liveness, Liveness::Unknown);
+    assert_eq!(agent.activity, "PROVIDER_EXECUTION");
+    assert!(at.saturating_sub(agent.last_event.as_ref().unwrap().at_ms) < 10_000);
+    let before = fs::read(&old.paths.database).unwrap();
+    let result = cli(&old, &["observe", "agent", &stale.id, "--json"]);
+    assert!(result.status.success());
+    let value: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(value["liveness"], "UNKNOWN");
+    assert_eq!(value["state"], "RUNNING");
+    let mut app = local::agenttop::App::new(reopened);
+    assert!(
+        local::agenttop::render_text(&app, 120, 40)
+            .unwrap()
+            .contains("RUNNING/UNKNOWN")
+    );
+    app.inspect = true;
+    let text = local::agenttop::render_text(&app, 120, 40).unwrap();
+    assert!(text.contains("Liveness UNKNOWN"));
+    assert!(!text.contains("PROVIDER_RUNNING"));
+    assert_eq!(before, fs::read(&old.paths.database).unwrap());
+    let mut current = Fixture::new();
+    current.paths = old.paths.clone();
+    current
+        .store()
+        .register_repository(RepositoryInfo::discover(&current.root).unwrap())
+        .unwrap();
+    current.store().index_repository(&current.root).unwrap();
+    let plan = current.plan();
+    let active = LiveRun::start(&current, &plan);
+    let mixed = wait_for_live(&current);
+    assert_eq!(mixed.sessions.len(), 2);
+    assert_eq!(
+        mixed
+            .agents
+            .iter()
+            .find(|a| a.id == stale.id)
+            .unwrap()
+            .liveness,
+        Liveness::Unknown
+    );
+    let live = mixed
+        .agents
+        .iter()
+        .find(|a| a.liveness == Liveness::Live)
+        .unwrap();
+    assert_ne!(live.session_id, stale.session_id);
+    active.join(1).unwrap().unwrap();
+}
+impl RunningProcess for ObservedProcess {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+    fn cancel(&mut self) -> local::Result<()> {
+        self.inner.cancel()
+    }
+    fn poll(&mut self) -> local::Result<Option<ProcessOutput>> {
+        // A second, read-only connection sees the legitimate live transition.
+        let snapshot = Store::read_only(&self.database, 100)?.observe(local::now_ms()?)?;
+        self.snapshots.lock().unwrap().push(snapshot);
+        self.inner.poll()
+    }
+}
+struct ObservedProvider {
+    fake: Fake,
+    database: PathBuf,
+    snapshots: Arc<Mutex<Vec<local::observe::Snapshot>>>,
+}
+impl ProviderAdapter for ObservedProvider {
+    fn capabilities(&self) -> Capabilities {
+        self.fake.capabilities()
+    }
+    fn launch(
+        &mut self,
+        input: &JobInput,
+        spec: ProcessSpec,
+        config: &RoleConfig,
+    ) -> local::Result<Box<dyn RunningProcess>> {
+        Ok(Box::new(ObservedProcess {
+            inner: self.fake.launch(input, spec, config)?,
+            database: self.database.clone(),
+            snapshots: self.snapshots.clone(),
+        }))
+    }
+    fn collect(&self, output: &ProcessOutput) -> local::Result<Value> {
+        self.fake.collect(output)
+    }
+    fn usage(&self, _: &ProcessOutput) -> local::Result<Usage> {
+        Ok(Usage {
+            provenance: TokenUsageProvenance::Exact,
+            input: Some(17),
+            output: Some(5),
+            cached: None,
+        })
+    }
+}
+struct ObservedChecks {
+    database: PathBuf,
+    snapshots: Arc<Mutex<Vec<local::observe::Snapshot>>>,
+}
+impl CheckLauncher for ObservedChecks {
+    fn provenance(&self) -> &'static str {
+        "DETERMINISTIC_TEST_FIXTURE"
+    }
+    fn launch(&mut self, spec: &ProcessSpec) -> local::Result<Box<dyn RunningProcess>> {
+        Ok(Box::new(ObservedProcess {
+            inner: Checks { fail: false }.launch(spec)?,
+            database: self.database.clone(),
+            snapshots: self.snapshots.clone(),
+        }))
+    }
+}
+
+#[test]
+fn observe_live_diamond_planner_tree_checks_usage_and_guarded_completion() {
+    use local::observe::usage::{Scope, series};
+    let f = Fixture::new();
+    let prepared = f.prepare();
+    let mut p = artifact(&prepared);
+    p.packet.tasks[2].dependencies = vec![p.packet.tasks[0].task_id.clone()];
+    p.packet.tasks[3].dependencies = vec![
+        p.packet.tasks[1].task_id.clone(),
+        p.packet.tasks[2].task_id.clone(),
+    ];
+    for (contract, task) in p.metadata.contracts.iter_mut().zip(&p.packet.tasks) {
+        contract.task_packet_hash = hash(task).unwrap();
+    }
+    p.metadata.integration.plan_packet_hash = hash(&p.packet).unwrap();
+    let snapshots = Arc::new(Mutex::new(vec![]));
+    let inputs = seen();
+    let mut store = f.store();
+    Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(ObservedProvider {
+                fake: Fake {
+                    mode: Mode::Planner(Box::new(p.clone())),
+                    seen: inputs.clone(),
+                },
+                database: f.paths.database.clone(),
+                snapshots: snapshots.clone(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap();
+    store
+        .activate_execution_plan(&f.root, &p.packet.plan_id)
+        .unwrap();
+    let run = Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(ObservedProvider {
+                fake: Fake {
+                    mode: Mode::Pass,
+                    seen: inputs.clone(),
+                },
+                database: f.paths.database.clone(),
+                snapshots: snapshots.clone(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .with_check_launcher(Box::new(ObservedChecks {
+        database: f.paths.database.clone(),
+        snapshots: snapshots.clone(),
+    }))
+    .run(&f.root, &p.packet.plan_id)
+    .unwrap();
+    assert_eq!(run.state, RunState::Complete);
+    let snapshots = snapshots.lock().unwrap();
+    let live = snapshots
+        .iter()
+        .find(|s| {
+            s.agents.iter().any(|a| {
+                a.task_id.as_deref() == Some("task:1")
+                    && a.role == "EXECUTOR"
+                    && a.state == "RUNNING"
+            })
+        })
+        .unwrap();
+    assert_eq!(live.sessions.len(), 1);
+    let session = &live.sessions[0];
+    assert_eq!(session.verified, 1);
+    assert_eq!(session.task_count, 4);
+    assert!(session.progress_complete);
+    let states: Vec<_> = live.tasks.iter().map(|t| t.presentation.as_str()).collect();
+    assert_eq!(states, vec!["VERIFIED", "EXECUTING", "READY", "BLOCKED"]);
+    assert_eq!(
+        live.tasks[3].blocker.as_ref().unwrap().dependencies,
+        vec!["task:1", "task:2"]
+    );
+    assert!(live.tasks[1].verifier_job.is_none());
+    let planner = live.agents.iter().find(|a| a.role == "PLANNER").unwrap();
+    let executor = live
+        .agents
+        .iter()
+        .find(|a| a.task_id.as_deref() == Some("task:1"))
+        .unwrap();
+    assert_eq!(executor.parent_id.as_ref(), Some(&planner.id));
+    assert_eq!(executor.activity, "PROVIDER_EXECUTION");
+    let va = live.agents.iter().find(|a| a.role == "VERIFIER").unwrap();
+    assert_eq!(va.verification.as_deref(), Some("PASS"));
+    let ea = live
+        .agents
+        .iter()
+        .find(|a| a.role == "EXECUTOR" && a.task_id.as_deref() == Some("task:0"))
+        .unwrap();
+    assert_eq!(va.parent_id.as_ref(), Some(&ea.id));
+    assert_ne!(va.id, ea.id);
+    assert!(live.agents.iter().all(|a| !a.ownership_uncertain));
+    assert_eq!(
+        series(live, Scope::Aggregate, None).total_observed,
+        Some(44)
+    );
+    assert!(
+        live.usage
+            .iter()
+            .all(|u| u.job_id.as_deref() != Some(&executor.job_id))
+    ); // running usage stays unknown
+    for scope in [
+        Scope::Provider("test".into()),
+        Scope::Role("VERIFIER".into()),
+        Scope::Task("task:0".into()),
+    ] {
+        assert!(series(live, scope, None).total_observed.is_some());
+    }
+    assert!(
+        live.events
+            .windows(2)
+            .all(|w| w[0].sequence < w[1].sequence)
+    );
+    assert!(snapshots.iter().any(|s| {
+        s.sessions.iter().any(|s| {
+            s.activity == "VERIFICATION_CHECK_STARTED" && s.check.as_deref() == Some("unit")
+        })
+    }));
+    let final_snapshot = store.observe(local::now_ms().unwrap()).unwrap();
+    assert_eq!(final_snapshot.sessions[0].state, "COMPLETE");
+    assert_eq!(final_snapshot.sessions[0].verified, 4);
+    let integration = final_snapshot
+        .agents
+        .iter()
+        .find(|a| a.role == "INTEGRATION_VERIFIER")
+        .unwrap();
+    assert_eq!(integration.verification.as_deref(), Some("PASS"));
+    let text =
+        local::agenttop::render_text(&local::agenttop::App::new(live.clone()), 120, 40).unwrap();
+    assert!(text.contains("1/4 VERIFIED"));
+    assert!(text.contains("BLOCKED"));
+    assert!(!text.contains('%'));
+}
+
+#[test]
+fn observe_cli_and_agenttop_are_read_only_and_never_invoke_provider() {
+    let f = Fixture::new();
+    let p = f.plan();
+    f.run(&p, Mode::Usage(TokenUsageProvenance::Exact), seen(), false)
+        .unwrap();
+    let store = Store::read_only(&f.paths.database, 100).unwrap();
+    let at = local::now_ms().unwrap();
+    let before = store.observe(at).unwrap();
+    fn fingerprint(root: &Path) -> BTreeMap<PathBuf, String> {
+        fn visit(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, String>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        blake3::hash(&fs::read(&path).unwrap()).to_string(),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+    let all_files = fingerprint(&f.root);
+    let bytes = fs::read(&f.paths.database).unwrap();
+    let wal_path = f.paths.database.with_extension("sqlite3-wal");
+    let wal = fs::read(&wal_path).ok();
+    let repo = Command::new("git")
+        .current_dir(&f.root)
+        .args(["diff", "--binary"])
+        .output()
+        .unwrap()
+        .stdout;
+    for args in [
+        vec!["observe", "snapshot", "--json"],
+        vec!["observe", "sessions", "--json"],
+        vec!["observe", "agents", "--json"],
+        vec!["observe", "tasks", "--json"],
+        vec!["observe", "usage", "--json"],
+        vec!["observe", "events", "--json"],
+        vec!["observe", "usage", "provider", "test", "--json"],
+        vec!["observe", "task", "task:0", "--json"],
+        vec![
+            "observe",
+            "session",
+            before.sessions[0].id.as_str(),
+            "--json",
+        ],
+        vec!["observe", "agent", before.agents[0].id.as_str(), "--json"],
+    ] {
+        let result = cli(&f, &args);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        serde_json::from_slice::<Value>(&result.stdout).unwrap();
+    }
+    assert!(
+        !cli(&f, &["observe", "task", "missing", "--json"])
+            .status
+            .success()
+    );
+    let result = Command::new(env!("CARGO_BIN_EXE_agenttop"))
+        .args(["--once", "--width", "80", "--height", "24"])
+        .current_dir(&f.root)
+        .env("HOME", &f.temp.0)
+        .env("XDG_CONFIG_HOME", f.paths.config_root.parent().unwrap())
+        .env("XDG_DATA_HOME", f.paths.data_root.parent().unwrap())
+        .env("XDG_CACHE_HOME", f.paths.cache_root.parent().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("TOKENS/min"));
+    assert_eq!(bytes, fs::read(&f.paths.database).unwrap());
+    assert_eq!(wal, fs::read(&wal_path).ok());
+    assert_eq!(all_files, fingerprint(&f.root));
+    assert_eq!(
+        repo,
+        Command::new("git")
+            .current_dir(&f.root)
+            .args(["diff", "--binary"])
+            .output()
+            .unwrap()
+            .stdout
+    );
+    assert_eq!(
+        serde_json::to_value(before).unwrap(),
+        serde_json::to_value(store.observe(at).unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn observe_recent_query_is_bounded_redacted_and_does_not_load_provider_logs() {
+    let f = Fixture::new();
+    let p = f.plan();
+    f.run(&p, Mode::Pass, seen(), false).unwrap();
+    let info = RepositoryInfo::discover(&f.root).unwrap();
+    let mut c = common::sql(&f.paths.database);
+    let tx = c.transaction().unwrap();
+    let payload = serde_json::to_string(&local::store::JournalEntry::Runtime {
+        job_id: None,
+        phase: "TEST_OBSERVATION".into(),
+        detail: "sk-credential-canary-never-show private provider transcript".into(),
+    })
+    .unwrap();
+    for i in 0..2100 {
+        tx.execute("INSERT INTO events(repo_id,workspace_id,plan_id,timestamp_ms,entry_json) VALUES (?1,?2,?3,?4,?5)",rusqlite::params![info.repository_id.as_str(),info.workspace_id.as_str(),p.packet.plan_id.as_str(),i,&payload]).unwrap();
+    }
+    tx.commit().unwrap();
+    let store = Store::read_only(&f.paths.database, 100).unwrap();
+    let start = std::time::Instant::now();
+    for _ in 0..10 {
+        let snapshot = store.observe(local::now_ms().unwrap()).unwrap();
+        assert!(snapshot.truncated);
+        assert_eq!(snapshot.events.len(), 2048);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("credential-canary"));
+        assert!(!json.contains("private provider transcript"));
+    }
+    eprintln!("10 capped observation queries: {:?}", start.elapsed());
+}
+
+#[test]
+fn observe_multiple_sessions_same_provider_and_malformed_legacy_metadata() {
+    let first = Fixture::new();
+    let p = first.plan();
+    first.run(&p, Mode::Pass, seen(), false).unwrap();
+    let mut second = Fixture::new();
+    second.paths = first.paths.clone();
+    second
+        .store()
+        .register_repository(RepositoryInfo::discover(&second.root).unwrap())
+        .unwrap();
+    second.store().index_repository(&second.root).unwrap();
+    let p2 = second.plan();
+    assert!(second.run(&p2, Mode::Reject, seen(), false).is_err());
+    let before = first.store().observe(local::now_ms().unwrap()).unwrap();
+    assert_eq!(before.sessions.len(), 2);
+    assert_ne!(before.sessions[0].id, before.sessions[1].id);
+    assert!(
+        before
+            .agents
+            .iter()
+            .all(|a| a.provider.as_deref() == Some("test"))
+    );
+    assert!(before.sessions.iter().any(|s| s.state == "BLOCKED"));
+    assert!(before.sessions.iter().any(|s| s.state == "COMPLETE"));
+    for session in &before.sessions {
+        let tree = local::observe::tree(&before, Some(&session.id));
+        assert!(!tree.is_empty());
+        assert!(
+            tree.iter()
+                .all(|(i, _)| before.agents[*i].workspace_id == session.workspace_id)
+        );
+    }
+    let c = common::sql(&first.paths.database);
+    c.create_scalar_function(
+        "agentctl_runtime_authorized",
+        2,
+        rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS,
+        |_| Ok(true),
+    )
+    .unwrap();
+    c.execute(
+        "UPDATE runtime_jobs SET record_json='not-json' WHERE job_id=?1",
+        [&before.agents[0].job_id],
+    )
+    .unwrap();
+    c.execute(
+        "UPDATE runtime_runs SET record_json='{}' WHERE repo_id=?1",
+        [&before.sessions[0].repository_id],
+    )
+    .unwrap();
+    let snapshot = first.store().observe(local::now_ms().unwrap()).unwrap();
+    assert!(snapshot.agents.iter().any(|a| a.ownership_uncertain
+        && a.state == "UNKNOWN"
+        && a.liveness == local::observe::Liveness::Unknown));
+    assert!(snapshot.sessions.iter().any(|s| {
+        s.blocker
+            .as_ref()
+            .is_some_and(|b| b.kind == "MALFORMED_HISTORY")
+    }));
+    assert!(local::agenttop::render_text(&local::agenttop::App::new(snapshot), 35, 12).is_ok());
+}
+
 #[test]
 fn native_auth_preflight_prefers_provider_login_without_importing_api_environment() {
     use local::runtime::credentials::*;

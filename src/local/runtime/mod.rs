@@ -3,6 +3,7 @@ pub(super) mod auth;
 pub(crate) mod cli;
 pub mod config;
 pub mod credentials;
+pub(crate) mod liveness;
 pub mod process;
 pub mod provider;
 pub mod session;

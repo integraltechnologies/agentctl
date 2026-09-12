@@ -25,6 +25,7 @@ pub fn run(args: &[&str]) -> Result<()> {
     };
     let paths = MachinePaths::resolve(&PathContext::from_env())?;
     match args {
+        ["observe", rest @ ..] => super::observe::cli(&paths, rest),
         ["init"] => {
             paths.create_directories()?;
             let config = MachineConfig::initialize(&paths.machine_config)?;

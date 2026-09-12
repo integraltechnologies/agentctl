@@ -18,6 +18,10 @@ Usage:
   agentctl code <context|impact|neighbors> <query> [--limit N] [--depth N] [--neighbors N] [--tests N] [--json]
     context also accepts --memory-canonical N --memory-facts N --memory-notes N --memory-bytes N
   agentctl state status [--json]
+  agentctl observe <snapshot|sessions|agents|tasks|events|usage> [--json]
+  agentctl observe <session|agent|job|task> <id> [--json]
+  agentctl observe usage <provider|task|role> <value> [--json]
+  agenttop [--once] [--width N --height N]
   agentctl provider <list|doctor> [--json]
   agentctl run planner <request-id> [--json]
   agentctl run plan <plan-id> [--dry-run] [--json]
@@ -71,6 +75,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         | ["run", ..]
         | ["provider", ..]
         | ["memory", ..]) => agentctl::local::cli::run(local)?,
+        local @ ["observe", ..] => agentctl::local::cli::run(local)?,
         _ => return Err(format!("invalid arguments\n\n{HELP}").into()),
     }
     Ok(())

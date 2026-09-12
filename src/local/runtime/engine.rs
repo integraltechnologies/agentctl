@@ -211,6 +211,14 @@ impl<'a> Runtime<'a> {
                 "provider cannot guarantee a fresh session",
             )?;
             let mut process = adapter.launch(&input, spec, &config)?;
+            let liveness = liveness::Guard::new(
+                self.store.connection.path().unwrap_or(""),
+                info.repository_id.as_str(),
+                info.workspace_id.as_str(),
+                &input.ownership.engineering_session_id,
+                input.ownership.agent_instance_id.as_str(),
+                job_id.as_str(),
+            );
             job.pid = process.pid();
             job.started_at_ms = Some(now_ms()?);
             job.state = RuntimeJobState::Running;
@@ -218,6 +226,8 @@ impl<'a> Runtime<'a> {
             let started = Instant::now();
             let mut interruption = None;
             let output = loop {
+                // Revoke before polling/cancellation (including errors/unwind).
+                liveness.set(false);
                 if self.cancelled(info, plan)? {
                     interruption = Some("cancelled".to_string());
                     process.cancel()?;
@@ -229,8 +239,10 @@ impl<'a> Runtime<'a> {
                 if let Some(output) = process.poll()? {
                     break output;
                 }
+                liveness.set(process.liveness_confirmed());
                 std::thread::sleep(Duration::from_millis(25));
             };
+            drop(liveness);
             job.stdout = Some(self.artifacts.put(&output.stdout)?);
             job.stderr = Some(self.artifacts.put(&output.stderr)?);
             event(

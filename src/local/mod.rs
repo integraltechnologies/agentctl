@@ -1,10 +1,12 @@
 //! Local configuration, Git discovery, canonical state, and provider-neutral runtime.
 
+pub mod agenttop;
 pub mod cli;
 pub mod config;
 pub mod graph;
 pub mod memory;
 mod migrations;
+pub mod observe;
 pub mod paths;
 pub mod planning;
 pub mod repository;
