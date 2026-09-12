@@ -7,6 +7,37 @@ use std::{
 use agentctl::protocol::*;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+#[allow(dead_code)]
+pub fn sql(path: &std::path::Path) -> rusqlite::Connection {
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.create_scalar_function(
+        "agentctl_runtime_authorized",
+        2,
+        rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS,
+        |_| Ok(false),
+    )
+    .unwrap();
+    c
+}
+#[allow(dead_code)]
+pub fn strip_runtime(c: &rusqlite::Connection) {
+    for name in [
+        "runtime_runs_insert",
+        "runtime_runs_update",
+        "runtime_runs_delete",
+        "runtime_jobs_insert",
+        "runtime_jobs_update",
+        "runtime_jobs_delete",
+        "runtime_task_gate",
+        "runtime_job_create_gate",
+        "runtime_job_update_gate",
+        "runtime_plan_gate",
+    ] {
+        c.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))
+            .unwrap();
+    }
+    c.execute_batch("DROP TABLE IF EXISTS runtime_jobs; DROP TABLE IF EXISTS runtime_runs; DELETE FROM schema_migrations WHERE version=7;").unwrap();
+}
 
 pub fn decode<T: DeserializeOwned>(value: Value) -> T {
     serde_json::from_value(value).unwrap()

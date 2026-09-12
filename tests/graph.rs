@@ -109,7 +109,7 @@ impl Fixture {
         self.store().index_repository(&self.root).unwrap()
     }
     fn sql(&self) -> Connection {
-        Connection::open(&self.database).unwrap()
+        common::sql(&self.database)
     }
 }
 fn write(root: &Path, path: &str, source: &str) {
@@ -910,6 +910,8 @@ fn future_graph_database_version_is_rejected() {
 }
 
 fn restore_v2_schema(f: &Fixture) {
+    common::strip_runtime(&f.sql());
+    f.sql().execute_batch("DROP TRIGGER execution_task_gate; DROP TABLE execution_plans; DROP TABLE planning_requests; DELETE FROM schema_migrations WHERE version>=5;").unwrap();
     f.sql().execute_batch("DROP TABLE memory_links; DROP TABLE memory_fts; DROP TABLE memory_entries; DELETE FROM schema_migrations WHERE version=4;").unwrap();
     // v3 is strictly additive: removing only its tables/history restores the
     // accepted v2 schema, leaving real repository, workspace, plan and journal rows.

@@ -15,9 +15,9 @@ Long term, the control plane will share persistent repository graph intelligence
 engineering memory, evidence, and durable task/job/resume state across providers.
 It will support detached engineering and ML jobs, observable progress, and `agenttop`,
 a btop-like TUI with a rolling token-usage graph. Roles are provider-neutral;
-provider/model identities are optional opaque metadata for future adapters.
+provider/model identities are opaque machine-configured adapter metadata.
 
-## Stage 3
+## Stage 5
 
 This repository currently provides one Rust 2024 crate with a library and a tiny CLI:
 
@@ -35,12 +35,19 @@ This repository currently provides one Rust 2024 crate with a library and a tiny
 - Provider-neutral engineering memory with explicit trust/provenance, typed links,
   immutable promotion/supersession history, deterministic FTS5 search, live project-policy
   projections, and bounded code/TaskPacket memory context.
+- Provider-neutral planning requests and frozen bounded planner input, strict ExecutionPlan
+  import, one independent verification contract per task, final integration contracts,
+  persistent plan lifecycle/history, and VERIFIED-only structural readiness.
+- Local serialized execution through thin Claude Code/Codex CLI adapters, actual
+  content-hashed diffs, canonical command evidence, fresh packet/integration verifiers,
+  runtime-owned job authorization, drift blocking, and durable recovery checkpoints.
 
 The accepted Stage 0 protocol and all 13 public schemas remain unchanged.
 
-It does **not** implement LSP, provider adapters or integrations, agent launching,
-orchestration, autonomous loops, daemons, an experiment runner, token collection,
-`agenttop`/TUI, MCP, web UI, remote services, networking, embeddings, or a vector DB.
+It does **not** implement LSP, automatic correction loops, concurrent writers, daemons,
+an experiment runner, `agenttop`/TUI, token analytics, MCP services, web UI, remote
+scheduling, embeddings, or a vector DB. Provider calls may use the network; canonical
+verification commands may not. Native execution currently requires macOS `sandbox-exec`.
 
 ## Development
 
@@ -205,6 +212,208 @@ required. Existing databases migrate on `init` or a writable open; read-only com
 not migrate. Independent clones and moved primary repositories retain Stage 1's distinct
 local identities; memory is not synchronized or relocated automatically.
 
+## Planning without a model runtime
+
+Stage 4 controls plans; an external planner decides their decomposition. Nothing in
+`agentctl` calls a model, generates a fake plan, launches an executor/verifier, or schedules
+work. Configure canonical checks in `.agentctl/project.toml` under `[verification.KEY]`
+with references to `[commands.KEY]` before importing executable plans.
+
+```sh
+agentctl plan prepare --objective 'Add deterministic cache invalidation to repository indexing' \
+  --query 'cache invalidation' --bytes 32768 --json
+agentctl plan context request:ID --json
+# An external producer writes execution-plan.json using this frozen planner input.
+agentctl plan import execution-plan.json --json
+agentctl plan validate plan:ID --json
+agentctl plan show plan:ID --json
+agentctl plan export plan:ID --json
+agentctl plan tasks plan:ID --json
+agentctl plan ready plan:ID --json
+agentctl plan blocked plan:ID --json
+agentctl plan activate plan:ID --json
+agentctl plan list --json
+agentctl plan supersede plan:OLD --with plan:NEW --json
+agentctl plan cancel plan:ID --reason 'Objective withdrawn' --json
+```
+
+Use returned request/plan IDs, not the illustrative placeholders. `prepare` accepts
+`--objective-file PATH` instead of inline text, or `--request-file PATH` containing a
+strict `RequestDraft`: objective, optional query, scope, constraints, definition_of_done,
+optional verification, invariant_refs, and provenance (actor, source_refs, optional opaque
+provider metadata). No transcript/reasoning field exists. All project invariants become
+critical request invariants. Explicit additional invariant keys can reference active
+repository-wide CANONICAL/INVARIANT memory.
+
+The planner input is a `PlannerPacket` with `artifact = FROZEN_PLANNING_INPUT`, request,
+context, and exact compact-JSON `serialized_bytes`. It combines the accepted graph/memory
+APIs with a frozen policy snapshot and bounded exact source excerpts. Defaults: four graph
+primaries, eight neighbors, four tests, eight files; four canonical memories, three
+observed/derived facts, **zero notes**; 768 bytes/20 lines per excerpt; 32 KiB total.
+`--notes N` explicitly opts into fallible notes. Other knobs are `--primary`, `--neighbors`,
+`--tests`, `--files`, `--canonical`, `--facts`, `--excerpt-bytes`, `--excerpt-lines`, and
+`--bytes`. Truncation is reported; required intent/invariant/policy text is never silently
+discarded to fit. `plan context` returns the same persisted historical input, not fresh
+claims about today's checkout. It does not regenerate context on every read.
+
+External output is an `ExecutionPlan` envelope with exactly two fields: `packet` is the
+unchanged Stage 0 `PlanPacket`; `metadata` contains version, request_id, the request's
+unchanged source binding, creation time, provenance, per-task contracts, an integration
+contract, and optional replan history. Each task contract names its TaskId and packet hash,
+requires an independent verifier with `PACKET_DIFF_AND_EVIDENCE` input, and adds memory_refs,
+exclusions, and non_goals. Its objective, scope, invariants, done criteria and check refs
+come from the immutable TaskPacket, not a second competing task definition. Integration
+binds the complete PlanPacket, requires all task verifications and final diff/evidence,
+and carries overall expectations including user-specified done criteria.
+
+Use `agentctl::local::planning::hash` on the typed `TaskPacket` and `PlanPacket` for contract
+hashes: BLAKE3 of compact serde JSON in declared field order, **not** pretty-printed JSON
+or an arbitrary map's key order. The executable fixture in [tests/planning.rs](tests/planning.rs)
+shows construction and cross-process import. Import deserializes strict Rust types and
+applies Stage 0 validation plus Stage 4 reference/scope/source/contract checks. It never
+executes embedded text or policy commands. Bounds are 32 tasks/256 KiB per plan, 16 KiB
+per TaskPacket, and 8 KiB per task contract. `plan tasks` reports individual byte sizes
+and carries source assumptions, constraints, and resolved critical invariant text.
+
+Import publishes `VALIDATED`, not ACTIVE. Activation rechecks graph/source/policy/memory
+assumptions and permits only one active plan per workspace. `ready` is structural readiness,
+not permission to execute: PLANNED/READY candidates need every prerequisite VERIFIED.
+Executor success or verification rejection cannot unlock dependents. The Stage 4 `plan`
+commands never run tasks; the Stage 5 `run` commands below do.
+Stage 4 packet verification requires the executor, verifier and every evidence record to
+be bound to the plan's workspace: sibling worktrees and unbound records cannot unlock tasks.
+The library's `complete_execution_plan` accepts externally recorded integration proof only
+after all packets are VERIFIED; it checks registered successful jobs, the actual contributing
+executor set, and evidence bound to the submitted final source/workspace. Authentication,
+fresh verifier sessions, actual command execution, and exact diff/evidence capture
+are supplied by Stage 5 for runtime-owned plans, not retroactively for legacy jobs.
+
+Replacement plans use new PlanIds and new TaskIds, with an explicit prior-plan reference
+and reason. Historical VERIFIED/replaced task references are supported, but never copy
+acceptance into new tasks. `supersede` retains the old plan and does not activate the new
+one automatically. Cancellation/supersession refuse unfinished jobs. Inspection reconstructs
+objective, DAG, task states, contracts and readiness without replaying conversations.
+
+Migration 5 adds only planning_requests and execution_plans; existing plans/tasks remain
+the single task store. Imports, lifecycle changes and audit events commit atomically.
+Migration 6 adds completion guards: SQL updates cannot set COMPLETE without a connection-local,
+payload-bound capability granted by the validated completion operation and its matching audit
+event. INSERT/REPLACE cannot start a plan completed. Existing Stage 4 databases migrate on open.
+Before upgrading v5, migration validates every existing COMPLETE plan against durable task
+verification history, workspace-owned jobs/evidence, integration proof, final source and its
+matching completion audit. Invalid or unverifiable history aborts the entire migration at v5
+with a plan-specific error; no completion state or audit is repaired or synthesized.
+Pending/terminal Stage 4 plans cannot transition task rows; legacy Stage 1 plans retain
+their accepted behavior. Existing packet schemas, graph IDs, memory semantics and dependency
+versions are unchanged (rusqlite's existing `functions` feature is enabled for the guard).
+Read-only opens do not migrate. Index STARTED/FAILED attempt-level
+observability remains deferred to the later observability stage.
+
 Rust types are canonical. Regenerate and review schemas whenever contracts change;
 tests fail if checked-in schemas drift. See [the architecture contract](docs/architecture.md)
 for versioning, lifecycle semantics, trust boundaries, and directory conventions.
+
+## Running agents and verification
+
+Configure installed executable paths and role mappings in machine `config.toml`.
+Models/effort are optional opaque provider values; choose them explicitly for your budget.
+For example (replace the executable paths with your installations):
+
+```toml
+[runtime]
+timeout_ms = 600000
+max_correction_rounds = 2
+
+[runtime.providers.codex]
+adapter = "codex"
+executable = "/absolute/path/to/codex"
+
+[runtime.providers.claude]
+adapter = "claude"
+executable = "/absolute/path/to/claude"
+
+[runtime.roles.planner]
+provider = "codex"
+[runtime.roles.executor]
+provider = "claude"
+[runtime.roles.verifier]
+provider = "codex"
+```
+
+Authentication defaults to `AUTO`: reuse the provider's native login first. Codex keeps
+the original `CODEX_HOME` for authentication; Claude preserves normal HOME/config-location
+and Keychain identity, using `--safe-mode` rather than `--bare`. Authentication is persistent,
+but each worker conversation is fresh and non-resumable. History/customizations remain
+disabled and provider history files are sandbox-denied; no credentials are copied into
+agentctl state. `provider doctor` and runtime preflight use token-free native login-status
+commands and report only authentication method/availability, not account or credential data.
+They do not prove live model access or refresh expired credentials on behalf of the provider.
+
+Optional API-key use must be intentional; configure a variable **name**, never its value:
+
+```toml
+[runtime.providers.codex.authentication]
+mode = "AUTO" # NATIVE forbids fallback; API_KEY bypasses native login
+api_key_env = "MY_CODEX_API_KEY" # optional AUTO fallback
+```
+
+The named value is passed only to the selected provider's key variable. Ambient API keys
+are not silently selected. Unsupported CLIs/auth mechanisms fail with login/configuration
+guidance, not an unsandboxed fallback.
+
+```sh
+agentctl provider list --json
+agentctl provider doctor --json
+# Prepare bounded intent using the existing plan prepare command, then:
+agentctl run planner request:... --json  # imports VALIDATED; never auto-activates
+agentctl plan activate plan:...
+agentctl run plan plan:... --dry-run --json
+agentctl run plan plan:... --json
+agentctl run status plan:... --json
+agentctl run resume plan:... --json
+agentctl run cancel plan:...           # request cancellation from another process
+agentctl run replace plan:old plan:new # explicit VALIDATED correction; then activate
+```
+
+Project verification profiles must reference nonempty canonical `commands` (program,
+argv, cwd), not planner shell prose. Checks run read-only against the workspace with
+network disabled and scratch-only build output; configure tools accordingly. Each task
+executes once, its actual changes are scope-checked, checks produce evidence, and a
+fresh verifier must PASS before dependents run. All packets then require fresh integration
+verification through the unchanged Stage 4 completion guard. No automatic commits,
+pushes, resets, worktree creation or cleanup of user source occur.
+
+Start with a clean committed checkout and a newly prepared/activated plan. Unexpected
+source, HEAD, index or policy changes block the run; rejected/uncertain work requires an
+explicit replacement plan. The default permits at most two replacement rounds (configurable
+downward to zero), never automatic executor↔verifier retries. Human reconciliation of the
+checkout is required before preparing a clean correction baseline.
+
+Migration 7 adds runtime runs/jobs and local authorization guards without rewriting old
+records. Source snapshots, diffs, bounded provider output and command logs live in private
+content-addressed storage outside the checkout. Resume uses durable artifacts, not chat
+replay: verified tasks are not re-executed, pending verification/integration checkpoints
+continue, and uncertain interrupted jobs block rather than being treated as successful.
+
+An EngineeringSession owns the undertaking; roles are reusable configuration, while each
+AgentInstance is session-native and ephemeral. The accepted planner DAG requests workers;
+agentctl checks readiness, routing, workspace and budget before creating each executor,
+then its independent verifier, and finally the integration verifier. Parent/session ownership
+is durable provenance, never conversation reuse. Implicit children inherit their parent's
+engineering session; persistent/cross-session workers are not implemented and would require
+explicit user intent. Provider-internal agent spawning is disabled. Temporary job context is
+removed after normal termination; durable packets/evidence/events remain, with no automatic
+conversation-to-memory promotion.
+
+Ownership fits existing v7 JSON metadata; no schema bump or historical backfill is needed.
+Older unaccepted v7 runtime rows remain inspectable but cannot resume without ownership;
+they require explicit reconciliation/replanning. Accepted Stage 0–4 data is unchanged.
+
+Stage 5 intentionally supports small text checkouts: at most 20,000 files/64 MiB total,
+2 MiB per file, 128 KiB expanded verifier diff and 256 KiB provider input. Ignored files
+are included; symlinks, hardlinks, nested repositories and read-denied protected files
+are rejected. Captures are double-checked sequential observations, not atomic filesystem
+snapshots. No live provider model calls are needed for tests. Native sandbox tests are
+separately runnable with `cargo test --locked -- --ignored` on a capable macOS host;
+they use fake executables/disposable repositories and opt-in installed native login-status
+checks, not paid model calls. Native login-status tests require locally logged-in CLIs.

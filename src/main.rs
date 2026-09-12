@@ -18,6 +18,19 @@ Usage:
   agentctl code <context|impact|neighbors> <query> [--limit N] [--depth N] [--neighbors N] [--tests N] [--json]
     context also accepts --memory-canonical N --memory-facts N --memory-notes N --memory-bytes N
   agentctl state status [--json]
+  agentctl provider <list|doctor> [--json]
+  agentctl run planner <request-id> [--json]
+  agentctl run plan <plan-id> [--dry-run] [--json]
+  agentctl run <resume|status|cancel> <plan-id> [--json]
+  agentctl run replace <old-plan-id> <validated-replacement-id>
+  agentctl run packet-hashes < plan-packet.json
+  agentctl plan prepare <--objective TEXT|--objective-file PATH|--request-file PATH> [--query TEXT] [--bytes N] [--notes N] [--json]
+  agentctl plan context <request-id> [--json]
+  agentctl plan import <plan.json> [--json]
+  agentctl plan <validate|activate|show|export|tasks|ready|blocked> <plan-id> [--json]
+  agentctl plan list [--all] [--limit N] [--json]
+  agentctl plan supersede <old-id> --with <new-id> [--json]
+  agentctl plan cancel <plan-id> --reason TEXT [--json]
   agentctl memory add --trust <canonical|agent-note> --kind KIND --content TEXT [--job ID] [--symbol ID] [--invariant KEY] [--key KEY] [--workspace] [--supersedes ID] [--json]
   agentctl memory <show|links|derive|observe|promote|reject> <id-or-symbol> [--json]
   agentctl memory supersede <old-id> --with <new-id> [--json]
@@ -54,6 +67,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         | ["state", ..]
         | ["events", ..]
         | ["code", ..]
+        | ["plan", ..]
+        | ["run", ..]
+        | ["provider", ..]
         | ["memory", ..]) => agentctl::local::cli::run(local)?,
         _ => return Err(format!("invalid arguments\n\n{HELP}").into()),
     }

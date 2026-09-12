@@ -9,7 +9,7 @@ use super::{
     store::{RegisteredRepository, RegisteredWorkspace},
 };
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 7;
 pub const APPLICATION_ID: i64 = 0x41475443; // AGTC
 
 const INITIAL: &str = r#"
@@ -116,6 +116,9 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
         (2, "repository_workspaces"),
         (3, "code_graph"),
         (4, "engineering_memory"),
+        (5, "planning_substrate"),
+        (6, "guarded_plan_completion"),
+        (7, "provider_runtime"),
     ]
     .into_iter()
     .filter(|(v, _)| *v <= version)
@@ -179,6 +182,57 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
             require(count == 1, format!("database is missing trigger {name}"))?;
         }
     }
+    if version >= 5 {
+        connection.prepare("SELECT request_id,packet_json FROM planning_requests LIMIT 0")?;
+        connection.prepare("SELECT metadata_json,state FROM execution_plans LIMIT 0")?;
+        for name in [
+            "planning_requests_immutable",
+            "planning_requests_no_delete",
+            "execution_plans_no_delete",
+            "execution_plans_immutable",
+            "execution_task_gate",
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing trigger {name}"))?;
+        }
+    }
+    if version >= 6 {
+        for name in ["execution_completion_guard", "execution_initial_state"] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing trigger {name}"))?;
+        }
+    }
+    if version >= 7 {
+        connection.prepare("SELECT record_json,cancel_requested FROM runtime_runs LIMIT 0")?;
+        connection.prepare("SELECT record_json,request_id FROM runtime_jobs LIMIT 0")?;
+        for name in [
+            "runtime_runs_insert",
+            "runtime_runs_update",
+            "runtime_runs_delete",
+            "runtime_jobs_insert",
+            "runtime_jobs_update",
+            "runtime_jobs_delete",
+            "runtime_task_gate",
+            "runtime_job_create_gate",
+            "runtime_job_update_gate",
+            "runtime_plan_gate",
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing trigger {name}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -216,6 +270,19 @@ fn migrate_transaction(connection: &mut Connection) -> Result<()> {
     if header(&transaction)? == 3 {
         check_version(&transaction, 3)?;
         transaction.execute_batch(include_str!("memory/schema.sql"))?;
+    }
+    if header(&transaction)? == 4 {
+        check_version(&transaction, 4)?;
+        transaction.execute_batch(include_str!("planning/schema.sql"))?;
+    }
+    if header(&transaction)? == 5 {
+        check_version(&transaction, 5)?;
+        super::planning::legacy_completion::validate(&transaction)?;
+        transaction.execute_batch(include_str!("planning/completion.sql"))?;
+    }
+    if header(&transaction)? == 6 {
+        check_version(&transaction, 6)?;
+        transaction.execute_batch(include_str!("runtime/schema.sql"))?;
     }
     check(&transaction)?;
     require(

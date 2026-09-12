@@ -1,4 +1,4 @@
-//! Local configuration, Git discovery, and SQLite storage. No agent execution.
+//! Local configuration, Git discovery, canonical state, and provider-neutral runtime.
 
 pub mod cli;
 pub mod config;
@@ -6,7 +6,9 @@ pub mod graph;
 pub mod memory;
 mod migrations;
 pub mod paths;
+pub mod planning;
 pub mod repository;
+pub mod runtime;
 pub mod store;
 
 use std::time::{SystemTime, UNIX_EPOCH};

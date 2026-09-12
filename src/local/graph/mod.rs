@@ -271,7 +271,7 @@ fn counts(connection: &Connection, info: &RepositoryInfo) -> Result<(usize, usiz
     Ok((count("graph_entities")?, count("graph_edges")?))
 }
 
-fn status(connection: &Connection, info: &RepositoryInfo) -> Result<IndexStatus> {
+pub(super) fn status(connection: &Connection, info: &RepositoryInfo) -> Result<IndexStatus> {
     let index = metadata(connection, info)?;
     let stored = stored_files(connection, info)?;
     let mut stale = BTreeSet::new();

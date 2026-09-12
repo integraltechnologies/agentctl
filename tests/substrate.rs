@@ -510,7 +510,7 @@ fn missing_migration_history_or_event_guards_are_not_silently_repaired() {
     conn.execute("DELETE FROM schema_migrations", []).unwrap();
     assert!(Store::open(&f.paths.database, 5000).is_err());
     conn.execute(
-        "INSERT INTO schema_migrations VALUES (1,'local_substrate'), (2,'repository_workspaces'), (3,'code_graph'), (4,'engineering_memory')",
+        "INSERT INTO schema_migrations VALUES (1,'local_substrate'), (2,'repository_workspaces'), (3,'code_graph'), (4,'engineering_memory'), (5,'planning_substrate'), (6,'guarded_plan_completion'), (7,'provider_runtime')",
         [],
     )
     .unwrap();

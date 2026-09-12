@@ -14,6 +14,9 @@ use super::{
 use crate::protocol::{JobId, TaskId};
 
 pub fn run(args: &[&str]) -> Result<()> {
+    if args == ["run", "packet-hashes"] {
+        return super::runtime::planner::packet_hashes();
+    }
     let json_mode = args.last() == Some(&"--json");
     let args = if json_mode {
         &args[..args.len() - 1]
@@ -33,6 +36,28 @@ pub fn run(args: &[&str]) -> Result<()> {
             )
         }
         ["doctor"] => doctor(&paths, json_mode),
+        runtime @ (["run", ..] | ["provider", ..]) => {
+            let config = load_machine(&paths)?;
+            super::runtime::cli::run(runtime, &config, &paths, json_mode)
+        }
+        ["plan", command, rest @ ..] => {
+            let config = load_machine(&paths)?;
+            let mut store = if [
+                "prepare",
+                "import",
+                "validate",
+                "activate",
+                "cancel",
+                "supersede",
+            ]
+            .contains(command)
+            {
+                Store::open(&paths.database, config.busy_timeout_ms)?
+            } else {
+                Store::read_only(&paths.database, config.busy_timeout_ms)?
+            };
+            super::planning::cli::run(&mut store, command, rest, json_mode)
+        }
         ["memory", command, rest @ ..] => {
             let config = load_machine(&paths)?;
             let mut store = if ["add", "derive", "observe", "promote", "supersede", "reject"]
@@ -390,7 +415,7 @@ fn check_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn output(json_mode: bool, value: &impl Serialize, human: &str) -> Result<()> {
+pub(crate) fn output(json_mode: bool, value: &impl Serialize, human: &str) -> Result<()> {
     if json_mode {
         println!("{}", serde_json::to_string_pretty(value)?);
     } else {

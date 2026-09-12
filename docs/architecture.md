@@ -1,4 +1,8 @@
-# Architecture contract — Stage 3, preserving protocol v1 and Stage 1/2 foundations
+# Architecture contract — Stage 5, preserving protocol v1 and Stage 1–4 foundations
+
+The historical stage sections below describe their original boundaries. The final
+Stage 5 section supplies execution/authorship guarantees for **runtime-owned** plans;
+it does not retroactively authenticate manually registered legacy jobs or evidence.
 
 ## Ownership and roles
 
@@ -260,7 +264,7 @@ filesystem that supports SQLite locking. Backups must capture a consistent SQLit
 snapshot, including committed WAL contents; copying only the main file while active
 is not a backup procedure.
 
-Database schema version 3 uses SQLite `application_id`, `user_version`, and a small
+Database schema version 5 uses SQLite `application_id`, `user_version`, and a small
 `schema_migrations` table. Migrations run in one transaction.
 Concurrent/repeated opens recheck the version inside the transaction. Future versions,
 foreign/unversioned nonempty databases, and missing migration metadata/required tables
@@ -626,7 +630,388 @@ graph packet or become authority just by being recent.
 
 Content is untrusted data, never commands, config patches, or instructions to this program.
 There is no authentication, autonomous extraction, semantic contradiction resolution,
-embeddings, network, provider adapter, planner/executor/verifier runtime, scheduler, or
-Stage 4 functionality. Registered evidence is reported faithfully, not independently
+embeddings, network, provider adapter, planner/executor/verifier runtime, or scheduler.
+Registered evidence is reported faithfully, not independently
 verified by this layer. Mechanical extraction is intentionally narrow; other knowledge
 uses explicit canonical decisions or attributed lower-trust notes.
+
+## Planning intelligence versus plan control
+
+Stage 4 implements deterministic plan control. An external producer supplies the task
+decomposition; agentctl neither synthesizes a plan from keywords nor calls a provider.
+There are no provider prompts, model choices, sessions, launchers, schedulers, correction
+loops, or verifier runners. Small coherent deltas are the intended TaskPacket granularity,
+but only structural bounds are enforced—there is no semantic quality score or forced
+fragmentation. Every task, including read-only investigation, requires verification.
+
+`PlanningRequest` records a generated request ID, objective, optional scope/query,
+constraints, user done criteria/checks, invariant refs, creation time, provenance and a
+`PlanningSource`. Ownership lives in its source observation (RepositoryId and WorkspaceId).
+`PlannerPacket` is the persisted, explicitly FROZEN_PLANNING_INPUT request/context artifact.
+It contains no database internals, source tree dump, conversations, or reasoning. Its
+exact compact UTF-8 JSON byte size includes the size field itself; it does not estimate tokens.
+Repeated reads return identical serialized data without rebuilding graph or memory context.
+Observed graph freshness in that artifact refers to preparation time, not read time.
+
+Preparation uses Stage 2 context/location and Stage 3 memory retrieval. Defaults: four
+primaries, depth one, eight neighbors, four tests, eight supporting files, four canonical
+memories, three observed/derived facts, zero agent notes, and 32 KiB for the entire artifact.
+Stage 2/3 count maxima remain unchanged; Stage 4 allows 1–16 files and a 4–128 KiB overall
+budget. Excerpts are exact UTF-8 source slices bound to path/hash/backend and byte/line
+ranges: one per selected primary/test file, normally at most 768 bytes and twenty lines;
+hard maxima 4096 bytes/eighty lines. Zero disables excerpts. Safe Stage 2 reads prevent
+symlink traversal and respect exclusions. Nothing is executed to obtain context.
+
+Optional material is removed deterministically to meet the total budget: excerpts,
+relations, neighbors, tests, memory summaries, then primaries. Truncation is explicit.
+Required intent, critical invariants and policy are never silently omitted; an undersized
+budget fails. Validated project policy has a 16 KiB cap here, intent also 16 KiB. Project
+policy is a frozen historical input snapshot, not another mutable policy authority.
+All project invariants are conservatively critical for every task (up to 32); applicability
+inference is not implemented. Additional explicitly requested invariant keys may resolve
+to active repository-wide canonical invariant memory. Their text is frozen and rechecked
+on import/activation. Task inspection carries necessary invariant text and user constraints
+without requiring the original conversation or copying the complete project config per task.
+
+## ExecutionPlan and verification contracts
+
+`ExecutionPlan` has `packet: PlanPacket` and `metadata: PlanMetadata`; it is a local Stage 4
+envelope, not a redesign of any Stage 0 schema. Metadata carries request ID, source baseline,
+provenance/time/version, task verification contracts, final integration contract and optional
+replan references. SQLite stores the existing PlanPacket exactly once in `plans`; `tasks`
+still contains only identity/ownership/lifecycle state. The new execution row stores only
+metadata plus plan lifecycle. A conflicting TaskId is rejected, not adopted from another plan.
+
+One VerificationContract per TaskId binds the typed TaskPacket hash, independent verifier
+requirement, and PACKET_DIFF_AND_EVIDENCE input. Objective, read/write scope, invariants,
+done criteria and required checks are inherited from that exact immutable packet. The
+contract adds typed MemoryIds, forbidden scope and non-goals; the plan baseline supplies
+initial source expectations, and the future verifier must receive resulting source/diff
+and evidence, never executor reasoning. The final integration contract binds the entire
+PlanPacket, all accepted task verifications, final source/diff/evidence, and overall
+expectations; its canonical check refs live in PlanPacket.integration_verification.
+Contract hashes are BLAKE3 of typed compact serde JSON with declared field order, calculated
+through `planning::hash`. External adapters must reproduce that encoding, not hash arbitrary
+JSON formatting. Contract hashing seals supplied decisions; it is not planner intelligence.
+
+Import requires strict deserialization and the existing DAG/TaskPacket validators, plus
+scope/reference/source and verification-contract validation. Missing/duplicate contracts,
+wrong packet hashes, disabled independence, weakened requested integration checks, missing
+done criteria/integration expectations, invalid graph/memory/invariant references and
+oversized artifacts are errors. Bounds: 32 tasks, 256 KiB envelope, 16 KiB task, 8 KiB
+contract, 32 scope paths and 32 graph/memory refs per task, 128 unique graph/memory refs per
+plan. Empty overall task scope is invalid. Read/write grants remain separate; graph refs
+require read scope. Task scope must fit any supplied request scope and cannot intersect
+its explicit exclusions or project protected paths. Administrative `.git` paths and
+existing symlink ancestors are rejected. New nonexistent paths remain valid planned scope.
+These lexical/observed checks do not replace a Stage 5 filesystem execution sandbox.
+
+Verification requirement refs resolve to project verification definitions, which already
+resolve to structured project commands. Unknown check names or embedded planner shell
+commands cannot substitute for policy. Commands are only data. Memory references reuse
+Stage 3 ownership/status/freshness checks: active canonical decisions, fresh derived facts,
+historical observations, and only explicitly opted-in fallible notes. Referencing memory
+never promotes it. Consumers must dereference MemoryIds and retain their trust labels;
+membership in a verification contract does not make a hypothesis canonical.
+
+## Source assumptions and lifecycle
+
+PlanningSource preserves repository/workspace HEAD/dirty/time observations, a normalized
+policy hash, graph version, and hashes/backends for at most sixteen selected source files.
+It explicitly disclaims exact diff/atomic whole-tree guarantees. Plan output must preserve
+the prepared baseline, not substitute another workspace or invent a fingerprint. Graph refs
+must be present in the current workspace index and supported by files included in the
+prepared context; broaden/reprepare context if an additional file is necessary. Import,
+explicit pending-plan validation, and activation require a complete fresh Stage 2 index,
+matching selected source support, HEAD/dirty observation, policy and critical invariant text,
+and acceptable memory refs. This reuses one Stage 2 freshness pass per validation plus
+bounded source/reference checks; read/list/tasks/readiness do not rescan/reindex source.
+
+Source outside the bounded support—particularly ignored or unsupported files—is not fully
+fingerprinted. Dirty-to-dirty edits outside support can escape drift detection. Filesystem
+observations are sequential, and content may change after validation. Cached context is
+historical; import/activation revalidation is mandatory. Once ACTIVE, source naturally
+changes during work: readiness reports dependency structure, not freshness or authorization
+to execute. Stage 5 must bind actual results and verifier evidence to the resulting diff,
+enforce workspace/job/session isolation and protected paths, and handle post-activation drift.
+
+Lifecycle is deliberately small: successful import publishes VALIDATED; explicit activation
+revalidates and changes it to ACTIVE; COMPLETE requires the completion gate. VALIDATED/ACTIVE
+plans may be explicitly CANCELLED or SUPERSEDED. There is no persisted invalid draft, retry
+loop, or silent rewrite. A unique index allows at most one ACTIVE plan per workspace, not
+one per logical repository. Linked worktrees can independently plan under the same shared
+repository memory. Read/list operations are local to the current workspace; list --all
+also exposes other workspaces/history without treating their source assumptions as current.
+
+Readiness uses the unchanged Stage 0 guards: PLANNED tasks eligible for READY and existing
+READY tasks require all prerequisites VERIFIED. It is a derived boolean and reason list,
+not a persisted READY transition. Rejected, executing, awaiting-verification, verifying or
+blocked tasks do not become candidates. Several independent tasks can be ready together;
+any unverified prerequisite blocks its dependents. Terminal plans expose history but no
+ready work. Stage 4-owned task transitions are database-gated on ACTIVE; legacy Stage 1
+plan behavior is unchanged. No scheduler or executor invokes those transitions automatically.
+For Stage 4 packet decisions, the successful executor job, successful verifier job and every
+referenced evidence record must have the ExecutionPlan's WorkspaceIdentity in storage, in
+addition to matching repository/plan/task/role semantics. Shared RepositoryIdentity does not
+authorize sibling-worktree proof; nullable legacy workspace bindings are insufficient here.
+SourceStateRef itself carries no workspace identity; its evidence row's workspace is checked.
+
+`complete_execution_plan` is a library ingestion gate for externally recorded verification,
+not a verifier runner. It reuses PlanPacket.validate_completion (all VERIFIED, integration
+PASS, required checks and all task invariants), requires a successful registered plan-level
+verifier, and checks the contributing executor set against durable packet-verification
+events. Historical packet proofs are rechecked for job/evidence workspace ownership at
+completion, including proofs recorded before the workspace check was added. Jobs must be in
+the plan workspace; referenced evidence must match that workspace
+and the submitted final SourceStateRef. The proof and final source commit with COMPLETE
+and its audit event. This trusts externally registered observations under Stage 1's local
+trust model; it does not authenticate actors, prove command execution/coverage, attest the
+current filesystem or establish exact dirty-diff binding. Stage 5 must enforce those facts.
+
+## Planning persistence, history, and resume boundary
+
+Additive migration 5 creates planning_requests and execution_plans with repository/workspace/
+request/plan foreign keys, inspection indexes, lifecycle checks and immutable-history guards.
+It rewrites no accepted packet, job, evidence, graph or memory payload. Plan insertion uses
+the same extracted Stage 1 transaction helper, avoiding nested commits or duplicate task
+storage. Request creation, import plus all task rows, validation/activation, cancellation,
+supersession and completion are atomic with aggregate local journal events. Read operations
+emit no events. Migration conflicts roll back, unknown future schemas and missing guards
+fail closed, and read-only opens never migrate. The thirteen Stage 0 schemas and dependency
+versions remain unchanged. No new service or runtime is introduced.
+
+Additive migration 6 installs a completion UPDATE trigger and an initial-state INSERT trigger
+without rewriting existing artifacts or history. Only validated completion temporarily enables
+a connection-local SQLite predicate, bound to the exact repository, plan, workspace, integration
+proof JSON and final source JSON. There is no SQL setter or writable authorization-token table.
+Authorization is revoked on success, error or unwind. The trigger additionally requires the
+matching append-only completion event, inserted in the same write transaction before the state
+update; either failure rolls back both. INSERT/REPLACE must start VALIDATED. Ordinary application
+connections deny completion by default; raw SQLite connections without the predicate fail closed.
+This enables rusqlite's `functions` feature, with no new dependency or version change.
+As with existing SQLite guards, this protects lifecycle DML, not an administrator who can alter
+the schema, replace the database or install a forged native SQL function.
+
+Before installing v6 guards, migration validates every v5 COMPLETE plan within the same
+transaction. It requires persisted VERIFIED task states justified by replayable Stage 0 task
+transitions, valid packet PASS/check/invariant proofs, successful correctly scoped executor and
+verifier jobs, workspace-bound packet evidence, integration PASS covering the exact accepted
+executor set and required checks/invariants, a successful plan-level verifier in the same
+workspace, and final evidence matching the stored SourceStateRef and workspace. Exactly one
+matching completion audit must follow task verification history and agree on plan, workspace,
+proof and final source. Invalid or unverifiable completion aborts the entire migration with
+the affected plan and reason; the database remains v5 with its records, history and schema
+unchanged. Nothing is repaired, downgraded or synthesized. A valid legacy completion remains
+COMPLETE without rewriting its artifacts or events. Review or restore invalid legacy records
+from trusted history before retrying; read-only inspection never performs a migration.
+This is a durable-history check: it does not require a live checkout, infer past policy or
+filesystem freshness, authenticate actors, or prove commands actually ran. Those facts cannot
+be established from v5 records alone. Runtime completion/workspace guards remain unchanged.
+
+Replans get new PlanIds and new immutable TaskIds. They can reference prior VERIFIED tasks
+and replaced/invalidated tasks with a reason; these are historical relationships, never a
+transfer of VERIFIED authority. Prior-plan state and referenced task states are checked.
+Explicit supersession retains the old plan, points it to the validated replacement, and
+does not activate the replacement automatically. Cycles, terminal rewrites and competing
+replacement histories are rejected. Unfinished registered jobs prevent cancellation or
+supersession; Stage 4 cannot stop them. Automatic task adoption, rebase, repair and retries
+remain deferred. Frozen requests, task state, rejection boundaries, contracts, memory refs,
+readiness and integration evidence provide resume inputs without conversation replay or a
+provider session manager. Index attempt-level STARTED/FAILED events remain a documented
+non-blocking limitation for the later observability/agenttop stage; Stage 4 does not reopen
+the accepted indexing implementation to add them.
+
+## Stage 5: provider-neutral local runtime
+
+`ProviderAdapter` supplies capabilities, launch, strict output collection and optional
+usage observation. A `RunningProcess` supplies PID, poll and cancellation. Core scheduling
+uses only issued role/job/session, provider-neutral input, workspace/source, captured
+artifacts and accepted packet types. Adapter and check-launcher implementations are trusted
+host code; model output is untrusted. Injectable deterministic implementations make the
+entire planner→A→B→C/D→integration flow testable offline. No async runtime, scheduler
+framework, SDK, new dependency or provider-specific protocol was added.
+
+Machine `[runtime.providers.<name>]` maps an absolute executable to `codex` or `claude`;
+`[runtime.roles.planner|executor|verifier]` selects that name and optional opaque model/effort.
+The controller enforces a per-process timeout (default ten minutes, maximum one hour).
+Provider calls use structured argv/stdin, never a concatenated shell command.
+
+### Native adapter and process boundary
+
+The [Codex noninteractive interface](https://developers.openai.com/codex/noninteractive/)
+uses `exec`, `--ephemeral`, `--ignore-user-config`, `--ignore-rules`, disabled project
+instructions, preserved native CODEX_HOME authentication, and strict JSON final-output parsing. The CLI's internal
+sandbox is explicitly bypassed **only inside the mandatory outer role-specific OS
+sandbox**: nested macOS Seatbelt application fails. There is no unsandboxed launch path.
+Codex usage is UNKNOWN because this final-output interface supplies no trustworthy counts.
+
+The [Claude CLI interface](https://code.claude.com/docs/en/cli-reference) uses print/safe mode,
+JSON output, a new UUID, no session persistence, no setting sources, no slash commands,
+empty strict MCP configuration and `dontAsk` permissions. Executors get Read/Edit/Write;
+verifiers get Read; planners additionally get Bash to compute canonical serialization
+hashes using the read-only `agentctl run packet-hashes` helper. That helper consumes only
+a PlanPacket on stdin, computes hashes, and never opens machine state or imports a plan.
+Claude's JSON result/structured result must contain the same canonical output types.
+Naturally reported input/output/cache-read usage is emitted as EXACT, with unspecified
+counts left absent; the adapter never estimates counts from response length or cost.
+
+Authentication and agent conversation are separate boundaries. AUTO prefers the provider's
+cached native login, with only explicitly configured `authentication.api_key_env` fallback;
+NATIVE forbids fallback and API_KEY intentionally selects the named environment value.
+No provider credential file is opened, parsed, copied or transformed by agentctl. The
+[Codex credential cache](https://developers.openai.com/codex/auth/) remains in CODEX_HOME/
+the native credential store; `cli_auth_credentials_store=auto` supports the native cache,
+while API-key jobs use ephemeral credential storage. `--ignore-user-config` preserves auth,
+`--ephemeral` and disabled history prevent conversation reuse, and SQLite runtime state is
+redirected to private per-job scratch. Claude keeps the original HOME/CLAUDE_CONFIG_DIR
+semantics (including an unset override) plus USER/LOGNAME for macOS Keychain lookup.
+Its `--safe-mode` disables customizations without disabling authentication; `--restricted`,
+fresh UUIDs, no persistence and explicit tools retain the bounded worker boundary.
+
+Native provider homes are data-denied except narrowly named native authentication/preferences
+files. Paths are canonicalized for sandbox matching, including `/var`→`/private/var` aliases.
+Only those native files may be refreshed in place by the provider; keychain access remains
+provider-owned. Existing history, rules, plugins and other jobs' scratch are not exposed.
+Checks never receive native auth or keys. Named API values and recognizable provider-token
+strings are scrubbed before captured output is persisted. This is defense in depth, not a
+general detector for deliberately encoded secrets or arbitrary sensitive source; installed
+provider binaries remain trusted and workers are instructed never to inspect credentials.
+Temporary context is deleted after normal exit/error; crash leftovers remain private and
+are not reused as authentication or conversation. No automatic shared-memory promotion occurs.
+Doctor/preflight call only `codex login status` / `claude --safe-mode auth status`, with bounded
+execution and discarded raw status/account details. Status is not a paid model invocation or
+a guarantee that tokens remain valid for the subsequent call. Unsupported enterprise helpers,
+custom endpoint routing and platforms still fail rather than guessing credentials.
+
+The current native boundary requires macOS `sandbox-exec` and fails closed elsewhere.
+Apart from the native authentication-file exceptions, it denies writes outside the current executor workspace and private scratch, and always
+denies Git metadata, project policy/provider configuration and machine-state writes.
+Checks and planner/verifier roles cannot write the checkout; checks also have no network
+or provider credentials. Build output must go to scratch (CARGO_TARGET_DIR is supplied).
+This is a write/state-integrity boundary, not a complete confidentiality sandbox: other
+ordinary readable host files are not universally hidden. Project read-denied paths are
+denied explicitly. Repositories, configured programs and installed adapters must still
+be chosen deliberately; unsupported CLIs fail rather than falling back to unsafe flags.
+
+Children start in an owned process group. Timeout, cancellation, drop and normal exit kill
+remaining group members; stdout/stderr are drained with a 4 MiB bound each. Unclosed child
+streams after shutdown cause rejection, not an unbounded join. A workspace flock excludes
+other controllers and is inherited by children that retain descriptors. Stage 5 does not
+promise containment of deliberately daemonizing native code that escapes its process group
+or closes inherited descriptors. Uncertain in-flight records are never accepted on restart,
+and workspace reconciliation remains a human responsibility in that case.
+
+### Issued authority and execution flow
+
+The immutable planning request identifies an EngineeringSession scoped to repository/workspace;
+explicit replacement-plan lineage preserves that undertaking. A deterministic supervisor ID
+names its ownership root, not a permanent persona or reusable provider conversation. Every
+job has a distinct AgentInstanceId (the existing issued AgentId), fresh provider conversation
+UUID, parent instance and SESSION_NATIVE lifetime. Planner jobs belong to that session;
+executors/integration verifiers belong to the planner when present, otherwise the runtime
+supervisor. Packet verifiers are fresh children of the completed executor, with no inherited
+executor conversation. Role/model routing remains machine policy, not an output-controlled
+provider choice. Engineering-session ownership is checked alongside exact plan/job/workspace
+authorization, including a connection-local session capability and parent-session validation.
+
+An accepted TaskPacket is the planner/supervisor request for the default executor→verifier
+topology. Only agentctl materializes it, after existing readiness/dependency/scope/concurrency/
+correction checks. Result/evidence readiness triggers the verifier; all VERIFIED packets
+trigger a fresh session-native integration verifier. Codex `features.multi_agent=false` and
+Claude's explicit tool set disable provider-native agent spawning. There is no generic helper
+spawn endpoint or external/persistent agent attachment in Stage 5. The internal child-ownership
+constructor inherits session/lifetime and records parentage, never accepts a cross-session
+override or launches a process. Any future persistent/cross-session topology requires explicit
+user intent and separate authorization. Durable provenance is retained after ephemeral workers
+terminate; it is not a pool of globally reusable agents.
+
+Planner input is the frozen Stage 4 PlannerPacket, a structural output template and the
+hash helper, not chat history. Strict output goes through the unchanged import/validation
+path and publishes VALIDATED only; activation is explicit. Before a runtime adopts an ACTIVE
+plan, it rejects pre-existing manual jobs/executed tasks and requires the prepared clean
+committed baseline plus fresh graph and support hashes. Dirty initial plans require a new
+baseline/request. Ignored files first become fully fingerprinted at runtime adoption; Stage
+4's earlier observation is not retroactively a complete snapshot.
+
+Migration 7 adds `runtime_runs` and `runtime_jobs`, workspace/plan/request foreign keys and
+ten authorization/history triggers. It runs transactionally after all v6 and legacy COMPLETE
+checks, preserves old rows, rejects future versions and rolls back conflicts. EngineeringSession
+and AgentOwnership use the existing v7 JSON records and input artifacts, not new Stage 0 fields
+or a cosmetic migration. Missing ownership in previously applied unaccepted v7 records is
+readable historical data, never silently backfilled: resume fails closed and requests explicit
+reconciliation/replanning. Current ownership is validated on writes and recovery. Opens verify
+required guards rather than silently recreating them. Source/log/diff bodies are external
+content-addressed private artifacts, verified by hash and length when read. Runtime rows
+and their journal entries commit together; cross-boundary canonical job/task updates use
+their existing atomic event transactions and conservative recovery, not an exactly-once claim.
+
+Only an internal, connection-local, exact repository/plan (or pre-plan request) capability
+can mutate runtime-owned jobs/tasks/plans. It expires on scope exit, including errors/unwind;
+normal registration/transition APIs and other connections cannot issue verifier success for
+a runtime plan. Outputs must use their issued JobId, role, target and exact supplied evidence
+IDs. There is no public verification-submission credential or SQL setter. The existing
+payload-bound Stage 4 completion capability and matching audit remain additionally required.
+This is machine-local orchestration authority, not user-account authentication or protection
+from the machine owner modifying SQLite/schema or replacing trusted executable code.
+
+One workspace lease serializes all tasks and checks. C and D can both be structurally ready,
+but execute sequentially; there are no automatic worktrees, commits, patches between trees,
+or concurrent writers. Every job/evidence/source state uses the plan WorkspaceIdentity;
+linked worktrees still share RepositoryIdentity without sharing task-result authority.
+Independent clones and moved primary repositories retain Stage 1's documented local identity
+limits; remote URLs never become execution identity.
+
+Each ready executor gets its TaskPacket/contract, invariants, constraints, bounded scope-filtered
+graph, current task memory and source excerpts. It does not get other tasks or conversations.
+After execution—even malformed/nonzero output where capture remains possible—the controller
+captures actual file additions/deletions/content/mode changes and scope violations, bound to
+plan/task/executor/workspace and before/after snapshots. Self-reported changed paths must match.
+Out-of-scope results remain evidence, never acceptance. Canonical command references run as
+program/argv/cwd with captured start/end, exit, environment provenance and external log hashes.
+A failed check blocks before a model can claim success.
+
+Every packet verifier is a new job/session with only task, independent contract, invariants,
+actual before/after diff and captured evidence records. No executor response or transcript is
+forwarded. Its result is validated against the issued target/evidence and unchanged current
+source, then submitted to the existing packet transition guard. PASS alone makes VERIFIED.
+Accepted changes refresh the graph before downstream bounded context is rebuilt; graph refresh
+is also safe to repeat after a checkpoint crash. Memory trust/promotion rules are unchanged.
+
+All VERIFIED packets require combined baseline→final diff, canonical integration checks and
+a separate fresh integration verifier. The runtime uses `complete_execution_plan`, never a
+parallel completion implementation. Integration rejection or source mismatch cannot COMPLETE.
+
+### Drift, correction, recovery and observability
+
+Snapshots include repository/workspace, HEAD, dirty flag, Git index hash, and a sorted file
+manifest with content hashes/modes. Two sequential captures must match. All files, including
+ignored files, count toward 20,000 files/25,000 entries/64 MiB, with 2 MiB per file and depth 64.
+Symlinks, hardlinks, nested Git/submodules, special files and read-denied files fail closed.
+Text verification additionally limits expanded diffs to 128 KiB and complete model input to
+256 KiB; oversized/binary diffs require decomposition or unsupported-work review. These are
+observations, not atomic filesystem snapshots: external edit-and-revert between observations
+cannot be proven absent. Expected executor changes advance the fingerprint only after PASS;
+unexpected HEAD/index/content/policy drift blocks with a SOURCE_DRIFT event before launch,
+acceptance or completion. No silent rebasing, rollback or plan rewriting occurs.
+
+Rejection/failure marks unresolved work and a BLOCKED_NEEDS_PLANNER boundary, preserving
+dependents. `run replace` is an explicit orchestrator decision for stopped runs and delegates
+to Stage 4's checked supersession; the replacement remains VALIDATED until activated. Fresh
+IDs never inherit VERIFIED state. The default maximum is two linked replacement rounds,
+configurable down to zero; reaching it requires human escalation, not more automatic calls.
+There is intentionally no automatic retry loop or source-discard operation.
+
+`run resume` uses runtime artifacts and canonical state without conversation replay. Durable
+pending diffs resume checks/verification; already persisted successful verifier outputs can
+be recovered without a new call; VERIFIED tasks never execute again. All-verified plans resume
+integration, and canonical COMPLETE reconciles the final runtime checkpoint idempotently.
+Queued/running records whose controller was lost become INTERRUPTED/failed and block; stored
+PIDs are diagnostic, never blindly reattached or killed on restart. Crash gaps before a safe
+checkpoint can therefore require manual review rather than automatic continuation.
+
+Stage 1's journal carries lifecycle, diff/check, drift, blocking, cancellation and completion
+events, plus canonical token-usage events distinguishing EXACT/ESTIMATED/UNKNOWN. Runtime jobs
+retain provider/model/effort, input/output hashes, PID, phase, timestamps and failure reason.
+`run status`, read-only dry-run and provider inspection expose this foundation. Live tool/idle
+telemetry, token aggregation, artifact retention/GC, broader platform/auth support, managed
+parallel worktrees and agenttop are future work, not implied by these records.

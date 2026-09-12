@@ -53,7 +53,7 @@ impl Fixture {
         Store::open(&self.db, 5000).unwrap()
     }
     fn sql(&self) -> Connection {
-        Connection::open(&self.db).unwrap()
+        common::sql(&self.db)
     }
     fn canonical(&self, content: &str) -> MemoryEntry {
         self.store()
@@ -992,6 +992,8 @@ fn mutation_event_failure_rolls_back_payload_fts_and_status() {
 }
 
 fn downgrade_memory(c: &Connection) {
+    common::strip_runtime(c);
+    c.execute_batch("DROP TRIGGER execution_task_gate; DROP TABLE execution_plans; DROP TABLE planning_requests; DELETE FROM schema_migrations WHERE version>=5;").unwrap();
     c.execute_batch("DROP TABLE memory_links; DROP TABLE memory_fts; DROP TABLE memory_entries; DELETE FROM schema_migrations WHERE version=4; PRAGMA user_version=3;").unwrap();
 }
 #[test]
@@ -1052,7 +1054,7 @@ fn failed_memory_migration_is_atomic_and_future_version_is_rejected() {
         )
         .unwrap();
     assert_eq!(n, 0);
-    c.execute_batch("DROP TABLE memory_links; PRAGMA user_version=5;")
+    c.execute_batch("DROP TABLE memory_links; PRAGMA user_version=8;")
         .unwrap();
     assert!(Store::open(&f.db, 5000).is_err());
 }

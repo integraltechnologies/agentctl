@@ -59,6 +59,37 @@ pub struct StoredTask {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum JournalEntry {
+    Runtime {
+        job_id: Option<JobId>,
+        phase: String,
+        detail: String,
+    },
+    PlanningRequestCreated {
+        request_id: super::planning::PlanningRequestId,
+    },
+    ExecutionPlanImported {
+        plan_id: PlanId,
+    },
+    ExecutionPlanValidated {
+        plan_id: PlanId,
+    },
+    ExecutionPlanActivated {
+        plan_id: PlanId,
+    },
+    ExecutionPlanSuperseded {
+        original: PlanId,
+        replacement: PlanId,
+        reason: String,
+    },
+    ExecutionPlanCancelled {
+        plan_id: PlanId,
+        reason: String,
+    },
+    ExecutionPlanCompleted {
+        plan_id: PlanId,
+        verification: VerificationPacket,
+        source: SourceStateRef,
+    },
     MemoryCreated {
         memory_id: super::memory::MemoryId,
         trust: MemoryTrustClass,
@@ -352,51 +383,10 @@ impl Store {
         plan: &PlanPacket,
         timestamp_ms: u64,
     ) -> Result<()> {
-        plan.validate()?;
-        let json = encode(plan, MAX_DOCUMENT_BYTES)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT INTO plans(repo_id,plan_id,packet_json) VALUES (?1,?2,?3)",
-            params![repo.as_str(), plan.plan_id.as_str(), json],
-        )?;
-        let mut links = Links {
-            plan_id: Some(plan.plan_id.clone()),
-            ..Links::default()
-        };
-        append(
-            &tx,
-            repo,
-            timestamp_ms,
-            &links,
-            None,
-            &JournalEntry::PlanCreated {
-                plan_id: plan.plan_id.clone(),
-            },
-        )?;
-        for task in &plan.tasks {
-            tx.execute(
-                "INSERT INTO tasks(repo_id,task_id,plan_id,state_json) VALUES (?1,?2,?3,?4)",
-                params![
-                    repo.as_str(),
-                    task.task_id.as_str(),
-                    plan.plan_id.as_str(),
-                    serde_json::to_string(&TaskState::Planned)?
-                ],
-            )?;
-            links.task_id = Some(task.task_id.clone());
-            append(
-                &tx,
-                repo,
-                timestamp_ms,
-                &links,
-                None,
-                &JournalEntry::TaskCreated {
-                    task_id: task.task_id.clone(),
-                },
-            )?;
-        }
+        insert_plan(&tx, repo, plan, timestamp_ms)?;
         tx.commit()?;
         Ok(())
     }
@@ -834,6 +824,26 @@ pub(super) struct Links {
 }
 
 impl Links {
+    pub(super) fn runtime(
+        workspace: WorkspaceId,
+        plan: Option<PlanId>,
+        job: Option<&AgentJob>,
+    ) -> Self {
+        if let Some(job) = job {
+            let mut links = Self::for_job(job);
+            links.workspace_id = Some(workspace);
+            links
+        } else {
+            Self::planning(workspace, plan)
+        }
+    }
+    pub(super) fn planning(workspace: WorkspaceId, plan: Option<PlanId>) -> Self {
+        Self {
+            workspace_id: Some(workspace),
+            plan_id: plan,
+            ..Self::default()
+        }
+    }
     pub(super) fn workspace(id: WorkspaceId) -> Self {
         Self {
             workspace_id: Some(id),
@@ -876,6 +886,8 @@ fn connection(path: &Path, timeout: u64, read_only: bool) -> Result<Connection> 
     connection.busy_timeout(Duration::from_millis(timeout))?;
     connection.pragma_update(None, "foreign_keys", true)?;
     connection.pragma_update(None, "trusted_schema", false)?;
+    super::planning::completion::register(&connection)?;
+    super::runtime::auth::register(&connection)?;
     Ok(connection)
 }
 
@@ -958,7 +970,63 @@ fn repository(connection: &Connection, id: &RepositoryId) -> Result<Option<Regis
     .transpose()
 }
 
-fn plan(connection: &Connection, repo: &RepositoryId, id: &PlanId) -> Result<Option<PlanPacket>> {
+/// Insert the canonical plan/tasks using a caller-owned transaction.
+pub(super) fn insert_plan(
+    c: &Connection,
+    repo: &RepositoryId,
+    plan: &PlanPacket,
+    timestamp_ms: u64,
+) -> Result<()> {
+    plan.validate()?;
+    let json = encode(plan, MAX_DOCUMENT_BYTES)?;
+    c.execute(
+        "INSERT INTO plans(repo_id,plan_id,packet_json) VALUES (?1,?2,?3)",
+        params![repo.as_str(), plan.plan_id.as_str(), json],
+    )?;
+    let mut links = Links {
+        plan_id: Some(plan.plan_id.clone()),
+        ..Links::default()
+    };
+    append(
+        c,
+        repo,
+        timestamp_ms,
+        &links,
+        None,
+        &JournalEntry::PlanCreated {
+            plan_id: plan.plan_id.clone(),
+        },
+    )?;
+    for task in &plan.tasks {
+        c.execute(
+            "INSERT INTO tasks(repo_id,task_id,plan_id,state_json) VALUES (?1,?2,?3,?4)",
+            params![
+                repo.as_str(),
+                task.task_id.as_str(),
+                plan.plan_id.as_str(),
+                serde_json::to_string(&TaskState::Planned)?
+            ],
+        )?;
+        links.task_id = Some(task.task_id.clone());
+        append(
+            c,
+            repo,
+            timestamp_ms,
+            &links,
+            None,
+            &JournalEntry::TaskCreated {
+                task_id: task.task_id.clone(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn plan(
+    connection: &Connection,
+    repo: &RepositoryId,
+    id: &PlanId,
+) -> Result<Option<PlanPacket>> {
     let json: Option<String> = connection
         .query_row(
             "SELECT packet_json FROM plans WHERE repo_id=?1 AND plan_id=?2",
@@ -1061,7 +1129,7 @@ fn task(connection: &Connection, repo: &RepositoryId, id: &TaskId) -> Result<Opt
     .transpose()
 }
 
-fn task_states(
+pub(super) fn task_states(
     connection: &Connection,
     repo: &RepositoryId,
     plan: &PlanId,
@@ -1082,7 +1150,11 @@ fn task_states(
     .collect()
 }
 
-fn job(connection: &Connection, repo: &RepositoryId, id: &JobId) -> Result<Option<AgentJob>> {
+pub(super) fn job(
+    connection: &Connection,
+    repo: &RepositoryId,
+    id: &JobId,
+) -> Result<Option<AgentJob>> {
     let json: Option<String> = connection
         .query_row(
             "SELECT packet_json FROM jobs WHERE repo_id=?1 AND job_id=?2",
@@ -1113,7 +1185,7 @@ pub(super) fn append(
     Ok(connection.last_insert_rowid())
 }
 
-fn validate_evidence(
+pub(super) fn validate_evidence(
     connection: &Connection,
     repo: &RepositoryId,
     evidence: &[EvidenceRef],
@@ -1141,7 +1213,7 @@ fn validate_evidence(
     Ok(())
 }
 
-fn validate_verifier(
+pub(super) fn validate_verifier(
     connection: &Connection,
     repo: &RepositoryId,
     task: &StoredTask,
@@ -1179,7 +1251,43 @@ fn validate_verifier(
         executor.state == JobState::Succeeded,
         "verification requires a successfully finished executor job",
     )?;
-    validate_evidence(connection, repo, &proof.evidence)
+    validate_evidence(connection, repo, &proof.evidence)?;
+    // Stage 4 plans own a concrete workspace. Legacy Stage 1 plans deliberately
+    // retain repository-only semantics, including unbound jobs/evidence.
+    let workspace: Option<String> = connection
+        .query_row(
+            "SELECT workspace_id FROM execution_plans WHERE repo_id=?1 AND plan_id=?2",
+            params![repo.as_str(), task.plan_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(workspace) = workspace {
+        for id in [executor_job_id, &proof.verifier_job_id] {
+            require(
+                associated_workspace(connection, "jobs", "job_id", repo, id.as_str())?
+                    .as_ref()
+                    .map(WorkspaceId::as_str)
+                    == Some(workspace.as_str()),
+                "packet verification jobs must belong to the execution plan workspace",
+            )?;
+        }
+        for evidence in &proof.evidence {
+            require(
+                associated_workspace(
+                    connection,
+                    "evidence",
+                    "evidence_id",
+                    repo,
+                    evidence.0.as_str(),
+                )?
+                .as_ref()
+                .map(WorkspaceId::as_str)
+                    == Some(workspace.as_str()),
+                "packet verification evidence must belong to the execution plan workspace",
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn merge_plan(links: &mut Links, plan: &PlanId) -> Result<()> {

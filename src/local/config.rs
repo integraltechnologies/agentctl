@@ -10,6 +10,8 @@ use crate::{Validate, protocol::CommandSpec, validation::repo_path};
 pub struct MachineConfig {
     pub version: u32,
     pub busy_timeout_ms: u64,
+    #[serde(default)]
+    pub runtime: super::runtime::RuntimeConfig,
 }
 
 impl Default for MachineConfig {
@@ -17,12 +19,14 @@ impl Default for MachineConfig {
         Self {
             version: 1,
             busy_timeout_ms: 5000,
+            runtime: super::runtime::RuntimeConfig::default(),
         }
     }
 }
 
 impl MachineConfig {
     pub fn validate(&self) -> Result<()> {
+        self.runtime.validate()?;
         require(
             self.version == 1,
             format!(

@@ -15,6 +15,31 @@ use std::path::Path;
 
 pub const DERIVATION_VERSION: &str = "graph-memory-1";
 
+/// Reuse memory ownership/trust/freshness rules inside a caller's transaction.
+pub(super) fn planning_reference(
+    c: &Connection,
+    info: &RepositoryInfo,
+    id: &MemoryId,
+    notes: bool,
+) -> Result<MemoryEntry> {
+    let view =
+        load(c, info, id)?.ok_or_else(|| Error::Invalid("memory reference not found".into()))?;
+    visible(info, &view.entry, false)?;
+    require(
+        view.status == MemoryStatus::Active,
+        "planning memory must be active",
+    )?;
+    require(
+        notes || view.entry.provenance.trust_class != MemoryTrustClass::AgentNote,
+        "agent notes require explicit planning opt-in",
+    )?;
+    require(
+        query::validity(c, info, &view.entry).0 != Validity::Stale,
+        "planning memory is stale",
+    )?;
+    Ok(view.entry)
+}
+
 impl Store {
     /// Explicit trust selection is required. DERIVED/OBSERVED use mechanical constructors.
     pub fn add_memory(
