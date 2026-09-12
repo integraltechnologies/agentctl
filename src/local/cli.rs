@@ -37,7 +37,11 @@ pub fn run(args: &[&str]) -> Result<()> {
             )
         }
         ["doctor"] => doctor(&paths, json_mode),
-        runtime @ (["run", ..] | ["provider", ..]) => {
+        runtime @ (["run", ..]
+        | ["provider", ..]
+        | ["roles", ..]
+        | ["role", ..]
+        | ["route", ..]) => {
             let config = load_machine(&paths)?;
             super::runtime::cli::run(runtime, &config, &paths, json_mode)
         }

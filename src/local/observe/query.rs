@@ -166,6 +166,17 @@ impl Store {
                 role,
                 provider: field(&v["config"], "provider"),
                 model: field(&v["config"], "model"),
+                requested_role: field(&v["route"], "requested_role"),
+                route_attempt: v["route"]["attempt"].as_u64(),
+                route_origin: field(&v["route"]["primary"], "provider"),
+                policy_skip_reason: v["route"]["policy_skipped"]
+                    .as_array()
+                    .filter(|s| !s.is_empty())
+                    .map(|_| "PROJECT_POLICY_RESTRICTION".into()),
+                fallback_reason: v["route"]["failures"]
+                    .as_array()
+                    .and_then(|a| a.last())
+                    .and_then(|v| field(v, "reason")),
                 plan_id: field(&v, "plan_id"),
                 task_id,
                 job_id,
@@ -456,6 +467,21 @@ impl Store {
                         "RUNTIME_EVENT".into()
                     };
                     e.summary = e.phase.replace('_', " ");
+                    if e.phase == "ROUTE_FALLBACK" {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&detail) {
+                            e.summary = format!(
+                                "Fallback {}: {} → {} ({})",
+                                field(&v, "role").unwrap_or_default(),
+                                field(&v["primary"], "provider").unwrap_or_default(),
+                                field(&v["selected"], "provider").unwrap_or_default(),
+                                v["failures"]
+                                    .as_array()
+                                    .and_then(|a| a.last())
+                                    .and_then(|f| field(f, "reason"))
+                                    .unwrap_or_else(|| "UNKNOWN".into())
+                            );
+                        }
+                    }
                     if e.phase.starts_with("VERIFICATION_CHECK_")
                         && detail.len() <= 80
                         && detail

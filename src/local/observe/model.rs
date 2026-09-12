@@ -44,6 +44,16 @@ pub struct Agent {
     pub role: String,
     pub provider: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub requested_role: Option<String>,
+    #[serde(default)]
+    pub route_attempt: Option<u64>,
+    #[serde(default)]
+    pub route_origin: Option<String>,
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
+    #[serde(default)]
+    pub policy_skip_reason: Option<String>,
     pub plan_id: Option<String>,
     pub task_id: Option<String>,
     pub job_id: String,

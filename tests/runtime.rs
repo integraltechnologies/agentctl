@@ -27,6 +27,924 @@ struct Fixture {
     paths: MachinePaths,
     config: RuntimeConfig,
 }
+
+struct LatePolicyMutation(&'static str);
+impl ProviderAdapter for LatePolicyMutation {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            model: true,
+            effort: true,
+            fresh_session: true,
+            structured_output: true,
+            token_usage: false,
+        }
+    }
+    fn launch(
+        &mut self,
+        _: &JobInput,
+        spec: ProcessSpec,
+        _: &RoleConfig,
+    ) -> local::Result<Box<dyn RunningProcess>> {
+        spec.recheck_policy()?;
+        assert!(spec.writable && spec.network);
+        assert!(spec.protected.is_empty());
+        let path = spec.workspace.join(".agentctl/project.toml");
+        match self.0 {
+            "removed" => fs::remove_file(path).unwrap(),
+            "malformed" => fs::write(path, "not = [valid").unwrap(),
+            _ => {
+                let mut p = ProjectConfig::load(&spec.workspace).unwrap();
+                p.routing.read_only = true;
+                p.routing.deny_network = true;
+                fs::write(path, toml::to_string(&p).unwrap()).unwrap();
+            }
+        }
+        // Native launch must reject before any spawn, even after the adapter
+        // boundary check passed. No nested sandbox permission/model call needed.
+        NativeProcess::launch(&spec).map(|p| Box::new(p) as Box<dyn RunningProcess>)
+    }
+    fn collect(&self, _: &ProcessOutput) -> local::Result<Value> {
+        unreachable!()
+    }
+}
+#[test]
+fn native_spawn_rechecks_policy_after_adapter_preparation_without_spawning() {
+    for mutation in ["changed", "removed", "malformed"] {
+        let f = Fixture::new();
+        let p = f.plan();
+        let mut store = f.store();
+        let result = Runtime::new(
+            &mut store,
+            f.paths.clone(),
+            f.config.clone(),
+            BTreeMap::from([(
+                "test".into(),
+                Box::new(LatePolicyMutation(mutation)) as Box<dyn ProviderAdapter>,
+            )]),
+        )
+        .unwrap()
+        .run(&f.root, &p.packet.plan_id);
+        assert!(result.is_err());
+        // Inspect durable failure without needing the now-invalid project file.
+        let c = common::sql(&f.paths.database);
+        let json: String = c
+            .query_row("SELECT record_json FROM runtime_jobs", [], |r| r.get(0))
+            .unwrap();
+        let job: RuntimeJob = serde_json::from_str(&json).unwrap();
+        assert!(job.pid.is_none());
+        assert!(
+            job.failure
+                .unwrap()
+                .contains("before process spawn; replan/revalidation")
+        );
+    }
+}
+
+#[test]
+fn validated_policy_snapshot_blocks_deterministic_launch_boundary_mutations() {
+    for boundary in ["before_snapshot", "validated", "prelaunch"] {
+        let mut f = Fixture::new();
+        configure_fallback(&mut f, 2);
+        let p = f.plan();
+        let inputs = seen();
+        let mut store = f.store();
+        let mut changed = ProjectConfig::load(&f.root).unwrap();
+        changed.routing.deny_network = true;
+        changed.routing.read_only = true;
+        changed.routing.profiles.insert(
+            "executor".into(),
+            routing::RolePatch {
+                provider: Some("fallback".into()),
+                model: Some("UNVALIDATED_MODEL".into()),
+                context_bytes: Some(100),
+                fallbacks: Some(vec![]),
+                instructions: Some(vec!["UNVALIDATED_INSTRUCTION".into()]),
+                ..Default::default()
+            },
+        );
+        let path = f.root.join(".agentctl/project.toml");
+        let mut runtime = Runtime::new(
+            &mut store,
+            f.paths.clone(),
+            f.config.clone(),
+            BTreeMap::from([(
+                "primary".into(),
+                Box::new(Fake {
+                    mode: Mode::Pass,
+                    seen: inputs.clone(),
+                }) as Box<dyn ProviderAdapter>,
+            )]),
+        )
+        .unwrap()
+        .with_policy_observer(move |phase| {
+            if phase == boundary {
+                fs::write(&path, toml::to_string(&changed).unwrap()).unwrap();
+            }
+        });
+        assert!(runtime.run(&f.root, &p.packet.plan_id).is_err());
+        assert!(
+            inputs.lock().unwrap().is_empty(),
+            "provider must never launch on policy drift"
+        );
+        let jobs = store.runtime_jobs(&f.root, None).unwrap();
+        if boundary == "before_snapshot" {
+            assert!(jobs.is_empty());
+        } else {
+            assert_eq!(jobs.len(), 1);
+            let job = &jobs[0];
+            assert_eq!(job.config.provider, "primary");
+            assert_eq!(job.config.model.as_deref(), Some("opaque-executor"));
+            assert_eq!(
+                job.route.as_ref().unwrap().project_policy_hash,
+                p.metadata.source.policy_hash
+            );
+            assert!(
+                job.failure
+                    .as_deref()
+                    .unwrap()
+                    .contains("replan/revalidation")
+            );
+        }
+        let snapshot = store.observe(local::now_ms().unwrap()).unwrap();
+        assert!(snapshot.events.iter().any(|e| e.phase == "POLICY_DRIFT"));
+    }
+}
+
+#[test]
+fn policy_filtered_primary_executes_allowed_backend_and_records_policy_not_failure() {
+    let mut f = Fixture::new();
+    configure_fallback(&mut f, 0);
+    let mut policy = ProjectConfig::load(&f.root).unwrap();
+    policy.routing.allowed_providers =
+        Some(["test".into(), "fallback".into()].into_iter().collect());
+    fs::write(
+        f.root.join(".agentctl/project.toml"),
+        toml::to_string(&policy).unwrap(),
+    )
+    .unwrap();
+    git(&f.root, &["add", "."]);
+    git(&f.root, &["commit", "--quiet", "-m", "fixture policy"]);
+    f.store().index_repository(&f.root).unwrap();
+    let p = f.plan();
+    let inputs = seen();
+    let mut store = f.store();
+    let adapters = ["test", "fallback"]
+        .into_iter()
+        .map(|name| {
+            (
+                name.into(),
+                Box::new(Fake {
+                    mode: Mode::Pass,
+                    seen: inputs.clone(),
+                }) as Box<dyn ProviderAdapter>,
+            )
+        })
+        .collect();
+    let run = Runtime::new(&mut store, f.paths.clone(), f.config.clone(), adapters)
+        .unwrap()
+        .with_check_launcher(Box::new(Checks { fail: false }))
+        .run(&f.root, &p.packet.plan_id)
+        .unwrap();
+    assert_eq!(run.state, RunState::Complete);
+    for job in store
+        .runtime_jobs(&f.root, None)
+        .unwrap()
+        .iter()
+        .filter(|j| j.role == AgentRole::Executor)
+    {
+        let r = job.route.as_ref().unwrap();
+        assert_eq!(r.primary.provider, "primary");
+        assert_eq!(r.selected.provider, "fallback");
+        assert_eq!(r.policy_skipped.len(), 2);
+        assert!(r.failures.is_empty());
+        assert_eq!(r.attempt, 0);
+    }
+    let snapshot = store.observe(local::now_ms().unwrap()).unwrap();
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|e| e.phase == "ROUTE_POLICY_FILTERED")
+    );
+    assert!(
+        snapshot
+            .agents
+            .iter()
+            .any(
+                |a| a.policy_skip_reason.as_deref() == Some("PROJECT_POLICY_RESTRICTION")
+                    && a.fallback_reason.is_none()
+            )
+    );
+}
+
+#[test]
+fn diagnostic_exit_codes_preserve_human_and_json_rows() {
+    let f = Fixture::new();
+    for json_mode in [false, true] {
+        for (args, valid) in [
+            (vec!["role", "show", "executor"], true),
+            (vec!["role", "show", "recon"], false),
+            (vec!["route", "check"], false),
+            (vec!["route", "unknown"], false),
+        ] {
+            let mut args = args;
+            if json_mode {
+                args.push("--json");
+            }
+            let o = cli(&f, &args);
+            assert_eq!(o.status.success(), valid);
+            assert!(!o.stdout.is_empty());
+            if json_mode {
+                let _: Value = serde_json::from_slice(&o.stdout).unwrap();
+            }
+            if args[1] == "check" {
+                assert!(String::from_utf8_lossy(&o.stdout).contains("opaque-executor"));
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_override_rejects_ambiguous_empty_and_unknown_components() {
+    let mut f = Fixture::new();
+    f.config.profiles.insert(
+        "custom".into(),
+        routing::RolePatch {
+            provider: Some("test".into()),
+            ..Default::default()
+        },
+    );
+    fs::write(
+        &f.paths.machine_config,
+        toml::to_string(&MachineConfig {
+            runtime: f.config.clone(),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for bad in [
+        "",
+        "executor",
+        "executor:",
+        ":test",
+        "executor::model",
+        "executor:test:",
+        "executor:test:model:extra",
+        "executor:test:model:extra:more",
+        "executor: :model",
+        " :test",
+        "executor:test: ",
+        "unknown:test",
+    ] {
+        assert!(
+            !cli(&f, &["route", "executor", "--override", bad, "--json"])
+                .status
+                .success(),
+            "accepted {bad:?}"
+        );
+    }
+    for good in ["executor:test", "executor:test:model"] {
+        assert!(
+            cli(&f, &["route", "executor", "--override", good, "--json"])
+                .status
+                .success()
+        );
+    }
+    assert!(
+        cli(
+            &f,
+            &[
+                "route",
+                "custom",
+                "--override",
+                "custom:test:model",
+                "--json"
+            ]
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn unused_or_forbidden_explicit_overrides_are_not_silently_ignored() {
+    let mut f = Fixture::new();
+    assert!(
+        !cli(&f, &["route", "executor", "--override", "verifier:test"])
+            .status
+            .success()
+    );
+    f.config
+        .providers
+        .insert("forbidden".into(), f.config.providers["test"].clone());
+    fs::write(
+        &f.paths.machine_config,
+        toml::to_string(&MachineConfig {
+            runtime: f.config.clone(),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let mut p = ProjectConfig::load(&f.root).unwrap();
+    p.routing.allowed_providers = Some(["test".into()].into_iter().collect());
+    fs::write(
+        f.root.join(".agentctl/project.toml"),
+        toml::to_string(&p).unwrap(),
+    )
+    .unwrap();
+    let o = cli(
+        &f,
+        &[
+            "route",
+            "executor",
+            "--override",
+            "executor:forbidden",
+            "--json",
+        ],
+    );
+    assert!(!o.status.success());
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("project forbids explicit")
+    );
+}
+
+struct RoutedFake {
+    inner: Fake,
+    unavailable_after_first: bool,
+    failure: Option<routing::FailureClass>,
+    calls: usize,
+}
+impl ProviderAdapter for RoutedFake {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+    fn launch(
+        &mut self,
+        input: &JobInput,
+        spec: ProcessSpec,
+        config: &RoleConfig,
+    ) -> local::Result<Box<dyn RunningProcess>> {
+        self.calls += 1;
+        if let Some(reason) = self
+            .failure
+            .filter(|_| !self.unavailable_after_first || self.calls > 1)
+        {
+            return Err(local::Error::ProviderAvailability(reason));
+        }
+        assert!(
+            input.compiled.is_some(),
+            "all issued workers receive compiled instructions"
+        );
+        self.inner.launch(input, spec, config)
+    }
+    fn collect(&self, output: &ProcessOutput) -> local::Result<Value> {
+        let mut value = self.inner.collect(output)?;
+        if value.get("executor_job_id").is_some() {
+            value["notes"] = json!("EXECUTOR_PRIVATE_CANARY");
+        }
+        Ok(value)
+    }
+    fn usage(&self, output: &ProcessOutput) -> local::Result<Usage> {
+        self.inner.usage(output)
+    }
+}
+fn configure_fallback(f: &mut Fixture, maximum: usize) {
+    for name in ["primary", "fallback", "unavailable"] {
+        f.config
+            .providers
+            .insert(name.into(), f.config.providers["test"].clone());
+    }
+    f.config.roles.get_mut("executor").unwrap().provider = "primary".into();
+    f.config.profiles.insert(
+        "executor".into(),
+        routing::RolePatch {
+            fallbacks: Some(vec![
+                RoleConfig {
+                    provider: "unavailable".into(),
+                    model: Some("missing-model".into()),
+                    effort: None,
+                },
+                RoleConfig {
+                    provider: "fallback".into(),
+                    model: Some("alternate-model".into()),
+                    effort: None,
+                },
+            ]),
+            max_fallback_attempts: Some(maximum),
+            ..Default::default()
+        },
+    );
+}
+
+struct PermissionProbe(Arc<Mutex<Vec<(bool, bool)>>>);
+impl ProviderAdapter for PermissionProbe {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            model: true,
+            effort: true,
+            fresh_session: true,
+            structured_output: true,
+            token_usage: false,
+        }
+    }
+    fn launch(
+        &mut self,
+        _: &JobInput,
+        spec: ProcessSpec,
+        _: &RoleConfig,
+    ) -> local::Result<Box<dyn RunningProcess>> {
+        self.0.lock().unwrap().push((spec.writable, spec.network));
+        Err(local::Error::ProviderAvailability(
+            routing::FailureClass::StartupFailure,
+        ))
+    }
+    fn collect(&self, _: &ProcessOutput) -> local::Result<Value> {
+        unreachable!()
+    }
+}
+#[test]
+fn fallback_cannot_expand_project_permission_boundaries() {
+    let mut f = Fixture::new();
+    configure_fallback(&mut f, 2);
+    let mut project = ProjectConfig::load(&f.root).unwrap();
+    project.routing.read_only = true;
+    project.routing.deny_network = true;
+    fs::write(
+        f.root.join(".agentctl/project.toml"),
+        toml::to_string(&project).unwrap(),
+    )
+    .unwrap();
+    git(&f.root, &["add", ".agentctl/project.toml"]);
+    git(
+        &f.root,
+        &["commit", "--quiet", "-m", "fixture hard routing policy"],
+    );
+    f.store().index_repository(&f.root).unwrap();
+    let p = f.plan();
+    let probes = Arc::new(Mutex::new(vec![]));
+    let adapters: BTreeMap<String, Box<dyn ProviderAdapter>> =
+        ["primary", "unavailable", "fallback"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.into(),
+                    Box::new(PermissionProbe(probes.clone())) as Box<dyn ProviderAdapter>,
+                )
+            })
+            .collect();
+    let mut store = f.store();
+    assert!(
+        Runtime::new(&mut store, f.paths.clone(), f.config.clone(), adapters)
+            .unwrap()
+            .with_check_launcher(Box::new(Checks { fail: false }))
+            .run(&f.root, &p.packet.plan_id)
+            .is_err()
+    );
+    assert_eq!(*probes.lock().unwrap(), vec![(false, false); 3]);
+    assert_eq!(store.runtime_jobs(&f.root, None).unwrap().len(), 3);
+}
+
+#[test]
+fn explicit_runtime_override_first_fallback_and_same_model_keep_distinct_workers() {
+    let mut f = Fixture::new();
+    configure_fallback(&mut f, 1);
+    f.config.profiles.get_mut("executor").unwrap().fallbacks = Some(vec![RoleConfig {
+        provider: "fallback".into(),
+        model: Some("same-model".into()),
+        effort: None,
+    }]);
+    let p = f.plan();
+    let inputs = seen();
+    let mut store = f.store();
+    let mut runtime = Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "fallback".into(),
+            Box::new(Fake {
+                mode: Mode::Pass,
+                seen: inputs.clone(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .with_role_overrides(BTreeMap::from([
+        (
+            "executor".into(),
+            routing::RolePatch {
+                provider: Some("unavailable".into()),
+                ..Default::default()
+            },
+        ),
+        (
+            "verifier".into(),
+            routing::RolePatch {
+                provider: Some("fallback".into()),
+                model: Some("same-model".into()),
+                ..Default::default()
+            },
+        ),
+    ]))
+    .unwrap()
+    .with_check_launcher(Box::new(Checks { fail: false }));
+    assert_eq!(
+        runtime.run(&f.root, &p.packet.plan_id).unwrap().state,
+        RunState::Complete
+    );
+    let jobs = store.runtime_jobs(&f.root, None).unwrap();
+    for job in jobs
+        .iter()
+        .filter(|j| j.state == RuntimeJobState::Succeeded)
+    {
+        assert_eq!(job.config.provider, "fallback");
+        assert_eq!(job.config.model.as_deref(), Some("same-model"));
+        assert_eq!(
+            job.route.as_ref().unwrap().sources["provider"],
+            "explicit user"
+        );
+        assert_eq!(
+            job.route.as_ref().unwrap().attempt,
+            usize::from(job.role == AgentRole::Executor)
+        );
+    }
+    let inputs = inputs.lock().unwrap();
+    assert_eq!(inputs.len(), 9);
+    let sessions: std::collections::BTreeSet<_> = inputs.iter().map(|i| &i.session_id).collect();
+    assert_eq!(sessions.len(), 9);
+    let owners: std::collections::BTreeSet<_> = inputs
+        .iter()
+        .map(|i| &i.ownership.agent_instance_id)
+        .collect();
+    assert_eq!(owners.len(), 9);
+}
+
+#[test]
+fn routed_planner_dag_fallback_keeps_provenance_ownership_and_verification() {
+    let mut f = Fixture::new();
+    configure_fallback(&mut f, 2);
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    let inputs = seen();
+    let mut store = f.store();
+    Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p.clone())),
+                seen: inputs.clone(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap();
+    store
+        .activate_execution_plan(&f.root, &p.packet.plan_id)
+        .unwrap();
+    let tasks = store.execution_tasks(&f.root, &p.packet.plan_id).unwrap();
+    assert!(tasks[0].structurally_ready);
+    assert!(!tasks[1].structurally_ready);
+    let adapters: BTreeMap<String, Box<dyn ProviderAdapter>> = BTreeMap::from([
+        (
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Pass,
+                seen: inputs.clone(),
+            }) as Box<dyn ProviderAdapter>,
+        ),
+        (
+            "primary".into(),
+            Box::new(RoutedFake {
+                inner: Fake {
+                    mode: Mode::Pass,
+                    seen: inputs.clone(),
+                },
+                unavailable_after_first: true,
+                failure: Some(routing::FailureClass::ProviderUnavailable),
+                calls: 0,
+            }) as Box<dyn ProviderAdapter>,
+        ),
+        (
+            "fallback".into(),
+            Box::new(Fake {
+                mode: Mode::Usage(TokenUsageProvenance::Exact),
+                seen: inputs.clone(),
+            }) as Box<dyn ProviderAdapter>,
+        ),
+    ]);
+    let run = Runtime::new(&mut store, f.paths.clone(), f.config.clone(), adapters)
+        .unwrap()
+        .with_check_launcher(Box::new(Checks { fail: false }))
+        .run(&f.root, &p.packet.plan_id)
+        .unwrap();
+    assert_eq!(run.state, RunState::Complete);
+    let session = run.engineering_session.unwrap();
+    let jobs = store.runtime_jobs(&f.root, None).unwrap();
+    let fallback_jobs: Vec<_> = jobs
+        .iter()
+        .filter(|j| j.config.provider == "fallback")
+        .collect();
+    assert_eq!(fallback_jobs.len(), 3);
+    for job in &jobs {
+        let route = job.route.as_ref().unwrap();
+        assert_eq!(route.selected, job.config);
+        assert_eq!(route.requested_role, routing::role_name(job.role));
+        assert_eq!(
+            job.ownership.as_ref().unwrap().engineering_session_id,
+            session.id
+        );
+        let provenance = job.prompt.as_ref().unwrap();
+        assert!(provenance.bytes < 262144);
+        assert_eq!(provenance.profile_hash, route.profile_hash);
+    }
+    for job in &fallback_jobs {
+        let r = job.route.as_ref().unwrap();
+        assert_eq!(r.attempt, 2);
+        assert_eq!(r.failures.len(), 2);
+        assert_eq!(r.primary.provider, "primary");
+        assert_eq!(
+            r.failures[0].reason,
+            routing::FailureClass::ProviderUnavailable
+        );
+    }
+    let successful: Vec<_> = jobs
+        .iter()
+        .filter(|j| j.state == RuntimeJobState::Succeeded)
+        .collect();
+    assert_eq!(successful.len(), 10);
+    let conversations: std::collections::BTreeSet<_> = jobs.iter().map(|j| &j.session_id).collect();
+    assert_eq!(conversations.len(), jobs.len());
+    for input in inputs.lock().unwrap().iter() {
+        let profile = routing::resolve(
+            &f.config,
+            &Default::default(),
+            routing::role_name(input.role),
+            None,
+        )
+        .unwrap();
+        let a = prompt::compile(&profile.profile, &profile.project_policy_hash, input).unwrap();
+        let b = prompt::compile(&profile.profile, &profile.project_policy_hash, input).unwrap();
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.bytes, input.compiled.as_ref().unwrap().bytes);
+        let text = String::from_utf8(a.bytes).unwrap();
+        eprintln!("compiled fixture {:?}: {} bytes", input.role, text.len());
+        assert!(text.len() < 128 * 1024, "fixture prompt growth regression");
+        for absent in [
+            "original giant conversation",
+            "executor chain-of-thought",
+            "EXECUTOR_PRIVATE_CANARY",
+            "unrelated-secret-memory",
+            "authentication\":",
+            "machine_config",
+        ] {
+            assert!(!text.contains(absent));
+        }
+        if input.role == AgentRole::Verifier {
+            assert!(text.contains("diff"));
+            assert!(text.contains("evidence"));
+            assert!(text.contains("VerificationPacket"));
+            assert!(input.artifact.get("result").is_none());
+        }
+        if input.role == AgentRole::Executor {
+            assert!(text.contains("ResultPacket"));
+            assert!(input.artifact.get("planner_packet").is_none());
+        }
+        let tiny = routing::RoleProfile {
+            context_bytes: 100,
+            ..profile.profile
+        };
+        assert!(prompt::compile(&tiny, "test", input).is_err());
+    }
+    drop(store);
+    // Historical records do not consult edited machine policy.
+    f.config.roles.get_mut("executor").unwrap().provider = "test".into();
+    fs::write(
+        &f.paths.machine_config,
+        toml::to_string(&MachineConfig {
+            runtime: f.config.clone(),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let snapshot = Store::read_only(&f.paths.database, 5000)
+        .unwrap()
+        .observe(local::now_ms().unwrap())
+        .unwrap();
+    assert!(
+        snapshot
+            .agents
+            .iter()
+            .any(|a| a.provider.as_deref() == Some("fallback")
+                && a.route_attempt == Some(2)
+                && a.requested_role.as_deref() == Some("executor"))
+    );
+    assert!(snapshot.events.iter().any(|e| e.phase == "ROUTE_FALLBACK"));
+    assert!(
+        snapshot
+            .usage
+            .iter()
+            .any(|u| u.provider.as_deref() == Some("fallback"))
+    );
+    assert!(
+        snapshot
+            .agents
+            .iter()
+            .all(|a| a.liveness == local::observe::Liveness::Unknown)
+    );
+    assert!(
+        Store::read_only(&f.paths.database, 5000)
+            .unwrap()
+            .runtime_jobs(&f.root, None)
+            .unwrap()
+            .iter()
+            .any(|j| j.config.provider == "fallback")
+    );
+}
+
+#[test]
+fn fallback_auth_startup_capability_and_attempt_limits_are_mechanical() {
+    for (reason, limit) in [
+        (routing::FailureClass::AuthUnavailable, 2),
+        (routing::FailureClass::StartupFailure, 2),
+        (routing::FailureClass::CapabilityUnsupported, 2),
+        (routing::FailureClass::ProviderUnavailable, 1),
+        (routing::FailureClass::ProviderUnavailable, 0),
+    ] {
+        let mut f = Fixture::new();
+        configure_fallback(&mut f, limit);
+        let p = f.plan();
+        let inputs = seen();
+        let mut store = f.store();
+        let adapters: BTreeMap<String, Box<dyn ProviderAdapter>> = BTreeMap::from([
+            (
+                "test".into(),
+                Box::new(Fake {
+                    mode: Mode::Pass,
+                    seen: inputs.clone(),
+                }) as Box<dyn ProviderAdapter>,
+            ),
+            (
+                "primary".into(),
+                Box::new(RoutedFake {
+                    inner: Fake {
+                        mode: Mode::Pass,
+                        seen: inputs.clone(),
+                    },
+                    unavailable_after_first: false,
+                    failure: Some(reason),
+                    calls: 0,
+                }) as Box<dyn ProviderAdapter>,
+            ),
+            (
+                "fallback".into(),
+                Box::new(Fake {
+                    mode: Mode::Pass,
+                    seen: inputs.clone(),
+                }) as Box<dyn ProviderAdapter>,
+            ),
+        ]);
+        let run = Runtime::new(&mut store, f.paths.clone(), f.config.clone(), adapters)
+            .unwrap()
+            .with_check_launcher(Box::new(Checks { fail: false }))
+            .run(&f.root, &p.packet.plan_id);
+        if limit == 2 {
+            assert_eq!(run.unwrap().state, RunState::Complete);
+        } else {
+            assert!(run.is_err());
+            assert_eq!(
+                store
+                    .runtime_status(&f.root, &p.packet.plan_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                RunState::Blocked
+            );
+        }
+        let jobs = store.runtime_jobs(&f.root, None).unwrap();
+        assert!(
+            jobs.iter()
+                .all(|j| j.route.as_ref().unwrap().attempt <= limit)
+        );
+        if limit == 2 {
+            assert!(jobs.iter().any(|j| {
+                j.route
+                    .as_ref()
+                    .unwrap()
+                    .failures
+                    .first()
+                    .is_some_and(|f| f.reason == reason)
+            }));
+        }
+    }
+}
+
+#[test]
+fn reject_and_unknown_failure_never_select_fallback() {
+    for mode in [Mode::Reject, Mode::Crash] {
+        let mut f = Fixture::new();
+        configure_fallback(&mut f, 2);
+        f.config.roles.get_mut("executor").unwrap().provider = "test".into();
+        f.config.profiles.insert(
+            "verifier".into(),
+            routing::RolePatch {
+                fallbacks: Some(vec![RoleConfig {
+                    provider: "fallback".into(),
+                    model: None,
+                    effort: None,
+                }]),
+                ..Default::default()
+            },
+        );
+        let p = f.plan();
+        assert!(f.run(&p, mode, seen(), false).is_err());
+        assert_eq!(
+            f.store()
+                .runtime_status(&f.root, &p.packet.plan_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::Blocked
+        );
+        assert!(
+            f.store()
+                .runtime_jobs(&f.root, None)
+                .unwrap()
+                .iter()
+                .all(|j| j.route.as_ref().unwrap().attempt == 0)
+        );
+    }
+}
+
+#[test]
+fn route_cli_is_read_only_and_explicit_override_is_inspectable() {
+    let mut f = Fixture::new();
+    for name in ["recon", "reviewer"] {
+        f.config
+            .roles
+            .insert(name.into(), f.config.roles["verifier"].clone());
+    }
+    fs::write(
+        &f.paths.machine_config,
+        toml::to_string(&MachineConfig {
+            runtime: f.config.clone(),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let before = fs::read(&f.paths.database).unwrap();
+    for args in [
+        vec!["roles", "--json"],
+        vec!["role", "show", "recon", "--json"],
+        vec!["route", "check", "--json"],
+        vec![
+            "route",
+            "executor",
+            "--override",
+            "executor:test:user-model",
+            "--json",
+        ],
+    ] {
+        let output = cli(&f, &args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if args.contains(&"--override") {
+            assert_eq!(value["resolved"]["primary"]["model"], "user-model");
+            assert_eq!(value["resolved"]["sources"]["model"], "explicit user");
+        }
+    }
+    assert_eq!(before, fs::read(&f.paths.database).unwrap());
+    assert!(
+        !cli(
+            &f,
+            &[
+                "route",
+                "executor",
+                "--override",
+                "executor:test:a",
+                "--override",
+                "executor:test:b"
+            ]
+        )
+        .status
+        .success()
+    );
+}
 impl Fixture {
     fn new() -> Self {
         let temp = common::TempDir::new();
@@ -1428,7 +2346,7 @@ fn old_v7_runtime_metadata_remains_inspectable_without_silent_ownership_backfill
     )
     .unwrap();
     c.execute(
-        "UPDATE runtime_jobs SET record_json=json_remove(record_json,'$.ownership','$.task_id')",
+        "UPDATE runtime_jobs SET record_json=json_remove(record_json,'$.ownership','$.task_id','$.route','$.prompt')",
         [],
     )
     .unwrap();
@@ -1453,6 +2371,13 @@ fn old_v7_runtime_metadata_remains_inspectable_without_silent_ownership_backfill
             .unwrap()
     );
     assert_eq!(f.store().status().unwrap().schema_version, 7);
+    assert!(
+        f.store()
+            .runtime_jobs(&f.root, None)
+            .unwrap()
+            .iter()
+            .all(|j| j.route.is_none() && j.prompt.is_none())
+    );
 }
 
 struct ObservedProcess {

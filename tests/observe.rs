@@ -142,6 +142,11 @@ fn graph_window_boundaries_future_observations_and_overflow_fail_honestly() {
 }
 fn agent(id: &str, parent: Option<&str>, session: &str) -> Agent {
     Agent {
+        requested_role: None,
+        route_attempt: None,
+        route_origin: None,
+        fallback_reason: None,
+        policy_skip_reason: None,
         id: id.into(),
         session_id: Some(session.into()),
         parent_id: parent.map(str::to_owned),

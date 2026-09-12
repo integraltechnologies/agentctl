@@ -13,7 +13,10 @@ pub struct Runtime<'a> {
     adapters: BTreeMap<String, Box<dyn ProviderAdapter>>,
     artifacts: Artifacts,
     checks: Box<dyn process::CheckLauncher>,
+    overrides: BTreeMap<String, routing::RolePatch>,
+    policy_observer: Option<PolicyObserver>,
 }
+type PolicyObserver = Box<dyn FnMut(&str)>;
 impl<'a> Runtime<'a> {
     pub fn new(
         store: &'a mut Store,
@@ -30,11 +33,29 @@ impl<'a> Runtime<'a> {
             adapters,
             artifacts,
             checks: Box::new(process::NativeChecks),
+            overrides: BTreeMap::new(),
+            policy_observer: None,
         })
     }
     pub fn with_check_launcher(mut self, launcher: Box<dyn process::CheckLauncher>) -> Self {
         self.checks = launcher;
         self
+    }
+    /// Trusted embedding/test observer. Cannot replace the frozen policy or
+    /// bypass its validation. Boundaries are before_snapshot, validated, prelaunch.
+    #[doc(hidden)]
+    pub fn with_policy_observer(mut self, observer: impl FnMut(&str) + 'static) -> Self {
+        self.policy_observer = Some(Box::new(observer));
+        self
+    }
+    /// Trusted caller/user policy only; never populated from provider output.
+    pub fn with_role_overrides(
+        mut self,
+        overrides: BTreeMap<String, routing::RolePatch>,
+    ) -> Result<Self> {
+        routing::validate_patches(&overrides)?;
+        self.overrides = overrides;
+        Ok(self)
     }
     fn lease(&self, info: &RepositoryInfo) -> Result<WorkspaceLease> {
         require(
@@ -71,6 +92,7 @@ impl<'a> Runtime<'a> {
         id: &str,
         role: AgentRole,
         lease: &WorkspaceLease,
+        policy: &ProjectConfig,
     ) -> Result<ProcessSpec> {
         let scratch = self
             .paths
@@ -79,6 +101,7 @@ impl<'a> Runtime<'a> {
             .join(id.replace(':', "-"));
         paths::ensure_directory(&scratch)?;
         Ok(ProcessSpec {
+            project_policy_hash: Some(planning::hash(policy)?),
             native_auth: None,
             api_key: None,
             executable: PathBuf::new(),
@@ -93,7 +116,7 @@ impl<'a> Runtime<'a> {
             network: true,
             timeout_ms: self.config.timeout_ms,
             git_directories: vec![info.git_directory.clone(), info.common_directory.clone()],
-            protected: ProjectConfig::load(&info.root)?.protected,
+            protected: policy.protected.clone(),
             credential_env: vec![],
             lock_fd: lease.fd(),
         })
@@ -127,11 +150,133 @@ impl<'a> Runtime<'a> {
         source: &SourceSnapshot,
         artifact: Value,
         lease: &WorkspaceLease,
+        expected_policy_hash: &str,
     ) -> Result<(RuntimeJob, Value)> {
-        let config = self.config.role(role)?.clone();
+        let name = routing::role_name(role);
+        if let Some(observer) = &mut self.policy_observer {
+            observer("before_snapshot");
+        }
+        let project = ProjectConfig::load(&info.root);
+        if project
+            .as_ref()
+            .ok()
+            .and_then(|p| planning::hash(p).ok())
+            .as_deref()
+            != Some(expected_policy_hash)
+        {
+            event(
+                self.store,
+                info,
+                plan,
+                None,
+                "POLICY_DRIFT",
+                "SOURCE_DRIFT: project policy changed; replan/revalidation required",
+            )?;
+            return Err(Error::Invalid(
+                "SOURCE_DRIFT: project policy changed; replan/revalidation required".into(),
+            ));
+        }
+        let project = project?;
+        if let Some(observer) = &mut self.policy_observer {
+            observer("validated");
+        }
+        let resolved = routing::resolve(
+            &self.config,
+            &project.routing,
+            name,
+            self.overrides.get(name),
+        )?;
+        if !resolved.policy_skipped.is_empty() {
+            event(
+                self.store,
+                info,
+                plan,
+                None,
+                "ROUTE_POLICY_FILTERED",
+                &serde_json::to_string(
+                    &serde_json::json!({"role":name,"primary":resolved.configured_primary,"skipped":resolved.policy_skipped,"selected":resolved.primary,"reason":"PROJECT_POLICY_RESTRICTION"}),
+                )?,
+            )?;
+        }
+        let mut failures = Vec::new();
+        for (attempt, config) in std::iter::once(&resolved.primary)
+            .chain(&resolved.fallbacks)
+            .take(1 + resolved.profile.max_fallback_attempts)
+            .enumerate()
+        {
+            if attempt > 0 {
+                require(
+                    source::capture(&info.root, &self.artifacts)? == *source,
+                    "source changed during failed startup; fallback blocked",
+                )?;
+                require(!self.cancelled(info, plan)?, "cancelled before fallback")?;
+                event(
+                    self.store,
+                    info,
+                    plan,
+                    None,
+                    "ROUTE_FALLBACK",
+                    &serde_json::to_string(
+                        &serde_json::json!({"role":name,"primary":resolved.primary,"selected":config,"attempt":attempt,"failures":failures}),
+                    )?,
+                )?;
+            }
+            let snapshot = routing::RouteSnapshot {
+                policy_skipped: resolved.policy_skipped.clone(),
+                requested_role: name.into(),
+                primary: resolved.configured_primary.clone(),
+                selected: config.clone(),
+                attempt,
+                failures: failures.clone(),
+                sources: resolved.sources.clone(),
+                profile_hash: planning::hash(&resolved.profile)?,
+                project_policy_hash: expected_policy_hash.into(),
+            };
+            match self.invoke_attempt(
+                info,
+                plan,
+                request,
+                task,
+                role,
+                source,
+                artifact.clone(),
+                lease,
+                &resolved.profile,
+                snapshot,
+                &project,
+            ) {
+                Err(Error::ProviderAvailability(reason)) => failures.push(routing::FailedRoute {
+                    route: config.clone(),
+                    reason,
+                }),
+                result => return result,
+            }
+        }
+        Err(Error::Invalid(format!(
+            "role {name}: all permitted route attempts failed: {}",
+            serde_json::to_string(&failures)?
+        )))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_attempt(
+        &mut self,
+        info: &RepositoryInfo,
+        plan: Option<&PlanId>,
+        request: Option<&planning::PlanningRequestId>,
+        task: Option<&TaskId>,
+        role: AgentRole,
+        source: &SourceSnapshot,
+        artifact: Value,
+        lease: &WorkspaceLease,
+        profile: &routing::RoleProfile,
+        route: routing::RouteSnapshot,
+        project: &ProjectConfig,
+    ) -> Result<(RuntimeJob, Value)> {
+        let config = route.selected.clone();
         let (job_id, session_id) = self.identity()?;
         let ownership = session::issued(self.store, info, plan, request, task, role, &job_id)?;
-        let input = JobInput {
+        let mut input = JobInput {
+            compiled: None,
             ownership: ownership.clone(),
             job_id: job_id.clone(),
             session_id: session_id.clone(),
@@ -147,7 +292,12 @@ impl<'a> Runtime<'a> {
             serde_json::to_vec(&input)?.len() <= 256 * 1024,
             "bounded runtime input exceeds 256 KiB",
         )?;
+        let compiled = prompt::compile(profile, &route.project_policy_hash, &input)?;
+        let prompt_provenance = compiled.provenance.clone();
+        input.compiled = Some(compiled);
         let mut job = RuntimeJob {
+            route: Some(route),
+            prompt: Some(prompt_provenance),
             ownership: Some(ownership),
             task_id: task.cloned(),
             job_id: job_id.clone(),
@@ -200,17 +350,55 @@ impl<'a> Runtime<'a> {
                 now_ms()?,
             )?;
         }
+        let mut launched = false;
         let result: Result<Value> = (|| {
-            let spec = self.process_spec(info, job_id.as_str(), role, lease)?;
+            let mut spec = self.process_spec(info, job_id.as_str(), role, lease, project)?;
+            spec.writable &= !profile.read_only;
+            spec.network &= profile.network;
+            spec.timeout_ms = profile.timeout_ms;
             let _scratch = process::ScratchCleanup(spec.scratch.clone());
             let adapter = self.adapters.get_mut(&config.provider).ok_or_else(|| {
-                Error::Invalid("configured provider adapter is unavailable".into())
+                Error::ProviderAvailability(routing::FailureClass::ProviderUnavailable)
             })?;
-            require(
-                adapter.capabilities().fresh_session,
-                "provider cannot guarantee a fresh session",
-            )?;
-            let mut process = adapter.launch(&input, spec, &config)?;
+            routing::validate_capabilities(&adapter.capabilities(), &config)?;
+            adapter.preflight()?;
+            if let Some(observer) = &mut self.policy_observer {
+                observer("prelaunch");
+            }
+            if ProjectConfig::load(&info.root)
+                .ok()
+                .and_then(|p| planning::hash(&p).ok())
+                .as_deref()
+                != Some(
+                    job.route
+                        .as_ref()
+                        .expect("issued route")
+                        .project_policy_hash
+                        .as_str(),
+                )
+            {
+                event(
+                    self.store,
+                    info,
+                    plan,
+                    Some(&job_id),
+                    "POLICY_DRIFT",
+                    "SOURCE_DRIFT: project policy changed before launch; replan/revalidation required",
+                )?;
+                return Err(Error::Invalid("SOURCE_DRIFT: project policy changed before launch; replan/revalidation required".into()));
+            }
+            let mut process = adapter.launch(&input, spec, &config).map_err(|e| match e {
+                Error::Io(ref io)
+                    if matches!(
+                        io.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    Error::ProviderAvailability(routing::FailureClass::StartupFailure)
+                }
+                other => other,
+            })?;
+            launched = true;
             let liveness = liveness::Guard::new(
                 self.store.connection.path().unwrap_or(""),
                 info.repository_id.as_str(),
@@ -232,7 +420,7 @@ impl<'a> Runtime<'a> {
                     interruption = Some("cancelled".to_string());
                     process.cancel()?;
                 }
-                if started.elapsed().as_millis() > self.config.timeout_ms as u128 {
+                if started.elapsed().as_millis() > profile.timeout_ms as u128 {
                     interruption = Some("timeout".into());
                     process.cancel()?;
                 }
@@ -337,6 +525,14 @@ impl<'a> Runtime<'a> {
             job.output = Some(self.artifacts.json(&value)?);
             Ok(value)
         })();
+        // Availability fallback is only a prelaunch boundary. Errors from a
+        // running process or result parser cannot reclassify engineering work.
+        let result = result.map_err(|error| match error {
+            Error::ProviderAvailability(_) if launched => {
+                Error::Invalid("unclassified failure after provider launch; no fallback".into())
+            }
+            other => other,
+        });
         job.finished_at_ms = Some(now_ms()?);
         let cancelled = self.cancelled(info, plan)?;
         job.state = if cancelled {
@@ -542,6 +738,17 @@ impl<'a> Runtime<'a> {
         lease: &WorkspaceLease,
     ) -> Result<Vec<EvidenceRef>> {
         let policy = ProjectConfig::load(&info.root)?;
+        let policy_hash = self
+            .store
+            .execution_plan(&info.root, plan)?
+            .plan
+            .metadata
+            .source
+            .policy_hash;
+        require(
+            planning::hash(&policy)? == policy_hash,
+            "SOURCE_DRIFT: check policy changed; replan/revalidation required",
+        )?;
         let mut refs = vec![];
         let mut commands = BTreeSet::new();
         for name in &requirements.requirement_refs {
@@ -560,7 +767,8 @@ impl<'a> Runtime<'a> {
             let command = &policy.commands[&name];
             command.validate()?;
             let (id, _) = self.identity()?;
-            let mut spec = self.process_spec(info, id.as_str(), AgentRole::Verifier, lease)?;
+            let mut spec =
+                self.process_spec(info, id.as_str(), AgentRole::Verifier, lease, &policy)?;
             let _scratch = process::ScratchCleanup(spec.scratch.clone());
             spec.network = false;
             spec.args = command.args.clone();
@@ -584,6 +792,14 @@ impl<'a> Runtime<'a> {
                 &name,
             )?;
             let started_at_ms = now_ms()?;
+            require(
+                ProjectConfig::load(&info.root)
+                    .ok()
+                    .and_then(|p| planning::hash(&p).ok())
+                    .as_deref()
+                    == Some(policy_hash.as_str()),
+                "SOURCE_DRIFT: check policy changed before launch; replan/revalidation required",
+            )?;
             let mut process = self.checks.launch(&spec)?;
             let started = Instant::now();
             let mut interrupted = false;
@@ -661,7 +877,7 @@ impl<'a> Runtime<'a> {
         )?;
         let (template_id, _) = self.identity()?;
         let template = super::planner::template(&prepared, template_id.as_str())?;
-        let (mut job,value) = self.invoke(&info,None,Some(request),None,AgentRole::Planner,&source,json!({"planner_packet":prepared,"output_template":template,"packet_schema":schemars::schema_for!(PlanPacket),"hash_helper":{"executable":std::env::current_exe()?,"argv":["run","packet-hashes"],"stdin":"the exact PlanPacket JSON"},"instruction":"Return an ExecutionPlan envelope shaped like output_template. Decompose tasks as needed with unique IDs and one contract per task; preserve the frozen source and request. Recompute task_packet_hash and plan_packet_hash using the read-only hash_helper (scratch files in TMPDIR are allowed). Hashes are BLAKE3 of typed compact serde serialization, not raw JSON formatting. Do not activate or write source. All output still undergoes Stage 4 validation."}),&lease)?;
+        let (mut job,value) = self.invoke(&info,None,Some(request),None,AgentRole::Planner,&source,json!({"planner_packet":prepared,"output_template":template,"packet_schema":schemars::schema_for!(PlanPacket),"hash_helper":{"executable":std::env::current_exe()?,"argv":["run","packet-hashes"],"stdin":"the exact PlanPacket JSON"},"instruction":"Return an ExecutionPlan envelope shaped like output_template. Decompose tasks as needed with unique IDs and one contract per task; preserve the frozen source and request. Recompute task_packet_hash and plan_packet_hash using the read-only hash_helper (scratch files in TMPDIR are allowed). Hashes are BLAKE3 of typed compact serde serialization, not raw JSON formatting. Do not activate or write source. All output still undergoes Stage 4 validation."}),&lease,&prepared.request.source.policy_hash)?;
         let result = (|| {
             require(
                 source::capture(root, &self.artifacts)? == source,
@@ -951,12 +1167,13 @@ impl<'a> Runtime<'a> {
                 &current,
                 artifact,
                 lease,
+                &run.policy_hash,
             );
             // A malformed/nonzero provider may still have edited source. Capture
             // that result and scope evidence before surfacing its failure.
             let executor_id = match &invocation {
                 Ok((job, _)) => job.job_id.clone(),
-                Err(_) => self
+                Err(error) => self
                     .store
                     .runtime_jobs(&info.root, Some(&run.plan_id))?
                     .into_iter()
@@ -966,9 +1183,9 @@ impl<'a> Runtime<'a> {
                         (input.task_id.as_ref() == Some(&task.packet.task_id)).then_some(j.job_id)
                     })
                     .ok_or_else(|| {
-                        Error::Invalid(
-                            "executor launch failed before issued job was persisted".into(),
-                        )
+                        Error::Invalid(format!(
+                            "executor launch failed before issued job was persisted: {error}"
+                        ))
                     })?,
             };
             let after = source::capture(&info.root, &self.artifacts)?;
@@ -1127,6 +1344,7 @@ impl<'a> Runtime<'a> {
                     &after,
                     artifact,
                     lease,
+                    &run.policy_hash,
                 )?;
                 pending.verifier = Some(job.job_id);
                 pending.proof = Some(serde_json::from_value(value)?);
@@ -1243,6 +1461,7 @@ impl<'a> Runtime<'a> {
             current,
             artifact,
             lease,
+            &run.policy_hash,
         )?;
         let proof: VerificationPacket = serde_json::from_value(value)?;
         self.expected(&info.root, &run.expected)?;

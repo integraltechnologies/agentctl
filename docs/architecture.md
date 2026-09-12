@@ -1089,3 +1089,92 @@ An RAII guard restores raw/alternate-screen mode on normal errors/unwind. `--onc
 Ratatui's in-memory terminal backend for deterministic text rendering and automated tests.
 The loop polls keys at 250 ms and snapshots at 1 s, retaining the last snapshot with a stale
 warning on read errors/busy databases. No HTTP/server/GUI transport or analytics stack is added.
+
+## Stage 7: role policy → resolved route → compiled instructions → adapter
+
+`runtime::routing` is a pure, deterministic policy layer: it reads no repository, database,
+provider or network. `RolePatch` has optional fields for field-wise precedence;
+`RoleProfile` resolves behavioral objective, context/reporting/verification semantics,
+instruction fragments, permissions, byte/timeout/advisory-token budgets and existing
+correction bounds. Built-in planner, executor, verifier, recon and reviewer semantics are
+provider-neutral. Role IDs are extensible strings, not additions to the Stage 0 enum.
+Recon/reviewer/custom roles have inspection and bounded graph-findings compilation, but
+no new orchestration/launch or canonical result lifecycle. Their helper JSON is not proof.
+
+Order: built-in safe semantics, Stage 5/6 `runtime.roles` mappings, machine
+`runtime.profiles`, project `routing.profiles`, explicit user-command/Rust-caller patches.
+Only explicit fields override; arrays replace, never append. Model/effort strings inherit
+even when provider changes, so users must override those too when inappropriate for the
+new backend. Empty opaque identifiers are rejected, not interpreted as reset operations.
+Unknown keys, invalid budgets and duplicate TOML keys fail. No default backend is invented
+when the old configuration lacks a route. Unconfigured built-in helpers remain inspectable.
+
+Project `routing.allowed_providers` is a hard allowlist across primary and all fallbacks.
+Forbidden configured candidates are filtered in order; the first remaining route is the
+effective primary. All-forbidden chains fail. An explicit forbidden provider override instead
+fails without substitution. Configured-primary and policy-skipped metadata plus a
+ROUTE_POLICY_FILTERED event distinguish PROJECT_POLICY_RESTRICTION from runtime failures. Hard
+project read-only/network limits and context ceiling intersect effective role settings;
+non-executor roles cannot acquire writes. Runtime timeout remains an upper bound. Provider
+selection does not alter sandbox, scope, protected paths, authorization or workspace lease.
+Trusted installed adapters declare existing model/effort/fresh-session/structured-output
+capabilities; orchestration validates these before launch. Current model names pass through.
+Route inspection only checks local configuration/executable/sandbox availability, not login;
+explicit provider doctor and launch retain token-free native-first auth checks.
+
+Flat ordered fallback chains prohibit repeated provider/model/effort tuples and contain at
+most four alternatives. `max_fallback_attempts` bounds alternatives excluding the primary;
+zero disables availability fallback after the first allowed candidate; policy skips do not
+consume this budget. Each attempt records a fresh job/AgentInstance/conversation in the
+same EngineeringSession and retains the same permission/context policy. Mechanically typed
+missing-adapter/executable, unavailable auth, unsupported capability and prelaunch OS
+not-found/permission failures may advance the chain. Unknown failures, timeouts, model prose,
+nonzero output, strict-JSON/engineering failures and REJECT never cause fallback. Before an
+alternative, source is recaptured against the issued snapshot and cancellation is checked.
+No repairs or difficulty inference are added; explicit correction plans use the same role
+policy and existing global correction bound. Scheduling remains serialized and VERIFIED-only.
+
+`runtime::prompt` owns logical composition, not adapters. Existing Stage 4 PlannerPacket and
+Stage 5 task/integration builders remain the bounded canonical inputs. Executor receives
+TaskPacket/relevant graph-memory/source/invariants; verifier receives task or integration
+objective, invariants, diff and captured evidence, never ResultPacket prose or conversations.
+Compilation joins a short stable role delta, configured role fragments and canonical input
+with the existing ExecutionPlan/ResultPacket/VerificationPacket output binding. There is no
+template engine or provider-specific role prompt. Byte-identical inputs/profile/compiler
+produce byte-identical output. Existing context truncation markers remain visible; the final
+byte limit includes instructions/contracts and fails without further truncation. Optional
+token targets are explicitly ADVISORY; neither current CLI provides an enforced token cap.
+Timeout, context size, scope/permissions, serial concurrency and correction limits are enforced.
+
+The input artifact retains canonical inputs (compiled bytes are skipped by serialization).
+New optional fields in v7 runtime-job JSON store resolved primary/actual route, requested role,
+field sources, attempt index, typed prior failures, and compiler/profile/project-policy/context/
+source/prompt hashes, output contract version and byte count. No credentials, private reasoning
+or additional prompt copies are persisted by Stage 7. Existing captured runtime output behavior
+is unchanged. ROUTE_FALLBACK events and read-only observer fields expose actual selection and
+reason; agenttop adds only a route line in its probe. Existing usage and LIVE/UNKNOWN semantics
+remain intact. Old JSON without these fields stays historical/unknown; no schema backfill,
+SQLite migration or public protocol/schema change occurs. Empty project routing is omitted
+from serialization, preserving Stage 6 project-policy hashes exactly.
+
+Machine policy and explicit overrides are frozen for one controller invocation (including its
+future jobs), matching the existing runtime configuration lifetime. A new invocation resolves
+new jobs using its current machine policy. Project edits still require explicit replan under
+the accepted source/policy guard, including routing edits. Running jobs never switch backend;
+failed attempts are distinct jobs, and persisted historical routes never consult new config.
+No runtime polling/reload, adaptive optimization, model catalog, quota service or Stage 8+ work
+is introduced.
+
+Launch preparation loads one canonical ProjectConfig and checks its full hash against the
+plan/request expectation before resolution. That same snapshot supplies role patches, hard
+restrictions, context settings and protected paths; ProcessSpec does not reload permissions.
+The on-disk normalized policy hash is rechecked immediately before adapter launch and again
+at native process spawn (after authentication/setup). Missing/malformed/changed policy blocks
+with SOURCE_DRIFT and replan/revalidation required. Verification check launch uses the same
+snapshot/recheck rule. This is fail-closed detection, not an atomic filesystem lock against
+external edits after the final comparison. Policy changes are never silently adopted.
+
+Diagnostic commands retain useful human/JSON rows but return nonzero on any invalid requested
+route, including partially invalid route check. Compact overrides accept exactly two or three
+nonempty unpadded segments; extra colons, unknown roles and duplicate overrides are errors.
+Colon-containing opaque models remain configurable through TOML, not ambiguous compact flags.

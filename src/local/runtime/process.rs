@@ -10,6 +10,8 @@ use std::{
 pub const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct ProcessSpec {
+    /// Hash of the validated canonical policy used to build this specification.
+    pub project_policy_hash: Option<String>,
     pub native_auth: Option<super::credentials::NativeAuth>,
     pub api_key: Option<(String, String)>,
     pub executable: PathBuf,
@@ -83,6 +85,21 @@ pub struct NativeProcess {
     live_child: bool,
     secrets: Vec<String>,
 }
+impl ProcessSpec {
+    pub fn recheck_policy(&self) -> Result<()> {
+        if let Some(expected) = &self.project_policy_hash {
+            require(
+                ProjectConfig::load(&self.workspace)
+                    .ok()
+                    .and_then(|p| planning::hash(&p).ok())
+                    .as_ref()
+                    == Some(expected),
+                "SOURCE_DRIFT: project policy changed before process spawn; replan/revalidation required",
+            )?;
+        }
+        Ok(())
+    }
+}
 fn drain(mut stream: impl Read + Send + 'static) -> JoinHandle<std::io::Result<Vec<u8>>> {
     std::thread::spawn(move || {
         let mut bytes = vec![];
@@ -102,6 +119,7 @@ fn drain(mut stream: impl Read + Send + 'static) -> JoinHandle<std::io::Result<V
 }
 impl NativeProcess {
     pub fn launch(spec: &ProcessSpec) -> Result<Self> {
+        spec.recheck_policy()?;
         paths::ensure_directory(&spec.scratch)?;
         let home = spec.scratch.join("home");
         paths::ensure_directory(&home)?;
@@ -162,6 +180,7 @@ impl NativeProcess {
                 });
             }
         }
+        spec.recheck_policy()?;
         let mut child = command.spawn()?;
         let stdout = Some(drain(child.stdout.take().expect("piped stdout")));
         let stderr = Some(drain(child.stderr.take().expect("piped stderr")));
@@ -458,6 +477,7 @@ mod tests {
         }
         fn spec(&self, writable: bool) -> ProcessSpec {
             ProcessSpec {
+                project_policy_hash: None,
                 native_auth: None,
                 api_key: None,
                 executable: "/usr/bin/true".into(),
@@ -565,7 +585,8 @@ mod tests {
                     authentication: Default::default(),
                 })
             };
-            let input = JobInput {
+            let mut input = JobInput {
+                compiled: None,
                 ownership: EngineeringSession {
                     id: "engineering:fixture".into(),
                     supervisor_instance_id: AgentId::new("agent:supervisor").unwrap(),
@@ -585,6 +606,14 @@ mod tests {
                 },
                 artifact: serde_json::json!({"task":"bounded fixture"}),
             };
+            input.compiled = Some(
+                super::super::prompt::compile(
+                    &super::super::routing::builtin("verifier", &RuntimeConfig::default()),
+                    "fixture",
+                    &input,
+                )
+                .unwrap(),
+            );
             let role = RoleConfig {
                 provider: "fixture".into(),
                 model: Some("opaque model ; not shell".into()),

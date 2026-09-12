@@ -57,6 +57,10 @@ pub enum RuntimeJobState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeJob {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<routing::RouteSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<prompt::PromptProvenance>,
     #[serde(default)]
     pub ownership: Option<AgentOwnership>,
     #[serde(default)]

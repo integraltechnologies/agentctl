@@ -455,4 +455,87 @@ so the graph shows receipt-time bursts, not inferred streaming generation. Missi
 is unknown, not zero; a partial known sum is labeled PARTIAL. No new estimator is added.
 Views are bounded recent history with explicit truncation warnings. Unowned legacy records
 remain uncertain. The local query API and TUI share one projection; no schema migration,
-provider transcript access, analytics warehouse or Stage 7+ behavior is introduced.
+provider transcript access or analytics warehouse is introduced.
+
+## Roles and configured routing (Stage 7)
+
+Workers request roles, not providers. Built-ins are planner (bounded decomposition),
+executor (scoped implementation), verifier (independent PASS/REJECT), recon (graph-first
+location), and reviewer (explicit review, never a replacement for verification).
+Custom role IDs are supported for policy/inspection and bounded helper compilation;
+only planner/executor/verifier have authorized runtime launch endpoints today.
+
+Existing `[runtime.roles.<role>]` provider/model/effort mappings remain valid and unchanged.
+Optional machine settings in `~/.config/engineering-agent/config.toml`:
+
+```toml
+[runtime.profiles.executor]
+context_bytes = 131072
+timeout_ms = 300000
+advisory_tokens = 20000
+max_fallback_attempts = 1
+fallbacks = [{ provider = "alternate", model = "configured-model" }]
+```
+
+Provider names must already exist under `runtime.providers`. Model strings are opaque.
+Profiles can also specify provider/model/effort, objective, short `instructions`,
+`read_only`, and `network`. Defaults preserve the existing runtime's timeout, correction
+limit, serial scheduling and permissions; they never silently choose another provider.
+
+Project-specific overrides belong in `.agentctl/project.toml`:
+
+```toml
+[routing]
+allowed_providers = ["primary", "alternate"]
+max_context_bytes = 131072
+deny_network = false
+
+[routing.profiles.executor]
+instructions = ["Preserve the public cache API."]
+```
+
+Precedence is built-ins < legacy machine mappings < machine profiles < project profiles
+< explicit user override. Only supplied fields replace lower fields; lists replace whole
+lists. Hard project allowlists, read-only/network restrictions and context ceilings always
+win. Forbidden configured candidates are filtered in order; the first allowed route is
+selected. A forbidden explicit provider override instead fails, without silent fallback.
+Policy skips are recorded separately from provider failures and do not consume attempts.
+
+```sh
+agentctl roles --json
+agentctl role show executor --json
+agentctl route executor --json
+agentctl route check --json
+agentctl route executor --override executor:alternate:configured-model --json
+agentctl run plan <plan-id> --override executor:alternate:configured-model --json
+```
+
+Inspection launches no provider. `route check` reports each role's configuration errors,
+executable existence and sandbox availability; authentication is explicitly NOT_PROBED
+(use `provider doctor` for token-free login checks). Overrides apply to the current command,
+including future jobs in that controller invocation, and never come from planner output.
+Invalid `role show`, `route`, and `route check` return nonzero while retaining diagnostics
+in text/JSON; a multi-role check retains valid rows too. Compact overrides require exactly
+two or three nonempty, unpadded colon-separated segments; extra colons are errors.
+
+Fallback is an ordered flat chain, at most four alternatives, only for mechanical
+unavailability/authentication/capability/startup failures. Duplicate/cyclic routes fail.
+Timeouts, unknown exits, malformed JSON, bad implementations and verifier REJECT do not
+trigger fallback. Each attempt is a fresh authorized job; fallback never expands permissions.
+Correction still requires explicit replacement and obeys the existing maximum of two rounds.
+
+The neutral compiler combines concise role instructions with the existing bounded canonical
+context and output contract. It fails if the entire prompt exceeds its byte budget; it never
+silently drops critical invariants. Token budgets are ADVISORY, not provider-enforced limits.
+Adapters consume compiled instructions while retaining native-first auth and fresh sessions.
+Verifier input contains task/invariants/diff/captured evidence, not executor reasoning.
+
+Job records preserve actual route, fallback history and prompt hashes/byte size. `observe`
+and `agenttop` show actual backend and fallback metadata without changing telemetry/liveness.
+No SQL migration or public schema change is needed. Machine policy is frozen per controller
+invocation; a subsequent invocation uses current machine policy. Project-policy edits retain
+the existing source-drift/replan guard. Each job uses one parsed project-policy snapshot,
+hash-validated against its plan/request, for routing and permissions. Disk policy is rechecked
+immediately before adapter launch and native process spawn; drift blocks with replan required,
+never reload-and-continue. Historical jobs never acquire invented profiles.
+There is no adaptive routing, model ranking, quota scraping or automatic semantic escalation.

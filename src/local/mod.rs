@@ -17,6 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("provider availability: {0:?}")]
+    ProviderAvailability(runtime::routing::FailureClass),
     #[error("{0}")]
     Invalid(String),
     #[error(transparent)]

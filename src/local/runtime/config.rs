@@ -18,6 +18,8 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, routing::RolePatch>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -36,6 +38,7 @@ fn rounds() -> u32 {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            profiles: BTreeMap::new(),
             providers: BTreeMap::new(),
             roles: BTreeMap::new(),
             timeout_ms: timeout(),
@@ -45,6 +48,7 @@ impl Default for RuntimeConfig {
 }
 impl RuntimeConfig {
     pub fn validate(&self) -> Result<()> {
+        routing::validate_patches(&self.profiles)?;
         require(
             (1..=3_600_000).contains(&self.timeout_ms),
             "runtime timeout must be 1–3600000 ms",
@@ -64,8 +68,7 @@ impl RuntimeConfig {
         }
         for (role, config) in &self.roles {
             require(
-                ["planner", "executor", "verifier"].contains(&role.as_str())
-                    && self.providers.contains_key(&config.provider),
+                routing::valid_role(role) && self.providers.contains_key(&config.provider),
                 "invalid runtime role/provider mapping",
             )?;
             for value in [&config.model, &config.effort].into_iter().flatten() {

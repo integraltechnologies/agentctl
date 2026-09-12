@@ -9,6 +9,120 @@ pub(crate) fn run(
     json_mode: bool,
 ) -> Result<()> {
     let root = std::env::current_dir()?;
+    // Overrides are accepted only at this user-facing boundary, not in packets.
+    let mut overrides = BTreeMap::new();
+    let mut clean = vec![];
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--override" {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| Error::Invalid("--override needs role:provider[:model]".into()))?;
+            let fields: Vec<_> = value.split(':').collect();
+            require(
+                (2..=3).contains(&fields.len())
+                    && fields
+                        .iter()
+                        .all(|v| !v.trim().is_empty() && *v == v.trim()),
+                "--override requires exactly 2 or 3 nonempty segments: role:provider[:model]",
+            )?;
+            require(
+                !overrides.contains_key(fields[0]),
+                "duplicate role override",
+            )?;
+            overrides.insert(
+                fields[0].to_owned(),
+                routing::RolePatch {
+                    provider: Some(fields[1].into()),
+                    model: fields.get(2).map(|v| (*v).into()),
+                    ..Default::default()
+                },
+            );
+            i += 2;
+        } else {
+            clean.push(args[i]);
+            i += 1;
+        }
+    }
+    let args = clean.as_slice();
+    if matches!(args.first(), Some(&"roles" | &"role" | &"route")) {
+        let project = if paths::project_config(&root).exists() {
+            ProjectConfig::load(&root)?.routing
+        } else {
+            routing::ProjectRoles::default()
+        };
+        let names = routing::roles(&machine.runtime, &project);
+        require(
+            overrides.keys().all(|name| names.contains(name)),
+            "explicit override names an unknown role",
+        )?;
+        match args {
+            ["route", "check"] => {}
+            ["role", "show", role] | ["route", role] => require(
+                overrides.keys().all(|name| name == role),
+                "override must target the requested role",
+            )?,
+            _ => require(
+                overrides.is_empty(),
+                "overrides require a route inspection or execution command",
+            )?,
+        }
+        let inspect = |name: &str| -> Result<serde_json::Value> {
+            let route = routing::resolve(&machine.runtime, &project, name, overrides.get(name))?;
+            let candidates:Vec<_> = std::iter::once(&route.primary).chain(&route.fallbacks).map(|r| json!({"route":r,"executable_exists":machine.runtime.providers[&r.provider].executable.is_file(),"authentication":"NOT_PROBED (use provider doctor)","fresh_session":true,"structured_output":true,"model":"opaque passthrough","sandbox_available":process::sandbox_available()})).collect();
+            Ok(
+                json!({"resolved":route,"candidates":candidates,"token_budget":"ADVISORY","context_timeout_permissions":"ENFORCED","configuration":"resolved without launching providers"}),
+            )
+        };
+        let mut invalid = false;
+        let value = match args {
+            ["roles"] => serde_json::to_value(&names)?,
+            ["role", "show", name] => match inspect(name) {
+                Ok(v) => v,
+                Err(e) => {
+                    invalid = true;
+                    json!({"builtin":routing::builtin(name,&machine.runtime),"configuration_error":e.to_string()})
+                }
+            },
+            ["route", "check"] => {
+                let mut rows = vec![];
+                for name in &names {
+                    rows.push(match inspect(name) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            invalid = true;
+                            json!({"role":name,"error":e.to_string()})
+                        }
+                    });
+                }
+                json!({"roles":rows})
+            }
+            ["route", name] => match inspect(name) {
+                Ok(v) => v,
+                Err(e) => {
+                    invalid = true;
+                    json!({"role":name,"error":e.to_string()})
+                }
+            },
+            _ => {
+                return Err(Error::Invalid(
+                    "expected roles, role show <role>, route <role>, or route check".into(),
+                ));
+            }
+        };
+        super::super::cli::output(json_mode, &value, &serde_json::to_string_pretty(&value)?)?;
+        return require(!invalid, "routing validation failed; see diagnostics");
+    }
+    require(
+        overrides.is_empty() || matches!(args, ["run", "plan" | "resume" | "planner", _]),
+        "--override is only supported for route inspection or worker execution",
+    )?;
+    require(
+        overrides
+            .keys()
+            .all(|name| ["planner", "executor", "verifier"].contains(&name.as_str())),
+        "run overrides must name an executable role: planner, executor, verifier",
+    )?;
     if let ["provider", command] = args {
         require(
             ["list", "doctor"].contains(command),
@@ -60,7 +174,7 @@ pub(crate) fn run(
                 let adapter:Box<dyn ProviderAdapter>=if p.adapter=="codex" {Box::new(CodexAdapter{executable:p.executable.clone(),authentication:p.authentication.clone()})}else{Box::new(ClaudeAdapter{executable:p.executable.clone(),authentication:p.authentication.clone()})};
                 (name.clone(),adapter)
             }).collect();
-            let mut runtime=Runtime::new(&mut store,paths.clone(),machine.runtime.clone(),adapters)?;
+            let mut runtime=Runtime::new(&mut store,paths.clone(),machine.runtime.clone(),adapters)?.with_role_overrides(overrides)?;
             let value=if *command=="planner" {serde_json::to_value(runtime.plan(&root,&planning::PlanningRequestId::new(*id).map_err(Error::Invalid)?)?)?}else{serde_json::to_value(runtime.run(&root,&PlanId::new(*id).map_err(Error::Invalid)?)?)?};
             super::super::cli::output(json_mode,&value,&serde_json::to_string_pretty(&value)?)
         }

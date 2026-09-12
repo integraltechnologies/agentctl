@@ -460,7 +460,7 @@ fn detail(app: &App) -> String {
                 .filter(|u| u.agent_id.as_deref() == Some(&a.id))
                 .collect();
             return format!(
-                "{} / {} | Liveness {}\nLast known phase {} | proof {}\nElapsed {} | since event {} (not inferred idle)\nBlocker {}\nLast {}\nToken observations {}\nProvider {} / {}\nAgent {}\nSession {}\nParent {}\nRepository {}\nWorkspace {}\nPlan {} / Task {}\nJob {}",
+                "{} / {} | Liveness {}\nLast known phase {} | proof {}\nElapsed {} | since event {} (not inferred idle)\nBlocker {}\nLast {}\nToken observations {}\nProvider {} / {}\nRoute {} from {} attempt {}\nAgent {}\nSession {}\nParent {}\nRepository {}\nWorkspace {}\nPlan {} / Task {}\nJob {}",
                 a.role,
                 a.state,
                 a.liveness.as_str(),
@@ -490,6 +490,17 @@ fn detail(app: &App) -> String {
                 },
                 a.provider.as_deref().unwrap_or("UNKNOWN"),
                 a.model.as_deref().unwrap_or("UNKNOWN"),
+                a.requested_role.as_deref().unwrap_or("historical"),
+                a.route_origin.as_deref().unwrap_or("UNKNOWN"),
+                a.route_attempt
+                    .map(|n| format!(
+                        "{n} {}",
+                        a.fallback_reason
+                            .as_deref()
+                            .or(a.policy_skip_reason.as_deref())
+                            .unwrap_or("")
+                    ))
+                    .unwrap_or_else(|| "UNKNOWN".into()),
                 a.id,
                 a.session_id.as_deref().unwrap_or("UNKNOWN"),
                 a.parent_id.as_deref().unwrap_or("UNKNOWN"),

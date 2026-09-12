@@ -153,7 +153,11 @@ impl Authentication {
     ) -> Result<()> {
         let native = NativeAuth::discover(provider)?;
         let status = self.preflight(executable, &native)?;
-        require(status.authenticated, status.guidance)?;
+        if !status.authenticated {
+            return Err(Error::ProviderAvailability(
+                super::routing::FailureClass::AuthUnavailable,
+            ));
+        }
         if status.method == "NATIVE" {
             process.native_auth = Some(native);
         } else {

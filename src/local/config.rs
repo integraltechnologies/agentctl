@@ -83,6 +83,11 @@ pub struct VerificationDefinition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "super::runtime::routing::ProjectRoles::is_empty"
+    )]
+    pub routing: super::runtime::routing::ProjectRoles,
     pub version: u32,
     pub display_name: Option<String>,
     #[serde(default)]
@@ -102,6 +107,7 @@ impl Default for ProjectConfig {
         Self {
             version: 1,
             display_name: None,
+            routing: Default::default(),
             invariants: BTreeMap::new(),
             architecture: BTreeMap::new(),
             commands: BTreeMap::new(),
@@ -113,6 +119,7 @@ impl Default for ProjectConfig {
 
 impl ProjectConfig {
     pub fn validate(&self) -> Result<()> {
+        self.routing.validate()?;
         require(
             self.version == 1,
             format!(
