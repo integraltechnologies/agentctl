@@ -28,6 +28,243 @@ struct Fixture {
     config: RuntimeConfig,
 }
 
+struct AnalyticsFake {
+    inner: Fake,
+}
+impl ProviderAdapter for AnalyticsFake {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+    fn launch(
+        &mut self,
+        i: &JobInput,
+        s: ProcessSpec,
+        c: &RoleConfig,
+    ) -> local::Result<Box<dyn RunningProcess>> {
+        self.inner.launch(i, s, c)
+    }
+    fn collect(&self, o: &ProcessOutput) -> local::Result<Value> {
+        self.inner.collect(o)
+    }
+    fn usage(&self, _: &ProcessOutput) -> local::Result<Usage> {
+        Ok(Usage {
+            provenance: TokenUsageProvenance::Exact,
+            input: Some(10),
+            output: Some(2),
+            cached: Some(3),
+        })
+    }
+}
+#[test]
+fn analytics_full_planner_reject_explicit_correction_fallback_and_guarded_completion() {
+    let mut f = Fixture::new();
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    let inputs = seen();
+    let mut store = f.store();
+    Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(AnalyticsFake {
+                inner: Fake {
+                    mode: Mode::Planner(Box::new(p.clone())),
+                    seen: inputs.clone(),
+                },
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap();
+    store
+        .activate_execution_plan(&f.root, &p.packet.plan_id)
+        .unwrap();
+    assert!(
+        Runtime::new(
+            &mut store,
+            f.paths.clone(),
+            f.config.clone(),
+            BTreeMap::from([(
+                "test".into(),
+                Box::new(AnalyticsFake {
+                    inner: Fake {
+                        mode: Mode::Reject,
+                        seen: inputs.clone()
+                    }
+                }) as Box<dyn ProviderAdapter>
+            )])
+        )
+        .unwrap()
+        .with_check_launcher(Box::new(Checks { fail: false }))
+        .run(&f.root, &p.packet.plan_id)
+        .is_err()
+    );
+    assert!(!store.execution_tasks(&f.root, &p.packet.plan_id).unwrap()[1].structurally_ready);
+    git(&f.root, &["add", "src/api.rs"]);
+    git(
+        &f.root,
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            "human-chosen correction baseline",
+        ],
+    );
+    store.index_repository(&f.root).unwrap();
+    let mut replacement = artifact(&f.prepare());
+    replacement.packet.plan_id = PlanId::new("plan:analytics-correction").unwrap();
+    for t in &mut replacement.packet.tasks {
+        t.task_id = TaskId::new(format!("{}:r", t.task_id.as_str())).unwrap();
+        for d in &mut t.dependencies {
+            *d = TaskId::new(format!("{}:r", d.as_str())).unwrap();
+        }
+    }
+    for (c, t) in replacement
+        .metadata
+        .contracts
+        .iter_mut()
+        .zip(&replacement.packet.tasks)
+    {
+        c.task_id = t.task_id.clone();
+        c.task_packet_hash = hash(t).unwrap();
+    }
+    replacement.metadata.integration.plan_id = replacement.packet.plan_id.clone();
+    replacement.metadata.integration.plan_packet_hash = hash(&replacement.packet).unwrap();
+    replacement.metadata.replan = Some(ReplanReference {
+        previous_plan_id: p.packet.plan_id.clone(),
+        reason: "explicit correction".into(),
+        previously_verified_tasks: vec![],
+        replaced_tasks: p.packet.tasks.iter().map(|t| t.task_id.clone()).collect(),
+    });
+    store.import_execution_plan(&f.root, &replacement).unwrap();
+    Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::new(),
+    )
+    .unwrap()
+    .replace(&f.root, &p.packet.plan_id, &replacement.packet.plan_id)
+    .unwrap();
+    store
+        .activate_execution_plan(&f.root, &replacement.packet.plan_id)
+        .unwrap();
+    configure_fallback(&mut f, 2);
+    let adapters: BTreeMap<String, Box<dyn ProviderAdapter>> = BTreeMap::from([
+        (
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Usage(TokenUsageProvenance::Exact),
+                seen: inputs.clone(),
+            }) as Box<dyn ProviderAdapter>,
+        ),
+        (
+            "primary".into(),
+            Box::new(RoutedFake {
+                inner: Fake {
+                    mode: Mode::Usage(TokenUsageProvenance::Exact),
+                    seen: inputs.clone(),
+                },
+                unavailable_after_first: true,
+                failure: Some(routing::FailureClass::ProviderUnavailable),
+                calls: 0,
+            }) as Box<dyn ProviderAdapter>,
+        ),
+        (
+            "fallback".into(),
+            Box::new(Fake {
+                mode: Mode::Usage(TokenUsageProvenance::Estimated),
+                seen: inputs.clone(),
+            }) as Box<dyn ProviderAdapter>,
+        ),
+    ]);
+    let run = Runtime::new(&mut store, f.paths.clone(), f.config.clone(), adapters)
+        .unwrap()
+        .with_check_launcher(Box::new(Checks { fail: false }))
+        .run(&f.root, &replacement.packet.plan_id)
+        .unwrap();
+    assert_eq!(run.state, RunState::Complete);
+    let info = RepositoryInfo::discover(&f.root).unwrap();
+    let now = local::now_ms().unwrap();
+    let mut q = local::analytics::Query::workspace(
+        info.repository_id.as_str().into(),
+        info.workspace_id.as_str().into(),
+        now,
+    );
+    q.from_ms = 0;
+    q.session = Some(run.engineering_session.unwrap().id);
+    let s = store.analytics(q.clone(), now).unwrap();
+    assert_eq!(s.summary.jobs, 18);
+    assert_eq!(s.summary.tokens.total.exact, Some(168));
+    assert_eq!(s.summary.tokens.total.estimated, Some(66));
+    assert_eq!(s.summary.unknown_jobs, 6);
+    assert_eq!(s.summary.token_quality, "PARTIAL");
+    assert_eq!(s.summary.pass, 5);
+    assert_eq!(s.summary.reject, 1);
+    assert_eq!(s.summary.rejected_executor_attempts, 1);
+    assert_eq!(s.summary.accepted_executor_attempts, 4);
+    assert_eq!(s.summary.packet_rejected_usage.total.exact, Some(24));
+    assert_eq!(s.summary.packet_accepted_usage.total.exact, Some(110));
+    assert_eq!(s.summary.packet_accepted_usage.total.estimated, Some(66));
+    assert_eq!(s.summary.fallback_executions, 3);
+    assert_eq!(s.summary.availability_failures["PROVIDER_UNAVAILABLE"], 6);
+    assert_eq!(s.summary.policy_skipped, 0);
+    assert_eq!(s.integration.tokens.total.exact, Some(22));
+    assert_eq!(s.unattributed.tokens.total.exact, Some(12));
+    assert_eq!(s.sessions[0].correction_round, Some(1));
+    assert_eq!(s.sessions[0].verified, 4);
+    assert_eq!(s.sessions[0].current_tasks, 4);
+    assert_eq!(s.sessions[0].lifecycle, "COMPLETE");
+    assert_eq!(s.verified_tasks_with_complete_usage, 1);
+    assert_eq!(s.verified_tasks_with_partial_usage, 3);
+    assert_eq!(s.tokens_per_complete_verified_task, Some(44.0));
+    assert!(s.jobs.iter().all(|j| j.prompt_bytes.is_some()
+        && j.context_bytes.is_some()
+        && j.context_budget.is_some()));
+    assert!(s.jobs.iter().all(|j| j.active_execution_ms.is_none()));
+    let before = serde_json::to_value(&s).unwrap();
+    f.config.roles.get_mut("executor").unwrap().model = Some("new-current-model".into());
+    fs::write(
+        &f.paths.machine_config,
+        toml::to_string(&MachineConfig {
+            runtime: f.config.clone(),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        before,
+        serde_json::to_value(store.analytics(q.clone(), now).unwrap()).unwrap()
+    );
+    drop(store);
+    let db = fs::read(&f.paths.database).unwrap();
+    for args in [
+        vec![
+            "analytics",
+            "session",
+            q.session.as_deref().unwrap(),
+            "--json",
+        ],
+        vec!["analytics", "roles"],
+        vec!["analytics", "usage", "--json"],
+        vec!["analytics", "routes", "--json"],
+        vec!["analytics", "corrections"],
+    ] {
+        let o = cli(&f, &args);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let text = String::from_utf8(o.stdout).unwrap();
+        assert!(!text.contains("EXECUTOR_PRIVATE_CANARY"));
+        if args.last() == Some(&"--json") {
+            serde_json::from_str::<Value>(&text).unwrap();
+        }
+    }
+    assert_eq!(db, fs::read(&f.paths.database).unwrap());
+}
+
 struct LatePolicyMutation(&'static str);
 impl ProviderAdapter for LatePolicyMutation {
     fn capabilities(&self) -> Capabilities {

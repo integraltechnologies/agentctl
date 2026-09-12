@@ -57,6 +57,14 @@ pub enum RuntimeJobState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeJob {
+    /// Planner jobs have no Stage 0 plan/job row. This is their sole usage
+    /// observation; plan-associated jobs continue using canonical usage events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_usage: Option<TokenUsageEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_verification: Option<VerificationDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_failure: Option<routing::FailureClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<routing::RouteSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

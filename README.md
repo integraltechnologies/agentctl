@@ -457,6 +457,39 @@ Views are bounded recent history with explicit truncation warnings. Unowned lega
 remain uncertain. The local query API and TUI share one projection; no schema migration,
 provider transcript access or analytics warehouse is introduced.
 
+## Historical engineering analytics (Stage 8)
+
+`agentctl analytics summary`, `usage`, `roles`, `routes`, and `corrections` provide
+read-only descriptive analytics. Use `session ID`, `task ID`, or `job ID` for a
+specific entity, and `--json` for the full bounded, versioned snapshot.
+
+The default scope is the current workspace, with jobs created in the last seven
+days. `--repository ID` explicitly combines that repository's workspaces;
+`--workspace ID` narrows it again. Filters include `--session`, `--role`,
+`--provider`, `--model`, `--task`, `--job`, `--lifecycle`, `--from-ms`, `--to-ms`,
+and `--limit` (default 10,000; maximum 20,000). Times are Unix milliseconds;
+the creation window is start-inclusive/end-exclusive. Outcomes are current
+durable state, not historical replay. Usage is observed through `as_of_ms`.
+
+Exact and estimated tokens have separate buckets. Unknown contributions never
+become zero; interrupted jobs remain incomplete. JSON includes denominators,
+sample sizes, context and elapsed-time distributions, actual historical routes,
+typed availability failures, policy skips, verification decisions, explicit
+correction lineage, and accepted/rejected attempt usage. Planner/session-wide
+usage and integration verification are not multiplied across tasks.
+
+The tokens-per-VERIFIED-task ratio uses only packets with complete attributable
+executor and verifier telemetry, alongside exact/estimated totals and excluded
+partial packet counts. It does not silently charge a superseded packet's work
+to a new packet: correction plans use distinct task IDs without a one-to-one
+replacement mapping. Inspect plan lineage and correction-round usage together.
+
+No pricing is assumed: monetary cost and active execution duration are UNKNOWN.
+Task difficulty differs; these measurements do not rank models or recommend or
+change routing. Historical missing metadata stays unknown. Analytics adds no
+SQL migration, aggregate cache, public schema changes, transcript reads, or
+agenttop refresh work. See the architecture document for precise definitions.
+
 ## Roles and configured routing (Stage 7)
 
 Workers request roles, not providers. Built-ins are planner (bounded decomposition),

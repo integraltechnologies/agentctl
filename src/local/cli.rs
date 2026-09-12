@@ -25,6 +25,7 @@ pub fn run(args: &[&str]) -> Result<()> {
     };
     let paths = MachinePaths::resolve(&PathContext::from_env())?;
     match args {
+        ["analytics", rest @ ..] => super::analytics::run(&paths, rest, json_mode),
         ["observe", rest @ ..] => super::observe::cli(&paths, rest),
         ["init"] => {
             paths.create_directories()?;

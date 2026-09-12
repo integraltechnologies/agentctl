@@ -21,6 +21,10 @@ Usage:
   agentctl observe <snapshot|sessions|agents|tasks|events|usage> [--json]
   agentctl observe <session|agent|job|task> <id> [--json]
   agentctl observe usage <provider|task|role> <value> [--json]
+  agentctl analytics <summary|usage|roles|routes|corrections> [filters] [--json]
+  agentctl analytics <session|task|job> <id> [filters] [--json]
+    filters: --repository ID --workspace ID --session ID --role ROLE --provider NAME
+             --model NAME --task ID --job ID --lifecycle STATE --from-ms N --to-ms N --limit N
   agenttop [--once] [--width N --height N]
   agentctl provider <list|doctor> [--json]
   agentctl roles [--json]
@@ -78,6 +82,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         | ["plan", ..]
         | ["run", ..]
         | ["provider", ..]
+        | ["analytics", ..]
         | ["roles", ..]
         | ["role", ..]
         | ["route", ..]

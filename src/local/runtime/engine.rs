@@ -296,6 +296,9 @@ impl<'a> Runtime<'a> {
         let prompt_provenance = compiled.provenance.clone();
         input.compiled = Some(compiled);
         let mut job = RuntimeJob {
+            planner_usage: None,
+            reported_verification: None,
+            availability_failure: None,
             route: Some(route),
             prompt: Some(prompt_provenance),
             ownership: Some(ownership),
@@ -441,37 +444,36 @@ impl<'a> Runtime<'a> {
                 "JOB_OUTPUT_RECEIVED",
                 "provider output captured; not yet accepted",
             )?;
+            let usage = self.adapters[&config.provider]
+                .usage(&output)
+                .unwrap_or_default();
+            let timestamp_ms = now_ms()?;
+            let context = EventContext {
+                agent_id: Some(
+                    AgentId::new(format!("agent:{}", job_id.as_str())).map_err(Error::Invalid)?,
+                ),
+                plan_id: plan.cloned(),
+                task_id: task.cloned(),
+                packet_id: task.cloned(),
+                job_id: Some(job_id.clone()),
+                role: Some(role),
+                provider: Some(ProviderMetadata {
+                    provider: config.provider.clone(),
+                    model: config.model.clone(),
+                }),
+            };
+            let usage = TokenUsageEvent {
+                version: ProtocolVersion::V1,
+                timestamp_ms,
+                context: context.clone(),
+                provenance: usage.provenance,
+                input_tokens: usage.input,
+                output_tokens: usage.output,
+                cached_tokens: usage.cached,
+                reasoning_tokens: None,
+                total_tokens: None,
+            };
             if plan.is_some() {
-                let usage = self.adapters[&config.provider]
-                    .usage(&output)
-                    .unwrap_or_default();
-                let timestamp_ms = now_ms()?;
-                let context = EventContext {
-                    agent_id: Some(
-                        AgentId::new(format!("agent:{}", job_id.as_str()))
-                            .map_err(Error::Invalid)?,
-                    ),
-                    plan_id: plan.cloned(),
-                    task_id: task.cloned(),
-                    packet_id: task.cloned(),
-                    job_id: Some(job_id.clone()),
-                    role: Some(role),
-                    provider: Some(ProviderMetadata {
-                        provider: config.provider.clone(),
-                        model: config.model.clone(),
-                    }),
-                };
-                let usage = TokenUsageEvent {
-                    version: ProtocolVersion::V1,
-                    timestamp_ms,
-                    context: context.clone(),
-                    provenance: usage.provenance,
-                    input_tokens: usage.input,
-                    output_tokens: usage.output,
-                    cached_tokens: usage.cached,
-                    reasoning_tokens: None,
-                    total_tokens: None,
-                };
                 self.store.append_agent_event_in_workspace(
                     &info.repository_id,
                     &info.workspace_id,
@@ -483,6 +485,8 @@ impl<'a> Runtime<'a> {
                         event: AgentEventKind::TokenUsageObserved { usage },
                     },
                 )?;
+            } else if usage.validate().is_ok() {
+                job.planner_usage = Some(usage);
             }
             require(
                 interruption.is_none() && output.failure.is_none() && output.exit == Some(0),
@@ -516,6 +520,7 @@ impl<'a> Runtime<'a> {
                             && serde_json::to_value(&proof.evidence)? == input.artifact["evidence"],
                         "verifier result does not match issued job/target/captured evidence",
                     )?;
+                    job.reported_verification = Some(proof.decision);
                 }
                 AgentRole::Planner => {
                     let output: planning::ExecutionPlan = serde_json::from_value(value.clone())?;
@@ -534,6 +539,10 @@ impl<'a> Runtime<'a> {
             other => other,
         });
         job.finished_at_ms = Some(now_ms()?);
+        job.availability_failure = match &result {
+            Err(Error::ProviderAvailability(reason)) => Some(*reason),
+            _ => None,
+        };
         let cancelled = self.cancelled(info, plan)?;
         job.state = if cancelled {
             RuntimeJobState::Cancelled

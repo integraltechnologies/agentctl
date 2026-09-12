@@ -4,6 +4,14 @@ use super::*;
 pub const COMPILER_VERSION: &str = "agentctl-role-v1";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptProvenance {
+    #[serde(default)]
+    pub context_bytes: Option<usize>,
+    #[serde(default)]
+    pub instruction_bytes: Option<usize>,
+    #[serde(default)]
+    pub context_budget: Option<usize>,
+    #[serde(default)]
+    pub context_truncated: Option<bool>,
     pub compiler: String,
     pub profile_hash: String,
     pub project_policy_hash: String,
@@ -74,6 +82,10 @@ fn compose(
         ),
     )?;
     let provenance = PromptProvenance {
+        context_bytes: Some(serde_json::to_vec(context)?.len()),
+        instruction_bytes: Some(bytes.len() - serde_json::to_vec(context)?.len()),
+        context_budget: Some(profile.context_bytes),
+        context_truncated: Some(has_truncation(&serde_json::to_value(context)?)),
         compiler: COMPILER_VERSION.into(),
         profile_hash: planning::hash(profile)?,
         project_policy_hash: policy.into(),
@@ -84,4 +96,13 @@ fn compose(
         bytes: bytes.len(),
     };
     Ok(CompiledPrompt { bytes, provenance })
+}
+fn has_truncation(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(m) => m
+            .iter()
+            .any(|(k, v)| (k == "truncated" && v.as_bool() == Some(true)) || has_truncation(v)),
+        serde_json::Value::Array(a) => a.iter().any(has_truncation),
+        _ => false,
+    }
 }

@@ -1090,6 +1090,100 @@ Ratatui's in-memory terminal backend for deterministic text rendering and automa
 The loop polls keys at 250 ms and snapshots at 1 s, retaining the last snapshot with a stale
 warning on read errors/busy databases. No HTTP/server/GUI transport or analytics stack is added.
 
+## Stage 8: read-only historical engineering analytics
+
+`local::analytics::Query` → `Store::analytics` → `Snapshot` is the single metric
+interpretation used by every analytics CLI view. `analytics_version = 1` versions
+these local projections, not the Stage 0 protocol. Reads open the existing
+database read-only and use one SQLite snapshot transaction; they do not load
+current routing policy, migrate, repair, emit events, or open captured artifacts.
+The Stage 6 observer/agenttop hot path is unchanged.
+
+Queries select a repository and optionally a workspace/session and job dimensions.
+CLI discovery defaults to one concrete workspace; repository-wide combination is
+explicit. The default seven-day job-creation cohort is `[from_ms, to_ms)`;
+usage for those jobs is read through `as_of_ms`, while task/plan outcomes reflect
+the current durable snapshot, not reconstructed past state. Limits cap jobs,
+plans, tasks and event rows (events at ten times the job limit). Oversized records
+are bounded before deserialization. Truncated snapshots explicitly disclaim
+population completeness and suppress the complete-task efficiency ratio.
+SQL selects scoped rows, then indexed in-memory joins avoid per-job queries and
+quadratic task/event scans. Tests exercise 300 sessions and 3,000 jobs, concurrent
+uncommitted writes, empty/filter scopes, and reopen/read-only fingerprints.
+
+Usage comes from canonical token delta events, deduplicated by workspace/event
+identity. Plan-less planner jobs cannot carry a Stage 0 plan-bound job event;
+their optional runtime `planner_usage` stores the same validated token fact.
+Canonical events take precedence if both representations exist. No other job
+gets a second usage store. Optional runtime facts additionally preserve a valid
+reported verifier decision and typed prelaunch availability failure. Prompt
+provenance stores compiled/context/instruction byte counts, budget, and structural
+truncation flags, never an additional prompt copy. Old records omit these facts
+and remain UNKNOWN. All additions use existing guarded JSON metadata; SQL v7,
+authorization, migrations and all thirteen public schemas are unchanged.
+
+Each token dimension has separate exact/estimated nullable sums, unknown
+observation counts, and overflow flags. Unknown includes missing job telemetry
+and incomplete running/interrupted/cancelled observations. Total tokens prefer
+the provider total, otherwise checked input+output; cached/reasoning dimensions
+are never added again. Unsupported cache-write counts remain unknown. Empty
+populations are NOT_APPLICABLE; observed zero is an explicit zero. Aggregates
+are EXACT, ESTIMATED, MIXED, PARTIAL or UNKNOWN, with job-level coverage counts.
+No monetary pricing or active-execution duration is inferred.
+
+Route provenance is an allowlisted structured projection of each persisted Stage 7
+snapshot. Provider, model and fallback-list sources remain independent, including
+explicit-user fields. For an alternative selected by fallback or policy promotion,
+the actual provider/model source is the fallback-list source; configured-primary
+sources remain separately inspectable. A policy-promoted attempt zero is not a
+runtime fallback. Ordered preceding failures reuse Stage 7's `FailureClass` and
+remain attached to the selected job even when provider/model filters exclude
+earlier attempts. Unknown source/reason values stay null; arbitrary metadata is
+not emitted. `preceding_failure_occurrences` counts history entries per selected
+snapshot, NOT distinct failed jobs; it is separate from `availability_failures`
+and must not be added to it. Policy-skipped routes remain a separate list/count.
+
+Ownership is explicit workspace/session/agent/job/plan/task identity, never
+timestamp proximity. Role and provider/model groups use the persisted actual
+route/configuration, not today's profile. Custom roles are ordinary group keys.
+Per-task executor, verifier and helper sums exclude unrelated planner activity;
+integration and session-wide activity are separate subsets. These dimensions
+overlap intentionally and must not be added to the overall total again.
+Unowned usage events have a separate orphan bucket, not invented ownership.
+
+Contract completion, valid reported verifier PASS/REJECT, canonically accepted
+proof, accepted executor attempt, VERIFIED packet and guarded COMPLETE plan
+remain separate facts. Accepted/rejected attempt usage follows the proof's
+explicit executor/verifier IDs, never all work preceding a rejection. Canonical
+check artifacts are not parsed into a new inferred quality score. The verified
+packet ratio includes only selected packets with complete executor/verifier
+telemetry; its exact/estimated numerator buckets and complete/partial packet
+counts accompany the scalar. Filters/cohorts can exclude relevant work, so this
+is a selected-cohort metric, not a lifetime billing total.
+
+Correction usage groups explicit runtime correction rounds. Previous-plan and
+replaced-task references preserve reject/replacement/pass inspection without
+inventing old-task → new-task mappings. A task's correction count counts explicit
+replacement references; an initial non-superseded task has zero, while ambiguous
+successor lineage stays unknown. These counts describe observed replacement
+facts, not hypothetical per-logical-task histories. No correction behavior changes.
+
+Reject rate is REJECT / completed PASS-or-REJECT decisions; unknown verifications
+are excluded and counted separately. Fallback rate is fallback starts / starts
+with known route provenance. Primary starts, fallback attempts/depth, typed
+provider/auth/capability/startup failures and policy skips remain separate;
+policy skips are counted once at attempt zero. Latency distributions expose
+sample/unknown counts and min/median/max. Completed execution intervals are
+recorded start-to-finish wall time, not CPU/provider activity; uncertain jobs
+never acquire a completed duration. Truncation rate uses only known truncation
+flags. Every rate has an explicit denominator and null for an empty denominator.
+
+Privacy projections allowlist scalar facts and sanitize labels; they exclude raw
+prompts, artifact paths/bodies, credentials, failures/transcripts and private
+reasoning. CLI JSON is the bounded snapshot, not an export subsystem. Human
+lists are capped. Task mix and telemetry gaps confound comparisons: there is no
+leaderboard, adaptive policy, recommendation engine or Stage 9 experiment system.
+
 ## Stage 7: role policy → resolved route → compiled instructions → adapter
 
 `runtime::routing` is a pure, deterministic policy layer: it reads no repository, database,
