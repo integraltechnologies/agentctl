@@ -8,8 +8,27 @@ pub struct Snapshot {
     pub tasks: Vec<Task>,
     pub events: Vec<Event>,
     pub usage: Vec<Usage>,
+    #[serde(default)]
+    pub experiments: Vec<Experiment>,
     pub truncated: bool,
     pub warnings: Vec<String>,
+}
+/// Stage 9A long-running job/experiment process, projected read-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Experiment {
+    pub id: String,
+    pub repository_id: String,
+    pub workspace_id: String,
+    pub command_summary: String,
+    pub state: String,
+    #[serde(default)]
+    pub liveness: Liveness,
+    pub attempt: usize,
+    pub created_at_ms: u64,
+    pub started_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+    pub exit_status: Option<i32>,
+    pub cancel_requested: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {

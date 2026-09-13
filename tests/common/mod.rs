@@ -20,7 +20,23 @@ pub fn sql(path: &std::path::Path) -> rusqlite::Connection {
     c
 }
 #[allow(dead_code)]
+pub fn strip_experiments(c: &rusqlite::Connection) {
+    for name in [
+        "experiment_runs_insert",
+        "experiment_runs_update",
+        "experiment_runs_delete",
+    ] {
+        c.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))
+            .unwrap();
+    }
+    c.execute_batch(
+        "DROP TABLE IF EXISTS experiment_runs; DELETE FROM schema_migrations WHERE version=8;",
+    )
+    .unwrap();
+}
+#[allow(dead_code)]
 pub fn strip_runtime(c: &rusqlite::Connection) {
+    strip_experiments(c);
     for name in [
         "runtime_runs_insert",
         "runtime_runs_update",

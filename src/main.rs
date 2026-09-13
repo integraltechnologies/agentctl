@@ -18,8 +18,8 @@ Usage:
   agentctl code <context|impact|neighbors> <query> [--limit N] [--depth N] [--neighbors N] [--tests N] [--json]
     context also accepts --memory-canonical N --memory-facts N --memory-notes N --memory-bytes N
   agentctl state status [--json]
-  agentctl observe <snapshot|sessions|agents|tasks|events|usage> [--json]
-  agentctl observe <session|agent|job|task> <id> [--json]
+  agentctl observe <snapshot|sessions|agents|tasks|events|experiments|usage> [--json]
+  agentctl observe <session|agent|job|task|experiment> <id> [--json]
   agentctl observe usage <provider|task|role> <value> [--json]
   agentctl analytics <summary|usage|roles|routes|corrections> [filters] [--json]
   agentctl analytics <session|task|job> <id> [filters] [--json]
@@ -36,6 +36,12 @@ Usage:
   agentctl run <resume|status|cancel> <plan-id> [--json]
   agentctl run replace <old-plan-id> <validated-replacement-id>
   agentctl run packet-hashes < plan-packet.json
+  agentctl experiment run --program PATH [--arg V]... [--cwd PATH] [--network] [--env NAME]... [--timeout-ms N] [--json]
+  agentctl experiment run --command KEY [--network] [--env NAME]... [--timeout-ms N] [--json]
+  agentctl experiment status <experiment-id> [--json]
+  agentctl experiment list [--json]
+  agentctl experiment cancel <experiment-id> [--json]
+  agentctl experiment restart <experiment-id> [--json]
   agentctl plan prepare <--objective TEXT|--objective-file PATH|--request-file PATH> [--query TEXT] [--bytes N] [--notes N] [--json]
   agentctl plan context <request-id> [--json]
   agentctl plan import <plan.json> [--json]
@@ -81,6 +87,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         | ["code", ..]
         | ["plan", ..]
         | ["run", ..]
+        | ["experiment", ..]
         | ["provider", ..]
         | ["analytics", ..]
         | ["roles", ..]

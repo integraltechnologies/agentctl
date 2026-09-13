@@ -1582,14 +1582,14 @@ impl RunningProcess for Immediate {
     fn poll(&mut self) -> local::Result<Option<ProcessOutput>> {
         Ok(self.0.take())
     }
-    fn cancel(&mut self) -> local::Result<()> {
+    fn cancel(&mut self) -> local::Result<CancellationOutcome> {
         self.0 = Some(ProcessOutput {
             exit: None,
             stdout: vec![],
             stderr: vec![],
             failure: Some("cancelled".into()),
         });
-        Ok(())
+        Ok(CancellationOutcome::Applied)
     }
 }
 struct Hang {
@@ -1607,9 +1607,9 @@ impl RunningProcess for Hang {
             failure: Some("cancelled".into()),
         }))
     }
-    fn cancel(&mut self) -> local::Result<()> {
+    fn cancel(&mut self) -> local::Result<CancellationOutcome> {
         self.cancelled = true;
-        Ok(())
+        Ok(CancellationOutcome::Applied)
     }
 }
 struct Checks {
@@ -2121,7 +2121,7 @@ fn v6_runtime_migration_is_additive_atomic_and_missing_guards_fail_closed() {
     );
     c.execute_batch("DROP TABLE runtime_jobs").unwrap();
     drop(c);
-    assert_eq!(f.store().status().unwrap().schema_version, 7);
+    assert_eq!(f.store().status().unwrap().schema_version, 8);
     assert_eq!(
         f.store()
             .execution_plan(&f.root, &p.packet.plan_id)
@@ -2607,7 +2607,7 @@ fn old_v7_runtime_metadata_remains_inspectable_without_silent_ownership_backfill
         c.query_row::<String, _, _>("SELECT record_json FROM runtime_runs", [], |r| r.get(0))
             .unwrap()
     );
-    assert_eq!(f.store().status().unwrap().schema_version, 7);
+    assert_eq!(f.store().status().unwrap().schema_version, 8);
     assert!(
         f.store()
             .runtime_jobs(&f.root, None)
@@ -2654,11 +2654,11 @@ impl RunningProcess for LiveFixtureProcess {
             }
         }
     }
-    fn cancel(&mut self) -> local::Result<()> {
+    fn cancel(&mut self) -> local::Result<CancellationOutcome> {
         self.confirmed = false;
         self.gate.store(1, std::sync::atomic::Ordering::Release);
         self.child.kill()?;
-        Ok(())
+        Ok(CancellationOutcome::Applied)
     }
 }
 impl Drop for LiveFixtureProcess {
@@ -2914,7 +2914,7 @@ impl RunningProcess for ObservedProcess {
     fn pid(&self) -> Option<u32> {
         self.inner.pid()
     }
-    fn cancel(&mut self) -> local::Result<()> {
+    fn cancel(&mut self) -> local::Result<CancellationOutcome> {
         self.inner.cancel()
     }
     fn poll(&mut self) -> local::Result<Option<ProcessOutput>> {

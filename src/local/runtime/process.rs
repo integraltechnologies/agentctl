@@ -39,6 +39,12 @@ pub struct ProcessOutput {
     pub stderr: Vec<u8>,
     pub failure: Option<String>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancellationOutcome {
+    Applied,
+    AlreadyExited,
+    Failed(String),
+}
 pub trait RunningProcess {
     fn pid(&self) -> Option<u32>;
     /// True only when the last poll directly confirmed the owned provider child
@@ -48,7 +54,7 @@ pub trait RunningProcess {
         false
     }
     fn poll(&mut self) -> Result<Option<ProcessOutput>>;
-    fn cancel(&mut self) -> Result<()>;
+    fn cancel(&mut self) -> Result<CancellationOutcome>;
 }
 /// Trusted host-side command launcher; injectable for offline deterministic tests.
 pub trait CheckLauncher {
@@ -83,6 +89,7 @@ pub struct NativeProcess {
     failure: Option<String>,
     reaped: bool,
     live_child: bool,
+    timeout_termination_attempted: bool,
     secrets: Vec<String>,
 }
 impl ProcessSpec {
@@ -119,7 +126,6 @@ fn drain(mut stream: impl Read + Send + 'static) -> JoinHandle<std::io::Result<V
 }
 impl NativeProcess {
     pub fn launch(spec: &ProcessSpec) -> Result<Self> {
-        spec.recheck_policy()?;
         paths::ensure_directory(&spec.scratch)?;
         let home = spec.scratch.join("home");
         paths::ensure_directory(&home)?;
@@ -197,20 +203,23 @@ impl NativeProcess {
             failure: None,
             reaped: false,
             live_child: false,
+            timeout_termination_attempted: false,
             secrets,
         })
     }
-    fn stop_family(&mut self) {
+    fn stop_family(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             // SAFETY: negative PID addresses only our freshly spawned process group.
-            unsafe {
-                libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+            let result = unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+            if result == -1 {
+                return Err(std::io::Error::last_os_error());
             }
+            Ok(())
         }
         #[cfg(not(unix))]
         {
-            let _ = self.child.kill();
+            self.child.kill()
         }
     }
 }
@@ -221,25 +230,45 @@ impl RunningProcess for NativeProcess {
     fn pid(&self) -> Option<u32> {
         Some(self.child.id())
     }
-    fn cancel(&mut self) -> Result<()> {
+    fn cancel(&mut self) -> Result<CancellationOutcome> {
         self.live_child = false;
-        self.failure = Some("cancelled".into());
-        self.stop_family();
-        Ok(())
+        if self.child.try_wait()?.is_some() {
+            return Ok(CancellationOutcome::AlreadyExited);
+        }
+        match self.stop_family() {
+            Ok(()) => {
+                self.failure = Some("cancelled".into());
+                Ok(CancellationOutcome::Applied)
+            }
+            Err(error) => {
+                if self.child.try_wait()?.is_some() {
+                    Ok(CancellationOutcome::AlreadyExited)
+                } else {
+                    Ok(CancellationOutcome::Failed(error.to_string()))
+                }
+            }
+        }
     }
     fn poll(&mut self) -> Result<Option<ProcessOutput>> {
         self.live_child = false;
         require(!self.reaped, "process output already collected")?;
-        if self.started.elapsed().as_millis() >= self.timeout as u128 && self.failure.is_none() {
-            self.failure = Some("timeout".into());
-            self.stop_family();
-        }
-        let Some(status) = self.child.try_wait()? else {
-            self.live_child = true;
-            return Ok(None);
+        let status = match self.child.try_wait()? {
+            Some(status) => status,
+            None => {
+                if self.started.elapsed().as_millis() >= self.timeout as u128
+                    && !self.timeout_termination_attempted
+                {
+                    self.timeout_termination_attempted = true;
+                    if self.stop_family().is_ok() {
+                        self.failure = Some("timeout".into());
+                    }
+                }
+                self.live_child = true;
+                return Ok(None);
+            }
         };
         // Remove any background descendants before accepting output/source state.
-        self.stop_family();
+        let _ = self.stop_family();
         let deadline = Instant::now();
         while self.stdout.as_ref().is_some_and(|h| !h.is_finished())
             || self.stderr.as_ref().is_some_and(|h| !h.is_finished())
@@ -288,7 +317,7 @@ impl RunningProcess for NativeProcess {
 impl Drop for NativeProcess {
     fn drop(&mut self) {
         if !self.reaped {
-            self.stop_family();
+            let _ = self.stop_family();
             let _ = self.child.wait();
         }
     }

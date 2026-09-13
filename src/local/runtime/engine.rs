@@ -1,5 +1,5 @@
 use super::*;
-use process::{ProcessSpec, WorkspaceLease};
+use process::{CancellationOutcome, ProcessSpec, WorkspaceLease};
 use provider::{JobInput, ProviderAdapter};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -416,19 +416,28 @@ impl<'a> Runtime<'a> {
             save_job(self.store, info, &job, "JOB_STARTED")?;
             let started = Instant::now();
             let mut interruption = None;
+            let mut cancellation_checked = false;
+            let mut timeout_checked = false;
             let output = loop {
                 // Revoke before polling/cancellation (including errors/unwind).
                 liveness.set(false);
-                if self.cancelled(info, plan)? {
-                    interruption = Some("cancelled".to_string());
-                    process.cancel()?;
-                }
-                if started.elapsed().as_millis() > profile.timeout_ms as u128 {
-                    interruption = Some("timeout".into());
-                    process.cancel()?;
-                }
                 if let Some(output) = process.poll()? {
                     break output;
+                }
+                if !cancellation_checked && self.cancelled(info, plan)? {
+                    cancellation_checked = true;
+                    if process.cancel()? == CancellationOutcome::Applied {
+                        interruption = Some("cancelled".to_string());
+                    }
+                }
+                if interruption.is_none()
+                    && !timeout_checked
+                    && started.elapsed().as_millis() > profile.timeout_ms as u128
+                {
+                    timeout_checked = true;
+                    if process.cancel()? == CancellationOutcome::Applied {
+                        interruption = Some("timeout".into());
+                    }
                 }
                 liveness.set(process.liveness_confirmed());
                 std::thread::sleep(Duration::from_millis(25));
@@ -812,15 +821,17 @@ impl<'a> Runtime<'a> {
             let mut process = self.checks.launch(&spec)?;
             let started = Instant::now();
             let mut interrupted = false;
+            let mut termination_checked = false;
             let output = loop {
-                if self.cancelled(info, Some(plan))?
-                    || started.elapsed().as_millis() > self.config.timeout_ms as u128
-                {
-                    interrupted = true;
-                    process.cancel()?;
-                }
                 if let Some(output) = process.poll()? {
                     break output;
+                }
+                if !termination_checked
+                    && (self.cancelled(info, Some(plan))?
+                        || started.elapsed().as_millis() > self.config.timeout_ms as u128)
+                {
+                    termination_checked = true;
+                    interrupted = process.cancel()? == CancellationOutcome::Applied;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             };

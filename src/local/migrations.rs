@@ -9,7 +9,7 @@ use super::{
     store::{RegisteredRepository, RegisteredWorkspace},
 };
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 pub const APPLICATION_ID: i64 = 0x41475443; // AGTC
 
 const INITIAL: &str = r#"
@@ -119,6 +119,7 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
         (5, "planning_substrate"),
         (6, "guarded_plan_completion"),
         (7, "provider_runtime"),
+        (8, "experiment_runtime"),
     ]
     .into_iter()
     .filter(|(v, _)| *v <= version)
@@ -233,6 +234,21 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
             require(n == 1, format!("database is missing trigger {name}"))?;
         }
     }
+    if version >= 8 {
+        connection.prepare("SELECT record_json,cancel_requested FROM experiment_runs LIMIT 0")?;
+        for name in [
+            "experiment_runs_insert",
+            "experiment_runs_update",
+            "experiment_runs_delete",
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing trigger {name}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -283,6 +299,10 @@ fn migrate_transaction(connection: &mut Connection) -> Result<()> {
     if header(&transaction)? == 6 {
         check_version(&transaction, 6)?;
         transaction.execute_batch(include_str!("runtime/schema.sql"))?;
+    }
+    if header(&transaction)? == 7 {
+        check_version(&transaction, 7)?;
+        transaction.execute_batch(include_str!("runtime/experiment_schema.sql"))?;
     }
     check(&transaction)?;
     require(

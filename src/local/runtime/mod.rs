@@ -15,6 +15,8 @@ mod state;
 use state::*;
 pub use state::{RunRecord, RunState, RuntimeJob, RuntimeJobState};
 mod engine;
+mod experiment;
+pub(crate) mod experiment_cli;
 pub(crate) mod planner;
 use super::{
     Error, Result,
@@ -27,6 +29,11 @@ use super::{
 use crate::{Validate, protocol::*};
 pub use config::*;
 pub use engine::Runtime;
+pub use experiment::{
+    DEFAULT_TIMEOUT_MS as EXPERIMENT_DEFAULT_TIMEOUT_MS, ExperimentAttempt, ExperimentInput,
+    ExperimentObservation, ExperimentRun, ExperimentRuntime, ExperimentState,
+    MAX_TIMEOUT_MS as EXPERIMENT_MAX_TIMEOUT_MS,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use source::permits;

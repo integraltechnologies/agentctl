@@ -36,12 +36,20 @@ pub fn cli(paths: &MachinePaths, args: &[&str]) -> Result<()> {
             super::require(!matches.is_empty(), "task not found in bounded recent view")?;
             serde_json::to_value(matches)?
         }
+        ["experiments"] => serde_json::to_value(&snapshot.experiments)?,
+        ["experiment", id] => serde_json::to_value(
+            snapshot
+                .experiments
+                .iter()
+                .find(|e| e.id == *id)
+                .ok_or_else(|| Error::Invalid("experiment not found in bounded recent view".into()))?,
+        )?,
         ["usage"] => serde_json::to_value(usage::series(&snapshot, usage::Scope::Aggregate, None))?,
         ["usage", kind, value] => {
             let scope = match *kind { "provider"=>usage::Scope::Provider((*value).into()),"task"=>usage::Scope::Task((*value).into()),"role"=>usage::Scope::Role((*value).into()),_=>return Err(Error::Invalid("usage filter must be provider, task or role".into())) };
             serde_json::to_value(usage::series(&snapshot, scope, None))?
         }
-        _ => return Err(Error::Invalid("observe snapshot|sessions|session ID|agents|agent ID|job ID|tasks|task ID|events|usage [provider|task|role VALUE] [--json]".into())),
+        _ => return Err(Error::Invalid("observe snapshot|sessions|session ID|agents|agent ID|job ID|tasks|task ID|events|experiments|experiment ID|usage [provider|task|role VALUE] [--json]".into())),
     };
     println!("{}", serde_json::to_string(&value)?);
     Ok(())

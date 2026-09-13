@@ -12,6 +12,7 @@ const JOBS: usize = 512;
 const PLANS: usize = 64;
 const EVENTS: usize = 2048;
 const TASKS: usize = 4096;
+const EXPERIMENTS: usize = 256;
 
 fn field(v: &Value, key: &str) -> Option<String> {
     v[key].as_str().filter(|s| !s.is_empty()).map(label)
@@ -702,6 +703,75 @@ impl Store {
         out.tasks.sort_by(|a, b| {
             (&a.repository_id, &a.plan_id, &a.id).cmp(&(&b.repository_id, &b.plan_id, &b.id))
         });
+        {
+            let mut statement = tx.prepare("SELECT experiment_id,repo_id,workspace_id,created_at_ms,CASE WHEN length(record_json)<=65536 THEN record_json ELSE '{}' END,cancel_requested FROM experiment_runs ORDER BY rowid DESC LIMIT ?1")?;
+            let rows = statement.query_map([EXPERIMENTS as i64 + 1], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, bool>(5)?,
+                ))
+            })?;
+            for (i, row) in rows.enumerate() {
+                if i == EXPERIMENTS {
+                    out.truncated = true;
+                    break;
+                }
+                let (id, repo, workspace, created_at_ms, json, cancel_requested) = row?;
+                let v: Value = serde_json::from_str(&json).unwrap_or(Value::Null);
+                if v["experiment_id"].as_str() != Some(id.as_str()) {
+                    out.truncated = true;
+                    out.warnings
+                        .push("Malformed or oversized experiment metadata marked unknown".into());
+                    continue;
+                }
+                let command = &v["command"];
+                let program = command["program"].as_str().unwrap_or("?");
+                let args: Vec<String> = command["args"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let attempts = v["attempts"].as_array().cloned().unwrap_or_default();
+                let last = attempts.last();
+                let state = v["state"].as_str().unwrap_or("UNKNOWN").to_string();
+                let liveness = if state == "RUNNING"
+                    && crate::local::runtime::liveness::is_live(
+                        self.connection.path().unwrap_or(""),
+                        &repo,
+                        &workspace,
+                        "",
+                        "",
+                        &id,
+                    ) {
+                    Liveness::Live
+                } else {
+                    Liveness::Unknown
+                };
+                out.experiments.push(Experiment {
+                    id,
+                    repository_id: repo,
+                    workspace_id: workspace,
+                    command_summary: label(&format!("{program} {}", args.join(" "))),
+                    state,
+                    liveness,
+                    attempt: attempts.len(),
+                    created_at_ms: u64::try_from(created_at_ms).unwrap_or(0),
+                    started_at_ms: last.and_then(|a| a["started_at_ms"].as_u64()),
+                    finished_at_ms: last.and_then(|a| a["finished_at_ms"].as_u64()),
+                    exit_status: last
+                        .and_then(|a| a["exit_status"].as_i64())
+                        .and_then(|v| i32::try_from(v).ok()),
+                    cancel_requested,
+                });
+            }
+        }
         out.warnings.sort();
         out.warnings.dedup();
         if out.truncated {

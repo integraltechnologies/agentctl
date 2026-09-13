@@ -64,6 +64,11 @@ pub enum JournalEntry {
         phase: String,
         detail: String,
     },
+    Experiment {
+        experiment_id: ExperimentId,
+        phase: String,
+        detail: String,
+    },
     PlanningRequestCreated {
         request_id: super::planning::PlanningRequestId,
     },
