@@ -26,7 +26,90 @@ fn human_run(run: &ExperimentRun) -> String {
     )
 }
 fn human_observation(o: &ExperimentObservation) -> String {
-    format!("{}  liveness={:?}", human_run(&o.run), o.liveness)
+    format!(
+        "{}  liveness={:?}  events={}  ingestion_errors={}",
+        human_run(&o.run),
+        o.liveness,
+        o.events.event_count,
+        o.events.ingestion_errors
+    )
+}
+
+fn event_query(
+    args: &[&str],
+    event_type: Option<&str>,
+    allow_name: bool,
+) -> Result<(ExperimentId, ExperimentEventQuery)> {
+    let id = args
+        .first()
+        .ok_or_else(|| Error::Invalid("experiment event query requires an ID".into()))?;
+    let id = ExperimentId::new(*id).map_err(Error::Invalid)?;
+    let mut query = ExperimentEventQuery {
+        event_type: event_type.map(str::to_owned),
+        ..Default::default()
+    };
+    let mut i = 1;
+    while i < args.len() {
+        match args[i] {
+            "--attempt" => {
+                let v = value(args, &mut i)?;
+                query.attempt = Some(
+                    v.parse()
+                        .map_err(|_| Error::Invalid("invalid --attempt".into()))?,
+                );
+            }
+            "--name" if allow_name => query.metric_name = Some(value(args, &mut i)?),
+            "--limit" => {
+                let v = value(args, &mut i)?;
+                query.limit = v
+                    .parse()
+                    .map_err(|_| Error::Invalid("invalid --limit".into()))?;
+            }
+            other => {
+                return Err(Error::Invalid(format!(
+                    "unknown experiment event query flag {other}"
+                )));
+            }
+        }
+    }
+    require(query.attempt != Some(0), "--attempt must be at least 1")?;
+    Ok((id, query))
+}
+
+fn human_event(event: &ExperimentRuntimeEvent) -> String {
+    let fact = match &event.event {
+        ExperimentEventData::Metric {
+            name,
+            value,
+            step,
+            epoch,
+            ..
+        } => {
+            format!("metric {name}={value} step={step:?} epoch={epoch:?}")
+        }
+        ExperimentEventData::Checkpoint {
+            name,
+            path,
+            byte_size,
+            ..
+        } => {
+            format!("checkpoint {name} path={path} bytes={byte_size}")
+        }
+        ExperimentEventData::Health { kind, message } => {
+            format!("health {kind:?} {}", message.as_deref().unwrap_or(""))
+        }
+        ExperimentEventData::ProcessStatus { status, message } => {
+            format!("status {status} {}", message.as_deref().unwrap_or(""))
+        }
+    };
+    format!(
+        "{}  attempt={} source_seq={} timestamp_ms={} source={}  {fact}",
+        event.arrival_sequence,
+        event.attempt,
+        event.source_sequence,
+        event.timestamp_ms,
+        event.source
+    )
 }
 
 pub(crate) fn run(
@@ -146,8 +229,27 @@ pub(crate) fn run(
             };
             output(json_mode, &list, &human)
         }
+        "metrics" | "checkpoints" | "events" => {
+            let event_type = match command {
+                "metrics" => Some("METRIC"),
+                "checkpoints" => Some("CHECKPOINT"),
+                _ => None,
+            };
+            let (id, query) = event_query(args, event_type, command == "metrics")?;
+            let events = store.experiment_events(&root, &id, &query)?;
+            let human = if events.is_empty() {
+                "No matching experiment events".into()
+            } else {
+                events
+                    .iter()
+                    .map(human_event)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            output(json_mode, &events, &human)
+        }
         _ => Err(Error::Invalid(
-            "expected experiment run|status|list|cancel|restart".into(),
+            "expected experiment run|status|list|cancel|restart|metrics|checkpoints|events".into(),
         )),
     }
 }

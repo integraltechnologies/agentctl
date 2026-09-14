@@ -118,6 +118,7 @@ impl<'a> Runtime<'a> {
             git_directories: vec![info.git_directory.clone(), info.common_directory.clone()],
             protected: policy.protected.clone(),
             credential_env: vec![],
+            experiment_event_file: None,
             lock_fd: lease.fd(),
         })
     }

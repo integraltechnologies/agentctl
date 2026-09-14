@@ -44,8 +44,35 @@ This repository currently provides one Rust 2024 crate with a library and a tiny
 
 The accepted Stage 0 protocol and all 13 public schemas remain unchanged.
 
+## Structured experiment events (Stage 9B)
+
+Every experiment attempt receives an `AGENTCTL_EVENT_FILE` path in its sanitized
+environment. Instrumented processes append one UTF-8 JSON object plus a newline per
+event; ordinary stdout/stderr is never parsed. Frames require `type`, `sequence`,
+`timestamp_ms`, and `source`. Supported types are `metric`, `checkpoint`, `health`,
+and `status`. For example:
+
+```json
+{"type":"metric","sequence":1,"timestamp_ms":1700000000000,"source":"trainer","name":"loss","value":0.183,"step":1200}
+```
+
+Frames are limited to 64 KiB. Sequence identity is scoped to experiment, attempt, and
+the event-file channel: exact replay is idempotent, while conflicting reuse is recorded
+as an ingestion-health fact. Arrival order is retained even when source sequences are
+out of order. A trailing partial frame is rejected at process exit. Metric values must
+be finite. Checkpoints are workspace-relative file references; traversal, absolute,
+Git-administrative, protected, and symlink-escape paths are rejected. Stable regular
+files up to 64 MiB receive observed size, mtime, and a BLAKE3 hash; larger files retain
+metadata without a claimed hash. Event rows are append-only and retained indefinitely.
+
+Read-only bounded queries are available as `agentctl experiment metrics <id>`,
+`checkpoints <id>`, and `events <id>`, with optional `--attempt` and `--limit`; metrics
+also accept `--name`. The default result bound is 1,000 and the maximum is 10,000.
+These facts do not evaluate thresholds, affect process control, invoke a model, wake a
+planner, select checkpoints, or start another experiment.
+
 It does **not** implement LSP, automatic correction loops, concurrent writers, daemons,
-an experiment runner, `agenttop`/TUI, token analytics, MCP services, web UI, remote
+autonomous experiment iteration, `agenttop`/TUI, token analytics, MCP services, web UI, remote
 scheduling, embeddings, or a vector DB. Provider calls may use the network; canonical
 verification commands may not. Native execution currently requires macOS `sandbox-exec`.
 

@@ -6,6 +6,7 @@
 //! to own. Liveness follows the unchanged Stage 6 philosophy: persisted RUNNING is a
 //! historical fact, never proof that a process is still alive; only the exact
 //! controller process that is currently polling a child handle may report LIVE.
+use super::experiment_events::EventIngestor;
 use super::*;
 use process::{
     CancellationOutcome, CheckLauncher, NativeChecks, ProcessSpec, ScratchCleanup, WorkspaceLease,
@@ -47,6 +48,10 @@ pub struct ExperimentAttempt {
     pub exit_status: Option<i32>,
     pub evidence: Option<EvidenceRef>,
     pub failure: Option<String>,
+    /// A factual controller-side ingestion failure. It never changes process state
+    /// and is separate from the process `failure` outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_ingestion_error: Option<String>,
     pub state: ExperimentState,
 }
 
@@ -87,6 +92,7 @@ pub struct ExperimentObservation {
     /// process to hold the owned child handle; a separate CLI invocation always
     /// observes UNKNOWN, identically to Stage 6 runtime-job liveness.
     pub liveness: crate::local::observe::Liveness,
+    pub events: ExperimentEventSummary,
 }
 
 pub struct ExperimentInput {
@@ -203,14 +209,23 @@ fn is_live(store: &Store, info: &RepositoryInfo, id: &ExperimentId) -> bool {
     )
 }
 
-fn observation(store: &Store, info: &RepositoryInfo, run: ExperimentRun) -> ExperimentObservation {
+fn observation(
+    store: &Store,
+    info: &RepositoryInfo,
+    run: ExperimentRun,
+) -> Result<ExperimentObservation> {
     use crate::local::observe::Liveness;
     let liveness = if is_live(store, info, &run.experiment_id) {
         Liveness::Live
     } else {
         Liveness::Unknown
     };
-    ExperimentObservation { run, liveness }
+    let events = store.experiment_event_summary(info, &run.experiment_id)?;
+    Ok(ExperimentObservation {
+        run,
+        liveness,
+        events,
+    })
 }
 
 impl Store {
@@ -220,7 +235,9 @@ impl Store {
         id: &ExperimentId,
     ) -> Result<Option<ExperimentObservation>> {
         let info = graph::checked_workspace(self, root)?;
-        Ok(load_experiment(self, &info, id)?.map(|run| observation(self, &info, run)))
+        load_experiment(self, &info, id)?
+            .map(|run| observation(self, &info, run))
+            .transpose()
     }
     pub fn experiment_list(&self, root: &Path) -> Result<Vec<ExperimentObservation>> {
         let info = graph::checked_workspace(self, root)?;
@@ -235,7 +252,7 @@ impl Store {
             )?
             .collect::<std::result::Result<Vec<String>, _>>()?;
         rows.into_iter()
-            .map(|s| Ok(observation(self, &info, serde_json::from_str(&s)?)))
+            .map(|s| observation(self, &info, serde_json::from_str(&s)?))
             .collect()
     }
     /// Requests cancellation from another process. Only sets a flag a live poll loop
@@ -296,6 +313,7 @@ fn build_spec(
     policy: &ProjectConfig,
     run: &ExperimentRun,
     lease: &WorkspaceLease,
+    attempt: u32,
 ) -> Result<ProcessSpec> {
     let scratch = paths
         .data_root
@@ -321,6 +339,7 @@ fn build_spec(
         git_directories: vec![info.git_directory.clone(), info.common_directory.clone()],
         protected: policy.protected.clone(),
         credential_env: run.env_passthrough.clone(),
+        experiment_event_file: Some(scratch.join(format!("attempt-{attempt}-events.jsonl"))),
         lock_fd: lease.fd(),
     })
 }
@@ -341,7 +360,12 @@ fn drive(
             .join(info.workspace_id.as_str()),
     )?;
     let attempt_number = run.attempts.len() as u32 + 1;
-    let spec = build_spec(paths, info, policy, run, &lease)?;
+    let spec = build_spec(paths, info, policy, run, &lease, attempt_number)?;
+    let mut event_ingestor = EventIngestor::create(
+        spec.experiment_event_file
+            .as_ref()
+            .expect("experiment specs have an event file"),
+    )?;
     let _scratch = ScratchCleanup(spec.scratch.clone());
     run.state = ExperimentState::Running;
     run.attempts.push(ExperimentAttempt {
@@ -352,6 +376,7 @@ fn drive(
         exit_status: None,
         evidence: None,
         failure: None,
+        event_ingestion_error: None,
         state: ExperimentState::Running,
     });
     save_experiment(store, info, run, "EXPERIMENT_ATTEMPT_STARTED")?;
@@ -385,8 +410,19 @@ fn drive(
     let mut cancellation_checked = false;
     let mut cancellation_applied = false;
     let mut cancellation_failure = None;
+    let mut event_ingestion_error = None;
     let output = loop {
         guard.set(false);
+        if let Err(error) = event_ingestor.drain(
+            store,
+            info,
+            policy,
+            &run.experiment_id,
+            attempt_number,
+            false,
+        ) {
+            event_ingestion_error = Some(format!("event ingestion retry pending: {error}"));
+        }
         if !cancellation_checked && cancel_requested(store, info, &run.experiment_id)? {
             cancellation_checked = true;
             if let Some(output) = process.poll()? {
@@ -440,6 +476,26 @@ fn drive(
         std::thread::sleep(Duration::from_millis(50));
     };
     drop(guard);
+    loop {
+        let drained = event_ingestor.drain(
+            store,
+            info,
+            policy,
+            &run.experiment_id,
+            attempt_number,
+            true,
+        );
+        let (_, caught_up) = match drained {
+            Ok(result) => result,
+            Err(error) => {
+                event_ingestion_error = Some(format!("event ingestion failed: {error}"));
+                break;
+            }
+        };
+        if caught_up {
+            break;
+        }
+    }
     let stdout = artifacts.put(&output.stdout)?;
     let stderr = artifacts.put(&output.stderr)?;
     let log = artifacts.json(&json!({
@@ -499,6 +555,7 @@ fn drive(
         attempt.exit_status = output.exit;
         attempt.evidence = Some(EvidenceRef(evidence_id));
         attempt.failure = output.failure.clone();
+        attempt.event_ingestion_error = event_ingestion_error;
         attempt.state = finished_state;
     }
     run.state = finished_state;

@@ -9,7 +9,7 @@ use super::{
     store::{RegisteredRepository, RegisteredWorkspace},
 };
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 pub const APPLICATION_ID: i64 = 0x41475443; // AGTC
 
 const INITIAL: &str = r#"
@@ -120,6 +120,7 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
         (6, "guarded_plan_completion"),
         (7, "provider_runtime"),
         (8, "experiment_runtime"),
+        (9, "experiment_events"),
     ]
     .into_iter()
     .filter(|(v, _)| *v <= version)
@@ -249,6 +250,35 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
             require(n == 1, format!("database is missing trigger {name}"))?;
         }
     }
+    if version >= 9 {
+        connection.prepare(
+            "SELECT experiment_id,attempt,event_type,metric_name,source_sequence,event_json FROM experiment_events LIMIT 0",
+        )?;
+        for name in [
+            "experiment_events_insert",
+            "experiment_events_update",
+            "experiment_events_delete",
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing trigger {name}"))?;
+        }
+        for name in [
+            "experiment_events_by_experiment",
+            "experiment_metrics_by_name",
+            "experiment_events_by_type",
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing index {name}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -303,6 +333,10 @@ fn migrate_transaction(connection: &mut Connection) -> Result<()> {
     if header(&transaction)? == 7 {
         check_version(&transaction, 7)?;
         transaction.execute_batch(include_str!("runtime/experiment_schema.sql"))?;
+    }
+    if header(&transaction)? == 8 {
+        check_version(&transaction, 8)?;
+        transaction.execute_batch(include_str!("runtime/experiment_event_schema.sql"))?;
     }
     check(&transaction)?;
     require(

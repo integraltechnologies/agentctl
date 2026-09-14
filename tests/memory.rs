@@ -1054,7 +1054,7 @@ fn failed_memory_migration_is_atomic_and_future_version_is_rejected() {
         )
         .unwrap();
     assert_eq!(n, 0);
-    c.execute_batch("DROP TABLE memory_links; PRAGMA user_version=8;")
+    c.execute_batch("DROP TABLE memory_links; PRAGMA user_version=9;")
         .unwrap();
     assert!(Store::open(&f.db, 5000).is_err());
 }

@@ -28,6 +28,9 @@ pub struct ProcessSpec {
     pub git_directories: Vec<PathBuf>,
     pub protected: Vec<super::super::config::ProtectedRule>,
     pub credential_env: Vec<String>,
+    /// Attempt-owned structured JSONL channel. This is not a credential and is
+    /// exposed only to experiment processes that explicitly opt into Stage 9B.
+    pub experiment_event_file: Option<PathBuf>,
     /// Inherited by the entire child family so a controller crash cannot release
     /// the workspace lease while an orphan can still edit files.
     pub(super) lock_fd: Option<i32>,
@@ -150,6 +153,9 @@ impl NativeProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(path) = &spec.experiment_event_file {
+            command.env("AGENTCTL_EVENT_FILE", path);
+        }
         let mut secrets = vec![];
         if let Some(native) = &spec.native_auth {
             native.environment(&mut command);
@@ -523,6 +529,7 @@ mod tests {
                 git_directories: vec![self.0.join("repo/.git")],
                 protected: vec![],
                 credential_env: vec![],
+                experiment_event_file: None,
                 lock_fd: None,
             }
         }

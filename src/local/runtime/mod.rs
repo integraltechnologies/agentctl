@@ -17,6 +17,7 @@ pub use state::{RunRecord, RunState, RuntimeJob, RuntimeJobState};
 mod engine;
 mod experiment;
 pub(crate) mod experiment_cli;
+mod experiment_events;
 pub(crate) mod planner;
 use super::{
     Error, Result,
@@ -33,6 +34,11 @@ pub use experiment::{
     DEFAULT_TIMEOUT_MS as EXPERIMENT_DEFAULT_TIMEOUT_MS, ExperimentAttempt, ExperimentInput,
     ExperimentObservation, ExperimentRun, ExperimentRuntime, ExperimentState,
     MAX_TIMEOUT_MS as EXPERIMENT_MAX_TIMEOUT_MS,
+};
+pub use experiment_events::{
+    DEFAULT_EVENT_QUERY_LIMIT, EVENT_FILE_ENV, ExperimentEventData, ExperimentEventQuery,
+    ExperimentEventSummary, ExperimentHealthKind, ExperimentRuntimeEvent, MAX_EVENT_FRAME_BYTES,
+    MAX_EVENT_QUERY_LIMIT,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
