@@ -37,8 +37,9 @@ export XDG_CACHE_HOME=/tmp/agentctl-dev/cache
 cargo run -- init
 ```
 
-There is no hosted CI configuration in the repository yet. Run the checks above
-before submitting changes.
+CI (`.github/workflows/ci.yml`) runs these checks on macOS and Linux, and a
+build/clippy check on Windows, for every push and pull request. Run them
+locally before submitting changes.
 
 ## Native sandbox tests
 
