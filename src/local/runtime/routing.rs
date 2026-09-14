@@ -53,6 +53,9 @@ pub struct ProjectRoles {
     pub read_only: bool,
     pub deny_network: bool,
     pub max_context_bytes: Option<usize>,
+    /// Optional further restriction on the machine's runtime.concurrency.max_agents.
+    /// Effective ceiling is always min(machine, project); a project can never raise it.
+    pub max_agents: Option<usize>,
 }
 impl ProjectRoles {
     pub fn is_empty(&self) -> bool {
@@ -64,6 +67,12 @@ impl ProjectRoles {
             require(
                 (1..=262144).contains(&n),
                 "project routing.max_context_bytes must be 1–262144",
+            )?;
+        }
+        if let Some(n) = self.max_agents {
+            require(
+                (1..=256).contains(&n),
+                "project routing.max_agents must be between 1 and 256 inclusive",
             )?;
         }
         if let Some(ids) = &self.allowed_providers {

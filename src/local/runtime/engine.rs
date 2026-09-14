@@ -181,6 +181,9 @@ impl<'a> Runtime<'a> {
         if let Some(observer) = &mut self.policy_observer {
             observer("validated");
         }
+        // Machine-owned hard ceiling; a project may only further lower it,
+        // never raise it. Provider/planner output has no path to this value.
+        let max_agents = self.config.effective_max_agents(&project.routing);
         let resolved = routing::resolve(
             &self.config,
             &project.routing,
@@ -245,6 +248,7 @@ impl<'a> Runtime<'a> {
                 &resolved.profile,
                 snapshot,
                 &project,
+                max_agents,
             ) {
                 Err(Error::ProviderAvailability(reason)) => failures.push(routing::FailedRoute {
                     route: config.clone(),
@@ -272,6 +276,7 @@ impl<'a> Runtime<'a> {
         profile: &routing::RoleProfile,
         route: routing::RouteSnapshot,
         project: &ProjectConfig,
+        max_agents: usize,
     ) -> Result<(RuntimeJob, Value)> {
         let config = route.selected.clone();
         let (job_id, session_id) = self.identity()?;
@@ -322,7 +327,7 @@ impl<'a> Runtime<'a> {
             finished_at_ms: None,
             failure: None,
         };
-        save_job(self.store, info, &job, "JOB_CREATED")?;
+        create_job(self.store, info, &job, max_agents)?;
         if let Some(plan) = plan {
             let canonical = AgentJob {
                 version: ProtocolVersion::V1,

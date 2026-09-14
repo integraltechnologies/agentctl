@@ -206,11 +206,14 @@ fn pending_planner_decisions(
         .collect()
 }
 
-/// Idempotent: creates at most one wakeup per decision (`UNIQUE(decision_id)`). Calling
-/// `prepare_plan` twice for the same decision (a crash between minting the planning
-/// request and committing the wakeup row) leaves one harmless orphaned `PlanningRequest`
-/// behind - never a duplicate logical wakeup, since the second attempt's insert is
-/// silently ignored and the request it created is simply never referenced.
+/// Idempotent: creates at most one wakeup per decision (`UNIQUE(decision_id)`), and
+/// never more than `run.max_planner_wakeups` wakeups for the experiment even when two
+/// reconcilers race for the same last slot (see the atomic INSERT below). Calling
+/// `prepare_plan` before that INSERT can commit (a crash, or simply losing the race)
+/// leaves one harmless orphaned `PlanningRequest` behind - never a duplicate logical
+/// wakeup and never a budget overrun, since the second attempt's insert is either
+/// ignored (same decision already has a wakeup) or rejected by the budget check (cap
+/// already reached), and the `PlanningRequest` it minted is simply never referenced.
 fn create_wakeup(
     store: &mut Store,
     info: &RepositoryInfo,
@@ -240,9 +243,18 @@ fn create_wakeup(
     let tx = store
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // `BEGIN IMMEDIATE` above acquires SQLite's write lock before this statement runs,
+    // serializing against every other writer transaction on this database (this is
+    // the only place anything is ever inserted into `experiment_wakeups`). The
+    // `count(*)` below is therefore a live subquery evaluated as part of this single
+    // atomic statement - never a value read earlier in Rust - so the budget check and
+    // the row insertion cannot be torn apart by a concurrent reconciler: this is what
+    // actually closes the TOCTOU race (two controllers both observing a stale count
+    // and both inserting a wakeup for a different decision).
     let changed = tx.execute(
         "INSERT OR IGNORE INTO experiment_wakeups(wakeup_id,repo_id,workspace_id,experiment_id,decision_id,planning_request_id,created_at_ms,record_json) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+         SELECT ?1,?2,?3,?4,?5,?6,?7,?8 \
+         WHERE (SELECT count(*) FROM experiment_wakeups WHERE repo_id=?2 AND experiment_id=?4) < ?9",
         params![
             wakeup.wakeup_id,
             info.repository_id.as_str(),
@@ -252,6 +264,7 @@ fn create_wakeup(
             wakeup.planning_request_id.as_str(),
             i64::try_from(wakeup.created_at_ms).map_err(|e| Error::Invalid(e.to_string()))?,
             serde_json::to_string(&wakeup)?,
+            i64::from(run.max_planner_wakeups),
         ],
     )? == 1;
     if changed {
@@ -280,7 +293,9 @@ fn create_wakeup(
 /// wakeup, strictly within the experiment's immutable budget. No model/planner output
 /// and no experiment event can reach this function or influence the budget; it only ever
 /// consumes durable `ExperimentDecision` rows already committed by Stage 9C. Idempotent
-/// and safe to call repeatedly (live polling, reopen, explicit reconciliation).
+/// and safe to call repeatedly (live polling, reopen, explicit reconciliation), and safe
+/// to call concurrently from an independent controller/connection: the cap itself is
+/// enforced inside `create_wakeup`'s own atomic transaction, not here.
 pub(super) fn reconcile(
     store: &mut Store,
     info: &RepositoryInfo,
@@ -289,14 +304,17 @@ pub(super) fn reconcile(
     if run.max_planner_wakeups == 0 {
         return Ok(());
     }
-    let mut used = wakeups_used(store, info, &run.experiment_id)?;
     for decision in pending_planner_decisions(store, info, &run.experiment_id)? {
-        if used >= run.max_planner_wakeups {
+        // Advisory only, re-read fresh on every iteration: it exists purely to skip
+        // the expensive `prepare_plan()` call once the budget is visibly exhausted.
+        // It is never the enforcement point and staleness here is harmless - even if
+        // a concurrent reconciler consumes the last slot between this read and the
+        // `create_wakeup` call below, that call's own atomic budget check still
+        // rejects it correctly.
+        if wakeups_used(store, info, &run.experiment_id)? >= run.max_planner_wakeups {
             break;
         }
-        if create_wakeup(store, info, run, &decision)? {
-            used += 1;
-        }
+        create_wakeup(store, info, run, &decision)?;
     }
     Ok(())
 }

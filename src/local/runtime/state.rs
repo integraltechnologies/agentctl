@@ -172,6 +172,30 @@ pub(super) fn save_job(
     job: &RuntimeJob,
     phase: &str,
 ) -> Result<()> {
+    save_job_impl(store, info, job, phase, None)
+}
+/// Sole choke point that admits a brand-new runtime job (any role: planner,
+/// executor, verifier, integration verifier). Counts only currently active
+/// (QUEUED/RUNNING) jobs machine-wide -- historical/completed jobs never
+/// count -- and refuses admission over `max_agents` instead of launching.
+/// The count and the admitting insert share one IMMEDIATE transaction, so
+/// concurrent callers across processes/workspaces are serialized by SQLite's
+/// writer lock and cannot race past the cap.
+pub(super) fn create_job(
+    store: &mut Store,
+    info: &RepositoryInfo,
+    job: &RuntimeJob,
+    max_agents: usize,
+) -> Result<()> {
+    save_job_impl(store, info, job, "JOB_CREATED", Some(max_agents))
+}
+fn save_job_impl(
+    store: &mut Store,
+    info: &RepositoryInfo,
+    job: &RuntimeJob,
+    phase: &str,
+    capacity: Option<usize>,
+) -> Result<()> {
     session::validate_job(store, info, job)?;
     require(
         store.connection.query_row(
@@ -195,6 +219,19 @@ pub(super) fn save_job(
     let tx = store
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(limit) = capacity {
+        let active: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM runtime_jobs WHERE json_extract(record_json,'$.state') IN ('QUEUED','RUNNING')",
+            [],
+            |r| r.get(0),
+        )?;
+        if active as usize >= limit {
+            return Err(Error::CapacityExceeded {
+                active: active as usize,
+                limit,
+            });
+        }
+    }
     tx.execute("INSERT INTO runtime_jobs(job_id,repo_id,workspace_id,plan_id,request_id,record_json) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(job_id) DO UPDATE SET record_json=excluded.record_json", params![job.job_id.as_str(),info.repository_id.as_str(),info.workspace_id.as_str(),job.plan_id.as_ref().map(PlanId::as_str),job.request_id.as_ref().map(planning::PlanningRequestId::as_str),serde_json::to_string(job)?])?;
     store::append(
         &tx,

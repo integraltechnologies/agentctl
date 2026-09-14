@@ -15,6 +15,33 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub authentication: super::credentials::Authentication,
 }
+/// Machine-owned hard ceiling on simultaneously active runtime agent jobs
+/// (planner/executor/verifier/integration-verifier alike). Never raised by
+/// provider output, routing profiles, or explicit user role overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConcurrencyConfig {
+    #[serde(default = "default_max_agents")]
+    pub max_agents: usize,
+}
+fn default_max_agents() -> usize {
+    4
+}
+impl Default for ConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            max_agents: default_max_agents(),
+        }
+    }
+}
+impl ConcurrencyConfig {
+    pub fn validate(&self) -> Result<()> {
+        require(
+            (1..=256).contains(&self.max_agents),
+            "runtime.concurrency.max_agents must be between 1 and 256 inclusive",
+        )
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -28,6 +55,8 @@ pub struct RuntimeConfig {
     pub timeout_ms: u64,
     #[serde(default = "rounds")]
     pub max_correction_rounds: u32,
+    #[serde(default)]
+    pub concurrency: ConcurrencyConfig,
 }
 fn timeout() -> u64 {
     600_000
@@ -43,12 +72,14 @@ impl Default for RuntimeConfig {
             roles: BTreeMap::new(),
             timeout_ms: timeout(),
             max_correction_rounds: rounds(),
+            concurrency: ConcurrencyConfig::default(),
         }
     }
 }
 impl RuntimeConfig {
     pub fn validate(&self) -> Result<()> {
         routing::validate_patches(&self.profiles)?;
+        self.concurrency.validate()?;
         require(
             (1..=3_600_000).contains(&self.timeout_ms),
             "runtime timeout must be 1–3600000 ms",
@@ -79,6 +110,14 @@ impl RuntimeConfig {
             }
         }
         Ok(())
+    }
+    /// The hard concurrent-agent ceiling in effect for a project: the machine
+    /// value, optionally further lowered by project policy. A project can
+    /// never raise the machine-configured ceiling.
+    pub fn effective_max_agents(&self, project: &routing::ProjectRoles) -> usize {
+        self.concurrency
+            .max_agents
+            .min(project.max_agents.unwrap_or(usize::MAX))
     }
     pub fn role(&self, role: AgentRole) -> Result<&RoleConfig> {
         self.roles

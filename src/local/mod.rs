@@ -20,6 +20,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum Error {
     #[error("provider availability: {0:?}")]
     ProviderAvailability(runtime::routing::FailureClass),
+    #[error(
+        "AGENT_CAPACITY_EXCEEDED: {active} of {limit} concurrent agent slot(s) already active; refusing to launch"
+    )]
+    CapacityExceeded { active: usize, limit: usize },
     #[error("{0}")]
     Invalid(String),
     #[error(transparent)]

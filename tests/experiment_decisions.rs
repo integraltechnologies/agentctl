@@ -1451,6 +1451,10 @@ fn wakeup_maps_into_existing_planning_infrastructure_and_planner_success_is_deri
         .experiment_control_summary(&f.root, &run.experiment_id)
         .unwrap();
     assert!(!control.attention_required);
+    // A successful planner invocation is entirely outside Stage 9D: it neither
+    // consumes an extra slot nor alters the configured (immutable) budget.
+    assert_eq!(control.wakeups_created, 1);
+    assert_eq!(control.wakeups_budget, DEFAULT_MAX_PLANNER_WAKEUPS);
 
     // Normal Stage 4+ authority is untouched: importing does not activate, and the
     // plan still requires the ordinary explicit activation step.
@@ -1505,7 +1509,7 @@ fn planner_failure_remains_visible_and_does_not_corrupt_experiment_or_process_ou
     .plan(&f.root, &request_id);
     assert!(result.is_err());
 
-    let reopened = f.store();
+    let mut reopened = f.store();
     let run_after = reopened
         .experiment_status(&f.root, &run.experiment_id)
         .unwrap()
@@ -1527,6 +1531,22 @@ fn planner_failure_remains_visible_and_does_not_corrupt_experiment_or_process_ou
     assert!(
         control.attention_required,
         "an unresolved planner failure must surface for attention"
+    );
+    // The failed invocation neither released nor replenished the slot the wakeup
+    // already consumed, and the configured budget itself is untouched.
+    assert_eq!(control.wakeups_created, 1);
+    assert_eq!(control.wakeups_budget, DEFAULT_MAX_PLANNER_WAKEUPS);
+    // Reconciling again cannot manufacture a replacement wakeup for the same
+    // decision, nor find any other budget to spend.
+    reopened
+        .experiment_reconcile(&f.root, &run.experiment_id)
+        .unwrap();
+    assert_eq!(
+        f.store()
+            .experiment_wakeups(&f.root, &run.experiment_id)
+            .unwrap()
+            .len(),
+        1
     );
 }
 
@@ -2142,4 +2162,203 @@ fn two_controllers_racing_reconciliation_produce_exactly_one_decision_and_one_wa
         )
         .unwrap();
     assert_eq!(cursor_rows, 1, "exactly one cursor row, never duplicated");
+}
+
+/// Races `n` independent controller connections against the same experiment's
+/// reconciliation, synchronized to start together via a barrier. Real `Store`
+/// connections, real experiment records, real decisions, real wakeup reconciliation -
+/// not a standalone SQLite probe.
+fn race_reconcilers(paths: &MachinePaths, root: &Path, experiment_id: &ExperimentId, n: usize) {
+    let barrier = Arc::new(Barrier::new(n));
+    let mut handles = vec![];
+    for _ in 0..n {
+        let paths = paths.clone();
+        let root = root.to_path_buf();
+        let experiment_id = experiment_id.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            let mut store = Store::open(&paths.database, 5000).unwrap();
+            barrier.wait();
+            store.experiment_reconcile(&root, &experiment_id).unwrap();
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
+#[test]
+fn cap_one_two_eligible_decisions_racing_for_the_same_open_slot_yield_exactly_one_wakeup() {
+    // The repository starts unindexed, so `prepare_plan` fails deterministically for
+    // every decision: `drive()`'s own internal reconciliation attempts and fails to
+    // create any wakeup at all, leaving BOTH decisions genuinely open before the race
+    // begins - this is what makes the race below a real contest for the one
+    // available slot, not merely a re-check of already-settled state.
+    let f = Fixture::unindexed();
+    let mut store = f.store();
+    let run = ExperimentRuntime::new(&mut store, f.paths.clone())
+        .unwrap()
+        .with_check_launcher(Box::new(EventFileLaunch::one(format!(
+            "{}{}",
+            metric_frame(1, "loss", 0.05),
+            metric_frame(2, "accuracy", 0.99)
+        ))))
+        .run(
+            &f.root,
+            input(
+                command("/bin/echo", &[]),
+                vec![
+                    planner_boundary("low-loss", "loss", MetricComparison::LessThan, 0.1),
+                    planner_boundary(
+                        "high-accuracy",
+                        "accuracy",
+                        MetricComparison::GreaterThan,
+                        0.9,
+                    ),
+                ],
+                1,
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        f.store()
+            .experiment_decisions(&f.root, &run.experiment_id)
+            .unwrap()
+            .len(),
+        2,
+        "Stage 9C decides independently of whether Stage 9D can currently act"
+    );
+    assert!(
+        f.store()
+            .experiment_wakeups(&f.root, &run.experiment_id)
+            .unwrap()
+            .is_empty(),
+        "wakeup creation could not yet succeed against the unindexed repository"
+    );
+
+    f.store().index_repository(&f.root).unwrap();
+    race_reconcilers(&f.paths, &f.root, &run.experiment_id, 6);
+
+    let wakeups = f
+        .store()
+        .experiment_wakeups(&f.root, &run.experiment_id)
+        .unwrap();
+    assert_eq!(
+        wakeups.len(),
+        1,
+        "cap=1 must never be exceeded even with two genuinely eligible decisions racing for it"
+    );
+    let decisions = f
+        .store()
+        .experiment_decisions(&f.root, &run.experiment_id)
+        .unwrap();
+    assert_eq!(decisions.len(), 2, "both decisions remain durably recorded");
+    let control = f
+        .store()
+        .experiment_control_summary(&f.root, &run.experiment_id)
+        .unwrap();
+    assert_eq!(control.wakeups_created, 1);
+    assert!(
+        control.attention_required,
+        "the losing decision remains visibly unresolved"
+    );
+
+    // Repeated reconciliation, including after a DB reopen, never manufactures a
+    // second wakeup merely because the budget is checked again.
+    for _ in 0..3 {
+        let mut reopened = Store::open(&f.paths.database, 5000).unwrap();
+        reopened
+            .experiment_reconcile(&f.root, &run.experiment_id)
+            .unwrap();
+    }
+    assert_eq!(
+        f.store()
+            .experiment_wakeups(&f.root, &run.experiment_id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn cap_three_five_eligible_decisions_concurrent_reconcilers_yield_exactly_three_wakeups() {
+    let f = Fixture::unindexed();
+    let mut store = f.store();
+    let mut payload = String::new();
+    let mut boundaries = vec![];
+    for i in 0..5 {
+        let metric = format!("m{i}");
+        payload.push_str(&metric_frame((i + 1) as u64, &metric, 0.0));
+        boundaries.push(planner_boundary(
+            &format!("b{i}"),
+            &metric,
+            MetricComparison::LessThan,
+            1.0,
+        ));
+    }
+    let run = ExperimentRuntime::new(&mut store, f.paths.clone())
+        .unwrap()
+        .with_check_launcher(Box::new(EventFileLaunch::one(payload)))
+        .run(&f.root, input(command("/bin/echo", &[]), boundaries, 3))
+        .unwrap();
+    assert_eq!(
+        f.store()
+            .experiment_decisions(&f.root, &run.experiment_id)
+            .unwrap()
+            .len(),
+        5
+    );
+    assert!(
+        f.store()
+            .experiment_wakeups(&f.root, &run.experiment_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    f.store().index_repository(&f.root).unwrap();
+    race_reconcilers(&f.paths, &f.root, &run.experiment_id, 8);
+
+    let wakeups = f
+        .store()
+        .experiment_wakeups(&f.root, &run.experiment_id)
+        .unwrap();
+    assert_eq!(
+        wakeups.len(),
+        3,
+        "cap=3 with 5 racing eligible decisions must yield exactly 3: never fewer (lost race) or more (TOCTOU)"
+    );
+    let unique_decisions: std::collections::BTreeSet<_> = wakeups
+        .iter()
+        .map(|w| w.wakeup.decision_id.clone())
+        .collect();
+    assert_eq!(unique_decisions.len(), 3, "no duplicate decision linkage");
+    let unique_requests: std::collections::BTreeSet<_> = wakeups
+        .iter()
+        .map(|w| w.wakeup.planning_request_id.as_str().to_string())
+        .collect();
+    assert_eq!(
+        unique_requests.len(),
+        3,
+        "no duplicate authoritative PlanningRequest linkage"
+    );
+    let control = f
+        .store()
+        .experiment_control_summary(&f.root, &run.experiment_id)
+        .unwrap();
+    assert_eq!(control.wakeups_created, 3);
+    assert_eq!(control.wakeups_budget, 3);
+    assert!(
+        control.attention_required,
+        "the two losing decisions remain visible and unresolved"
+    );
+
+    // Budget stays exhausted on subsequent reconciliation, including after reopen.
+    race_reconcilers(&f.paths, &f.root, &run.experiment_id, 4);
+    assert_eq!(
+        f.store()
+            .experiment_wakeups(&f.root, &run.experiment_id)
+            .unwrap()
+            .len(),
+        3
+    );
 }
