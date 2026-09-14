@@ -62,13 +62,12 @@ impl Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         self.set(false);
-        if let Ok(mut entries) = registry().lock() {
-            if entries
+        if let Ok(mut entries) = registry().lock()
+            && entries
                 .get(&self.key)
                 .is_some_and(|entry| entry.ptr_eq(&Arc::downgrade(&self.live)))
-            {
-                entries.remove(&self.key);
-            }
+        {
+            entries.remove(&self.key);
         }
     }
 }

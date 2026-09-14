@@ -130,13 +130,12 @@ fn validate_plan(
                         == Some(v.verifier_job_id.as_str()),
                 "packet verification audit has incorrect workspace/job ownership",
             )?;
-            if to == TaskState::Verified {
-                if let VerificationTarget::Packet {
+            if to == TaskState::Verified
+                && let VerificationTarget::Packet {
                     executor_job_id, ..
                 } = &v.target
-                {
-                    executors.insert(executor_job_id.clone());
-                }
+            {
+                executors.insert(executor_job_id.clone());
             }
         }
         replay.insert(task_id, to);

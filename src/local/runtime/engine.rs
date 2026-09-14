@@ -961,10 +961,10 @@ impl<'a> Runtime<'a> {
             let current = source::capture(root, &self.artifacts)?;
             let baseline = self.artifacts.json(&current)?;
             let mut round = 0;
-            if let Some(replan) = &view.plan.metadata.replan {
-                if let Some(previous) = load_run(self.store, &info, &replan.previous_plan_id)? {
-                    round = previous.correction_round + 1;
-                }
+            if let Some(replan) = &view.plan.metadata.replan
+                && let Some(previous) = load_run(self.store, &info, &replan.previous_plan_id)?
+            {
+                round = previous.correction_round + 1;
             }
             let mut run = RunRecord {
                 engineering_session: Some(session::for_plan(self.store, &info, id)?),
@@ -1117,20 +1117,20 @@ impl<'a> Runtime<'a> {
                         .into(),
                 );
                 job.finished_at_ms = Some(now_ms()?);
-                if let Some(canonical) = self.store.job(&info.repository_id, &job.job_id)? {
-                    if !canonical.state.is_terminal() {
-                        self.store.transition_job(
-                            &info.repository_id,
-                            &job.job_id,
-                            canonical.state,
-                            if canonical.state == JobState::Queued {
-                                JobState::Cancelled
-                            } else {
-                                JobState::Failed
-                            },
-                            now_ms()?,
-                        )?;
-                    }
+                if let Some(canonical) = self.store.job(&info.repository_id, &job.job_id)?
+                    && !canonical.state.is_terminal()
+                {
+                    self.store.transition_job(
+                        &info.repository_id,
+                        &job.job_id,
+                        canonical.state,
+                        if canonical.state == JobState::Queued {
+                            JobState::Cancelled
+                        } else {
+                            JobState::Failed
+                        },
+                        now_ms()?,
+                    )?;
                 }
                 save_job(self.store, info, &job, "JOB_INTERRUPTED")?;
                 interrupted = true;
@@ -1310,19 +1310,18 @@ impl<'a> Runtime<'a> {
                 "verified task lacks runtime checkpoint",
             )?;
         } else {
-            if pending.proof.is_none() {
-                if let Some((job, proof, input)) =
+            if pending.proof.is_none()
+                && let Some((job, proof, input)) =
                     self.completed_verifier(info, &run.plan_id, Some(&pending.task_id), &after)?
-                {
-                    require(
-                        input.artifact["evidence"] == serde_json::to_value(&pending.evidence)?,
-                        "recovery evidence mismatch",
-                    )?;
-                    pending.verifier = Some(job.job_id);
-                    pending.proof = Some(proof);
-                    run.pending = Some(pending.clone());
-                    save_run(self.store, info, run, "VERIFIER_OUTPUT_RECOVERED")?;
-                }
+            {
+                require(
+                    input.artifact["evidence"] == serde_json::to_value(&pending.evidence)?,
+                    "recovery evidence mismatch",
+                )?;
+                pending.verifier = Some(job.job_id);
+                pending.proof = Some(proof);
+                run.pending = Some(pending.clone());
+                save_run(self.store, info, run, "VERIFIER_OUTPUT_RECOVERED")?;
             }
             if pending.proof.is_none() {
                 if pending.evidence.len() == 1 {

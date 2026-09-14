@@ -839,13 +839,13 @@ impl<'a> ExperimentRuntime<'a> {
         if run.state == ExperimentState::Running {
             // Reconcile: an in-flight record from a crashed controller. Never guess
             // success; the interrupted attempt's outcome stays explicitly unproven.
-            if let Some(last) = run.attempts.last_mut() {
-                if !last.state.is_terminal() {
-                    last.state = ExperimentState::Interrupted;
-                    last.failure.get_or_insert_with(|| {
-                        "controller interrupted; success unproven; no automatic retry".into()
-                    });
-                }
+            if let Some(last) = run.attempts.last_mut()
+                && !last.state.is_terminal()
+            {
+                last.state = ExperimentState::Interrupted;
+                last.failure.get_or_insert_with(|| {
+                    "controller interrupted; success unproven; no automatic retry".into()
+                });
             }
             run.state = ExperimentState::Interrupted;
             save_experiment(self.store, &info, &run, "EXPERIMENT_INTERRUPTED")?;

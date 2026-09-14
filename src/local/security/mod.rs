@@ -692,10 +692,10 @@ fn platform_read_files() -> Vec<PathBuf> {
         "/etc/localtime",
         "/etc/nsswitch.conf",
     ] {
-        if let Ok(real) = fs::canonicalize(candidate) {
-            if real.is_file() {
-                push_unique(&mut files, real);
-            }
+        if let Ok(real) = fs::canonicalize(candidate)
+            && real.is_file()
+        {
+            push_unique(&mut files, real);
         }
     }
     files
@@ -1066,12 +1066,10 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
     let keychain_client = cfg!(target_os = "macos")
         && spec.class == WorkerClass::ProviderFrontend
         && spec.native_auth.is_some();
-    if keychain_client {
-        if let Some(home) = &real_home {
-            let keychains = home.join("Library/Keychains");
-            if keychains.is_dir() {
-                push_unique(&mut fs_policy.read_roots, keychains);
-            }
+    if keychain_client && let Some(home) = &real_home {
+        let keychains = home.join("Library/Keychains");
+        if keychains.is_dir() {
+            push_unique(&mut fs_policy.read_roots, keychains);
         }
     }
     let denied = &mut fs_policy.denied;
@@ -1354,10 +1352,8 @@ pub(crate) mod unix {
         if let Some(b) = limits.max_file_size_bytes {
             out.push(clamp(libc::RLIMIT_FSIZE as Resource, b, b));
         }
-        if memory {
-            if let Some(b) = limits.max_memory_bytes {
-                out.push(clamp(libc::RLIMIT_AS as Resource, b, b));
-            }
+        if memory && let Some(b) = limits.max_memory_bytes {
+            out.push(clamp(libc::RLIMIT_AS as Resource, b, b));
         }
         if let (Some(n), Some(current)) = (limits.max_processes, tree::count_user_processes()) {
             let total = current as u64 + n;

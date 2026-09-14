@@ -2486,7 +2486,7 @@ fn planner_default_topology_is_session_native_with_fresh_instances_and_parentage
         assert_eq!(input.ownership.engineering_session_id, session.id);
         assert_eq!(input.ownership.lifetime, AgentLifetime::SessionNative);
     }
-    for pair in inputs[1..9].chunks_exact(2) {
+    for pair in inputs[1..9].as_chunks::<2>().0 {
         assert_eq!(pair[0].role, AgentRole::Executor);
         assert_eq!(pair[1].role, AgentRole::Verifier);
         assert_eq!(

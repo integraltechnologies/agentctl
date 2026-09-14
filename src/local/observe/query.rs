@@ -130,10 +130,10 @@ impl Store {
             let id =
                 field(owner, "agent_instance_id").unwrap_or_else(|| format!("legacy:{job_id}"));
             let mut sid = field(owner, "engineering_session_id");
-            if let Some(s) = sid.as_ref().and_then(|s| sessions.get(s)) {
-                if s.repository_id != repo || s.workspace_id != workspace {
-                    sid = None;
-                }
+            if let Some(s) = sid.as_ref().and_then(|s| sessions.get(s))
+                && (s.repository_id != repo || s.workspace_id != workspace)
+            {
+                sid = None;
             }
             if let Some(sid) = &sid {
                 sessions
@@ -468,20 +468,20 @@ impl Store {
                         "RUNTIME_EVENT".into()
                     };
                     e.summary = e.phase.replace('_', " ");
-                    if e.phase == "ROUTE_FALLBACK" {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&detail) {
-                            e.summary = format!(
-                                "Fallback {}: {} → {} ({})",
-                                field(&v, "role").unwrap_or_default(),
-                                field(&v["primary"], "provider").unwrap_or_default(),
-                                field(&v["selected"], "provider").unwrap_or_default(),
-                                v["failures"]
-                                    .as_array()
-                                    .and_then(|a| a.last())
-                                    .and_then(|f| field(f, "reason"))
-                                    .unwrap_or_else(|| "UNKNOWN".into())
-                            );
-                        }
+                    if e.phase == "ROUTE_FALLBACK"
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&detail)
+                    {
+                        e.summary = format!(
+                            "Fallback {}: {} → {} ({})",
+                            field(&v, "role").unwrap_or_default(),
+                            field(&v["primary"], "provider").unwrap_or_default(),
+                            field(&v["selected"], "provider").unwrap_or_default(),
+                            v["failures"]
+                                .as_array()
+                                .and_then(|a| a.last())
+                                .and_then(|f| field(f, "reason"))
+                                .unwrap_or_else(|| "UNKNOWN".into())
+                        );
                     }
                     if e.phase.starts_with("VERIFICATION_CHECK_")
                         && detail.len() <= 80
@@ -497,12 +497,12 @@ impl Store {
                 } => {
                     e.phase = format!("TASK_{}", tag(&to));
                     e.summary = e.phase.replace('_', " ");
-                    if let Some(v) = verification {
-                        if let Some(a) = out.agents.iter_mut().find(|a| {
+                    if let Some(v) = verification
+                        && let Some(a) = out.agents.iter_mut().find(|a| {
                             a.repository_id == repo && a.job_id == v.verifier_job_id.as_str()
-                        }) {
-                            a.verification = Some(tag(&v.decision));
-                        }
+                        })
+                    {
+                        a.verification = Some(tag(&v.decision));
                     }
                 }
                 JournalEntry::ExecutionPlanCompleted { verification, .. } => {
@@ -585,12 +585,11 @@ impl Store {
                     e.repository_id == a.repository_id && e.job_id.as_deref() == Some(&a.job_id)
                 })
                 .cloned();
-            if a.state == "RUNNING" {
-                if let Some(e) = &a.last_event {
-                    if e.phase == "JOB_OUTPUT_RECEIVED" {
-                        a.activity = "PROVIDER_RETURNED".into();
-                    }
-                }
+            if a.state == "RUNNING"
+                && let Some(e) = &a.last_event
+                && e.phase == "JOB_OUTPUT_RECEIVED"
+            {
+                a.activity = "PROVIDER_RETURNED".into();
             }
         }
         for t in &mut out.tasks {

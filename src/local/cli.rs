@@ -274,7 +274,7 @@ pub fn run(args: &[&str]) -> Result<()> {
                 filters.len() % 2 == 0,
                 "event filters require values: --repo ID --task ID --job ID --limit N",
             )?;
-            for pair in filters.chunks_exact(2) {
+            for pair in filters.as_chunks::<2>().0 {
                 match pair[0] {
                     "--repo" if repo.is_none() => {
                         repo = Some(

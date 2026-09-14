@@ -352,15 +352,11 @@ impl Builder<'_> {
                     ) && ["test", "it"].contains(&target.as_str())
                         && (self.provenance.path.contains(".test.")
                             || self.provenance.path.contains(".spec."))
+                        && let Some(args) = node.child_by_field_name("arguments")
+                        && let Some(title) = args.named_child(0).filter(|n| n.kind() == "string")
                     {
-                        if let Some(args) = node.child_by_field_name("arguments") {
-                            if let Some(title) =
-                                args.named_child(0).filter(|n| n.kind() == "string")
-                            {
-                                let name = format!("{target}:{}", self.text(title));
-                                owner = self.entity(node, EntityKind::Test, &name, Some(parent))?;
-                            }
-                        }
+                        let name = format!("{target}:{}", self.text(title));
+                        owner = self.entity(node, EntityKind::Test, &name, Some(parent))?;
                     }
                     self.edge(owner, None, RelationKind::Calls, &target, function)?;
                 }

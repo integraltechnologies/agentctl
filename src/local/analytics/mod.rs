@@ -60,12 +60,11 @@ pub fn summarize(jobs: &[&Job]) -> Summary {
                 _ => s.decisions_unknown += 1,
             }
         }
-        if j.executor_disposition.as_deref() == Some("PASS")
-            || j.canonical_decision.as_deref() == Some("PASS")
+        if (j.executor_disposition.as_deref() == Some("PASS")
+            || j.canonical_decision.as_deref() == Some("PASS"))
+            && let Some(t) = &j.task
         {
-            if let Some(t) = &j.task {
-                verified.insert((&j.workspace, &j.plan, t));
-            }
+            verified.insert((&j.workspace, &j.plan, t));
         }
         if let Some(round) = j.correction_round {
             *s.correction_rounds.entry(round).or_default() += 1;

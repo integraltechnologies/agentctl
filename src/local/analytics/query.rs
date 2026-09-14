@@ -263,17 +263,15 @@ impl Store {
                 let started = v["started_at_ms"].as_u64();
                 let finished = v["finished_at_ms"].as_u64();
                 let completed = lifecycle == "SUCCEEDED";
-                if plan.is_none() && role == "planner" {
-                    if let Ok(u) =
+                if plan.is_none()
+                    && role == "planner"
+                    && let Ok(u) =
                         serde_json::from_value::<TokenUsageEvent>(v["planner_usage"].clone())
-                    {
-                        if u.validate().is_ok()
-                            && u.timestamp_ms <= at_ms
-                            && u.context.job_id.as_ref().is_some_and(|j| j.as_str() == id)
-                        {
-                            planner_usage.insert((label(&workspace), label(&id)), u);
-                        }
-                    }
+                    && u.validate().is_ok()
+                    && u.timestamp_ms <= at_ms
+                    && u.context.job_id.as_ref().is_some_and(|j| j.as_str() == id)
+                {
+                    planner_usage.insert((label(&workspace), label(&id)), u);
                 }
                 out.jobs.push(Job {
                     id: label(&id),
@@ -467,11 +465,11 @@ impl Store {
             }
         }
         for j in &mut out.jobs {
-            if j.usage_observations == 0 {
-                if let Some(u) = planner_usage.get(&(j.workspace.clone(), j.id.clone())) {
-                    add_usage(&mut j.tokens, u);
-                    j.usage_observations = 1;
-                }
+            if j.usage_observations == 0
+                && let Some(u) = planner_usage.get(&(j.workspace.clone(), j.id.clone()))
+            {
+                add_usage(&mut j.tokens, u);
+                j.usage_observations = 1;
             }
             if j.usage_observations == 0
                 || ["RUNNING", "QUEUED", "INTERRUPTED", "CANCELLED"].contains(&j.lifecycle.as_str())

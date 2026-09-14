@@ -67,7 +67,7 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
             let mut limit = if context { limits.primary } else { 20 };
             require(flags.len() % 2 == 0, "query flags need numeric values")?;
             let mut seen = BTreeSet::new();
-            for flag in flags.chunks_exact(2) {
+            for flag in flags.as_chunks::<2>().0 {
                 require(seen.insert(flag[0]), "repeated query flag")?;
                 let number: usize = flag[1]
                     .parse()

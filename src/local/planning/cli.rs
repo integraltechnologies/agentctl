@@ -22,9 +22,9 @@ pub(crate) fn read(path: &str, limit: u64) -> Result<String> {
 pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -> Result<()> {
     let root = env::current_dir()?;
     if command == "prepare" {
-        require(args.len() % 2 == 0, "prepare flags require values")?;
+        require(args.len().is_multiple_of(2), "prepare flags require values")?;
         let mut flags = BTreeMap::new();
-        for pair in args.chunks_exact(2) {
+        for pair in args.as_chunks::<2>().0 {
             require(
                 [
                     "--objective",
