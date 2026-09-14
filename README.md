@@ -1,601 +1,437 @@
 # agentctl
 
-`agentctl` is an Integral Technologies project for a machine-level, provider-neutral
-engineering control plane underneath coding agents. Engineering state should survive
-switching providers, ending conversations, and restarting agent jobs. Canonical state
-belongs to `agentctl`, never to a provider conversation or harness.
+agentctl is a local, provider-agnostic engineering control plane for coordinating
+coding agents. It keeps planning, execution state, verification, repository
+intelligence, and engineering memory outside any individual model or provider
+session.
 
-The intended workflow is a high-compute **planner** producing a dependency DAG of
-compact `TaskPacket`s, bounded lower-compute **executors**, an independent fresh-context
-**verifier for every packet**, and a final **integration verifier**. Executor success
-does not unlock dependent work: only a `VERIFIED` prerequisite does. Individually
-verified packets still need integration verification before the plan is complete.
+It drives installed coding-agent CLIs (currently Claude Code and Codex) as
+sandboxed, disposable workers. The durable record of the work lives in a local
+database that you own.
 
-Long term, the control plane will share persistent repository graph intelligence,
-engineering memory, evidence, and durable task/job/resume state across providers.
-It will support detached engineering and ML jobs, observable progress, and `agenttop`,
-a btop-like TUI with a rolling token-usage graph. Roles are provider-neutral;
-provider/model identities are opaque machine-configured adapter metadata.
+> **Status: alpha.** Interfaces, storage, and configuration may still change. See
+> [Current status](#current-status).
 
-## Stage 5
+## What agentctl does
 
-This repository currently provides one Rust 2024 crate with a library and a tiny CLI:
+- **Planner → executor → verifier orchestration.**
+  - A planner turns an objective into a DAG of small TaskPackets.
+  - Each task is implemented by a fresh executor, then judged by a fresh,
+    independent verifier.
+  - The verifier sees only the task, its invariants, the actual diff, and the
+    captured check evidence. It never sees the executor's reasoning.
+- **Verified-only progression.** A task's dependents run only after a verifier
+  `PASS`. Executor success alone never unlocks work.
+- **Integration verification.** When every task is verified, the runtime runs the
+  project's integration checks and a separate verifier over the combined diff. Only
+  then can the plan complete.
+- **Provider-independent state.**
+  - Plans, tasks, jobs, diffs, evidence, and decisions are stored locally and
+    journaled.
+  - Provider conversations are never resumed or replayed.
+  - You can switch providers, restart, or resume without losing engineering state.
+- **Repository intelligence.** An incremental, content-hashed code graph for Rust,
+  Python, TypeScript, and JavaScript supports symbol lookup, ranked location,
+  callers, tests, impact, and bounded context packets. It runs locally, without a
+  language server or a model.
+- **Structured engineering memory.** Durable decisions, derived facts, observed
+  evidence, and agent notes carry explicit trust and provenance. Low-trust notes
+  never silently become authority.
+- **Resumable execution.**
+  - `run resume` continues from durable checkpoints.
+  - Verified tasks never run again.
+  - Uncertain work blocks rather than being assumed successful.
+- **Provider routing and fallback.** Roles map to configured providers and models.
+  An ordered fallback chain covers mechanical launch failures. Projects can
+  restrict providers but cannot add them.
+- **Global concurrency limit.** A machine-wide ceiling (`max_agents`, default 4)
+  applies to simultaneously active agent jobs across every workspace.
+- **Experiments.** agentctl can supervise long-running programs such as training
+  runs and benchmarks in the same sandbox. It ingests their structured metric and
+  checkpoint events, evaluates deterministic threshold boundaries, and can open a
+  new planning request when a boundary fires.
+- **Sandboxing and capability enforcement.**
+  - Every worker runs under an OS sandbox (Seatbelt on macOS, Landlock + seccomp on
+    Linux).
+  - Workers get confined filesystem access, an allowlisted environment, optional
+    network denial, resource limits, and process-tree cleanup.
+  - A launch is refused when the host cannot enforce what it requires.
+- **Observability.** The `agenttop` terminal UI and `agentctl observe` provide
+  read-only views of sessions, agent trees, task DAGs, recent events, and token
+  usage.
+- **Analytics.** `agentctl analytics` reports historical token usage, verifier
+  decisions, fallback and correction behavior, and latency. Unknowns are kept
+  explicit.
 
-- Versioned JSON contracts for plans, tasks, results, verification, resume, evidence,
-  jobs, events, probing, token usage, and experiments, plus memory trust/provenance.
-- Task DAG validation, task/job lifecycle rules, and pure verification/completion guards.
-- Generated JSON Schemas in `schemas/` and regression tests for the protocol invariants.
-- Typed machine/project TOML config, XDG paths, Git checkout registration and source-state inspection.
-- Local SQLite storage for immutable plans/tasks, job state, compact evidence metadata,
-  and an append-only journal. State transitions and journal records commit atomically.
-- Persistent, content-hashed code graphs for Rust, Python, TypeScript/TSX, and JavaScript/JSX.
-- Incremental file-level extraction, hash-checked queries, deterministic code location,
-  bounded graph context, and known structural impact. Linked worktrees have isolated
-  source-specific graph state under their shared repository identity.
-- Provider-neutral engineering memory with explicit trust/provenance, typed links,
-  immutable promotion/supersession history, deterministic FTS5 search, live project-policy
-  projections, and bounded code/TaskPacket memory context.
-- Provider-neutral planning requests and frozen bounded planner input, strict ExecutionPlan
-  import, one independent verification contract per task, final integration contracts,
-  persistent plan lifecycle/history, and VERIFIED-only structural readiness.
-- Local serialized execution through thin Claude Code/Codex CLI adapters, actual
-  content-hashed diffs, canonical command evidence, fresh packet/integration verifiers,
-  runtime-owned job authorization, drift blocking, and durable recovery checkpoints.
+## Why agentctl exists
 
-The accepted Stage 0 protocol and all 13 public schemas remain unchanged.
+Coding-agent harnesses are powerful, but the most important engineering state
+often ends up inside provider-specific sessions: the plan, which tasks are done,
+what was verified and against what evidence, and what was decided. That state is
+hard to inspect, hard to resume, and tied to one vendor's conversation.
 
-## Structured experiment events (Stage 9B)
+agentctl puts a durable control plane underneath the harnesses:
 
-Every experiment attempt receives an `AGENTCTL_EVENT_FILE` path in its sanitized
-environment. Instrumented processes append one UTF-8 JSON object plus a newline per
-event; ordinary stdout/stderr is never parsed. Frames require `type`, `sequence`,
-`timestamp_ms`, and `source`. Supported types are `metric`, `checkpoint`, `health`,
-and `status`. For example:
+- **Planning is explicit and bounded.** Planner input is a frozen, inspectable
+  packet.
+- **Execution is observable and resumable.** Canonical state lives in SQLite, not
+  in chat history.
+- **Acceptance is independent.** Fresh verifiers judge actual diffs and captured
+  evidence.
+- **Providers are interchangeable workers**, not the system of record.
 
-```json
-{"type":"metric","sequence":1,"timestamp_ms":1700000000000,"source":"trainer","name":"loss","value":0.183,"step":1200}
+## Current status
+
+agentctl is **alpha** software (version 0.1.0). It is usable for small,
+well-scoped repositories, but expect rough edges and breaking changes.
+
+| Platform | Worker execution | Notes |
+| --- | --- | --- |
+| macOS | supported | Seatbelt via `/usr/bin/sandbox-exec`. Memory limits are not enforceable. |
+| Linux | supported when Landlock (kernel 5.13+, enabled) and seccomp are available | Executors cannot create or remove entries directly in the workspace root. Metadata writes are not mediated. |
+| Windows | **not supported** | The backend fails closed: filesystem and network confinement are not implemented, so every worker launch is refused. |
+
+Run `agentctl security doctor` to see exactly what your host enforces.
+
+Alpha limitations to know about:
+
+- Only Claude Code and Codex CLI adapters exist. Codex token usage is not
+  reported.
+- Tasks within a workspace run one at a time. There are no parallel worktrees.
+- The runtime supports modest repositories: up to 20,000 files and 64 MiB, with no
+  symlinks, hardlinks, or submodules in the checkout. Verifier diffs are limited to
+  128 KiB.
+- The code graph is syntactic and single-file. It resolves only a narrow set of
+  references.
+- Process-tree cleanup on macOS and Linux is best effort, and resource limits are
+  mostly per process. See [docs/security.md](docs/security.md#known-limitations).
+- agentctl never commits or pushes. You review and commit results yourself.
+- There is no artifact garbage collection yet.
+
+## Installation
+
+Requirements:
+
+- Rust 1.88 or newer (install with [rustup](https://rustup.rs));
+- Git on `PATH`;
+- macOS, or Linux with Landlock and seccomp, to run workers;
+- the Claude Code and/or Codex CLI installed and logged in, for the providers you
+  plan to use.
+
+agentctl is not published to crates.io or any package manager. Install it from
+source:
+
+```bash
+git clone https://github.com/integraltechnologies/agentctl.git
+cd agentctl
+cargo install --locked --path .
 ```
 
-Frames are limited to 64 KiB. Sequence identity is scoped to experiment, attempt, and
-the event-file channel: exact replay is idempotent, while conflicting reuse is recorded
-as an ingestion-health fact. Arrival order is retained even when source sequences are
-out of order. A trailing partial frame is rejected at process exit. Metric values must
-be finite. Checkpoints are workspace-relative file references; traversal, absolute,
-Git-administrative, protected, and symlink-escape paths are rejected. Stable regular
-files up to 64 MiB receive observed size, mtime, and a BLAKE3 hash; larger files retain
-metadata without a claimed hash. Event rows are append-only and retained indefinitely.
+This installs two binaries into `~/.cargo/bin`: `agentctl` and `agenttop`. SQLite
+is bundled, so no database server is needed.
 
-Read-only bounded queries are available as `agentctl experiment metrics <id>`,
-`checkpoints <id>`, and `events <id>`, with optional `--attempt` and `--limit`; metrics
-also accept `--name`. The default result bound is 1,000 and the maximum is 10,000.
-These facts do not evaluate thresholds, affect process control, invoke a model, wake a
-planner, select checkpoints, or start another experiment.
+## Quick start
 
-It does **not** implement LSP, automatic correction loops, concurrent writers, daemons,
-autonomous experiment iteration, `agenttop`/TUI, token analytics, MCP services, web UI, remote
-scheduling, embeddings, or a vector DB. Provider calls may use the network; canonical
-verification commands may not. Native execution currently requires macOS `sandbox-exec`.
+This walkthrough takes one small change through planning, execution, verification,
+and integration. It uses one provider (Claude Code) for every role. See
+[docs/providers.md](docs/providers.md) to use Codex or mix providers.
 
-## Development
+### 1. Initialize agentctl and check the sandbox
 
-Requires stable Rust 1.88 or newer. No runtime services are needed.
-Repository commands require Git on PATH. SQLite is bundled at build time; no SQLite
-server or separate installation is needed. State is intended for a local filesystem.
-
-```sh
-cargo build --locked
-cargo run -- --version
-cargo run -- schemas generate
-cargo run -- schemas generate --output /tmp/agentctl-schemas
-cargo run -- protocol validate task path/to/task.json
-cargo run -- --help
-
-cargo run -- init
-cargo run -- doctor --json
-cargo run -- repo init
-cargo run -- repo status --json
-cargo run -- repo list
-cargo run -- repo index --json
-cargo run -- repo index --status --json
-cargo run -- code symbol resolve_candidate --json
-cargo run -- code locate "vehicle confirmation" --limit 5 --json
-cargo run -- code context "vehicle confirmation" --limit 3 --depth 1 --neighbors 12 --tests 4 --json
-cargo run -- code impact 'qualified::symbol' --json
-cargo run -- code callers 'qualified::symbol' --json
-cargo run -- state status --json
-cargo run -- events list --limit 20 --json
-
-cargo test --locked
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
+```bash
+agentctl init              # creates ~/.config/agentctl/config.toml and the local database
+agentctl security doctor   # must end with "Hard requirements: all enforced"
 ```
 
-`protocol validate` checks a single document's structure and semantic invariants.
-The library's `PlanPacket::validate_task_transition`, `task_is_runnable`, and
-`validate_completion` also check caller-supplied lifecycle state and verification
-packets. The local store reuses these guards with durable state; it never schedules
-or executes work. Creation/transition APIs are library operations in Stage 1.
+### 2. Configure a provider
 
-`init` creates missing machine configuration and state. `repo init` runs inside a Git
-checkout and creates `.agentctl/project.toml` only when absent. Existing configuration
-is never overwritten. Status/list/doctor commands inspect existing state; put `--json`
-last for machine-readable output. Errors use stderr and a nonzero exit code.
+agentctl reuses the provider CLI's own login and never stores credentials. Log in
+first with `claude auth login` if you have not already. Then map the roles to the
+CLI:
 
-Defaults are `~/.config/agentctl/config.toml`,
-`~/.local/share/agentctl/state.sqlite3`, and `~/.cache/agentctl/`, honoring absolute
-XDG overrides. Machine config contains `version = 1` and `busy_timeout_ms = 5000`.
-Project config has versioned declarations for invariants, architecture, commands,
-protected data, and canonical verification. No provider settings are introduced.
+```bash
+cat >> ~/.config/agentctl/config.toml <<EOF
 
-A logical repository ID hashes its canonical Git **common directory**; all linked
-worktrees share it. Each checkout has a distinct workspace ID hashing its canonical
-per-worktree Git directory, with its own root, HEAD, and dirty-state observation.
-`repo status` shows both identities; `repo list` groups registered workspaces under
-one logical repository. Independent clones remain distinct, and no remote is required:
-remote URLs are metadata only. Moving a primary repository normally creates new local
-IDs; robust relocation is deferred and old registrations remain inspectable. Git status
-and HEAD are observations, not an exact fingerprint of a dirty working tree.
+[runtime.providers.claude]
+adapter = "claude"
+executable = "$(command -v claude)"
 
-## Code intelligence
+[runtime.roles.planner]
+provider = "claude"
 
-Run `repo init`, then `repo index` in each workspace. The first pass extracts supported
-files; subsequent passes hash content and only reparse new/changed/version-invalid files.
-Deleted or newly ignored files lose their facts. A parse/read failure removes that file's
-old facts, persists a diagnostic, and makes indexing exit nonzero while committing useful
-results from other files. Database/journal failures roll back the entire update.
+[runtime.roles.executor]
+provider = "claude"
 
-`repo index --status` reports the indexed source observation, parser/backend versions,
-counts, stale paths, and failures. Every code query rechecks discovery and
-content hashes; stale snapshots are refused with a refresh instruction. Partial indexes
-can answer from successful files, prominently marked partial with failed-file counts.
-These are sequential filesystem observations, not exact diff/evidence bindings.
-
-`code symbol` performs exact name/qualified-name/ID lookup; `code search` searches name
-substrings; `code file` lists file entities. `code locate` ranks names, normalized
-snake_case/camelCase tokens, paths, containers, and compact signatures without an LLM.
-`code refs`, `code callers`, `code tests`, `code neighbors`, `code context`, and
-`code impact` expose bounded graph relationships. Ambiguous impact/relationship requests
-require a qualified name or graph ID. Empty searches are valid empty results.
-
-Tree-sitter provides syntax, not compiler or runtime truth. Imports and most calls remain
-explicitly unresolved; only unique same-module Rust `self::name` call/type/trait paths
-are resolved. Test entities recognize documented naming/attribute conventions, and test
-links indicate lexical containment, not proven coverage. No macro expansion, dynamic
-dispatch, cross-file resolution, C adapter, embeddings, or provider calls are implemented.
-Indexing skips ignored files, symlinks, nested repositories, common build/dependency trees,
-and project `deny_read` paths. See the architecture contract for limits and guarantees.
-
-## Shared engineering memory
-
-Memory belongs to a logical repository by default, so linked worktrees share durable
-decisions without copying rows. `--workspace` scopes a temporary note/decision to the
-current checkout. Source-derived facts and workspace evidence observations retain their
-concrete workspace. Other workspaces' entries are hidden unless `--all-workspaces` is
-explicit; another workspace's derived fact is never declared fresh in this one.
-
-```sh
-agentctl memory add --trust canonical --kind architecture-decision \
-  --content 'Fuzzy vehicle identity matches require explicit confirmation.' \
-  --key vehicle:confirmation --symbol resolve_candidate --invariant KD-VEHICLE-004
-agentctl memory add --trust agent-note --kind finding --job job:executor-a \
-  --workspace --content 'Possible resolve_candidate singleton bypass.'
-agentctl memory derive confirm_vehicle --json
-agentctl memory observe evidence:1 --json
-agentctl memory search 'vehicle confirmation' --trust canonical --limit 10 --json
-agentctl memory list --symbol resolve_candidate --json
-agentctl memory list --task a --json
-agentctl memory show memory:ID --json
-agentctl memory links memory:ID --json
-agentctl memory promote memory:ID --actor reviewer --json
-agentctl memory supersede memory:OLD --with memory:NEW --json
-agentctl memory reject memory:ID --actor reviewer
-agentctl memory list --status superseded --include-stale --json
-agentctl memory stale --json
-agentctl memory policy --json
-agentctl code context resolve_candidate --memory-canonical 3 --memory-facts 3 \
-  --memory-notes 1 --memory-bytes 4096 --json
+[runtime.roles.verifier]
+provider = "claude"
+EOF
 ```
 
-Replace illustrative IDs with registered records. Stage 0 requires an author job for
-AGENT_NOTE; register plans/jobs through the existing Store APIs first. There is no job
-launcher or invented CLI job creation. `observe` requires existing persisted evidence;
-it records an observation, never executes its command. `derive` mechanically summarizes
-one unambiguous indexed symbol's signature and bounded syntactic outgoing relations—no
-LLM prose or claims of compiler resolution. Free-form DERIVED/OBSERVED creation is refused.
+If you set `XDG_CONFIG_HOME`, the file is at
+`$XDG_CONFIG_HOME/agentctl/config.toml` instead.
 
-CANONICAL creation requires explicit `--trust canonical`. Promotion is also explicit:
-it creates a new canonical descendant, preserves original provenance and ownership scope,
-and leaves the original unchanged. Local journal events audit both actions; there is no
-authentication or automatic authority inference. Keyed canonical decisions are unique
-while active. To replace one atomically, use `memory add --trust canonical --key KEY
---supersedes memory:OLD ...`; old content remains historical. `--all` includes inactive
-history; `--include-stale` separately includes stale derived facts. Normal reads exclude both.
+### 3. Verify the configuration
 
-DERIVED freshness checks only supporting paths/hashes and graph/parser/derivation
-versions, honoring the graph's read exclusions. Source changes do not invalidate durable
-decisions or notes. OBSERVED remains historical, explicitly bound to the recorded evidence
-and source state, not a claim that today's checkout passes. Notes remain fallible even
-when their validity label is DURABLE (meaning not file-hash-bound).
-
-`.agentctl/project.toml` stays the sole source of truth for its policies. Invariants,
-architecture, commands, protected paths, and verification definitions appear as read-only
-CANONICAL/PROJECT_CONFIG projections with config fingerprints, never mutable database
-copies. Edit that file to change them; `config:` keys are reserved. Projections reflect
-the current worktree's config and may differ between branches. Search/list JSON separates
-`entries` and `policy`; item limits/truncation are explicit. Memory text is data, not
-instructions, and never changes config or launches commands.
-
-Search normalizes camelCase/snake_case and punctuation, requires all lexical tokens,
-and supports typed link, exact tag, kind, trust, status, and recency filters. Matching
-canonical entries rank ahead of observed/derived facts, then notes. Results and source
-checks are bounded; narrow filters if truncated. Code context adds only compact summaries
-with separate trust quotas and a compact-JSON byte budget; full provenance remains available
-through `memory show`. `Store::memory_for_task` provides the same bounded retrieval for
-future task/resume consumers, without implementing a runtime.
-
-SQLite migration 4 adds memory entries, typed links, and FTS5 to the existing machine
-database without rewriting tasks/jobs/events/graph data. No new dependency or service is
-required. Existing databases migrate on `init` or a writable open; read-only commands do
-not migrate. Independent clones and moved primary repositories retain Stage 1's distinct
-local identities; memory is not synchronized or relocated automatically.
-
-## Planning without a model runtime
-
-Stage 4 controls plans; an external planner decides their decomposition. Nothing in
-`agentctl` calls a model, generates a fake plan, launches an executor/verifier, or schedules
-work. Configure canonical checks in `.agentctl/project.toml` under `[verification.KEY]`
-with references to `[commands.KEY]` before importing executable plans.
-
-```sh
-agentctl plan prepare --objective 'Add deterministic cache invalidation to repository indexing' \
-  --query 'cache invalidation' --bytes 32768 --json
-agentctl plan context request:ID --json
-# An external producer writes execution-plan.json using this frozen planner input.
-agentctl plan import execution-plan.json --json
-agentctl plan validate plan:ID --json
-agentctl plan show plan:ID --json
-agentctl plan export plan:ID --json
-agentctl plan tasks plan:ID --json
-agentctl plan ready plan:ID --json
-agentctl plan blocked plan:ID --json
-agentctl plan activate plan:ID --json
-agentctl plan list --json
-agentctl plan supersede plan:OLD --with plan:NEW --json
-agentctl plan cancel plan:ID --reason 'Objective withdrawn' --json
+```bash
+agentctl doctor
+agentctl provider doctor      # CLI version and token-free login status; sends no prompt
+agentctl route executor       # resolved route and permissions; launches nothing
 ```
 
-Use returned request/plan IDs, not the illustrative placeholders. `prepare` accepts
-`--objective-file PATH` instead of inline text, or `--request-file PATH` containing a
-strict `RequestDraft`: objective, optional query, scope, constraints, definition_of_done,
-optional verification, invariant_refs, and provenance (actor, source_refs, optional opaque
-provider metadata). No transcript/reasoning field exists. All project invariants become
-critical request invariants. Explicit additional invariant keys can reference active
-repository-wide CANONICAL/INVARIANT memory.
+### 4. Register your repository
 
-The planner input is a `PlannerPacket` with `artifact = FROZEN_PLANNING_INPUT`, request,
-context, and exact compact-JSON `serialized_bytes`. It combines the accepted graph/memory
-APIs with a frozen policy snapshot and bounded exact source excerpts. Defaults: four graph
-primaries, eight neighbors, four tests, eight files; four canonical memories, three
-observed/derived facts, **zero notes**; 768 bytes/20 lines per excerpt; 32 KiB total.
-`--notes N` explicitly opts into fallible notes. Other knobs are `--primary`, `--neighbors`,
-`--tests`, `--files`, `--canonical`, `--facts`, `--excerpt-bytes`, `--excerpt-lines`, and
-`--bytes`. Truncation is reported; required intent/invariant/policy text is never silently
-discarded to fit. `plan context` returns the same persisted historical input, not fresh
-claims about today's checkout. It does not regenerate context on every read.
+Start from a Git checkout with a clean, committed working tree:
 
-External output is an `ExecutionPlan` envelope with exactly two fields: `packet` is the
-unchanged Stage 0 `PlanPacket`; `metadata` contains version, request_id, the request's
-unchanged source binding, creation time, provenance, per-task contracts, an integration
-contract, and optional replan history. Each task contract names its TaskId and packet hash,
-requires an independent verifier with `PACKET_DIFF_AND_EVIDENCE` input, and adds memory_refs,
-exclusions, and non_goals. Its objective, scope, invariants, done criteria and check refs
-come from the immutable TaskPacket, not a second competing task definition. Integration
-binds the complete PlanPacket, requires all task verifications and final diff/evidence,
-and carries overall expectations including user-specified done criteria.
+```bash
+cd /path/to/your/repo
+agentctl repo init            # creates .agentctl/project.toml
+```
 
-Use `agentctl::local::planning::hash` on the typed `TaskPacket` and `PlanPacket` for contract
-hashes: BLAKE3 of compact serde JSON in declared field order, **not** pretty-printed JSON
-or an arbitrary map's key order. The executable fixture in [tests/planning.rs](tests/planning.rs)
-shows construction and cross-process import. Import deserializes strict Rust types and
-applies Stage 0 validation plus Stage 4 reference/scope/source/contract checks. It never
-executes embedded text or policy commands. Bounds are 32 tasks/256 KiB per plan, 16 KiB
-per TaskPacket, and 8 KiB per task contract. `plan tasks` reports individual byte sizes
-and carries source assumptions, constraints, and resolved critical invariant text.
+Declare at least one canonical check. The verifier requires evidence from checks
+declared here, and planners cannot invent their own. Replace the command with your
+project's offline test command:
 
-Import publishes `VALIDATED`, not ACTIVE. Activation rechecks graph/source/policy/memory
-assumptions and permits only one active plan per workspace. `ready` is structural readiness,
-not permission to execute: PLANNED/READY candidates need every prerequisite VERIFIED.
-Executor success or verification rejection cannot unlock dependents. The Stage 4 `plan`
-commands never run tasks; the Stage 5 `run` commands below do.
-Stage 4 packet verification requires the executor, verifier and every evidence record to
-be bound to the plan's workspace: sibling worktrees and unbound records cannot unlock tasks.
-The library's `complete_execution_plan` accepts externally recorded integration proof only
-after all packets are VERIFIED; it checks registered successful jobs, the actual contributing
-executor set, and evidence bound to the submitted final source/workspace. Authentication,
-fresh verifier sessions, actual command execution, and exact diff/evidence capture
-are supplied by Stage 5 for runtime-owned plans, not retroactively for legacy jobs.
+```bash
+cat >> .agentctl/project.toml <<'EOF'
 
-Replacement plans use new PlanIds and new TaskIds, with an explicit prior-plan reference
-and reason. Historical VERIFIED/replaced task references are supported, but never copy
-acceptance into new tasks. `supersede` retains the old plan and does not activate the new
-one automatically. Cancellation/supersession refuse unfinished jobs. Inspection reconstructs
-objective, DAG, task states, contracts and readiness without replaying conversations.
+[commands.test]
+program = "cargo"
+args = ["test", "--locked", "--offline"]
+cwd = "."
 
-Migration 5 adds only planning_requests and execution_plans; existing plans/tasks remain
-the single task store. Imports, lifecycle changes and audit events commit atomically.
-Migration 6 adds completion guards: SQL updates cannot set COMPLETE without a connection-local,
-payload-bound capability granted by the validated completion operation and its matching audit
-event. INSERT/REPLACE cannot start a plan completed. Existing Stage 4 databases migrate on open.
-Before upgrading v5, migration validates every existing COMPLETE plan against durable task
-verification history, workspace-owned jobs/evidence, integration proof, final source and its
-matching completion audit. Invalid or unverifiable history aborts the entire migration at v5
-with a plan-specific error; no completion state or audit is repaired or synthesized.
-Pending/terminal Stage 4 plans cannot transition task rows; legacy Stage 1 plans retain
-their accepted behavior. Existing packet schemas, graph IDs, memory semantics and dependency
-versions are unchanged (rusqlite's existing `functions` feature is enabled for the guard).
-Read-only opens do not migrate. Index STARTED/FAILED attempt-level
-observability remains deferred to the later observability stage.
+[verification.test]
+description = "Unit tests pass"
+command_refs = ["test"]
+EOF
 
-Rust types are canonical. Regenerate and review schemas whenever contracts change;
-tests fail if checked-in schemas drift. See [the architecture contract](docs/architecture.md)
-for versioning, lifecycle semantics, trust boundaries, and directory conventions.
+git add .agentctl/project.toml
+git commit -m "Add agentctl project policy"
+agentctl repo index
+```
 
-## Running agents and verification
+Checks run in the sandbox with a read-only checkout, no network, and a private
+scratch `HOME`. If your toolchain lives under your home directory, grant it with
+`[runtime.security] read_roots` and `env` (for example `RUSTUP_HOME`). See
+[docs/configuration.md](docs/configuration.md).
 
-Configure installed executable paths and role mappings in machine `config.toml`.
-Models/effort are optional opaque provider values; choose them explicitly for your budget.
-For example (replace the executable paths with your installations):
+### 5. Describe the work
+
+```bash
+agentctl plan prepare --objective 'Add a --verbose flag that prints each processed file'
+```
+
+This prints `Prepared request:<id>`. The request freezes the objective, your
+project invariants, and bounded code and memory context.
+
+### 6. Plan
+
+```bash
+agentctl run planner request:<id>     # the planner produces a task DAG; imported as VALIDATED
+agentctl plan list                    # find the plan ID
+agentctl plan tasks <plan-id>         # review tasks, scopes and checks before running anything
+agentctl plan activate <plan-id>
+```
+
+### 7. Run
+
+```bash
+agentctl run plan <plan-id> --dry-run
+agentctl run plan <plan-id>
+```
+
+`run plan` stays in the foreground. For each ready task, it runs an executor, the
+declared checks, and an independent verifier. It then runs integration checks and
+an integration verifier.
+
+### 8. Watch progress
+
+From another terminal:
+
+```bash
+agenttop
+agentctl run status <plan-id>
+```
+
+### 9. Inspect the verified result
+
+```bash
+agentctl plan show <plan-id>          # COMPLETE only after integration verification passes
+agentctl observe tasks
+git status && git diff                # agentctl never commits; review and commit yourself
+agentctl analytics summary
+```
+
+If a task is rejected or blocked, the run stops. Prepare a replacement plan and
+link it with `agentctl run replace <old-plan-id> <new-plan-id>`, or resume an
+interrupted run with `agentctl run resume <plan-id>`. See [docs/cli.md](docs/cli.md).
+
+## How it works
+
+```text
+user intent
+   │  plan prepare: freeze objective, invariants, bounded graph/memory context
+   ▼
+planning ── planner worker ──▶ ExecutionPlan (task DAG + verification contracts)
+   │  import → VALIDATED → activate → ACTIVE
+   ▼
+for each task whose prerequisites are VERIFIED:
+   executor worker ──▶ actual diff captured and scope-checked
+   project checks  ──▶ evidence (sandboxed, offline)
+   verifier worker ──▶ PASS → VERIFIED (unlocks dependents) │ REJECT → blocked, replan
+   ▼
+integration: combined diff + integration checks + fresh integration verifier
+   ▼
+COMPLETE
+```
+
+agentctl owns the canonical state at every step. Provider workers receive bounded,
+explicit inputs, return strict JSON, and are discarded. Their claims are checked
+against what actually happened on disk and in the checks. Every transition is
+recorded in an append-only journal and guarded in the database. An interrupted run
+therefore resumes from durable facts, not from a conversation.
+
+See [docs/architecture.md](docs/architecture.md) for components and authority
+boundaries.
+
+## Security model
+
+- **Fail-closed capability checks.**
+  - Every launch is compiled into an OS-neutral policy and checked against what the
+    host backend reports it can enforce.
+  - A missing capability refuses the launch; there is no unsandboxed fallback.
+  - agentctl refuses to launch workers as root.
+- **Filesystem confinement.**
+  - Workers can read only OS and toolchain roots, the workspace, a private scratch
+    directory, and roots you grant.
+  - Only executors, experiments, and scratch can be written.
+  - Git metadata, agentctl state, provider homes, and common credential stores are
+    always denied.
+- **Network.** Checks are always offline. Experiments are offline unless you allow
+  network. Provider frontends have network access, which roles and projects can
+  remove.
+- **Environment isolation.**
+  - Workers receive an allowlisted environment, never the ambient one.
+  - Credential-looking and loader-injection variables are rejected.
+  - Checks and experiments never receive provider credentials.
+- **Process and resource containment.**
+  - Timeouts, bounded output capture, and resource limits apply to every worker.
+  - Process-group and marker/sentinel sweeps find and kill escaped descendants.
+    Cleanup that cannot be proven is reported, not assumed.
+- **Machine policy versus project policy.** The machine configuration is the
+  authority. `.agentctl/project.toml` can only **tighten** it: fewer providers,
+  lower limits, read-only roles, no network, extra protected paths. It can never
+  grant paths, environment, network, or a higher concurrency ceiling.
+
+`agentctl security doctor` prints the host's capability report and runs a live
+self-test.
+
+This is not perfect isolation. Worker output is treated as untrusted, but same-user
+host compromise is out of scope. Readable workspace content is visible to every
+worker, and cleanup of deliberately daemonizing processes is best effort. Read
+[docs/security.md](docs/security.md) for the threat model, platform details, and
+known limitations.
+
+## Configuration
+
+The machine configuration lives in `~/.config/agentctl/config.toml`. The optional
+keys below override the defaults shown.
 
 ```toml
-[runtime]
-timeout_ms = 600000
-max_correction_rounds = 2
+version = 1
+busy_timeout_ms = 5000
 
-[runtime.providers.codex]
-adapter = "codex"
-executable = "/absolute/path/to/codex"
+[runtime]
+timeout_ms = 600000          # per worker process
+max_correction_rounds = 2    # explicit replacement plans before human escalation
+
+[runtime.concurrency]
+max_agents = 4               # machine-wide active agent jobs
 
 [runtime.providers.claude]
 adapter = "claude"
 executable = "/absolute/path/to/claude"
 
 [runtime.roles.planner]
-provider = "codex"
+provider = "claude"
 [runtime.roles.executor]
 provider = "claude"
 [runtime.roles.verifier]
-provider = "codex"
+provider = "claude"
 ```
 
-Authentication defaults to `AUTO`: reuse the provider's native login first. Codex keeps
-the original `CODEX_HOME` for authentication; Claude preserves normal HOME/config-location
-and Keychain identity, using `--safe-mode` rather than `--bare`. Authentication is persistent,
-but each worker conversation is fresh and non-resumable. History/customizations remain
-disabled and provider history files are sandbox-denied; no credentials are copied into
-agentctl state. `provider doctor` and runtime preflight use token-free native login-status
-commands and report only authentication method/availability, not account or credential data.
-They do not prove live model access or refresh expired credentials on behalf of the provider.
+The project configuration lives in `.agentctl/project.toml`, committed with your
+code. It holds invariants, architecture notes, canonical commands and
+verification, protected paths, and tightening-only `[routing]` and `[security]`
+limits. See [docs/configuration.md](docs/configuration.md) for every field,
+default, and trust boundary.
 
-Optional API-key use must be intentional; configure a variable **name**, never its value:
+## Observability
 
-```toml
-[runtime.providers.codex.authentication]
-mode = "AUTO" # NATIVE forbids fallback; API_KEY bypasses native login
-api_key_env = "MY_CODEX_API_KEY" # optional AUTO fallback
+- `agenttop` is a read-only terminal UI. It shows a rolling tokens-per-minute graph,
+  the agent tree, the task DAG with `N/M VERIFIED` progress, a per-worker probe, and
+  recent events. `agenttop --once` renders a single frame as text.
+- `agentctl observe snapshot|sessions|agents|tasks|events|experiments|usage` returns
+  the same data, as JSON with `--json`.
+- `agentctl run status <plan-id>` shows run and job state for one plan.
+- `agentctl analytics summary|usage|roles|routes|corrections` produces historical,
+  descriptive metrics. Token provenance (`EXACT`/`ESTIMATED`/`UNKNOWN`) is kept, and
+  missing data is never counted as zero.
+
+Liveness is reported honestly. A job is `LIVE` only when the controller that owns
+the process has just confirmed it. Other observers show `UNKNOWN`.
+
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [docs/cli.md](docs/cli.md) | every command, with behavior and limits |
+| [docs/configuration.md](docs/configuration.md) | machine and project configuration reference |
+| [docs/providers.md](docs/providers.md) | Claude Code and Codex adapters, authentication |
+| [docs/security.md](docs/security.md) | threat model, capabilities, platform backends, limitations |
+| [docs/architecture.md](docs/architecture.md) | components, state, lifecycles, authority boundaries |
+| [docs/development.md](docs/development.md) | building, testing, and contributing |
+
+## Roadmap
+
+These directions follow from current design limits. They are not commitments or
+dates.
+
+- **Stronger cross-platform sandboxing.** Filesystem and network confinement on
+  Windows, and kernel-level process-tree and aggregate resource containment on
+  Linux and macOS.
+- **Parallel execution.** Isolated, managed worktrees so independent verified-ready
+  tasks can run concurrently.
+- **Richer repository intelligence.** Cross-file resolution with correct
+  invalidation, and more languages.
+- **Provider integrations.** Broader authentication and platform support, and more
+  complete token telemetry.
+- **Orchestration and experiments.** More decision-boundary types beyond metric
+  thresholds.
+- **Operations.** Artifact retention and garbage collection, and repository
+  relocation handling.
+- **Observability.** Finer-grained indexing and runtime activity events.
+
+## Contributing
+
+Contributions are welcome. Before opening a change, run:
+
+```bash
+cargo build --locked
+cargo test --locked
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The named value is passed only to the selected provider's key variable. Ambient API keys
-are not silently selected. Unsupported CLIs/auth mechanisms fail with login/configuration
-guidance, not an unsandboxed fallback.
+Tests are offline and never call a model; they use fake provider adapters. Native
+sandbox tests are opt-in: `cargo test --locked -- --ignored` on a macOS or Linux
+host, as a non-root user. Regenerate `schemas/` with `cargo run -- schemas
+generate` when you change a contract.
 
-```sh
-agentctl provider list --json
-agentctl provider doctor --json
-# Prepare bounded intent using the existing plan prepare command, then:
-agentctl run planner request:... --json  # imports VALIDATED; never auto-activates
-agentctl plan activate plan:...
-agentctl run plan plan:... --dry-run --json
-agentctl run plan plan:... --json
-agentctl run status plan:... --json
-agentctl run resume plan:... --json
-agentctl run cancel plan:...           # request cancellation from another process
-agentctl run replace plan:old plan:new # explicit VALIDATED correction; then activate
-```
+When you change behavior, configuration, or commands, keep the documented authority
+boundaries and update the relevant document in `docs/`. See
+[docs/development.md](docs/development.md).
 
-Project verification profiles must reference nonempty canonical `commands` (program,
-argv, cwd), not planner shell prose. Checks run read-only against the workspace with
-network disabled and scratch-only build output; configure tools accordingly. Each task
-executes once, its actual changes are scope-checked, checks produce evidence, and a
-fresh verifier must PASS before dependents run. All packets then require fresh integration
-verification through the unchanged Stage 4 completion guard. No automatic commits,
-pushes, resets, worktree creation or cleanup of user source occur.
+## License
 
-Start with a clean committed checkout and a newly prepared/activated plan. Unexpected
-source, HEAD, index or policy changes block the run; rejected/uncertain work requires an
-explicit replacement plan. The default permits at most two replacement rounds (configurable
-downward to zero), never automatic executor↔verifier retries. Human reconciliation of the
-checkout is required before preparing a clean correction baseline.
-
-Migration 7 adds runtime runs/jobs and local authorization guards without rewriting old
-records. Source snapshots, diffs, bounded provider output and command logs live in private
-content-addressed storage outside the checkout. Resume uses durable artifacts, not chat
-replay: verified tasks are not re-executed, pending verification/integration checkpoints
-continue, and uncertain interrupted jobs block rather than being treated as successful.
-
-An EngineeringSession owns the undertaking; roles are reusable configuration, while each
-AgentInstance is session-native and ephemeral. The accepted planner DAG requests workers;
-agentctl checks readiness, routing, workspace and budget before creating each executor,
-then its independent verifier, and finally the integration verifier. Parent/session ownership
-is durable provenance, never conversation reuse. Implicit children inherit their parent's
-engineering session; persistent/cross-session workers are not implemented and would require
-explicit user intent. Provider-internal agent spawning is disabled. Temporary job context is
-removed after normal termination; durable packets/evidence/events remain, with no automatic
-conversation-to-memory promotion.
-
-Ownership fits existing v7 JSON metadata; no schema bump or historical backfill is needed.
-Older unaccepted v7 runtime rows remain inspectable but cannot resume without ownership;
-they require explicit reconciliation/replanning. Accepted Stage 0–4 data is unchanged.
-
-Stage 5 intentionally supports small text checkouts: at most 20,000 files/64 MiB total,
-2 MiB per file, 128 KiB expanded verifier diff and 256 KiB provider input. Ignored files
-are included; symlinks, hardlinks, nested repositories and read-denied protected files
-are rejected. Captures are double-checked sequential observations, not atomic filesystem
-snapshots. No live provider model calls are needed for tests. Native sandbox tests are
-separately runnable with `cargo test --locked -- --ignored` on a capable macOS host;
-they use fake executables/disposable repositories and opt-in installed native login-status
-checks, not paid model calls. Native login-status tests require locally logged-in CLIs.
-
-## Stage 6: observe and agenttop
-
-`agenttop` is a read-only, keyboard-driven terminal view of canonical engineering activity.
-Build both executables with `cargo build --locked`, then run `target/debug/agenttop`.
-It does not start workers, contact providers, index a checkout, or change engineering state.
-
-```sh
-agentctl observe snapshot --json
-agentctl observe sessions --json
-agentctl observe session <id> --json
-agentctl observe agents --json
-agentctl observe agent <id> --json # also: job <id>, tasks, task <id>, events
-agentctl observe usage --json
-agentctl observe usage provider <name> --json # also: task <id>, role <role>
-agenttop --once --width 100 --height 30 # text rendering; no interactive terminal needed
-```
-
-The top graph shows observed tokens/minute over ten minutes. Below it are the selected
-session's agent tree, TaskPacket DAG, selected worker/task probe and recent events.
-Use **q** to quit, **↑/↓** to select, **Tab** to switch agents/tasks, **Enter** to expand
-the probe, **s** to cycle sessions, **g** to cycle aggregate/provider/task/role graph
-filters, **r** to refresh and **?** for help. Narrow terminals switch panels instead of
-squeezing every column. Polling is read-only once per second.
-
-Progress is `N/M VERIFIED`, never a guessed percentage. Provider activity is
-`PROVIDER_EXECUTION` as a last-known phase, separately from `liveness: LIVE | UNKNOWN`.
-LIVE requires the current controller's owned-child poll to confirm that it has not exited;
-PID, lifecycle, timestamps and recent events cannot establish liveness. Separate CLI/TUI
-processes and restarted controllers have no such evidence and show `RUNNING/UNKNOWN`,
-without changing lifecycle. Elapsed time and event silence are not inferred model idle
-time. No heartbeat or persisted liveness is added; recovery still belongs to the runtime.
-
-Usage preserves EXACT/ESTIMATED/UNKNOWN provenance. Current adapters report at job return,
-so the graph shows receipt-time bursts, not inferred streaming generation. Missing usage
-is unknown, not zero; a partial known sum is labeled PARTIAL. No new estimator is added.
-Views are bounded recent history with explicit truncation warnings. Unowned legacy records
-remain uncertain. The local query API and TUI share one projection; no schema migration,
-provider transcript access or analytics warehouse is introduced.
-
-## Historical engineering analytics (Stage 8)
-
-`agentctl analytics summary`, `usage`, `roles`, `routes`, and `corrections` provide
-read-only descriptive analytics. Use `session ID`, `task ID`, or `job ID` for a
-specific entity, and `--json` for the full bounded, versioned snapshot.
-
-The default scope is the current workspace, with jobs created in the last seven
-days. `--repository ID` explicitly combines that repository's workspaces;
-`--workspace ID` narrows it again. Filters include `--session`, `--role`,
-`--provider`, `--model`, `--task`, `--job`, `--lifecycle`, `--from-ms`, `--to-ms`,
-and `--limit` (default 10,000; maximum 20,000). Times are Unix milliseconds;
-the creation window is start-inclusive/end-exclusive. Outcomes are current
-durable state, not historical replay. Usage is observed through `as_of_ms`.
-
-Exact and estimated tokens have separate buckets. Unknown contributions never
-become zero; interrupted jobs remain incomplete. JSON includes denominators,
-sample sizes, context and elapsed-time distributions, actual historical routes,
-typed availability failures, policy skips, verification decisions, explicit
-correction lineage, and accepted/rejected attempt usage. Planner/session-wide
-usage and integration verification are not multiplied across tasks.
-
-The tokens-per-VERIFIED-task ratio uses only packets with complete attributable
-executor and verifier telemetry, alongside exact/estimated totals and excluded
-partial packet counts. It does not silently charge a superseded packet's work
-to a new packet: correction plans use distinct task IDs without a one-to-one
-replacement mapping. Inspect plan lineage and correction-round usage together.
-
-No pricing is assumed: monetary cost and active execution duration are UNKNOWN.
-Task difficulty differs; these measurements do not rank models or recommend or
-change routing. Historical missing metadata stays unknown. Analytics adds no
-SQL migration, aggregate cache, public schema changes, transcript reads, or
-agenttop refresh work. See the architecture document for precise definitions.
-
-## Roles and configured routing (Stage 7)
-
-Workers request roles, not providers. Built-ins are planner (bounded decomposition),
-executor (scoped implementation), verifier (independent PASS/REJECT), recon (graph-first
-location), and reviewer (explicit review, never a replacement for verification).
-Custom role IDs are supported for policy/inspection and bounded helper compilation;
-only planner/executor/verifier have authorized runtime launch endpoints today.
-
-Existing `[runtime.roles.<role>]` provider/model/effort mappings remain valid and unchanged.
-Optional machine settings in `~/.config/engineering-agent/config.toml`:
-
-```toml
-[runtime.profiles.executor]
-context_bytes = 131072
-timeout_ms = 300000
-advisory_tokens = 20000
-max_fallback_attempts = 1
-fallbacks = [{ provider = "alternate", model = "configured-model" }]
-```
-
-Provider names must already exist under `runtime.providers`. Model strings are opaque.
-Profiles can also specify provider/model/effort, objective, short `instructions`,
-`read_only`, and `network`. Defaults preserve the existing runtime's timeout, correction
-limit, serial scheduling and permissions; they never silently choose another provider.
-
-Project-specific overrides belong in `.agentctl/project.toml`:
-
-```toml
-[routing]
-allowed_providers = ["primary", "alternate"]
-max_context_bytes = 131072
-deny_network = false
-
-[routing.profiles.executor]
-instructions = ["Preserve the public cache API."]
-```
-
-Precedence is built-ins < legacy machine mappings < machine profiles < project profiles
-< explicit user override. Only supplied fields replace lower fields; lists replace whole
-lists. Hard project allowlists, read-only/network restrictions and context ceilings always
-win. Forbidden configured candidates are filtered in order; the first allowed route is
-selected. A forbidden explicit provider override instead fails, without silent fallback.
-Policy skips are recorded separately from provider failures and do not consume attempts.
-
-```sh
-agentctl roles --json
-agentctl role show executor --json
-agentctl route executor --json
-agentctl route check --json
-agentctl route executor --override executor:alternate:configured-model --json
-agentctl run plan <plan-id> --override executor:alternate:configured-model --json
-```
-
-Inspection launches no provider. `route check` reports each role's configuration errors,
-executable existence and sandbox availability; authentication is explicitly NOT_PROBED
-(use `provider doctor` for token-free login checks). Overrides apply to the current command,
-including future jobs in that controller invocation, and never come from planner output.
-Invalid `role show`, `route`, and `route check` return nonzero while retaining diagnostics
-in text/JSON; a multi-role check retains valid rows too. Compact overrides require exactly
-two or three nonempty, unpadded colon-separated segments; extra colons are errors.
-
-Fallback is an ordered flat chain, at most four alternatives, only for mechanical
-unavailability/authentication/capability/startup failures. Duplicate/cyclic routes fail.
-Timeouts, unknown exits, malformed JSON, bad implementations and verifier REJECT do not
-trigger fallback. Each attempt is a fresh authorized job; fallback never expands permissions.
-Correction still requires explicit replacement and obeys the existing maximum of two rounds.
-
-The neutral compiler combines concise role instructions with the existing bounded canonical
-context and output contract. It fails if the entire prompt exceeds its byte budget; it never
-silently drops critical invariants. Token budgets are ADVISORY, not provider-enforced limits.
-Adapters consume compiled instructions while retaining native-first auth and fresh sessions.
-Verifier input contains task/invariants/diff/captured evidence, not executor reasoning.
-
-Job records preserve actual route, fallback history and prompt hashes/byte size. `observe`
-and `agenttop` show actual backend and fallback metadata without changing telemetry/liveness.
-No SQL migration or public schema change is needed. Machine policy is frozen per controller
-invocation; a subsequent invocation uses current machine policy. Project-policy edits retain
-the existing source-drift/replan guard. Each job uses one parsed project-policy snapshot,
-hash-validated against its plan/request, for routing and permissions. Disk policy is rechecked
-immediately before adapter launch and native process spawn; drift blocks with replan required,
-never reload-and-continue. Historical jobs never acquire invented profiles.
-There is no adaptive routing, model ranking, quota scraping or automatic semantic escalation.
+agentctl is licensed under the Mozilla Public License 2.0 (`MPL-2.0`). See
+[LICENSE](LICENSE) for the full text.
