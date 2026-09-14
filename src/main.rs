@@ -36,8 +36,13 @@ Usage:
   agentctl run <resume|status|cancel> <plan-id> [--json]
   agentctl run replace <old-plan-id> <validated-replacement-id>
   agentctl run packet-hashes < plan-packet.json
-  agentctl experiment run --program PATH [--arg V]... [--cwd PATH] [--network] [--env NAME]... [--timeout-ms N] [--json]
-  agentctl experiment run --command KEY [--network] [--env NAME]... [--timeout-ms N] [--json]
+  agentctl experiment run --program PATH [--arg V]... [--cwd PATH] [--network] [--env NAME]... [--timeout-ms N]
+    [--boundary ID:METRIC:OP:VALUE:record[:TAG=VAL,...]]...
+    [--boundary ID:METRIC:OP:VALUE:planner:VERIFICATION_REF[:TAG=VAL,...]]...
+    [--max-wakeups N] [--json]
+  agentctl experiment run --command KEY [--network] [--env NAME]... [--timeout-ms N] [--boundary ...]... [--max-wakeups N] [--json]
+    OP is one of < <= > >= ==; a planner boundary needs a verification profile already declared in project policy
+    the optional TAG=VAL,... selector matches metric series tags; omitting it matches only an UNTAGGED metric of that name (fail-closed, not a wildcard)
   agentctl experiment status <experiment-id> [--json]
   agentctl experiment list [--json]
   agentctl experiment cancel <experiment-id> [--json]
@@ -45,6 +50,9 @@ Usage:
   agentctl experiment metrics <experiment-id> [--attempt N] [--name NAME] [--limit N] [--json]
   agentctl experiment checkpoints <experiment-id> [--attempt N] [--limit N] [--json]
   agentctl experiment events <experiment-id> [--attempt N] [--limit N] [--json]
+  agentctl experiment boundaries <experiment-id> [--json]
+  agentctl experiment decisions <experiment-id> [--json]
+  agentctl experiment wakeups <experiment-id> [--json]
   agentctl plan prepare <--objective TEXT|--objective-file PATH|--request-file PATH> [--query TEXT] [--bytes N] [--notes N] [--json]
   agentctl plan context <request-id> [--json]
   agentctl plan import <plan.json> [--json]

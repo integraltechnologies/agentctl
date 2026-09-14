@@ -9,7 +9,7 @@ use super::{
     store::{RegisteredRepository, RegisteredWorkspace},
 };
 
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 11;
 pub const APPLICATION_ID: i64 = 0x41475443; // AGTC
 
 const INITIAL: &str = r#"
@@ -121,6 +121,8 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
         (7, "provider_runtime"),
         (8, "experiment_runtime"),
         (9, "experiment_events"),
+        (10, "experiment_decisions"),
+        (11, "experiment_decision_cursors"),
     ]
     .into_iter()
     .filter(|(v, _)| *v <= version)
@@ -279,6 +281,59 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
             require(n == 1, format!("database is missing index {name}"))?;
         }
     }
+    if version >= 10 {
+        connection.prepare(
+            "SELECT decision_id,experiment_id,attempt,boundary_id,requires_planner,record_json FROM experiment_decisions LIMIT 0",
+        )?;
+        connection.prepare(
+            "SELECT wakeup_id,experiment_id,decision_id,planning_request_id,record_json FROM experiment_wakeups LIMIT 0",
+        )?;
+        for name in [
+            "experiment_decisions_insert",
+            "experiment_decisions_update",
+            "experiment_decisions_delete",
+            "experiment_wakeups_insert",
+            "experiment_wakeups_update",
+            "experiment_wakeups_delete",
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing trigger {name}"))?;
+        }
+        for name in [
+            "experiment_decisions_by_experiment",
+            "experiment_decisions_pending_planner",
+            "experiment_wakeups_by_experiment",
+            "experiment_wakeups_by_request",
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing index {name}"))?;
+        }
+    }
+    if version >= 11 {
+        connection.prepare(
+            "SELECT experiment_id,attempt,boundaries_hash,last_evaluated_arrival_sequence FROM experiment_decision_cursors LIMIT 0",
+        )?;
+        for name in [
+            "experiment_decision_cursors_insert",
+            "experiment_decision_cursors_update",
+            "experiment_decision_cursors_delete",
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing trigger {name}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -337,6 +392,14 @@ fn migrate_transaction(connection: &mut Connection) -> Result<()> {
     if header(&transaction)? == 8 {
         check_version(&transaction, 8)?;
         transaction.execute_batch(include_str!("runtime/experiment_event_schema.sql"))?;
+    }
+    if header(&transaction)? == 9 {
+        check_version(&transaction, 9)?;
+        transaction.execute_batch(include_str!("runtime/experiment_decision_schema.sql"))?;
+    }
+    if header(&transaction)? == 10 {
+        check_version(&transaction, 10)?;
+        transaction.execute_batch(include_str!("runtime/experiment_cursor_schema.sql"))?;
     }
     check(&transaction)?;
     require(

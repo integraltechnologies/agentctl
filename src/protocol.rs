@@ -510,6 +510,7 @@ pub enum MetricComparison {
     LessThanOrEqual,
     GreaterThan,
     GreaterThanOrEqual,
+    Equal,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -526,9 +527,40 @@ pub enum ExperimentBoundary {
     EpochComplete,
     MetricThreshold {
         metric: String,
+        /// Exact-match selector against a Stage 9B metric event's own `tags`. Absent
+        /// in an old document deserializes as empty, which is NOT a wildcard: an
+        /// empty selector matches only an untagged event of that metric name (see
+        /// `local::runtime::experiment_decisions` for the full fail-closed matching
+        /// semantics). This keeps a legacy single-series boundary from silently
+        /// broadening to match every newly-introduced tagged variant of the metric.
+        #[serde(default)]
+        tags: BTreeMap<String, String>,
         comparison: MetricComparison,
         value: f64,
     },
+}
+
+/// Stage 9C deterministic outcome of a satisfied boundary. Deliberately small: a
+/// boundary either just records a fact, or names the single existing verification
+/// profile Stage 9D must attach when it wakes the normal planner. Neither variant
+/// grants any process-control or model-invocation authority by itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum BoundaryAction {
+    RecordOnly,
+    RequirePlannerReview {
+        /// Must name a profile already declared in project policy; resolved and
+        /// checked against policy at experiment-declaration time, not invented later.
+        verification_ref: String,
+    },
+}
+impl Default for BoundaryAction {
+    /// A boundary document written before this field existed asserted nothing about
+    /// planner escalation; defaulting to the strictly-weaker no-op action preserves
+    /// its old meaning exactly instead of silently granting new authority.
+    fn default() -> Self {
+        Self::RecordOnly
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -536,6 +568,8 @@ pub enum ExperimentBoundary {
 pub struct BoundaryDefinition {
     pub boundary_id: String,
     pub condition: ExperimentBoundary,
+    #[serde(default)]
+    pub action: BoundaryAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

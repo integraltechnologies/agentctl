@@ -37,6 +37,7 @@ pub fn strip_experiments(c: &rusqlite::Connection) {
 }
 #[allow(dead_code)]
 pub fn strip_experiment_events(c: &rusqlite::Connection) {
+    strip_experiment_decisions(c);
     for name in [
         "experiment_events_insert",
         "experiment_events_update",
@@ -47,6 +48,40 @@ pub fn strip_experiment_events(c: &rusqlite::Connection) {
     }
     c.execute_batch(
         "DROP TABLE IF EXISTS experiment_events; DELETE FROM schema_migrations WHERE version=9;",
+    )
+    .unwrap();
+}
+#[allow(dead_code)]
+pub fn strip_experiment_decisions(c: &rusqlite::Connection) {
+    strip_experiment_decision_cursors(c);
+    for name in [
+        "experiment_decisions_insert",
+        "experiment_decisions_update",
+        "experiment_decisions_delete",
+        "experiment_wakeups_insert",
+        "experiment_wakeups_update",
+        "experiment_wakeups_delete",
+    ] {
+        c.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))
+            .unwrap();
+    }
+    c.execute_batch(
+        "DROP TABLE IF EXISTS experiment_wakeups; DROP TABLE IF EXISTS experiment_decisions; DELETE FROM schema_migrations WHERE version=10;",
+    )
+    .unwrap();
+}
+#[allow(dead_code)]
+pub fn strip_experiment_decision_cursors(c: &rusqlite::Connection) {
+    for name in [
+        "experiment_decision_cursors_insert",
+        "experiment_decision_cursors_update",
+        "experiment_decision_cursors_delete",
+    ] {
+        c.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))
+            .unwrap();
+    }
+    c.execute_batch(
+        "DROP TABLE IF EXISTS experiment_decision_cursors; DELETE FROM schema_migrations WHERE version=11;",
     )
     .unwrap();
 }
@@ -173,7 +208,7 @@ pub fn samples() -> BTreeMap<&'static str, Value> {
         ("token-usage", json!(token())),
         (
             "experiment",
-            json!({"version": "1", "experiment_id": "experiment:1", "command": command(), "input_refs": ["data:training"], "source_state": {"revision": "git:abc123", "worktree_diff_hash": null}, "metric_refs": ["metric:loss"], "output_refs": ["artifact:model"], "decision_boundaries": [{"boundary_id": "exit", "condition": {"kind": "PROCESS_EXIT"}}, {"boundary_id": "threshold", "condition": {"kind": "METRIC_THRESHOLD", "metric": "loss", "comparison": "LESS_THAN", "value": 0.5}}]}),
+            json!({"version": "1", "experiment_id": "experiment:1", "command": command(), "input_refs": ["data:training"], "source_state": {"revision": "git:abc123", "worktree_diff_hash": null}, "metric_refs": ["metric:loss"], "output_refs": ["artifact:model"], "decision_boundaries": [{"boundary_id": "exit", "condition": {"kind": "PROCESS_EXIT"}, "action": {"kind": "RECORD_ONLY"}}, {"boundary_id": "threshold", "condition": {"kind": "METRIC_THRESHOLD", "metric": "loss", "comparison": "LESS_THAN", "value": 0.5}, "action": {"kind": "REQUIRE_PLANNER_REVIEW", "verification_ref": "check:integration"}}]}),
         ),
         ("experiment-event", json!(experiment_event())),
         (

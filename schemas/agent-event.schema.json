@@ -564,6 +564,14 @@
             "metric": {
               "type": "string"
             },
+            "tags": {
+              "description": "Exact-match selector against a Stage 9B metric event's own `tags`. Absent\nin an old document deserializes as empty, which is NOT a wildcard: an\nempty selector matches only an untagged event of that metric name (see\n`local::runtime::experiment_decisions` for the full fail-closed matching\nsemantics). This keeps a legacy single-series boundary from silently\nbroadening to match every newly-introduced tagged variant of the metric.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            },
             "value": {
               "type": "number",
               "format": "double"
@@ -714,7 +722,8 @@
         "LESS_THAN",
         "LESS_THAN_OR_EQUAL",
         "GREATER_THAN",
-        "GREATER_THAN_OR_EQUAL"
+        "GREATER_THAN_OR_EQUAL",
+        "EQUAL"
       ]
     },
     "PlanId": {

@@ -100,6 +100,8 @@ fn input(command: CommandSpec) -> ExperimentInput {
         network: false,
         env_passthrough: vec![],
         timeout_ms: 5_000,
+        decision_boundaries: vec![],
+        max_planner_wakeups: DEFAULT_MAX_PLANNER_WAKEUPS,
     }
 }
 fn output(exit: Option<i32>, stdout: &[u8]) -> ProcessOutput {
@@ -432,6 +434,8 @@ fn project_network_policy_intersects_operator_request_and_survives_reopen_restar
                     network: requested,
                     env_passthrough: vec![],
                     timeout_ms: 5_000,
+                    decision_boundaries: vec![],
+                    max_planner_wakeups: DEFAULT_MAX_PLANNER_WAKEUPS,
                 },
             )
             .unwrap();
@@ -457,6 +461,8 @@ fn project_network_policy_intersects_operator_request_and_survives_reopen_restar
                 network: true,
                 env_passthrough: vec![],
                 timeout_ms: 5_000,
+                decision_boundaries: vec![],
+                max_planner_wakeups: DEFAULT_MAX_PLANNER_WAKEUPS,
             },
         )
         .unwrap();
@@ -485,7 +491,15 @@ fn project_command_and_restrictions_share_one_drift_checked_snapshot() {
     let run = ExperimentRuntime::new(&mut store, f.paths.clone())
         .unwrap()
         .with_check_launcher(Box::new(FakeLaunch(output(Some(0), b"ok"))))
-        .run_project_command(&f.root, "echo".into(), false, vec![], 5_000)
+        .run_project_command(
+            &f.root,
+            "echo".into(),
+            false,
+            vec![],
+            5_000,
+            vec![],
+            DEFAULT_MAX_PLANNER_WAKEUPS,
+        )
         .unwrap();
     assert_eq!(run.command.args, vec!["fixture"]);
     let mut changed = ProjectConfig::load(&f.root).unwrap();
@@ -520,7 +534,15 @@ fn project_command_and_restrictions_share_one_drift_checked_snapshot() {
                 mutation: Some(mutation),
                 executed: executed.clone(),
             }))
-            .run_project_command(&fixture.root, "echo".into(), true, vec![], 5_000)
+            .run_project_command(
+                &fixture.root,
+                "echo".into(),
+                true,
+                vec![],
+                5_000,
+                vec![],
+                DEFAULT_MAX_PLANNER_WAKEUPS,
+            )
             .unwrap_err();
         assert!(error.to_string().contains("SOURCE_DRIFT"));
         assert!(!executed.load(Ordering::SeqCst));
@@ -543,6 +565,8 @@ fn project_command_and_restrictions_share_one_drift_checked_snapshot() {
                 network: true,
                 env_passthrough: vec![],
                 timeout_ms: 5_000,
+                decision_boundaries: vec![],
+                max_planner_wakeups: DEFAULT_MAX_PLANNER_WAKEUPS,
             },
         )
         .unwrap_err();
@@ -877,6 +901,8 @@ fn malformed_or_forbidden_commands_are_rejected_before_any_process_launch() {
                 network: false,
                 env_passthrough: vec![],
                 timeout_ms: 1000,
+                decision_boundaries: vec![],
+                max_planner_wakeups: DEFAULT_MAX_PLANNER_WAKEUPS,
             },
         );
     assert!(escape.is_err());
@@ -893,6 +919,8 @@ fn malformed_or_forbidden_commands_are_rejected_before_any_process_launch() {
                 network: false,
                 env_passthrough: vec![],
                 timeout_ms: 0,
+                decision_boundaries: vec![],
+                max_planner_wakeups: DEFAULT_MAX_PLANNER_WAKEUPS,
             },
         );
     assert!(bad_timeout.is_err());
@@ -1350,7 +1378,7 @@ fn v8_to_v9_migration_preserves_experiment_history_and_fabricates_no_events() {
     raw.pragma_update(None, "user_version", 8).unwrap();
     drop(raw);
     let reopened = f.store();
-    assert_eq!(reopened.status().unwrap().schema_version, 9);
+    assert_eq!(reopened.status().unwrap().schema_version, 11);
     let preserved = reopened
         .experiment_status(&f.root, &run.experiment_id)
         .unwrap()

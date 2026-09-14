@@ -17,7 +17,9 @@ pub use state::{RunRecord, RunState, RuntimeJob, RuntimeJobState};
 mod engine;
 mod experiment;
 pub(crate) mod experiment_cli;
+mod experiment_decisions;
 mod experiment_events;
+mod experiment_wakeups;
 pub(crate) mod planner;
 use super::{
     Error, Result,
@@ -31,14 +33,20 @@ use crate::{Validate, protocol::*};
 pub use config::*;
 pub use engine::Runtime;
 pub use experiment::{
-    DEFAULT_TIMEOUT_MS as EXPERIMENT_DEFAULT_TIMEOUT_MS, ExperimentAttempt, ExperimentInput,
-    ExperimentObservation, ExperimentRun, ExperimentRuntime, ExperimentState,
+    DEFAULT_MAX_PLANNER_WAKEUPS, DEFAULT_TIMEOUT_MS as EXPERIMENT_DEFAULT_TIMEOUT_MS,
+    ExperimentAttempt, ExperimentInput, ExperimentObservation, ExperimentRun, ExperimentRuntime,
+    ExperimentState, MAX_DECISION_BOUNDARIES, MAX_PLANNER_WAKEUPS,
     MAX_TIMEOUT_MS as EXPERIMENT_MAX_TIMEOUT_MS,
 };
+pub use experiment_decisions::{ExperimentBoundarySummary, ExperimentDecision};
 pub use experiment_events::{
     DEFAULT_EVENT_QUERY_LIMIT, EVENT_FILE_ENV, ExperimentEventData, ExperimentEventQuery,
     ExperimentEventSummary, ExperimentHealthKind, ExperimentRuntimeEvent, MAX_EVENT_FRAME_BYTES,
     MAX_EVENT_QUERY_LIMIT,
+};
+pub use experiment_wakeups::{
+    ExperimentControlSummary, ExperimentWakeup, ExperimentWakeupObservation,
+    PlannerInvocationStatus, PlannerJobSummary,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};

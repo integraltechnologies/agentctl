@@ -12,6 +12,94 @@ fn value(args: &[&str], i: &mut usize) -> Result<String> {
     Ok(v)
 }
 
+/// `ID:METRIC:OP:VALUE:record[:TAG=VAL,...]` or
+/// `ID:METRIC:OP:VALUE:planner:VERIFICATION_REF[:TAG=VAL,...]`. A deliberately tiny
+/// grammar: one scalar comparison, one required-match tag selector, one of two
+/// actions. No expression language, no scripts. Omitting the tag segment leaves the
+/// selector empty, which (see `local::runtime::experiment_decisions::tags_match`)
+/// fail-closed matches only an untagged metric of that name - it is never a wildcard.
+fn parse_boundary(spec: &str) -> Result<BoundaryDefinition> {
+    const USAGE: &str = "--boundary ID:METRIC:OP:VALUE:record[:TAG=VAL,...] or ID:METRIC:OP:VALUE:planner:VERIFICATION_REF[:TAG=VAL,...] (OP is one of < <= > >= ==)";
+    let mut parts = spec.splitn(5, ':');
+    let (Some(boundary_id), Some(metric), Some(op), Some(value), Some(rest)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(Error::Invalid(USAGE.into()));
+    };
+    let comparison = match op {
+        "<" => MetricComparison::LessThan,
+        "<=" => MetricComparison::LessThanOrEqual,
+        ">" => MetricComparison::GreaterThan,
+        ">=" => MetricComparison::GreaterThanOrEqual,
+        "==" => MetricComparison::Equal,
+        other => {
+            return Err(Error::Invalid(format!(
+                "--boundary: unknown comparison {other}; use <, <=, >, >=, or =="
+            )));
+        }
+    };
+    let value: f64 = value
+        .parse()
+        .map_err(|_| Error::Invalid("--boundary: VALUE must be a finite number".into()))?;
+    require(value.is_finite(), "--boundary: VALUE must be finite")?;
+    let mut rest = rest.splitn(3, ':');
+    let action_word = rest.next().ok_or_else(|| Error::Invalid(USAGE.into()))?;
+    let (verification_ref, tag_spec) = match action_word {
+        "record" => (None, rest.next()),
+        "planner" => {
+            let verification_ref = rest.next().ok_or_else(|| Error::Invalid(USAGE.into()))?;
+            (Some(verification_ref), rest.next())
+        }
+        other => {
+            return Err(Error::Invalid(format!(
+                "--boundary: unknown action {other}; use record or planner:VERIFICATION_REF"
+            )));
+        }
+    };
+    require(rest.next().is_none(), USAGE)?;
+    let action = match verification_ref {
+        None => BoundaryAction::RecordOnly,
+        Some(verification_ref) => BoundaryAction::RequirePlannerReview {
+            verification_ref: verification_ref.to_string(),
+        },
+    };
+    Ok(BoundaryDefinition {
+        boundary_id: boundary_id.to_string(),
+        condition: ExperimentBoundary::MetricThreshold {
+            metric: metric.to_string(),
+            tags: parse_tags(tag_spec)?,
+            comparison,
+            value,
+        },
+        action,
+    })
+}
+
+fn parse_tags(spec: Option<&str>) -> Result<BTreeMap<String, String>> {
+    let mut tags = BTreeMap::new();
+    let Some(spec) = spec else {
+        return Ok(tags);
+    };
+    for pair in spec.split(',') {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| Error::Invalid(format!("--boundary tag {pair:?} must be KEY=VALUE")))?;
+        require(
+            !key.is_empty() && !value.is_empty(),
+            "--boundary tag KEY and VALUE must be nonempty",
+        )?;
+        require(
+            tags.insert(key.to_string(), value.to_string()).is_none(),
+            format!("--boundary: duplicate tag key {key}"),
+        )?;
+    }
+    Ok(tags)
+}
+
 fn human_run(run: &ExperimentRun) -> String {
     let attempt = run.attempts.last();
     format!(
@@ -27,11 +115,15 @@ fn human_run(run: &ExperimentRun) -> String {
 }
 fn human_observation(o: &ExperimentObservation) -> String {
     format!(
-        "{}  liveness={:?}  events={}  ingestion_errors={}",
+        "{}  liveness={:?}  events={}  ingestion_errors={}  decisions={}  wakeups={}/{}  attention_required={}",
         human_run(&o.run),
         o.liveness,
         o.events.event_count,
-        o.events.ingestion_errors
+        o.events.ingestion_errors,
+        o.control.decision_count,
+        o.control.wakeups_created,
+        o.control.wakeups_budget,
+        o.control.attention_required
     )
 }
 
@@ -129,6 +221,8 @@ pub(crate) fn run(
             let mut network = false;
             let mut env_passthrough: Vec<String> = vec![];
             let mut timeout_ms = EXPERIMENT_DEFAULT_TIMEOUT_MS;
+            let mut decision_boundaries: Vec<BoundaryDefinition> = vec![];
+            let mut max_planner_wakeups = DEFAULT_MAX_PLANNER_WAKEUPS;
             let mut i = 0;
             while i < args.len() {
                 match args[i] {
@@ -142,6 +236,13 @@ pub(crate) fn run(
                         timeout_ms = v
                             .parse()
                             .map_err(|_| Error::Invalid("invalid --timeout-ms".into()))?;
+                    }
+                    "--boundary" => decision_boundaries.push(parse_boundary(&value(args, &mut i)?)?),
+                    "--max-wakeups" => {
+                        let v = value(args, &mut i)?;
+                        max_planner_wakeups = v
+                            .parse()
+                            .map_err(|_| Error::Invalid("invalid --max-wakeups".into()))?;
                     }
                     "--network" => {
                         network = true;
@@ -174,7 +275,15 @@ pub(crate) fn run(
             });
             let mut runtime = ExperimentRuntime::new(store, paths.clone())?;
             let run = if let Some(key) = project_command {
-                runtime.run_project_command(&root, key, network, env_passthrough, timeout_ms)?
+                runtime.run_project_command(
+                    &root,
+                    key,
+                    network,
+                    env_passthrough,
+                    timeout_ms,
+                    decision_boundaries,
+                    max_planner_wakeups,
+                )?
             } else {
                 runtime.run(
                     &root,
@@ -183,6 +292,8 @@ pub(crate) fn run(
                         network,
                         env_passthrough,
                         timeout_ms,
+                        decision_boundaries,
+                        max_planner_wakeups,
                     },
                 )?
             };
@@ -248,8 +359,78 @@ pub(crate) fn run(
             };
             output(json_mode, &events, &human)
         }
+        "boundaries" => {
+            require(args.len() == 1, "experiment boundaries requires exactly one ID")?;
+            let id = ExperimentId::new(args[0]).map_err(Error::Invalid)?;
+            let boundaries = store.experiment_boundaries(&root, &id)?;
+            let human = if boundaries.decision_boundaries.is_empty() {
+                "No decision boundaries declared for this experiment".into()
+            } else {
+                let mut lines: Vec<String> = boundaries
+                    .decision_boundaries
+                    .iter()
+                    .map(|b| format!("{}  {:?}  {:?}", b.boundary_id, b.condition, b.action))
+                    .collect();
+                lines.push(format!(
+                    "boundaries_hash={}  max_planner_wakeups={}",
+                    boundaries.boundaries_hash, boundaries.max_planner_wakeups
+                ));
+                lines.join("\n")
+            };
+            output(json_mode, &boundaries, &human)
+        }
+        "decisions" => {
+            require(args.len() == 1, "experiment decisions requires exactly one ID")?;
+            let id = ExperimentId::new(args[0]).map_err(Error::Invalid)?;
+            let decisions = store.experiment_decisions(&root, &id)?;
+            let human = if decisions.is_empty() {
+                "No decisions fired for this experiment".into()
+            } else {
+                decisions
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "{}  attempt={}  boundary={}  {}={} vs threshold  event_sequence={}  decided_at_ms={}",
+                            d.decision_id,
+                            d.attempt,
+                            d.boundary.boundary_id,
+                            d.metric_name,
+                            d.observed_value,
+                            d.triggering_event_sequence,
+                            d.decided_at_ms
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            output(json_mode, &decisions, &human)
+        }
+        "wakeups" => {
+            require(args.len() == 1, "experiment wakeups requires exactly one ID")?;
+            let id = ExperimentId::new(args[0]).map_err(Error::Invalid)?;
+            let wakeups = store.experiment_wakeups(&root, &id)?;
+            let human = if wakeups.is_empty() {
+                "No planner wakeups for this experiment".into()
+            } else {
+                wakeups
+                    .iter()
+                    .map(|w| {
+                        format!(
+                            "{}  decision={}  planning_request={}  status={:?}  planner_jobs={}",
+                            w.wakeup.wakeup_id,
+                            w.wakeup.decision_id,
+                            w.wakeup.planning_request_id.as_str(),
+                            w.status,
+                            w.planner_jobs.len()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            output(json_mode, &wakeups, &human)
+        }
         _ => Err(Error::Invalid(
-            "expected experiment run|status|list|cancel|restart|metrics|checkpoints|events".into(),
+            "expected experiment run|status|list|cancel|restart|metrics|checkpoints|events|boundaries|decisions|wakeups".into(),
         )),
     }
 }

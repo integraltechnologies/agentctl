@@ -6,7 +6,9 @@
 //! to own. Liveness follows the unchanged Stage 6 philosophy: persisted RUNNING is a
 //! historical fact, never proof that a process is still alive; only the exact
 //! controller process that is currently polling a child handle may report LIVE.
+use super::experiment_decisions as decisions;
 use super::experiment_events::EventIngestor;
+use super::experiment_wakeups as wakeups;
 use super::*;
 use process::{
     CancellationOutcome, CheckLauncher, NativeChecks, ProcessSpec, ScratchCleanup, WorkspaceLease,
@@ -18,6 +20,13 @@ use std::time::Duration;
 /// Experiments are not an AI role and may legitimately run far longer.
 pub const MAX_TIMEOUT_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+/// Stage 9D bounded-autonomy defaults. Zero boundaries declared makes the budget
+/// inert; a nonzero budget still hard-caps distinct planner wakeups per experiment.
+pub const DEFAULT_MAX_PLANNER_WAKEUPS: u32 = 3;
+pub const MAX_PLANNER_WAKEUPS: u32 = 20;
+/// Boundaries per experiment. Small and fixed: Stage 9C is a deterministic
+/// scalar-comparison policy, not a place to declare hundreds of rules.
+pub const MAX_DECISION_BOUNDARIES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -52,6 +61,11 @@ pub struct ExperimentAttempt {
     /// and is separate from the process `failure` outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ingestion_error: Option<String>,
+    /// A factual controller-side Stage 9C/9D evaluation failure (e.g. a transient I/O
+    /// error persisting a decision or minting a wakeup). Never changes process state;
+    /// the next poll retries evaluation from currently-persisted facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_evaluation_error: Option<String>,
     pub state: ExperimentState,
 }
 
@@ -83,6 +97,18 @@ pub struct ExperimentRun {
     pub created_at_ms: u64,
     pub state: ExperimentState,
     pub attempts: Vec<ExperimentAttempt>,
+    /// Stage 9C decision boundaries, frozen at creation. Never mutated afterward;
+    /// `boundaries_hash` lets a decision prove which declaration produced it even
+    /// if this experiment is inspected long after boundaries could (in principle)
+    /// have looked different in a newer client.
+    #[serde(default)]
+    pub decision_boundaries: Vec<BoundaryDefinition>,
+    #[serde(default)]
+    pub boundaries_hash: String,
+    /// Stage 9D bound on distinct planner wakeups this experiment may ever create.
+    /// Immutable; nothing (including planner output) may raise it later.
+    #[serde(default)]
+    pub max_planner_wakeups: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +119,8 @@ pub struct ExperimentObservation {
     /// observes UNKNOWN, identically to Stage 6 runtime-job liveness.
     pub liveness: crate::local::observe::Liveness,
     pub events: ExperimentEventSummary,
+    /// Stage 9C/9D: decision/wakeup counts and whether operator attention is required.
+    pub control: wakeups::ExperimentControlSummary,
 }
 
 pub struct ExperimentInput {
@@ -100,6 +128,8 @@ pub struct ExperimentInput {
     pub network: bool,
     pub env_passthrough: Vec<String>,
     pub timeout_ms: u64,
+    pub decision_boundaries: Vec<BoundaryDefinition>,
+    pub max_planner_wakeups: u32,
 }
 
 fn save_experiment(
@@ -169,7 +199,7 @@ fn journal_experiment(
     Ok(())
 }
 
-fn load_experiment(
+pub(super) fn load_experiment(
     store: &Store,
     info: &RepositoryInfo,
     id: &ExperimentId,
@@ -221,10 +251,12 @@ fn observation(
         Liveness::Unknown
     };
     let events = store.experiment_event_summary(info, &run.experiment_id)?;
+    let control = wakeups::summary(store, info, &run)?;
     Ok(ExperimentObservation {
         run,
         liveness,
         events,
+        control,
     })
 }
 
@@ -290,6 +322,27 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// Explicit, standalone Stage 9C/9D reconciliation: evaluates any not-yet-scanned
+    /// persisted facts and creates any missing wakeups, without waiting for (or
+    /// requiring) a live `drive()` poll loop. Safe to call at any time, including
+    /// concurrently from a second connection/controller racing the same experiment -
+    /// idempotent for the same reasons the inline calls from `drive()` are: a durable
+    /// per-attempt cursor, `INSERT OR IGNORE` decisions, and `UNIQUE(decision_id)`
+    /// wakeups. This is a mutating operation (it authorizes itself and may write), so
+    /// it is distinct from the read-only `experiment status`/`boundaries`/`decisions`/
+    /// `wakeups` queries.
+    pub fn experiment_reconcile(&mut self, root: &Path, id: &ExperimentId) -> Result<()> {
+        let info = graph::checked_workspace(self, root)?;
+        let run = load_experiment(self, &info, id)?
+            .ok_or_else(|| Error::Invalid("experiment not found".into()))?;
+        let _permit = auth::authorize(
+            &self.connection,
+            &info.repository_id,
+            id.as_str(),
+            id.as_str(),
+        )?;
+        evaluate_decisions_and_wakeups(self, &info, &run)
+    }
 }
 
 /// Rejects a cwd that escapes the workspace root before anything is persisted or
@@ -344,6 +397,18 @@ fn build_spec(
     })
 }
 
+/// Stage 9C then Stage 9D, in that order: a decision must exist durably before any
+/// wakeup can reference it. Both stages are pure, idempotent, and operate only on
+/// already-committed facts; neither ever kills, restarts, or launches a process.
+fn evaluate_decisions_and_wakeups(
+    store: &mut Store,
+    info: &RepositoryInfo,
+    run: &ExperimentRun,
+) -> Result<()> {
+    decisions::evaluate(store, info, run)?;
+    wakeups::reconcile(store, info, run)
+}
+
 fn drive(
     store: &mut Store,
     paths: &paths::MachinePaths,
@@ -377,9 +442,16 @@ fn drive(
         evidence: None,
         failure: None,
         event_ingestion_error: None,
+        decision_evaluation_error: None,
         state: ExperimentState::Running,
     });
     save_experiment(store, info, run, "EXPERIMENT_ATTEMPT_STARTED")?;
+    // Heals any Stage 9C/9D crash window left by a prior attempt (a decision
+    // persisted but not yet woken, say) before this attempt contributes anything
+    // new. Idempotent: every persisted fact is checked, nothing is ever re-fired.
+    let mut decision_evaluation_error = evaluate_decisions_and_wakeups(store, info, run)
+        .err()
+        .map(|e| format!("decision evaluation retry pending: {e}"));
     let mut process = match spec.recheck_policy().and_then(|_| launcher.launch(&spec)) {
         Ok(p) => p,
         Err(e) => {
@@ -422,6 +494,9 @@ fn drive(
             false,
         ) {
             event_ingestion_error = Some(format!("event ingestion retry pending: {error}"));
+        }
+        if let Err(error) = evaluate_decisions_and_wakeups(store, info, run) {
+            decision_evaluation_error = Some(format!("decision evaluation retry pending: {error}"));
         }
         if !cancellation_checked && cancel_requested(store, info, &run.experiment_id)? {
             cancellation_checked = true;
@@ -492,9 +567,16 @@ fn drive(
                 break;
             }
         };
+        if let Err(error) = evaluate_decisions_and_wakeups(store, info, run) {
+            decision_evaluation_error = Some(format!("decision evaluation failed: {error}"));
+        }
         if caught_up {
             break;
         }
+    }
+    // One last pass over whatever the final drain just caught up on.
+    if let Err(error) = evaluate_decisions_and_wakeups(store, info, run) {
+        decision_evaluation_error = Some(format!("decision evaluation failed: {error}"));
     }
     let stdout = artifacts.put(&output.stdout)?;
     let stderr = artifacts.put(&output.stderr)?;
@@ -556,10 +638,23 @@ fn drive(
         attempt.evidence = Some(EvidenceRef(evidence_id));
         attempt.failure = output.failure.clone();
         attempt.event_ingestion_error = event_ingestion_error;
+        attempt.decision_evaluation_error = decision_evaluation_error;
         attempt.state = finished_state;
     }
     run.state = finished_state;
     save_experiment(store, info, run, "EXPERIMENT_FINISHED")?;
+    // The attempt is now terminal in the persisted record; a last reconciliation
+    // pass still runs so a decision fired by the final drain above always gets its
+    // wakeup attempt before `drive` returns, without waiting on a future restart.
+    if let Err(error) = evaluate_decisions_and_wakeups(store, info, run) {
+        journal_experiment(
+            store,
+            info,
+            run,
+            "EXPERIMENT_DECISION_EVALUATION_FAILED",
+            error.to_string(),
+        )?;
+    }
     Ok(())
 }
 
@@ -592,8 +687,11 @@ impl<'a> ExperimentRuntime<'a> {
             input.network,
             input.env_passthrough,
             input.timeout_ms,
+            input.decision_boundaries,
+            input.max_planner_wakeups,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn run_project_command(
         &mut self,
         root: &Path,
@@ -601,6 +699,8 @@ impl<'a> ExperimentRuntime<'a> {
         network: bool,
         env_passthrough: Vec<String>,
         timeout_ms: u64,
+        decision_boundaries: Vec<BoundaryDefinition>,
+        max_planner_wakeups: u32,
     ) -> Result<ExperimentRun> {
         self.start(
             root,
@@ -608,8 +708,11 @@ impl<'a> ExperimentRuntime<'a> {
             network,
             env_passthrough,
             timeout_ms,
+            decision_boundaries,
+            max_planner_wakeups,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn start(
         &mut self,
         root: &Path,
@@ -617,6 +720,8 @@ impl<'a> ExperimentRuntime<'a> {
         network: bool,
         env_passthrough: Vec<String>,
         timeout_ms: u64,
+        decision_boundaries: Vec<BoundaryDefinition>,
+        max_planner_wakeups: u32,
     ) -> Result<ExperimentRun> {
         require(
             (1..=MAX_TIMEOUT_MS).contains(&timeout_ms),
@@ -637,6 +742,8 @@ impl<'a> ExperimentRuntime<'a> {
         };
         command.validate()?;
         resolve_cwd(&info, &command)?;
+        decisions::validate_boundaries(&policy, &decision_boundaries, max_planner_wakeups)?;
+        let boundaries_hash = planning::hash(&decision_boundaries)?;
         let hex: String =
             self.store
                 .connection
@@ -660,6 +767,9 @@ impl<'a> ExperimentRuntime<'a> {
             created_at_ms: now_ms()?,
             state: ExperimentState::Created,
             attempts: vec![],
+            decision_boundaries,
+            boundaries_hash,
+            max_planner_wakeups,
         };
         save_experiment(self.store, &info, &run, "EXPERIMENT_CREATED")?;
         drive(

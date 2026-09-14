@@ -583,6 +583,19 @@ fn experiment_boundaries_are_generic_and_finite() {
         ExperimentBoundary::EpochComplete,
         ExperimentBoundary::MetricThreshold {
             metric: "loss".into(),
+            tags: BTreeMap::new(),
+            comparison: MetricComparison::LessThan,
+            value: 0.1,
+        },
+        ExperimentBoundary::MetricThreshold {
+            metric: "loss".into(),
+            tags: BTreeMap::new(),
+            comparison: MetricComparison::Equal,
+            value: 0.0,
+        },
+        ExperimentBoundary::MetricThreshold {
+            metric: "loss".into(),
+            tags: BTreeMap::from([("phase".to_string(), "val".to_string())]),
             comparison: MetricComparison::LessThan,
             value: 0.1,
         },
@@ -603,6 +616,120 @@ fn experiment_boundaries_are_generic_and_finite() {
         .decision_boundaries
         .push(experiment.decision_boundaries[0].clone());
     assert!(experiment.validate().is_err());
+}
+
+#[test]
+fn legacy_boundary_definition_json_without_action_defaults_to_record_only() {
+    // A document written before Stage 9D's `action` field existed: only `boundary_id`
+    // and `condition`, exactly as Stage 0's original contract allowed.
+    let legacy = json!({
+        "boundary_id": "legacy-threshold",
+        "condition": {"kind": "METRIC_THRESHOLD", "metric": "loss", "comparison": "LESS_THAN", "value": 0.5}
+    });
+    let boundary: BoundaryDefinition = decode(legacy.clone());
+    assert_eq!(boundary.action, BoundaryAction::RecordOnly);
+    boundary.validate().unwrap();
+    // Canonical serialization of the parsed value may (and does) emit the action
+    // explicitly; that is not a compatibility break, just normal round-tripping.
+    let reencoded: Value = serde_json::to_value(&boundary).unwrap();
+    assert_eq!(reencoded["action"], json!({"kind": "RECORD_ONLY"}));
+    // The legacy document and its "spelled out" equivalent parse to the same value.
+    let mut spelled_out = legacy.clone();
+    spelled_out
+        .as_object_mut()
+        .unwrap()
+        .insert("action".into(), json!({"kind": "RECORD_ONLY"}));
+    let explicit: BoundaryDefinition = decode(spelled_out);
+    assert_eq!(boundary, explicit);
+    // A malformed/unknown action is still rejected, not silently defaulted.
+    let mut bad = legacy;
+    bad.as_object_mut()
+        .unwrap()
+        .insert("action".into(), json!({"kind": "SELF_DESTRUCT"}));
+    assert!(serde_json::from_value::<BoundaryDefinition>(bad).is_err());
+    // A planner-review action still deserializes and validates normally alongside the
+    // now-defaulted field.
+    let planner = json!({
+        "boundary_id": "planner-threshold",
+        "condition": {"kind": "METRIC_THRESHOLD", "metric": "loss", "comparison": "LESS_THAN", "value": 0.5},
+        "action": {"kind": "REQUIRE_PLANNER_REVIEW", "verification_ref": "check:integration"}
+    });
+    let boundary: BoundaryDefinition = decode(planner);
+    boundary.validate().unwrap();
+    assert_eq!(
+        boundary.action,
+        BoundaryAction::RequirePlannerReview {
+            verification_ref: "check:integration".into()
+        }
+    );
+}
+
+#[test]
+fn legacy_experiment_spec_with_boundaries_but_no_action_field_still_validates() {
+    let legacy = json!({
+        "version": "1", "experiment_id": "experiment:1", "command": command(),
+        "input_refs": [], "source_state": null, "metric_refs": [], "output_refs": [],
+        "decision_boundaries": [
+            {"boundary_id": "exit", "condition": {"kind": "PROCESS_EXIT"}},
+            {"boundary_id": "threshold", "condition": {"kind": "METRIC_THRESHOLD", "metric": "loss", "comparison": "LESS_THAN", "value": 0.5}}
+        ]
+    });
+    let spec: ExperimentSpec = decode(legacy);
+    spec.validate().unwrap();
+    assert!(
+        spec.decision_boundaries
+            .iter()
+            .all(|b| b.action == BoundaryAction::RecordOnly)
+    );
+}
+
+#[test]
+fn legacy_metric_threshold_json_without_tags_defaults_to_empty_and_still_hashes_deterministically()
+{
+    let legacy = json!({"kind": "METRIC_THRESHOLD", "metric": "loss", "comparison": "LESS_THAN", "value": 0.5});
+    let condition: ExperimentBoundary = decode(legacy);
+    match &condition {
+        ExperimentBoundary::MetricThreshold { tags, .. } => assert!(tags.is_empty()),
+        other => panic!("expected MetricThreshold, got {other:?}"),
+    }
+    condition.validate().unwrap();
+    // Same condition, tags spelled out empty explicitly: identical value.
+    let explicit = ExperimentBoundary::MetricThreshold {
+        metric: "loss".into(),
+        tags: BTreeMap::new(),
+        comparison: MetricComparison::LessThan,
+        value: 0.5,
+    };
+    assert_eq!(condition, explicit);
+    assert_eq!(
+        serde_json::to_string(&condition).unwrap(),
+        serde_json::to_string(&explicit).unwrap()
+    );
+}
+
+#[test]
+fn boundary_actions_are_bounded_and_reject_blank_verification_refs() {
+    for action in [
+        BoundaryAction::RecordOnly,
+        BoundaryAction::RequirePlannerReview {
+            verification_ref: "check:integration".into(),
+        },
+    ] {
+        action.validate().unwrap();
+        roundtrip(action);
+    }
+    assert!(
+        BoundaryAction::RequirePlannerReview {
+            verification_ref: "".into(),
+        }
+        .validate()
+        .is_err()
+    );
+    let mut boundary = decode::<ExperimentSpec>(samples()["experiment"].clone())
+        .decision_boundaries
+        .remove(0);
+    boundary.boundary_id = "".into();
+    assert!(boundary.validate().is_err());
 }
 
 fn assert_local_refs_resolve(node: &Value, root: &Value) {

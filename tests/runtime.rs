@@ -2121,7 +2121,7 @@ fn v6_runtime_migration_is_additive_atomic_and_missing_guards_fail_closed() {
     );
     c.execute_batch("DROP TABLE runtime_jobs").unwrap();
     drop(c);
-    assert_eq!(f.store().status().unwrap().schema_version, 9);
+    assert_eq!(f.store().status().unwrap().schema_version, 11);
     assert_eq!(
         f.store()
             .execution_plan(&f.root, &p.packet.plan_id)
@@ -2607,7 +2607,7 @@ fn old_v7_runtime_metadata_remains_inspectable_without_silent_ownership_backfill
         c.query_row::<String, _, _>("SELECT record_json FROM runtime_runs", [], |r| r.get(0))
             .unwrap()
     );
-    assert_eq!(f.store().status().unwrap().schema_version, 9);
+    assert_eq!(f.store().status().unwrap().schema_version, 11);
     assert!(
         f.store()
             .runtime_jobs(&f.root, None)

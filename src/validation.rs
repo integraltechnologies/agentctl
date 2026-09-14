@@ -617,13 +617,51 @@ impl Validate for ExperimentBoundary {
                 ensure(*timeout_ms > 0, "boundary.timeout_ms", "must be positive")?
             }
             Self::NanMetric { metric } => nonempty(metric, "boundary.metric")?,
-            Self::MetricThreshold { metric, value, .. } => {
+            Self::MetricThreshold {
+                metric,
+                value,
+                tags,
+                ..
+            } => {
                 nonempty(metric, "boundary.metric")?;
                 ensure(value.is_finite(), "boundary.value", "must be finite")?;
+                ensure(
+                    tags.len() <= 16,
+                    "boundary.tags",
+                    "at most 16 series-selector tags",
+                )?;
+                for (key, val) in tags {
+                    nonempty(key, "boundary.tags")?;
+                    nonempty(val, "boundary.tags")?;
+                    ensure(
+                        key.len() <= 64 && val.len() <= 256,
+                        "boundary.tags",
+                        "key at most 64 bytes, value at most 256 bytes",
+                    )?;
+                }
             }
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl Validate for BoundaryAction {
+    fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::RecordOnly => Ok(()),
+            Self::RequirePlannerReview { verification_ref } => {
+                nonempty(verification_ref, "boundary.action.verification_ref")
+            }
+        }
+    }
+}
+
+impl Validate for BoundaryDefinition {
+    fn validate(&self) -> Result<(), ValidationError> {
+        nonempty(&self.boundary_id, "boundary.boundary_id")?;
+        self.condition.validate()?;
+        self.action.validate()
     }
 }
 
@@ -642,13 +680,12 @@ impl Validate for ExperimentSpec {
         }
         let mut ids = BTreeSet::new();
         for boundary in &self.decision_boundaries {
-            nonempty(&boundary.boundary_id, "boundary.boundary_id")?;
+            boundary.validate()?;
             ensure(
                 ids.insert(&boundary.boundary_id),
                 "boundary.boundary_id",
                 "duplicate boundary",
             )?;
-            boundary.condition.validate()?;
         }
         Ok(())
     }
