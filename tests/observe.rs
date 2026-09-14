@@ -363,3 +363,128 @@ fn legacy_snapshot_missing_liveness_defaults_unknown_and_remains_visible() {
             .contains("Liveness UNKNOWN")
     );
 }
+
+#[test]
+fn agenttop_neutralizes_hostile_dynamic_fields_without_mutating_snapshot() {
+    const ESC: &str = "\x1b[31mRED\x1b[0m";
+    const NEWLINES: &str = "line1\nline2\rline3";
+    const CONTROLS: &str = "a\tb\u{7}c";
+    const BIDI: &str = "safe\u{202e}evil";
+    const UNICODE: &str = "café 日本語 ok";
+
+    let session = Session {
+        id: "s".into(),
+        ownership_known: true,
+        repository_id: "repo".into(),
+        workspace_id: "ws".into(),
+        root: "/workspace".into(),
+        supervisor_id: None,
+        plans: vec![],
+        current_plan: None,
+        title: ESC.into(),
+        state: "RUNNING".into(),
+        verified: 0,
+        task_count: 1,
+        progress_complete: false,
+        correction_round: None,
+        blocker: Some(Blocker {
+            kind: "hostile".into(),
+            description: BIDI.into(),
+            dependencies: vec![],
+        }),
+        activity: NEWLINES.into(),
+        check: Some(CONTROLS.into()),
+        last_event: None,
+    };
+    let mut a = agent("hostile", None, "s");
+    a.role = UNICODE.into();
+    a.provider = Some(ESC.into());
+
+    let task = Task {
+        id: "t1".into(),
+        repository_id: "repo".into(),
+        workspace_id: "ws".into(),
+        session_id: Some("s".into()),
+        plan_id: "p1".into(),
+        objective: BIDI.into(),
+        dependencies: vec![],
+        lifecycle: "ACTIVE".into(),
+        presentation: NEWLINES.into(),
+        blocker: None,
+        executor_job: None,
+        verifier_job: None,
+        attempts_in_view: 0,
+        last_event: None,
+    };
+
+    let mut snapshot = Snapshot {
+        sessions: vec![session],
+        agents: vec![a],
+        tasks: vec![task],
+        ..Default::default()
+    };
+    snapshot.warnings = vec![CONTROLS.into()];
+    let baseline_json = serde_json::to_string(&snapshot).unwrap();
+
+    let mut app = App::new(snapshot);
+    let agents_view = agenttop::render_text(&app, 120, 40).unwrap();
+
+    // 1. ANSI ESC sequence is neutralized but the visible payload stays legible.
+    assert!(!agents_view.contains('\u{1b}'));
+    assert!(agents_view.contains("\\u{1b}"));
+    assert!(agents_view.contains("RED"));
+
+    // 2. newline/carriage return cannot forge additional rendered lines: all
+    // three fragments stay on the single row the hostile value occupies.
+    let activity_row = agents_view
+        .lines()
+        .find(|l| l.contains("line1"))
+        .expect("session activity row rendered");
+    assert!(activity_row.contains("line2") && activity_row.contains("line3"));
+    assert!(agents_view.contains("\\u{a}"));
+    assert!(agents_view.contains("\\u{d}"));
+
+    // 3. tab/BEL control characters are escaped, not raw.
+    assert!(!agents_view.contains('\u{7}'));
+    assert!(agents_view.contains("\\u{7}"));
+    assert!(agents_view.contains("\\u{9}"));
+
+    // 4. bidi override character is neutralized.
+    assert!(!agents_view.contains('\u{202e}'));
+    assert!(agents_view.contains("\\u{202e}"));
+
+    // 5. plain ASCII/Unicode text remains legible and untouched (CJK
+    // characters land in separate terminal cells because they are
+    // double-width, so check each grapheme rather than the substring).
+    assert!(agents_view.contains("café"));
+    for c in ['日', '本', '語'] {
+        assert!(agents_view.contains(c), "missing {c:?} in {agents_view:?}");
+    }
+    assert!(agents_view.contains(" ok "));
+
+    // Same checks against the task-focused panel (task objective/presentation).
+    app.action(Action::Panel);
+    let tasks_view = agenttop::render_text(&app, 120, 40).unwrap();
+    assert!(!tasks_view.contains('\u{202e}'));
+    assert!(tasks_view.contains("\\u{202e}"));
+    let presentation_row = tasks_view
+        .lines()
+        .find(|l| l.contains("line1"))
+        .expect("task presentation row rendered");
+    assert!(presentation_row.contains("line2") && presentation_row.contains("line3"));
+
+    // 6. sanitization is presentation-only: canonical snapshot/model data (and
+    // its JSON serialization) is byte-for-byte unchanged after rendering.
+    assert_eq!(app.snapshot.sessions[0].title, ESC);
+    assert_eq!(
+        app.snapshot.sessions[0]
+            .blocker
+            .as_ref()
+            .unwrap()
+            .description,
+        BIDI
+    );
+    assert_eq!(app.snapshot.agents[0].role, UNICODE);
+    assert_eq!(app.snapshot.tasks[0].objective, BIDI);
+    assert_eq!(serde_json::to_string(&app.snapshot).unwrap(), baseline_json);
+}

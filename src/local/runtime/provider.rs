@@ -1,5 +1,6 @@
 use super::process::{NativeProcess, ProcessOutput, ProcessSpec, RunningProcess};
 use super::*;
+use crate::local::security::json as strict_json;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +98,7 @@ impl ProviderAdapter for CodexAdapter {
     ) -> Result<Box<dyn RunningProcess>> {
         process.executable = self.executable.clone();
         process.input = prompt(input)?;
+        process.class = crate::local::security::WorkerClass::ProviderFrontend;
         self.authentication
             .configure(&self.executable, "codex", &mut process)?;
         process.args = vec![
@@ -148,7 +150,7 @@ impl ProviderAdapter for CodexAdapter {
         Ok(Box::new(NativeProcess::launch(&process)?))
     }
     fn collect(&self, output: &ProcessOutput) -> Result<Value> {
-        Ok(serde_json::from_slice(&output.stdout)?)
+        Ok(strict_json::from_slice(&output.stdout)?)
     }
 }
 impl ProviderAdapter for ClaudeAdapter {
@@ -172,6 +174,7 @@ impl ProviderAdapter for ClaudeAdapter {
     ) -> Result<Box<dyn RunningProcess>> {
         process.executable = self.executable.clone();
         process.input = prompt(input)?;
+        process.class = crate::local::security::WorkerClass::ProviderFrontend;
         self.authentication
             .configure(&self.executable, "claude", &mut process)?;
         process.args = vec![
@@ -219,7 +222,7 @@ impl ProviderAdapter for ClaudeAdapter {
         Ok(Box::new(NativeProcess::launch(&process)?))
     }
     fn collect(&self, output: &ProcessOutput) -> Result<Value> {
-        let response: Value = serde_json::from_slice(&output.stdout)?;
+        let response: Value = strict_json::from_slice(&output.stdout)?;
         require(
             response.get("is_error").and_then(Value::as_bool) != Some(true),
             "Claude reported a failed result",
@@ -227,7 +230,7 @@ impl ProviderAdapter for ClaudeAdapter {
         if let Some(value) = response.get("structured_output") {
             return Ok(value.clone());
         }
-        Ok(serde_json::from_str(
+        Ok(strict_json::from_str(
             response
                 .get("result")
                 .and_then(Value::as_str)

@@ -3315,6 +3315,8 @@ fn observe_multiple_sessions_same_provider_and_malformed_legacy_metadata() {
     assert!(local::agenttop::render_text(&local::agenttop::App::new(snapshot), 35, 12).is_ok());
 }
 
+// Executes a `#!/bin/sh` provider fixture with Unix permission bits.
+#[cfg(unix)]
 #[test]
 fn native_auth_preflight_prefers_provider_login_without_importing_api_environment() {
     use local::runtime::credentials::*;

@@ -10,6 +10,7 @@ use super::experiment_decisions as decisions;
 use super::experiment_events::EventIngestor;
 use super::experiment_wakeups as wakeups;
 use super::*;
+use crate::local::security::{SecurityConfig, WorkerClass, validate_passthrough_names};
 use process::{
     CancellationOutcome, CheckLauncher, NativeChecks, ProcessSpec, ScratchCleanup, WorkspaceLease,
 };
@@ -367,6 +368,7 @@ fn build_spec(
     run: &ExperimentRun,
     lease: &WorkspaceLease,
     attempt: u32,
+    security: &SecurityConfig,
 ) -> Result<ProcessSpec> {
     let scratch = paths
         .data_root
@@ -393,6 +395,9 @@ fn build_spec(
         protected: policy.protected.clone(),
         credential_env: run.env_passthrough.clone(),
         experiment_event_file: Some(scratch.join(format!("attempt-{attempt}-events.jsonl"))),
+        class: WorkerClass::Tool,
+        cache_root: paths.cache_root.clone(),
+        security: security.tightened(&policy.security),
         lock_fd: lease.fd(),
     })
 }
@@ -409,6 +414,7 @@ fn evaluate_decisions_and_wakeups(
     wakeups::reconcile(store, info, run)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive(
     store: &mut Store,
     paths: &paths::MachinePaths,
@@ -416,6 +422,7 @@ fn drive(
     artifacts: &Artifacts,
     info: &RepositoryInfo,
     policy: &ProjectConfig,
+    security: &SecurityConfig,
     run: &mut ExperimentRun,
 ) -> Result<()> {
     let lease = WorkspaceLease::acquire(
@@ -425,11 +432,12 @@ fn drive(
             .join(info.workspace_id.as_str()),
     )?;
     let attempt_number = run.attempts.len() as u32 + 1;
-    let spec = build_spec(paths, info, policy, run, &lease, attempt_number)?;
+    let spec = build_spec(paths, info, policy, run, &lease, attempt_number, security)?;
     let mut event_ingestor = EventIngestor::create(
         spec.experiment_event_file
             .as_ref()
             .expect("experiment specs have an event file"),
+        spec.security.experiment_events,
     )?;
     let _scratch = ScratchCleanup(spec.scratch.clone());
     run.state = ExperimentState::Running;
@@ -574,6 +582,17 @@ fn drive(
             break;
         }
     }
+    // Telemetry storage being capped is an ingestion-health fact, never a
+    // change to the process outcome.
+    if let Some((events, bytes)) = event_ingestor.volume_cap() {
+        let cap = format!(
+            "EVENT_VOLUME_CAP_EXCEEDED: at most {events} events / {bytes} bytes are recorded per attempt; later events were not recorded or evaluated"
+        );
+        event_ingestion_error = Some(match event_ingestion_error {
+            Some(existing) => format!("{cap}; {existing}"),
+            None => cap,
+        });
+    }
     // One last pass over whatever the final drain just caught up on.
     if let Err(error) = evaluate_decisions_and_wakeups(store, info, run) {
         decision_evaluation_error = Some(format!("decision evaluation failed: {error}"));
@@ -665,6 +684,7 @@ pub struct ExperimentRuntime<'a> {
     paths: paths::MachinePaths,
     artifacts: Artifacts,
     launcher: Box<dyn CheckLauncher + Send>,
+    security: SecurityConfig,
 }
 impl<'a> ExperimentRuntime<'a> {
     pub fn new(store: &'a mut Store, paths: paths::MachinePaths) -> Result<Self> {
@@ -674,7 +694,14 @@ impl<'a> ExperimentRuntime<'a> {
             paths,
             artifacts,
             launcher: Box::new(NativeChecks),
+            security: SecurityConfig::default(),
         })
+    }
+    /// Machine-owned `[runtime.security]`; defaults apply when not supplied.
+    pub fn with_security(mut self, security: SecurityConfig) -> Result<Self> {
+        security.validate()?;
+        self.security = security;
+        Ok(self)
     }
     pub fn with_check_launcher(mut self, launcher: Box<dyn CheckLauncher + Send>) -> Self {
         self.launcher = launcher;
@@ -741,6 +768,7 @@ impl<'a> ExperimentRuntime<'a> {
             }
         };
         command.validate()?;
+        validate_passthrough_names(&env_passthrough)?;
         resolve_cwd(&info, &command)?;
         decisions::validate_boundaries(&policy, &decision_boundaries, max_planner_wakeups)?;
         let boundaries_hash = planning::hash(&decision_boundaries)?;
@@ -779,6 +807,7 @@ impl<'a> ExperimentRuntime<'a> {
             &self.artifacts,
             &info,
             &policy,
+            &self.security,
             &mut run,
         )?;
         Ok(run)
@@ -835,6 +864,7 @@ impl<'a> ExperimentRuntime<'a> {
             &self.artifacts,
             &info,
             &policy,
+            &self.security,
             &mut run,
         )?;
         Ok(run)

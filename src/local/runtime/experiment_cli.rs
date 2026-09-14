@@ -115,7 +115,7 @@ fn human_run(run: &ExperimentRun) -> String {
 }
 fn human_observation(o: &ExperimentObservation) -> String {
     format!(
-        "{}  liveness={:?}  events={}  ingestion_errors={}  decisions={}  wakeups={}/{}  attention_required={}",
+        "{}  liveness={:?}  events={}  ingestion_errors={}  decisions={}  wakeups={}/{}  attention_required={}{}",
         human_run(&o.run),
         o.liveness,
         o.events.event_count,
@@ -123,7 +123,12 @@ fn human_observation(o: &ExperimentObservation) -> String {
         o.control.decision_count,
         o.control.wakeups_created,
         o.control.wakeups_budget,
-        o.control.attention_required
+        o.control.attention_required,
+        if o.events.event_volume_capped {
+            "  EVENT_VOLUME_CAP_EXCEEDED (later events not recorded)"
+        } else {
+            ""
+        }
     )
 }
 
@@ -207,6 +212,7 @@ fn human_event(event: &ExperimentRuntimeEvent) -> String {
 pub(crate) fn run(
     store: &mut Store,
     paths: &paths::MachinePaths,
+    security: &crate::local::security::SecurityConfig,
     command: &str,
     args: &[&str],
     json_mode: bool,
@@ -273,7 +279,8 @@ pub(crate) fn run(
                 args: argv,
                 cwd: cwd.unwrap_or_else(|| ".".into()),
             });
-            let mut runtime = ExperimentRuntime::new(store, paths.clone())?;
+            let mut runtime =
+                ExperimentRuntime::new(store, paths.clone())?.with_security(security.clone())?;
             let run = if let Some(key) = project_command {
                 runtime.run_project_command(
                     &root,
@@ -305,7 +312,8 @@ pub(crate) fn run(
                 "experiment restart requires exactly one ID",
             )?;
             let id = ExperimentId::new(args[0]).map_err(Error::Invalid)?;
-            let mut runtime = ExperimentRuntime::new(store, paths.clone())?;
+            let mut runtime =
+                ExperimentRuntime::new(store, paths.clone())?.with_security(security.clone())?;
             let run = runtime.restart(&root, &id)?;
             output(json_mode, &run, &human_run(&run))
         }
@@ -436,9 +444,9 @@ pub(crate) fn run(
 }
 fn output(json_mode: bool, value: &impl serde::Serialize, human: &str) -> Result<()> {
     if json_mode {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        println!("{}", crate::local::terminal::json(value)?);
     } else {
-        println!("{human}");
+        println!("{}", crate::local::terminal::human(human));
     }
     Ok(())
 }

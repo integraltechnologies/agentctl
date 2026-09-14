@@ -1,8 +1,9 @@
 use super::*;
+use crate::local::security::{self, tree::TreeOutcome};
 use std::{
     fs::File,
     io::{Read, Write},
-    process::{Child, Command, Stdio},
+    process::Child,
     thread::JoinHandle,
     time::Instant,
 };
@@ -31,9 +32,15 @@ pub struct ProcessSpec {
     /// Attempt-owned structured JSONL channel. This is not a credential and is
     /// exposed only to experiment processes that explicitly opt into Stage 9B.
     pub experiment_event_file: Option<PathBuf>,
+    /// Provider frontend (network + native auth) or untrusted tool (neither).
+    pub class: security::WorkerClass,
+    /// agentctl cache root; like the data/config roots it is always denied.
+    pub cache_root: PathBuf,
+    /// Effective machine-owned security policy (a project can only tighten it).
+    pub security: security::SecurityConfig,
     /// Inherited by the entire child family so a controller crash cannot release
     /// the workspace lease while an orphan can still edit files.
-    pub(super) lock_fd: Option<i32>,
+    pub(crate) lock_fd: Option<i32>,
 }
 #[derive(Debug, Clone)]
 pub struct ProcessOutput {
@@ -94,6 +101,7 @@ pub struct NativeProcess {
     live_child: bool,
     timeout_termination_attempted: bool,
     secrets: Vec<String>,
+    tree: security::tree::ProcessTree,
 }
 impl ProcessSpec {
     pub fn recheck_policy(&self) -> Result<()> {
@@ -128,72 +136,24 @@ fn drain(mut stream: impl Read + Send + 'static) -> JoinHandle<std::io::Result<V
     })
 }
 impl NativeProcess {
+    /// The only native spawn path for providers, checks and experiments: the spec
+    /// is compiled into an OS-neutral `SecurityPolicy`, the active platform
+    /// backend must enforce every required capability (fail closed), and only
+    /// then is the process started inside that backend's confinement.
     pub fn launch(spec: &ProcessSpec) -> Result<Self> {
-        paths::ensure_directory(&spec.scratch)?;
-        let home = spec.scratch.join("home");
-        paths::ensure_directory(&home)?;
-        let mut command = sandbox_command(spec)?;
-        command
-            .current_dir(&spec.cwd)
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("HOME", &home)
-            .env("TMPDIR", &spec.scratch)
-            .env("CODEX_HOME", home.join(".codex"))
-            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
-            .env("XDG_CONFIG_HOME", &home)
-            .env("XDG_CACHE_HOME", &home)
-            .env("XDG_DATA_HOME", &home)
-            .env("CARGO_TARGET_DIR", spec.scratch.join("target"))
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("LANG", "en_US.UTF-8")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(path) = &spec.experiment_event_file {
-            command.env("AGENTCTL_EVENT_FILE", path);
-        }
-        let mut secrets = vec![];
-        if let Some(native) = &spec.native_auth {
-            native.environment(&mut command);
-        }
-        if let Some((source, target)) = &spec.api_key {
-            let value = std::env::var(source)
-                .map_err(|_| Error::Invalid("configured API-key environment disappeared".into()))?;
-            command.env(target, &value);
-            secrets.push(value);
-        }
-        for name in &spec.credential_env {
-            if let Ok(value) = std::env::var(name) {
-                command.env(name, &value);
-                if !value.is_empty() {
-                    secrets.push(value);
-                }
-            }
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-            let lock_fd = spec.lock_fd;
-            // SAFETY: only async-signal-safe fcntl is called before exec. The owned
-            // lease descriptor remains live in the parent for the whole run.
-            unsafe {
-                command.pre_exec(move || {
-                    if let Some(fd) = lock_fd {
-                        if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                    Ok(())
-                });
-            }
-        }
+        // Canonical policy drift is the first pre-spawn gate, then confinement.
         spec.recheck_policy()?;
-        let mut child = command.spawn()?;
+        paths::ensure_directory(&spec.scratch)?;
+        paths::ensure_directory(&spec.scratch.join("home"))?;
+        let policy = security::compile(spec)?;
+        spec.recheck_policy()?;
+        let security::Spawned { mut child, tree } = security::launch(
+            &policy,
+            &security::Launch {
+                cwd: &spec.cwd,
+                lock_fd: spec.lock_fd,
+            },
+        )?;
         let stdout = Some(drain(child.stdout.take().expect("piped stdout")));
         let stderr = Some(drain(child.stderr.take().expect("piped stderr")));
         let mut stdin = child.stdin.take().expect("piped stdin");
@@ -210,23 +170,19 @@ impl NativeProcess {
             reaped: false,
             live_child: false,
             timeout_termination_attempted: false,
-            secrets,
+            secrets: policy.secrets,
+            tree,
         })
     }
+    /// Process group on Unix, Job Object on Windows.
     fn stop_family(&mut self) -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            // SAFETY: negative PID addresses only our freshly spawned process group.
-            let result = unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
-            if result == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        {
-            self.child.kill()
-        }
+        self.tree.terminate()
+    }
+    fn add_failure(&mut self, text: String) {
+        self.failure = Some(match self.failure.take() {
+            Some(existing) => format!("{existing}; {text}"),
+            None => text,
+        });
     }
 }
 impl RunningProcess for NativeProcess {
@@ -273,8 +229,34 @@ impl RunningProcess for NativeProcess {
                 return Ok(None);
             }
         };
-        // Remove any background descendants before accepting output/source state.
-        let _ = self.stop_family();
+        // The direct child exiting proves nothing about its descendants: kill the
+        // group, hunt escapees, and report any cleanup that cannot be proven.
+        match self.tree.reap() {
+            TreeOutcome::Clean => {}
+            TreeOutcome::EscapedTerminated(count) => {
+                if self.failure.is_none() {
+                    self.failure = Some(format!(
+                        "process tree: {count} descendant(s) escaped the job's process group and were terminated; background work outliving the job is not accepted"
+                    ));
+                }
+            }
+            TreeOutcome::Unproven(detail) => {
+                self.add_failure(format!("process tree cleanup unproven: {detail}"))
+            }
+        }
+        #[cfg(unix)]
+        if self.failure.is_none() {
+            use std::os::unix::process::ExitStatusExt;
+            match status.signal() {
+                Some(libc::SIGXCPU) => {
+                    self.failure = Some("resource limit exceeded: cpu time (RLIMIT_CPU)".into())
+                }
+                Some(libc::SIGXFSZ) => {
+                    self.failure = Some("resource limit exceeded: file size (RLIMIT_FSIZE)".into())
+                }
+                _ => {}
+            }
+        }
         let deadline = Instant::now();
         while self.stdout.as_ref().is_some_and(|h| !h.is_finished())
             || self.stderr.as_ref().is_some_and(|h| !h.is_finished())
@@ -325,117 +307,19 @@ impl Drop for NativeProcess {
         if !self.reaped {
             let _ = self.stop_family();
             let _ = self.child.wait();
+            let _ = self.tree.reap();
         }
     }
 }
 
-fn quote(path: &Path) -> Result<String> {
-    Ok(serde_json::to_string(path.to_str().ok_or_else(|| {
-        Error::Invalid("non-UTF-8 sandbox path".into())
-    })?)?)
-}
-fn resolved(path: &Path) -> Result<PathBuf> {
-    if let Ok(path) = std::fs::canonicalize(path) {
-        return Ok(path);
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::Invalid("cannot resolve sandbox path".into()))?;
-    Ok(resolved(parent)?.join(
-        path.file_name()
-            .ok_or_else(|| Error::Invalid("sandbox path needs a name".into()))?,
-    ))
-}
+/// True when this host's security backend enforces the baseline every worker
+/// requires (filesystem read/write confinement and environment isolation).
 pub fn sandbox_available() -> bool {
-    cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").is_file()
-}
-fn sandbox_command(spec: &ProcessSpec) -> Result<Command> {
-    require(
-        sandbox_available(),
-        "mandatory runtime process isolation is unavailable (Stage 5 requires macOS sandbox-exec); refusing unsandboxed execution",
-    )?;
-    let scratch = quote(&spec.scratch)?;
-    let mut exceptions =
-        format!("(require-not (subpath {scratch}))(require-not (literal \"/dev/null\"))");
-    if spec.writable {
-        exceptions.push_str(&format!(
-            "(require-not (subpath {}))",
-            quote(&spec.workspace)?
-        ));
-    }
-    let auth_files: Vec<_> = spec
-        .native_auth
-        .as_ref()
-        .map(|a| a.readable_files())
-        .unwrap_or_default()
-        .iter()
-        .map(|p| resolved(p))
-        .collect::<Result<_>>()?;
-    for path in &auth_files {
-        require(
-            !path.starts_with(&spec.workspace)
-                && !path.starts_with(&spec.data_root)
-                && !path.starts_with(&spec.config_root),
-            "provider-native authentication must remain outside workspace/agentctl state",
-        )?;
-        exceptions.push_str(&format!("(require-not (literal {}))", quote(path)?));
-    }
-    let mut profile = format!(
-        "(version 1)(allow default)(deny file-write* (require-all {exceptions}))(deny process-info* (target others))(deny signal (target others))"
-    );
-    for root in [&spec.data_root, &spec.config_root] {
-        profile.push_str(&format!("(deny file-read* file-write* (require-all (subpath {})(require-not (subpath {scratch}))))", quote(root)?));
-    }
-    for p in spec.git_directories.iter().cloned().chain(
-        [".git", ".agentctl", ".codex", ".claude"]
-            .iter()
-            .map(|p| spec.workspace.join(p)),
-    ) {
-        profile.push_str(&format!("(deny file-write* (subpath {}))", quote(&p)?));
-    }
-    let mut private_roots = vec![];
-    if let Some(home) = std::env::var_os("HOME") {
-        for p in [".codex", ".claude"] {
-            private_roots.push(PathBuf::from(&home).join(p));
-        }
-    }
-    if let Some(native) = &spec.native_auth {
-        private_roots.push(native.provider_home.clone());
-    }
-    for root in private_roots {
-        let root = resolved(&root)?;
-        let mut except = format!("(require-not (subpath {scratch}))");
-        for file in &auth_files {
-            except.push_str(&format!("(require-not (literal {}))", quote(file)?));
-        }
-        profile.push_str(&format!(
-            "(deny file-read-data file-write* (require-all (subpath {}){except}))",
-            quote(&root)?
-        ));
-    }
-    for rule in &spec.protected {
-        profile.push_str(&format!(
-            "(deny {} (subpath {}))",
-            if rule.deny_read {
-                "file-read* file-write*"
-            } else {
-                "file-write*"
-            },
-            quote(&spec.workspace.join(&rule.path))?
-        ));
-    }
-    if !spec.network {
-        profile.push_str("(deny network*)");
-    }
-    let mut command = Command::new("/usr/bin/sandbox-exec");
-    command
-        .args(["-p", &profile])
-        .arg(&spec.executable)
-        .args(&spec.args);
-    Ok(command)
+    security::baseline_enforced()
 }
 
 pub(super) struct WorkspaceLease {
+    #[cfg_attr(not(unix), allow(dead_code))]
     file: File,
 }
 impl WorkspaceLease {
@@ -464,10 +348,12 @@ impl WorkspaceLease {
         }
         #[cfg(not(unix))]
         {
-            return Err(Error::Invalid(
+            let _ = file;
+            Err(Error::Invalid(
                 "runtime workspace leases require Unix".into(),
-            ));
+            ))
         }
+        #[cfg(unix)]
         Ok(Self { file })
     }
     pub(super) fn fd(&self) -> Option<i32> {
@@ -504,7 +390,7 @@ mod tests {
             ));
             std::fs::create_dir(&path).unwrap();
             let f = Self(std::fs::canonicalize(path).unwrap());
-            for name in ["repo", "repo/.git", "data", "config", "scratch"] {
+            for name in ["repo", "repo/.git", "data", "config", "cache", "scratch"] {
                 std::fs::create_dir_all(f.0.join(name)).unwrap();
             }
             std::fs::write(f.0.join("config/secret"), "fixture secret").unwrap();
@@ -530,6 +416,9 @@ mod tests {
                 protected: vec![],
                 credential_env: vec![],
                 experiment_event_file: None,
+                class: security::WorkerClass::Tool,
+                cache_root: self.0.join("cache"),
+                security: Default::default(),
                 lock_fd: None,
             }
         }
@@ -707,8 +596,21 @@ mod tests {
             "--json".into(),
         ];
         spec.native_auth = Some(super::super::credentials::NativeAuth::discover("claude").unwrap());
+        // Adapters mark provider launches; only frontends may carry native auth.
+        spec.class = security::WorkerClass::ProviderFrontend;
         let output = finish(&mut NativeProcess::launch(&spec).unwrap());
-        assert_eq!(output.exit, Some(0), "native status process failed");
+        // Report only the exit code and the loggedIn flag, never account data.
+        let logged_in = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .and_then(|v| v.get("loggedIn").cloned());
+        assert_eq!(
+            output.exit,
+            Some(0),
+            "native status process failed: exit {:?}, loggedIn {logged_in:?}, failure {:?}, stderr {}",
+            output.exit,
+            output.failure,
+            String::from_utf8_lossy(&output.stderr)
+        );
         let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(
             status["loggedIn"], true,

@@ -51,7 +51,7 @@ pub fn cli(paths: &MachinePaths, args: &[&str]) -> Result<()> {
         }
         _ => return Err(Error::Invalid("observe snapshot|sessions|session ID|agents|agent ID|job ID|tasks|task ID|events|experiments|experiment ID|usage [provider|task|role VALUE] [--json]".into())),
     };
-    println!("{}", serde_json::to_string(&value)?);
+    println!("{}", crate::local::terminal::json_compact(&value)?);
     Ok(())
 }
 

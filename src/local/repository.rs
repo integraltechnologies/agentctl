@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 use serde::{Deserialize, Serialize};
@@ -135,46 +135,43 @@ impl RepositoryInfo {
         } else {
             &start
         };
-        let root = canonical_git_path(start, &["rev-parse", "--show-toplevel"])?;
-        let git_directory = canonical_git_path(&root, &["rev-parse", "--absolute-git-dir"])?;
+        // rev-parse runs no filters/hooks; everything after uses the fully
+        // neutralized configuration discovered for this repository.
+        let root = canonical_git_path(&Git::base(start), &["rev-parse", "--show-toplevel"])?;
+        let git = Git::hardened(&root)?;
+        let git_directory = canonical_git_path(&git, &["rev-parse", "--absolute-git-dir"])?;
         let common_directory = canonical_git_path(
-            &root,
+            &git,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )?;
         let repository_id = RepositoryId::for_common_directory(&common_directory);
         let workspace_id = WorkspaceId::for_git_directory(&git_directory);
-        let head = git(&root, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+        let head = git.run(&["rev-parse", "--verify", "HEAD^{commit}"])?;
         let head_commit = if head.status.success() {
             Some(text(&head.stdout)?.trim_end_matches('\n').to_owned())
         } else {
             // A symbolic HEAD with no branch ref is an unborn repository. Other failures are errors.
-            let symbolic = git(&root, &["symbolic-ref", "-q", "HEAD"])?;
+            let symbolic = git.run(&["symbolic-ref", "-q", "HEAD"])?;
             require(symbolic.status.success(), git_failure(&root, &head))?;
             let reference = text(&symbolic.stdout)?.trim_end_matches('\n').to_owned();
-            let exists = git(&root, &["show-ref", "--verify", "--quiet", &reference])?;
+            let exists = git.run(&["show-ref", "--verify", "--quiet", &reference])?;
             require(exists.status.code() == Some(1), git_failure(&root, &head))?;
             None
         };
-        let status = checked_git(
-            &root,
-            &[
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=normal",
-                "--ignore-submodules=none",
-            ],
-        )?;
-        let remote_config = git(
-            &root,
-            &[
-                "config",
-                "--local",
-                "--null",
-                "--get-regexp",
-                "^remote\\..*\\.url$",
-            ],
-        )?;
+        let status = git.checked(&[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ])?;
+        let remote_config = git.run(&[
+            "config",
+            "--local",
+            "--null",
+            "--get-regexp",
+            "^remote\\..*\\.url$",
+        ])?;
         require(
             remote_config.status.success() || remote_config.status.code() == Some(1),
             git_failure(&root, &remote_config),
@@ -253,8 +250,8 @@ fn directory_identity(path: &Path) -> Result<Option<DirectoryIdentity>> {
     }
 }
 
-fn canonical_git_path(root: &Path, args: &[&str]) -> Result<PathBuf> {
-    let output = checked_git(root, args)?;
+fn canonical_git_path(git: &Git, args: &[&str]) -> Result<PathBuf> {
+    let output = git.checked(args)?;
     let value = text(&output.stdout)?
         .strip_suffix('\n')
         .unwrap_or(text(&output.stdout)?);
@@ -271,36 +268,150 @@ fn text(bytes: &[u8]) -> Result<&str> {
     std::str::from_utf8(bytes).map_err(|e| Error::Invalid(format!("non-UTF-8 Git metadata: {e}")))
 }
 
-fn git(root: &Path, args: &[&str]) -> Result<Output> {
-    let mut command = Command::new("git");
-    command
-        .args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-C"])
-        .arg(root)
-        .args(args);
-    for variable in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CONFIG",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_NAMESPACE",
-    ] {
-        command.env_remove(variable);
-    }
-    command
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|e| Error::Invalid(format!("could not run Git for {}: {e}", root.display())))
+#[cfg(windows)]
+const NULL_DEVICE: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_DEVICE: &str = "/dev/null";
+
+/// Filter/driver keys whose values name programs Git would execute.
+const DRIVER_KEYS: &str =
+    r"^(filter|diff|merge)\..+\.(clean|smudge|process|required|textconv|command|driver)$";
+
+/// agentctl's own Git subprocesses. Every inherited `GIT_*` variable is dropped;
+/// hooks, fsmonitor and global attributes are disabled; and every clean/smudge/
+/// process filter and diff/merge driver defined in ANY config scope (system,
+/// global, local, worktree, includes) is overridden to a no-op, so attributes in
+/// a repository cannot make `git status` run repository- or user-configured
+/// programs. Overrides travel through `GIT_CONFIG_COUNT` rather than `-c`, so
+/// arbitrary subsection names cannot be misparsed, and they propagate to child
+/// Git processes (e.g. submodule status).
+struct Git {
+    root: PathBuf,
+    overrides: Vec<(String, String)>,
 }
 
-fn checked_git(root: &Path, args: &[&str]) -> Result<Output> {
-    let output = git(root, args)?;
-    require(output.status.success(), git_failure(root, &output))?;
-    Ok(output)
+impl Git {
+    fn base(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            overrides: vec![],
+        }
+    }
+
+    fn hardened(root: &Path) -> Result<Self> {
+        refuse_privileged(root)?;
+        let base = Self::base(root);
+        let listed = base.run(&[
+            "config",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            DRIVER_KEYS,
+        ])?;
+        require(
+            listed.status.success() || listed.status.code() == Some(1),
+            git_failure(root, &listed),
+        )?;
+        let mut filters = BTreeSet::new();
+        let mut overrides = vec![];
+        for key in listed.stdout.split(|b| *b == 0).filter(|k| !k.is_empty()) {
+            let key = text(key)?.trim_end_matches('\n');
+            let Some((section, rest)) = key.split_once('.') else {
+                continue;
+            };
+            let Some((name, _)) = rest.rsplit_once('.') else {
+                continue;
+            };
+            match section.to_ascii_lowercase().as_str() {
+                "filter" => {
+                    filters.insert(name.to_owned());
+                }
+                "diff" => {
+                    overrides.push((format!("diff.{name}.textconv"), String::new()));
+                    overrides.push((format!("diff.{name}.command"), String::new()));
+                }
+                "merge" => overrides.push((format!("merge.{name}.driver"), String::new())),
+                _ => {}
+            }
+        }
+        for name in filters {
+            for variable in ["clean", "smudge", "process"] {
+                overrides.push((format!("filter.{name}.{variable}"), String::new()));
+            }
+            overrides.push((format!("filter.{name}.required"), "false".into()));
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            overrides,
+        })
+    }
+
+    fn run(&self, args: &[&str]) -> Result<Output> {
+        let mut command = Command::new("git");
+        command
+            .args(["--no-optional-locks", "--no-pager", "-C"])
+            .arg(&self.root)
+            .args(args)
+            .stdin(Stdio::null());
+        for (name, _) in std::env::vars_os() {
+            if name
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+            {
+                command.env_remove(name);
+            }
+        }
+        let fixed = [
+            ("core.fsmonitor", "false"),
+            ("core.hooksPath", NULL_DEVICE),
+            ("core.attributesFile", NULL_DEVICE),
+        ];
+        let config: Vec<(String, String)> = fixed
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .chain(self.overrides.iter().cloned())
+            .collect();
+        command.env("GIT_CONFIG_COUNT", config.len().to_string());
+        for (index, (key, value)) in config.iter().enumerate() {
+            command
+                .env(format!("GIT_CONFIG_KEY_{index}"), key)
+                .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+        }
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .output()
+            .map_err(|e| {
+                Error::Invalid(format!(
+                    "could not run Git for {}: {e}",
+                    self.root.display()
+                ))
+            })
+    }
+
+    fn checked(&self, args: &[&str]) -> Result<Output> {
+        let output = self.run(args)?;
+        require(output.status.success(), git_failure(&self.root, &output))?;
+        Ok(output)
+    }
+}
+
+/// agentctl never drives Git as root against another user's repository.
+fn refuse_privileged(root: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            require(
+                fs::metadata(root)?.uid() == 0,
+                "refusing to run agentctl Git operations as root on a repository owned by another user",
+            )?;
+        }
+    }
+    let _ = root;
+    Ok(())
 }
 
 fn git_failure(root: &Path, output: &Output) -> String {

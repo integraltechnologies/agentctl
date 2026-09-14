@@ -100,6 +100,12 @@ pub struct ProjectConfig {
     pub protected: Vec<ProtectedRule>,
     #[serde(default)]
     pub verification: BTreeMap<String, VerificationDefinition>,
+    /// Repository-declared limits: tightening only, never a grant.
+    #[serde(
+        default,
+        skip_serializing_if = "super::security::ProjectSecurity::is_empty"
+    )]
+    pub security: super::security::ProjectSecurity,
 }
 
 impl Default for ProjectConfig {
@@ -113,6 +119,7 @@ impl Default for ProjectConfig {
             commands: BTreeMap::new(),
             protected: vec![],
             verification: BTreeMap::new(),
+            security: Default::default(),
         }
     }
 }
@@ -120,6 +127,7 @@ impl Default for ProjectConfig {
 impl ProjectConfig {
     pub fn validate(&self) -> Result<()> {
         self.routing.validate()?;
+        self.security.validate()?;
         require(
             self.version == 1,
             format!(
@@ -147,7 +155,7 @@ impl ProjectConfig {
             }
         }
         for rule in &self.protected {
-            repo_path(&rule.path)?;
+            paths::safe_relative(&rule.path)?;
             require(
                 rule.deny_read || rule.deny_write,
                 "protected rules must deny reading or writing",

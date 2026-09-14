@@ -154,6 +154,8 @@ pub(super) fn read_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
     read_regular_file(path, limit, false)
 }
 fn read_regular_file(path: &Path, limit: u64, artifact: bool) -> Result<Vec<u8>> {
+    #[cfg(not(unix))]
+    let _ = artifact;
     paths::check_file(path, false)?;
     let mut options = OpenOptions::new();
     options.read(true);

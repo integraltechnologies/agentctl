@@ -92,11 +92,17 @@ pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Resul
     };
     let snapshot = Store::read_only(&paths.database, 100)?.analytics(q, now)?;
     if json_mode {
-        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        println!("{}", crate::local::terminal::json(&snapshot)?);
         return Ok(());
     }
+    // Provider/model/role names and warnings are untrusted text.
+    macro_rules! say {
+        ($($arg:tt)*) => {
+            println!("{}", crate::local::terminal::human(&format!($($arg)*)))
+        };
+    }
     let s = &snapshot.summary;
-    println!(
+    say!(
         "ANALYTICS v{} — {command}\nJobs {} | contract-completed {} | usage {}\nTokens exact {:?} | estimated {:?} | unknown jobs {} | partial jobs {}\nVerifier REJECT {}/{} | fallback executions {}/{} | policy skips {}\nVERIFIED packet usage coverage {} complete / {} partial\nContext bytes median {:?} | completed execution ms median {:?}",
         snapshot.analytics_version,
         s.jobs,
@@ -117,7 +123,7 @@ pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Resul
         s.completed_execution_ms.median
     );
     for session in snapshot.sessions.iter().take(20) {
-        println!(
+        say!(
             "Session {}: {} | {}/{} VERIFIED | correction round {:?}",
             session.id,
             session.lifecycle,
@@ -128,7 +134,7 @@ pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Resul
     }
     if command == "task" || command == "corrections" {
         for task in snapshot.tasks.iter().take(20) {
-            println!(
+            say!(
                 "Task {}: {} | executor/verifier attempts {}/{} | correction count {:?}, round {:?} | usage {}",
                 task.id,
                 task.lifecycle,
@@ -142,7 +148,7 @@ pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Resul
     }
     if command == "job" {
         for job in &snapshot.jobs {
-            println!(
+            say!(
                 "Job {}: {} / {} / {} | {} | fallback depth {:?} | usage {} | wall ms {:?}",
                 job.id,
                 job.role,
@@ -155,13 +161,13 @@ pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Resul
             );
         }
     }
-    println!(
+    say!(
         "Human lists show at most 20 entries; --json exposes the full bounded snapshot. None means UNKNOWN/not applicable, never zero."
     );
     if command == "routes" || command == "job" {
         for job in snapshot.jobs.iter().take(20) {
             if let Some(route) = &job.route_provenance {
-                println!(
+                say!(
                     "Route {}: provider={} model={} fallback-source={} depth={:?} preceding={:?} policy-skips={}",
                     job.id,
                     route.provider_source.as_deref().unwrap_or("UNKNOWN"),
@@ -184,7 +190,7 @@ pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Resul
         &snapshot.roles
     };
     for g in groups.iter().take(20) {
-        println!(
+        say!(
             "{} / {} / {}: {} jobs, {} usage, exact {:?}, estimated {:?}",
             g.role.as_deref().unwrap_or("UNKNOWN"),
             g.provider.as_deref().unwrap_or("UNKNOWN"),
@@ -196,7 +202,7 @@ pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Resul
         );
     }
     for warning in &snapshot.warnings {
-        println!("Note: {warning}");
+        say!("Note: {warning}");
     }
     Ok(())
 }

@@ -12,7 +12,9 @@ pub mod paths;
 pub mod planning;
 pub mod repository;
 pub mod runtime;
+pub mod security;
 pub mod store;
+pub mod terminal;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

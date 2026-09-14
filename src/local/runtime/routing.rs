@@ -298,11 +298,45 @@ pub fn resolve(
         }
         set!(objective);
         set!(instructions);
-        set!(context_bytes);
-        set!(timeout_ms);
-        set!(read_only);
-        set!(network);
         set!(max_fallback_attempts);
+        // Security-relevant fields: repository policy may only tighten what the
+        // machine/user layers established; it can never grant itself authority.
+        let repository = layer == "project profiles";
+        let mut record = |field: &str| {
+            sources.insert(field.into(), layer.into());
+        };
+        if let Some(value) = p.context_bytes {
+            profile.context_bytes = if repository {
+                profile.context_bytes.min(value)
+            } else {
+                value
+            };
+            record("context_bytes");
+        }
+        if let Some(value) = p.timeout_ms {
+            profile.timeout_ms = if repository {
+                profile.timeout_ms.min(value)
+            } else {
+                value
+            };
+            record("timeout_ms");
+        }
+        if let Some(value) = p.read_only {
+            profile.read_only = if repository {
+                profile.read_only || value
+            } else {
+                value
+            };
+            record("read_only");
+        }
+        if let Some(value) = p.network {
+            profile.network = if repository {
+                profile.network && value
+            } else {
+                value
+            };
+            record("network");
+        }
         if let Some(value) = p.advisory_tokens {
             profile.advisory_tokens = Some(value);
             sources.insert("advisory_tokens".into(), layer.into());

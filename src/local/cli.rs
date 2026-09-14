@@ -38,6 +38,7 @@ pub fn run(args: &[&str]) -> Result<()> {
             )
         }
         ["doctor"] => doctor(&paths, json_mode),
+        ["security", "doctor"] => security_doctor(&paths, json_mode),
         runtime @ (["run", ..]
         | ["provider", ..]
         | ["roles", ..]
@@ -71,7 +72,14 @@ pub fn run(args: &[&str]) -> Result<()> {
             } else {
                 Store::read_only(&paths.database, config.busy_timeout_ms)?
             };
-            super::runtime::experiment_cli::run(&mut store, &paths, command, rest, json_mode)
+            super::runtime::experiment_cli::run(
+                &mut store,
+                &paths,
+                &config.runtime.security,
+                command,
+                rest,
+                json_mode,
+            )
         }
         ["memory", command, rest @ ..] => {
             let config = load_machine(&paths)?;
@@ -430,11 +438,113 @@ fn check_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Local, deterministic security diagnostics: which isolation the host backend
+/// enforces, whether any hard requirement is unsupported, and a live self-test.
+/// No model call, no network request, and no secret values are printed.
+fn security_doctor(paths: &MachinePaths, json_mode: bool) -> Result<()> {
+    use super::security::{self, Capability, CapabilityStatus};
+    let machine = load_machine(paths);
+    let config = machine
+        .as_ref()
+        .map(|m| m.runtime.security.clone())
+        .unwrap_or_default();
+    let report = security::backend().capabilities();
+    let baseline = security::baseline_enforced();
+    let unsupported: Vec<Capability> = report
+        .capabilities
+        .iter()
+        .filter(|c| match c.capability {
+            Capability::FilesystemRead
+            | Capability::FilesystemWrite
+            | Capability::EnvironmentIsolation
+            | Capability::NetworkDeny
+            | Capability::CredentialIsolation => c.status != CapabilityStatus::Enforced,
+            Capability::ProcessTree => c.status == CapabilityStatus::Unsupported,
+            _ => false,
+        })
+        .map(|c| c.capability)
+        .collect();
+    let self_test = if baseline && !report.running_as_root {
+        security::self_test(&config)
+    } else {
+        Err("skipped: baseline isolation is not enforced here; every worker is refused".into())
+    };
+    #[cfg(unix)]
+    let owner_only = |path: &Path| {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o077 == 0)
+    };
+    #[cfg(not(unix))]
+    let owner_only = |_: &Path| None::<bool>;
+    let value = json!({
+        "backend": report.backend,
+        "platform": report.platform,
+        "running_as_root": report.running_as_root,
+        "baseline_enforced": baseline,
+        "unsupported_hard_requirements": unsupported,
+        "capabilities": report.capabilities,
+        "self_test": match &self_test { Ok(()) => "PASSED".to_string(), Err(e) => format!("FAILED: {e}") },
+        "machine_config": machine.as_ref().map(|_| "loaded").unwrap_or("unavailable; defaults shown"),
+        "machine_policy": {
+            "read_roots": config.read_roots,
+            "inherit_env": config.inherit_env,
+            "explicit_env_names": config.env.keys().collect::<Vec<_>>(),
+            "resources": config.resources,
+            "experiment_events": config.experiment_events,
+        },
+        "default_read_roots": security::platform_read_roots(),
+        "state_owner_only": {
+            "data_directory": owner_only(&paths.data_root),
+            "database": owner_only(&paths.database),
+        },
+        "trust_boundary": "worker processes are untrusted; same-user host compromise is outside the claimed boundary",
+    });
+    let mut human = vec![format!(
+        "Security backend: {} ({}){}",
+        report.backend,
+        report.platform,
+        if report.running_as_root {
+            " — RUNNING AS ROOT: workers refused"
+        } else {
+            ""
+        }
+    )];
+    for c in &report.capabilities {
+        human.push(format!(
+            "{:<12} {:<27} {} — {}",
+            serde_json::to_value(c.status)?.as_str().unwrap_or_default(),
+            serde_json::to_value(c.capability)?
+                .as_str()
+                .unwrap_or_default(),
+            c.mechanism,
+            c.detail
+        ));
+    }
+    human.push(match &self_test {
+        Ok(()) => {
+            "Self-test: PASSED (planted secret unreadable, outside/.git writes denied)".into()
+        }
+        Err(e) => format!("Self-test: FAILED: {e}"),
+    });
+    human.push(if unsupported.is_empty() {
+        "Hard requirements: all enforced".into()
+    } else {
+        format!("Hard requirements NOT enforced: {unsupported:?} — affected jobs are refused before launch")
+    });
+    output(json_mode, &value, &human.join("\n"))?;
+    require(
+        baseline && unsupported.is_empty() && self_test.is_ok() && !report.running_as_root,
+        "security doctor: required worker isolation is not enforced on this host; workers will be refused",
+    )
+}
+
 pub(crate) fn output(json_mode: bool, value: &impl Serialize, human: &str) -> Result<()> {
     if json_mode {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        println!("{}", super::terminal::json(value)?);
     } else {
-        println!("{human}");
+        println!("{}", super::terminal::human(human));
     }
     Ok(())
 }

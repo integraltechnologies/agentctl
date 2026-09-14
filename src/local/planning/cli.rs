@@ -218,9 +218,9 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
 }
 fn output(json: bool, value: &impl serde::Serialize, human: &str) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        println!("{}", crate::local::terminal::json(value)?);
     } else {
-        println!("{human}");
+        println!("{}", crate::local::terminal::human(human));
     }
     Ok(())
 }

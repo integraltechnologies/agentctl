@@ -191,6 +191,12 @@ impl Store {
         )?;
         check_database_paths(path, true)?;
         paths::create_database_file(path)?;
+        owner_only(path.parent().expect("absolute database path"), true)?;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut file = path.as_os_str().to_os_string();
+            file.push(suffix);
+            owner_only(Path::new(&file), false)?;
+        }
         let mut connection = connection(path, busy_timeout_ms, false)?;
         migrations::migrate(&mut connection)?;
         let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
@@ -891,9 +897,43 @@ fn connection(path: &Path, timeout: u64, read_only: bool) -> Result<Connection> 
     connection.busy_timeout(Duration::from_millis(timeout))?;
     connection.pragma_update(None, "foreign_keys", true)?;
     connection.pragma_update(None, "trusted_schema", false)?;
+    // Ordinary SQL can no longer deliberately corrupt the file (writable_schema,
+    // schema_version writes, ...). Extension loading stays disabled (default).
+    connection.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     super::planning::completion::register(&connection)?;
     super::runtime::auth::register(&connection)?;
     Ok(connection)
+}
+
+/// Canonical state is private to the operator account: the data directory and
+/// database files must belong to the current user and are narrowed to
+/// owner-only access. (Same-user compromise remains outside the trust boundary.)
+pub(crate) fn owner_only(path: &Path, directory: bool) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        // SAFETY: geteuid has no preconditions.
+        require(
+            meta.uid() == unsafe { libc::geteuid() },
+            format!(
+                "{}: owned by another user; refusing to use it as agentctl state",
+                path.display()
+            ),
+        )?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            let owner = if directory { 0o700 } else { 0o600 };
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & owner))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, directory);
+    Ok(())
 }
 
 fn check_database_paths(path: &Path, allow_missing: bool) -> Result<()> {
@@ -909,6 +949,8 @@ fn check_database_paths(path: &Path, allow_missing: bool) -> Result<()> {
 }
 
 fn check_single_link(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

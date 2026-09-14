@@ -236,9 +236,9 @@ fn human_results(status: &IndexStatus, mut lines: Vec<String>) -> String {
 }
 fn output(json: bool, value: &impl Serialize, human: &str) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        println!("{}", crate::local::terminal::json(value)?);
     } else {
-        println!("{human}");
+        println!("{}", crate::local::terminal::human(human));
     }
     Ok(())
 }

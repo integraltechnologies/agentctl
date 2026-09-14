@@ -1,6 +1,7 @@
 //! Stage 9B structured experiment facts. These records are deliberately factual:
 //! this module has no threshold evaluation, planner hook, or process-control path.
 use super::*;
+use crate::local::security::{EventVolumeLimits, json as strict_json};
 use serde_json::Value as JsonValue;
 use std::{
     collections::BTreeMap,
@@ -14,11 +15,21 @@ pub const DEFAULT_EVENT_QUERY_LIMIT: usize = 1_000;
 pub const MAX_EVENT_QUERY_LIMIT: usize = 10_000;
 const READ_BYTES_PER_POLL: usize = 256 * 1024;
 const MAX_CHECKPOINT_HASH_BYTES: u64 = 64 * 1024 * 1024;
+/// Controller-reserved source sequence of the single event-volume-cap marker.
+const CAP_SEQUENCE: u64 = i64::MAX as u64;
 
-/// Path components that always name administrative/control-plane storage, independent of
-/// user-configured protected paths: Git's own directory and agentctl's own control-plane
-/// directory. Checkpoints must never be able to present these as ordinary workspace files.
-const CONTROL_PLANE_COMPONENTS: [&str; 2] = [".git", ".agentctl"];
+/// Case-folds on case-insensitive-by-default filesystems (APFS, NTFS) so a
+/// differently-cased path cannot slip past a protected-path comparison.
+fn fold(text: &str) -> String {
+    if cfg!(any(target_os = "macos", windows)) {
+        text.to_lowercase()
+    } else {
+        text.to_owned()
+    }
+}
+fn within(path: &Path, parent: &Path) -> bool {
+    Path::new(&fold(&path.to_string_lossy())).starts_with(fold(&parent.to_string_lossy()))
+}
 
 /// Canonicalized directories a checkpoint path must not resolve into, covering both Git's
 /// administrative storage and agentctl's own control-plane directory (when present).
@@ -110,6 +121,10 @@ pub struct ExperimentEventSummary {
     pub latest_metrics: BTreeMap<String, f64>,
     pub latest_checkpoint: Option<String>,
     pub ingestion_errors: u64,
+    /// True when any attempt hit the machine/project event-volume ceiling; later
+    /// events of that attempt were neither recorded nor evaluated.
+    #[serde(default)]
+    pub event_volume_capped: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -227,15 +242,13 @@ fn checkpoint(
 ) -> Result<ExperimentEventData> {
     bounded(&name, "checkpoint name", 128)?;
     require(path.len() <= 1_024, "checkpoint path exceeds 1024 bytes")?;
-    crate::validation::repo_path(&path)?;
+    paths::safe_relative(&path)?;
     require(
-        !path
-            .split('/')
-            .any(|part| CONTROL_PLANE_COMPONENTS.contains(&part)),
+        !path.split('/').any(paths::is_control_plane_component),
         "checkpoint path may not enter Git or agentctl administrative storage",
     )?;
     for rule in &policy.protected {
-        if path == rule.path || path.starts_with(&format!("{}/", rule.path)) {
+        if within(Path::new(&path), Path::new(&rule.path)) {
             return Err(Error::Invalid(format!(
                 "checkpoint path intersects protected path {}",
                 rule.path
@@ -250,19 +263,38 @@ fn checkpoint(
     require(
         !control_plane_directories(info)
             .iter()
-            .any(|dir| canonical.starts_with(dir)),
+            .any(|dir| within(&canonical, dir)),
         "checkpoint path resolves into Git or agentctl administrative storage",
     )?;
     for rule in &policy.protected {
         if let Ok(protected) = std::fs::canonicalize(info.root.join(&rule.path)) {
             require(
-                canonical != protected && !canonical.starts_with(&protected),
+                !within(&canonical, &protected),
                 format!("checkpoint path resolves into protected path {}", rule.path),
             )?;
         }
     }
-    let before = canonical.metadata()?;
+    // Hash through one descriptor opened without following a final symlink and
+    // verified to be the inode validated above, so a swap cannot redirect it.
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(&canonical)?;
+    let before = file.metadata()?;
     require(before.is_file(), "checkpoint path must name a regular file")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let named = std::fs::symlink_metadata(&canonical)?;
+        require(
+            named.dev() == before.dev() && named.ino() == before.ino(),
+            "checkpoint path changed during validation",
+        )?;
+    }
     let byte_size = before.len();
     let modified_at_ms = before
         .modified()
@@ -270,7 +302,6 @@ fn checkpoint(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|d| u64::try_from(d.as_millis()).ok());
     let content_hash = if byte_size <= MAX_CHECKPOINT_HASH_BYTES {
-        let mut file = File::open(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         let mut buffer = [0_u8; 64 * 1024];
         loop {
@@ -280,7 +311,7 @@ fn checkpoint(
             }
             hasher.update(&buffer[..n]);
         }
-        let after = canonical.metadata()?;
+        let after = file.metadata()?;
         if after.len() == before.len() && after.modified().ok() == before.modified().ok() {
             Some(format!("blake3:{}", hasher.finalize().to_hex()))
         } else {
@@ -445,7 +476,7 @@ fn decode_line(
 ) -> Result<Draft> {
     let observed_at_ms = now_ms()?;
     let frame_hash = format!("blake3:{}", blake3::hash(line).to_hex());
-    let parsed: std::result::Result<JsonValue, _> = serde_json::from_slice(line);
+    let parsed: std::result::Result<JsonValue, _> = strict_json::from_slice(line);
     let nonfinite = parsed.as_ref().ok().is_some_and(|value| {
         value.get("type").and_then(JsonValue::as_str) == Some("metric")
             && value.get("value").is_some_and(|value| {
@@ -484,16 +515,27 @@ fn decode_line(
     }
 }
 
+/// Machine-owned per-attempt storage bound. Counts only rows actually inserted
+/// (idempotent replays are free) and is updated only after commit.
+struct Volume {
+    limits: EventVolumeLimits,
+    events: u64,
+    bytes: u64,
+    loaded: bool,
+    capped: bool,
+}
+
 pub(super) struct EventIngestor {
     file: File,
     pending: Vec<u8>,
     discarding_oversize: bool,
     line_number: u64,
     queued: Vec<Draft>,
+    volume: Volume,
 }
 
 impl EventIngestor {
-    pub(super) fn create(path: &Path) -> Result<Self> {
+    pub(super) fn create(path: &Path, limits: EventVolumeLimits) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -506,7 +548,22 @@ impl EventIngestor {
             discarding_oversize: false,
             line_number: 0,
             queued: vec![],
+            volume: Volume {
+                limits,
+                events: 0,
+                bytes: 0,
+                loaded: false,
+                capped: false,
+            },
         })
+    }
+
+    /// `(max events, max bytes)` once this attempt's event storage is exhausted.
+    pub(super) fn volume_cap(&self) -> Option<(u64, u64)> {
+        self.volume.capped.then_some((
+            self.volume.limits.max_events_per_attempt,
+            self.volume.limits.max_event_bytes_per_attempt,
+        ))
     }
 
     pub(super) fn drain(
@@ -518,9 +575,24 @@ impl EventIngestor {
         attempt: u32,
         final_drain: bool,
     ) -> Result<(usize, bool)> {
+        if !self.volume.loaded {
+            let (events, bytes): (i64, i64) = store.connection.query_row(
+                "SELECT count(*),coalesce(sum(length(event_json)),0) FROM experiment_events WHERE repo_id=?1 AND experiment_id=?2 AND attempt=?3",
+                params![info.repository_id.as_str(), id.as_str(), i64::from(attempt)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            self.volume.events = u64::try_from(events).unwrap_or(0);
+            self.volume.bytes = u64::try_from(bytes).unwrap_or(0);
+            self.volume.loaded = true;
+        }
+        if self.volume.capped {
+            // Nothing past the cap is read, recorded, or made decision-worthy.
+            self.queued.clear();
+            return Ok((0, true));
+        }
         let mut inserted = 0;
         if !self.queued.is_empty() {
-            inserted += persist(store, info, id, attempt, &self.queued)?;
+            inserted += persist(store, info, id, attempt, &self.queued, &mut self.volume)?;
             self.queued.clear();
         }
         let mut drafts = vec![];
@@ -582,10 +654,53 @@ impl EventIngestor {
         }
         let caught_up = reached_eof;
         self.queued = drafts;
-        inserted += persist(store, info, id, attempt, &self.queued)?;
+        inserted += persist(store, info, id, attempt, &self.queued, &mut self.volume)?;
         self.queued.clear();
-        Ok((inserted, caught_up))
+        Ok((inserted, caught_up || self.volume.capped))
     }
+}
+
+/// Records the single controller-authored cap marker (idempotent).
+fn cap_marker(
+    tx: &Connection,
+    info: &RepositoryInfo,
+    id: &ExperimentId,
+    attempt: u32,
+    limits: &EventVolumeLimits,
+) -> Result<()> {
+    let now = now_ms()?;
+    let event = ExperimentRuntimeEvent {
+        arrival_sequence: 0,
+        experiment_id: id.clone(),
+        workspace_id: info.workspace_id.clone(),
+        attempt,
+        channel: "INGESTION".into(),
+        source_sequence: CAP_SEQUENCE,
+        timestamp_ms: now,
+        observed_at_ms: now,
+        source: "agentctl".into(),
+        event: ExperimentEventData::Health {
+            kind: ExperimentHealthKind::IngestionError,
+            message: Some(format!(
+                "EVENT_VOLUME_CAP_EXCEEDED: attempt reached the machine/project limit of {} events or {} bytes; later events are not recorded or evaluated",
+                limits.max_events_per_attempt, limits.max_event_bytes_per_attempt
+            )),
+        },
+    };
+    tx.execute(
+        "INSERT OR IGNORE INTO experiment_events(repo_id,workspace_id,experiment_id,attempt,channel,source_sequence,event_type,metric_name,timestamp_ms,observed_at_ms,frame_hash,event_json) VALUES (?1,?2,?3,?4,'INGESTION',?5,'HEALTH',NULL,?6,?6,?7,?8)",
+        params![
+            info.repository_id.as_str(),
+            info.workspace_id.as_str(),
+            id.as_str(),
+            i64::from(attempt),
+            i64::MAX,
+            i64::try_from(now).map_err(|e| Error::Invalid(e.to_string()))?,
+            format!("blake3:{}", blake3::hash(b"agentctl-event-volume-cap").to_hex()),
+            serde_json::to_string(&event)?
+        ],
+    )?;
+    Ok(())
 }
 
 fn persist(
@@ -594,8 +709,9 @@ fn persist(
     id: &ExperimentId,
     attempt: u32,
     drafts: &[Draft],
+    volume: &mut Volume,
 ) -> Result<usize> {
-    if drafts.is_empty() {
+    if drafts.is_empty() || volume.capped {
         return Ok(0);
     }
     let tx = store
@@ -603,6 +719,12 @@ fn persist(
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut inserted = 0;
     let mut conflicts = vec![];
+    let (mut events, mut bytes, mut capped) = (volume.events, volume.bytes, false);
+    let limits = volume.limits;
+    let over = |events: u64, bytes: u64, size: u64| {
+        events + 1 > limits.max_events_per_attempt
+            || bytes + size > limits.max_event_bytes_per_attempt
+    };
     for draft in drafts {
         let event = ExperimentRuntimeEvent {
             arrival_sequence: 0,
@@ -616,6 +738,12 @@ fn persist(
             source: draft.source.clone(),
             event: draft.event.clone(),
         };
+        let json = serde_json::to_string(&event)?;
+        let size = json.len() as u64;
+        if over(events, bytes, size) {
+            capped = true;
+            break;
+        }
         let changed = tx.execute(
             "INSERT OR IGNORE INTO experiment_events(repo_id,workspace_id,experiment_id,attempt,channel,source_sequence,event_type,metric_name,timestamp_ms,observed_at_ms,frame_hash,event_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
@@ -624,11 +752,13 @@ fn persist(
                 event.event.event_type(), event.event.metric_name(),
                 i64::try_from(draft.timestamp_ms).map_err(|e| Error::Invalid(e.to_string()))?,
                 i64::try_from(draft.observed_at_ms).map_err(|e| Error::Invalid(e.to_string()))?,
-                draft.frame_hash, serde_json::to_string(&event)?
+                draft.frame_hash, json
             ],
         )?;
         if changed == 1 {
             inserted += 1;
+            events += 1;
+            bytes += size;
         } else if draft.channel == "EVENT_FILE" {
             let existing_hash: String = tx.query_row(
                 "SELECT frame_hash FROM experiment_events WHERE repo_id=?1 AND experiment_id=?2 AND attempt=?3 AND channel=?4 AND source_sequence=?5",
@@ -641,6 +771,9 @@ fn persist(
         }
     }
     for line in conflicts {
+        if capped {
+            break;
+        }
         let draft = ingestion_error(
             line,
             "rejected conflicting replay for an existing source sequence",
@@ -658,12 +791,27 @@ fn persist(
             source: draft.source,
             event: draft.event,
         };
-        inserted += tx.execute(
+        let json = serde_json::to_string(&event)?;
+        let size = json.len() as u64;
+        if over(events, bytes, size) {
+            capped = true;
+            break;
+        }
+        let changed = tx.execute(
             "INSERT OR IGNORE INTO experiment_events(repo_id,workspace_id,experiment_id,attempt,channel,source_sequence,event_type,metric_name,timestamp_ms,observed_at_ms,frame_hash,event_json) VALUES (?1,?2,?3,?4,?5,?6,'HEALTH',NULL,?7,?8,?9,?10)",
-            params![info.repository_id.as_str(), info.workspace_id.as_str(), id.as_str(), i64::from(attempt), draft.channel, i64::try_from(draft.source_sequence).map_err(|e| Error::Invalid(e.to_string()))?, i64::try_from(draft.timestamp_ms).map_err(|e| Error::Invalid(e.to_string()))?, i64::try_from(draft.observed_at_ms).map_err(|e| Error::Invalid(e.to_string()))?, draft.frame_hash, serde_json::to_string(&event)?],
+            params![info.repository_id.as_str(), info.workspace_id.as_str(), id.as_str(), i64::from(attempt), draft.channel, i64::try_from(draft.source_sequence).map_err(|e| Error::Invalid(e.to_string()))?, i64::try_from(draft.timestamp_ms).map_err(|e| Error::Invalid(e.to_string()))?, i64::try_from(draft.observed_at_ms).map_err(|e| Error::Invalid(e.to_string()))?, draft.frame_hash, json],
         )?;
+        inserted += changed;
+        if changed == 1 {
+            events += 1;
+            bytes += size;
+        }
+    }
+    if capped {
+        cap_marker(&tx, info, id, attempt, &volume.limits)?;
     }
     tx.commit()?;
+    (volume.events, volume.bytes, volume.capped) = (events, bytes, capped);
     Ok(inserted)
 }
 
@@ -780,7 +928,13 @@ impl Store {
             params![info.repository_id.as_str(), info.workspace_id.as_str(), id.as_str()],
             |row| row.get(0),
         ).optional()?;
+        let event_volume_capped: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM experiment_events WHERE repo_id=?1 AND workspace_id=?2 AND experiment_id=?3 AND channel='INGESTION' AND source_sequence=?4)",
+            params![info.repository_id.as_str(), info.workspace_id.as_str(), id.as_str(), i64::MAX],
+            |row| row.get(0),
+        )?;
         Ok(ExperimentEventSummary {
+            event_volume_capped,
             event_count: u64::try_from(count).map_err(|e| Error::Invalid(e.to_string()))?,
             last_event_timestamp_ms: last
                 .map(u64::try_from)

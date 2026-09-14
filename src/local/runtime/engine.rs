@@ -119,6 +119,9 @@ impl<'a> Runtime<'a> {
             protected: policy.protected.clone(),
             credential_env: vec![],
             experiment_event_file: None,
+            class: crate::local::security::WorkerClass::ProviderFrontend,
+            cache_root: self.paths.cache_root.clone(),
+            security: self.config.security.tightened(&policy.security),
             lock_fd: lease.fd(),
         })
     }
@@ -794,6 +797,7 @@ impl<'a> Runtime<'a> {
             let mut spec =
                 self.process_spec(info, id.as_str(), AgentRole::Verifier, lease, &policy)?;
             let _scratch = process::ScratchCleanup(spec.scratch.clone());
+            spec.class = crate::local::security::WorkerClass::Tool;
             spec.network = false;
             spec.args = command.args.clone();
             spec.executable = PathBuf::from(&command.program);

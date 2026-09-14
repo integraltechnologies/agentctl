@@ -6,6 +6,7 @@ use super::{
         usage::{self, Scope},
     },
     paths::{MachinePaths, PathContext},
+    terminal,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -164,13 +165,15 @@ fn block(title: impl Into<String>) -> Block<'static> {
     Block::default().title(title.into()).borders(Borders::ALL)
 }
 fn compact(s: &str) -> String {
-    s.chars()
+    let tail: String = s
+        .chars()
         .rev()
         .take(12)
         .collect::<String>()
         .chars()
         .rev()
-        .collect()
+        .collect();
+    terminal::field(&tail).into_owned()
 }
 fn age(now: u64, timestamp: Option<u64>) -> String {
     timestamp
@@ -213,9 +216,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         .iter()
         .filter_map(|p| p.tokens_per_minute)
         .max();
+    let scope_text = format!("{:?}", series.scope);
     let title = format!(
-        "TOKENS/min observed | {:?} | now {current} | {}{}",
-        series.scope,
+        "TOKENS/min observed | {} | now {current} | {}{}",
+        terminal::field(&scope_text),
         series.quality,
         if series.incomplete { " [bounded]" } else { "" }
     );
@@ -267,15 +271,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             app.session_index + 1,
             app.snapshot.sessions.len(),
             compact(&s.id),
-            s.state,
-            s.title,
-            s.activity,
-            s.check.as_deref().unwrap_or(""),
+            terminal::field(&s.state),
+            terminal::field(&s.title),
+            terminal::field(&s.activity),
+            terminal::field(s.check.as_deref().unwrap_or("")),
             s.blocker
                 .as_ref()
-                .map(|b| format!(" {}", b.description))
+                .map(|b| format!(" {}", terminal::field(&b.description)))
                 .unwrap_or_default(),
-            s.root
+            terminal::field(&s.root)
         )
     } else if app.snapshot.sessions.is_empty() && app.snapshot.agents.is_empty() {
         "No engineering sessions or agents. Observation never starts work.".into()
@@ -307,19 +311,19 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             let line = format!(
                 "{}{} {} {} {} {} {}{}",
                 "  ".repeat((*depth).min(5)),
-                a.role,
+                terminal::field(&a.role),
                 format_args!(
                     "{}/{}",
-                    a.verification.as_deref().unwrap_or(&a.state),
+                    terminal::field(a.verification.as_deref().unwrap_or(&a.state)),
                     a.liveness.as_str()
                 ),
-                a.task_id.clone().unwrap_or_else(|| compact(&a.job_id)),
+                terminal::field(&a.task_id.clone().unwrap_or_else(|| compact(&a.job_id))),
                 age(
                     a.finished_at_ms.unwrap_or(app.snapshot.at_ms),
                     a.started_at_ms
                 ),
-                a.provider.as_deref().unwrap_or("?"),
-                a.model.as_deref().unwrap_or("?"),
+                terminal::field(a.provider.as_deref().unwrap_or("?")),
+                terminal::field(a.model.as_deref().unwrap_or("?")),
                 if a.ownership_uncertain {
                     " [parent?]"
                 } else {
@@ -362,14 +366,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             Line::styled(
                 format!(
                     "{} {} {}",
-                    t.id,
-                    t.presentation,
+                    terminal::field(&t.id),
+                    terminal::field(&t.presentation),
                     t.blocker
                         .as_ref()
                         .map(|b| if b.dependencies.is_empty() {
-                            b.description.clone()
+                            terminal::field(&b.description).into_owned()
                         } else {
-                            format!("<- {}", b.dependencies.join(","))
+                            format!("<- {}", terminal::field(&b.dependencies.join(",")))
                         })
                         .unwrap_or_default()
                 ),
@@ -437,13 +441,13 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                 "{}s ago {} {}",
                 app.snapshot.at_ms.saturating_sub(e.at_ms) / 1000,
                 e.job_id.as_deref().map(compact).unwrap_or_default(),
-                e.summary
+                terminal::field(&e.summary)
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
     frame.render_widget(Paragraph::new(recent), rows[3]);
-    let footer=app.error.clone().or_else(||app.snapshot.warnings.first().cloned()).map(|message|format!("q quit | ? help | {message}")).unwrap_or_else(||"q quit | Tab panel | arrows select | Enter probe | g graph | s session | r refresh | ? help".into());
+    let footer=app.error.clone().or_else(||app.snapshot.warnings.first().cloned()).map(|message|format!("q quit | ? help | {}", terminal::field(&message))).unwrap_or_else(||"q quit | Tab panel | arrows select | Enter probe | g graph | s session | r refresh | ? help".into());
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::Yellow)),
         rows[4],
@@ -461,24 +465,28 @@ fn detail(app: &App) -> String {
                 .collect();
             return format!(
                 "{} / {} | Liveness {}\nLast known phase {} | proof {}\nElapsed {} | since event {} (not inferred idle)\nBlocker {}\nLast {}\nToken observations {}\nProvider {} / {}\nRoute {} from {} attempt {}\nAgent {}\nSession {}\nParent {}\nRepository {}\nWorkspace {}\nPlan {} / Task {}\nJob {}",
-                a.role,
-                a.state,
+                terminal::field(&a.role),
+                terminal::field(&a.state),
                 a.liveness.as_str(),
-                a.activity,
-                a.verification.as_deref().unwrap_or("UNKNOWN"),
+                terminal::field(&a.activity),
+                terminal::field(a.verification.as_deref().unwrap_or("UNKNOWN")),
                 age(
                     a.finished_at_ms.unwrap_or(app.snapshot.at_ms),
                     a.started_at_ms
                 ),
                 age(app.snapshot.at_ms, a.last_event.as_ref().map(|e| e.at_ms)),
-                a.blocker
-                    .as_ref()
-                    .map(|b| b.description.as_str())
-                    .unwrap_or("none observed"),
-                a.last_event
-                    .as_ref()
-                    .map(|e| e.summary.as_str())
-                    .unwrap_or("UNKNOWN"),
+                terminal::field(
+                    a.blocker
+                        .as_ref()
+                        .map(|b| b.description.as_str())
+                        .unwrap_or("none observed")
+                ),
+                terminal::field(
+                    a.last_event
+                        .as_ref()
+                        .map(|e| e.summary.as_str())
+                        .unwrap_or("UNKNOWN")
+                ),
                 if usage.is_empty() {
                     "UNKNOWN".into()
                 } else {
@@ -488,51 +496,57 @@ fn detail(app: &App) -> String {
                         .collect::<Vec<_>>()
                         .join(", ")
                 },
-                a.provider.as_deref().unwrap_or("UNKNOWN"),
-                a.model.as_deref().unwrap_or("UNKNOWN"),
-                a.requested_role.as_deref().unwrap_or("historical"),
-                a.route_origin.as_deref().unwrap_or("UNKNOWN"),
+                terminal::field(a.provider.as_deref().unwrap_or("UNKNOWN")),
+                terminal::field(a.model.as_deref().unwrap_or("UNKNOWN")),
+                terminal::field(a.requested_role.as_deref().unwrap_or("historical")),
+                terminal::field(a.route_origin.as_deref().unwrap_or("UNKNOWN")),
                 a.route_attempt
                     .map(|n| format!(
                         "{n} {}",
-                        a.fallback_reason
-                            .as_deref()
-                            .or(a.policy_skip_reason.as_deref())
-                            .unwrap_or("")
+                        terminal::field(
+                            a.fallback_reason
+                                .as_deref()
+                                .or(a.policy_skip_reason.as_deref())
+                                .unwrap_or("")
+                        )
                     ))
                     .unwrap_or_else(|| "UNKNOWN".into()),
-                a.id,
-                a.session_id.as_deref().unwrap_or("UNKNOWN"),
-                a.parent_id.as_deref().unwrap_or("UNKNOWN"),
-                a.repository_id,
-                a.workspace_id,
-                a.plan_id.as_deref().unwrap_or("-"),
-                a.task_id.as_deref().unwrap_or("-"),
-                a.job_id
+                terminal::field(&a.id),
+                terminal::field(a.session_id.as_deref().unwrap_or("UNKNOWN")),
+                terminal::field(a.parent_id.as_deref().unwrap_or("UNKNOWN")),
+                terminal::field(&a.repository_id),
+                terminal::field(&a.workspace_id),
+                terminal::field(a.plan_id.as_deref().unwrap_or("-")),
+                terminal::field(a.task_id.as_deref().unwrap_or("-")),
+                terminal::field(&a.job_id)
             );
         }
     } else if let Some(i) = app.tasks().get(app.selected) {
         let t = &app.snapshot.tasks[*i];
         return format!(
             "{} — {}\nPlan {}\nSession {}\nCanonical {} / presentation {}\nDependencies {}\nBlocker {}\nExecutor {}\nVerifier {}\nAttempts in bounded view {}\nLast {}",
-            t.id,
-            t.objective,
-            t.plan_id,
-            t.session_id.as_deref().unwrap_or("UNKNOWN"),
-            t.lifecycle,
-            t.presentation,
-            t.dependencies.join(","),
-            t.blocker
-                .as_ref()
-                .map(|b| b.description.as_str())
-                .unwrap_or("none observed"),
-            t.executor_job.as_deref().unwrap_or("not created"),
-            t.verifier_job.as_deref().unwrap_or("not created"),
+            terminal::field(&t.id),
+            terminal::field(&t.objective),
+            terminal::field(&t.plan_id),
+            terminal::field(t.session_id.as_deref().unwrap_or("UNKNOWN")),
+            terminal::field(&t.lifecycle),
+            terminal::field(&t.presentation),
+            terminal::field(&t.dependencies.join(",")),
+            terminal::field(
+                t.blocker
+                    .as_ref()
+                    .map(|b| b.description.as_str())
+                    .unwrap_or("none observed")
+            ),
+            terminal::field(t.executor_job.as_deref().unwrap_or("not created")),
+            terminal::field(t.verifier_job.as_deref().unwrap_or("not created")),
             t.attempts_in_view,
-            t.last_event
-                .as_ref()
-                .map(|e| e.summary.as_str())
-                .unwrap_or("UNKNOWN")
+            terminal::field(
+                t.last_event
+                    .as_ref()
+                    .map(|e| e.summary.as_str())
+                    .unwrap_or("UNKNOWN")
+            )
         );
     }
     "No selection. No agents are launched by observation.".into()

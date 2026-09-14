@@ -107,6 +107,54 @@ pub(crate) fn absolute_path(path: &Path) -> Result<()> {
     )
 }
 
+/// Security-sensitive repository-relative path: normalized, no traversal, globs,
+/// drive letters, alternate data streams (`:`), backslashes/UNC or control
+/// characters (`validation::repo_path`), plus — on Windows — device names
+/// (`CON`, `NUL`, `COM1`, ... with any extension) and trailing dots/spaces, which
+/// would otherwise name something other than the checked string.
+pub(crate) fn safe_relative(path: &str) -> Result<()> {
+    crate::validation::repo_path(path)?;
+    if cfg!(windows) {
+        for component in path.split('/') {
+            require(
+                !windows_alias(component),
+                format!("{path}: Windows device name or trailing dot/space"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn windows_alias(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        .to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        stem.len() == 4 && stem.starts_with(prefix) && stem.as_bytes()[3].is_ascii_digit()
+    };
+    component.ends_with('.')
+        || component.ends_with(' ')
+        || matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        )
+        || numbered("COM")
+        || numbered("LPT")
+}
+
+/// Git/agentctl control-plane component, compared case-insensitively (APFS and
+/// NTFS are case-insensitive by default) and including 8.3 short aliases.
+pub(crate) fn is_control_plane_component(component: &str) -> bool {
+    let upper = component.to_ascii_uppercase();
+    upper == ".GIT"
+        || upper == ".AGENTCTL"
+        || upper.starts_with("GIT~")
+        || upper.starts_with("AGENTC~")
+}
+
 pub(crate) fn ensure_directory(path: &Path) -> Result<()> {
     absolute_path(path)?;
     match fs::symlink_metadata(path) {
@@ -164,6 +212,7 @@ pub(crate) fn check_file(path: &Path, allow_missing: bool) -> Result<()> {
 }
 
 fn options() -> OpenOptions {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = OpenOptions::new();
     #[cfg(unix)]
     {

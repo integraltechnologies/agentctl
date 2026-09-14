@@ -10,6 +10,7 @@ Usage:
   agentctl protocol validate <type> <file>
   agentctl init [--json]
   agentctl doctor [--json]
+  agentctl security doctor [--json]
   agentctl repo init [--json]
   agentctl repo status [--json]
   agentctl repo list [--json]
@@ -92,6 +93,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         local @ (["init", ..]
         | ["doctor", ..]
+        | ["security", ..]
         | ["repo", ..]
         | ["state", ..]
         | ["events", ..]
@@ -115,7 +117,11 @@ fn main() -> ExitCode {
     match run(&env::args().skip(1).collect::<Vec<_>>()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("agentctl: {error}");
+            // Errors routinely quote untrusted text (paths, Git output, IDs).
+            eprintln!(
+                "agentctl: {}",
+                agentctl::local::terminal::human(&error.to_string())
+            );
             ExitCode::FAILURE
         }
     }

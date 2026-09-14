@@ -62,24 +62,36 @@ impl NativeAuth {
             config_override: override_path.is_some(),
         })
     }
-    pub(super) fn environment(&self, command: &mut Command) {
-        command.env("HOME", &self.home);
+    /// Provider-frontend variables for native login (`None` removes one). These
+    /// are locations and login identity, never values read from a credential
+    /// store; tool workers never receive them.
+    pub(crate) fn variables(&self) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        let mut variables = vec![("HOME", Some(self.home.clone().into_os_string()))];
         // macOS Keychain lookup in Claude requires the ordinary login identity
         // environment as well as HOME; these are names, never credentials.
         for name in ["USER", "LOGNAME"] {
             if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
+                variables.push((name, Some(value)));
             }
         }
         if self.provider == "codex" {
-            command.env("CODEX_HOME", &self.provider_home);
+            variables.push(("CODEX_HOME", Some(self.provider_home.clone().into())));
         } else if self.config_override {
-            command.env("CLAUDE_CONFIG_DIR", &self.provider_home);
+            variables.push(("CLAUDE_CONFIG_DIR", Some(self.provider_home.clone().into())));
         } else {
-            command.env_remove("CLAUDE_CONFIG_DIR");
+            variables.push(("CLAUDE_CONFIG_DIR", None));
+        }
+        variables
+    }
+    pub(super) fn environment(&self, command: &mut Command) {
+        for (name, value) in self.variables() {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
         }
     }
-    pub(super) fn readable_files(&self) -> Vec<PathBuf> {
+    pub(crate) fn readable_files(&self) -> Vec<PathBuf> {
         if self.provider == "codex" {
             vec![self.provider_home.join("auth.json")]
         } else {
@@ -91,6 +103,15 @@ impl NativeAuth {
                     self.home.join(".claude.json")
                 },
             ]
+        }
+    }
+    /// Provider configuration the frontend reads at startup. Granted read-only
+    /// to provider frontends; never writable, never given to tool workers.
+    pub(crate) fn config_files(&self) -> Vec<PathBuf> {
+        if self.provider == "codex" {
+            vec![]
+        } else {
+            vec![self.provider_home.join("settings.json")]
         }
     }
 }

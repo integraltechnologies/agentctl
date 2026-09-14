@@ -57,6 +57,9 @@ pub struct RuntimeConfig {
     pub max_correction_rounds: u32,
     #[serde(default)]
     pub concurrency: ConcurrencyConfig,
+    /// Machine-owned worker security authority (`[runtime.security]`).
+    #[serde(default)]
+    pub security: crate::local::security::SecurityConfig,
 }
 fn timeout() -> u64 {
     600_000
@@ -73,6 +76,7 @@ impl Default for RuntimeConfig {
             timeout_ms: timeout(),
             max_correction_rounds: rounds(),
             concurrency: ConcurrencyConfig::default(),
+            security: Default::default(),
         }
     }
 }
@@ -80,6 +84,7 @@ impl RuntimeConfig {
     pub fn validate(&self) -> Result<()> {
         routing::validate_patches(&self.profiles)?;
         self.concurrency.validate()?;
+        self.security.validate()?;
         require(
             (1..=3_600_000).contains(&self.timeout_ms),
             "runtime timeout must be 1–3600000 ms",

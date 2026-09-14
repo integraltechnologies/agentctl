@@ -1602,3 +1602,98 @@ fn native_process_can_emit_live_structured_event_file_frames() {
         1
     );
 }
+
+fn metric_payload(count: u32) -> Vec<u8> {
+    (1..=count)
+        .map(|i| {
+            format!(
+                "{{\"type\":\"metric\",\"sequence\":{i},\"timestamp_ms\":{i},\"source\":\"trainer\",\"name\":\"loss\",\"value\":{i}.0}}\n"
+            )
+        })
+        .collect::<String>()
+        .into_bytes()
+}
+
+#[test]
+fn stage9_event_volume_cap_is_machine_owned_explicit_and_never_silent() {
+    let f = Fixture::new();
+    // The project asks for MORE than the machine allows: the machine cap wins.
+    let mut policy = ProjectConfig::load(&f.root).unwrap();
+    policy.security.max_experiment_events = Some(1_000);
+    fs::write(
+        f.root.join(".agentctl/project.toml"),
+        toml::to_string(&policy).unwrap(),
+    )
+    .unwrap();
+    let mut machine = local::security::SecurityConfig::default();
+    machine.experiment_events.max_events_per_attempt = 3;
+    let mut store = f.store();
+    let run = ExperimentRuntime::new(&mut store, f.paths.clone())
+        .unwrap()
+        .with_security(machine)
+        .unwrap()
+        .with_check_launcher(Box::new(EventFileLaunch::one(metric_payload(10))))
+        .run(&f.root, input(command("/usr/bin/true", &[])))
+        .unwrap();
+    drop(store);
+    // Telemetry capping never changes the process outcome...
+    assert_eq!(run.state, ExperimentState::Succeeded);
+    // ...but is an explicit, persisted ingestion-health failure.
+    let error = run.attempts[0].event_ingestion_error.as_deref().unwrap();
+    assert!(error.starts_with("EVENT_VOLUME_CAP_EXCEEDED"), "{error}");
+    let events = event_query(
+        &f.store(),
+        &f.root,
+        &run.experiment_id,
+        None,
+        None,
+        None,
+        100,
+    );
+    let metrics: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.event, ExperimentEventData::Metric { .. }))
+        .collect();
+    assert_eq!(metrics.len(), 3, "never more than the cap is recorded");
+    assert_eq!(events.len(), 4, "exactly one controller cap marker");
+    let status = f
+        .store()
+        .experiment_status(&f.root, &run.experiment_id)
+        .unwrap()
+        .unwrap();
+    assert!(status.events.event_volume_capped);
+    assert_eq!(status.events.ingestion_errors, 1);
+    // Nothing beyond the cap is presented as observed.
+    assert_eq!(status.events.latest_metrics["loss"], 3.0);
+
+    // A project may lower the machine ceiling.
+    let mut policy = ProjectConfig::load(&f.root).unwrap();
+    policy.security.max_experiment_events = Some(2);
+    fs::write(
+        f.root.join(".agentctl/project.toml"),
+        toml::to_string(&policy).unwrap(),
+    )
+    .unwrap();
+    let mut store = f.store();
+    let run = ExperimentRuntime::new(&mut store, f.paths.clone())
+        .unwrap()
+        .with_check_launcher(Box::new(EventFileLaunch::one(metric_payload(10))))
+        .run(&f.root, input(command("/usr/bin/true", &[])))
+        .unwrap();
+    drop(store);
+    let status = f
+        .store()
+        .experiment_status(&f.root, &run.experiment_id)
+        .unwrap()
+        .unwrap();
+    assert!(status.events.event_volume_capped);
+    assert_eq!(status.events.latest_metrics["loss"], 2.0);
+    // Under the cap nothing is flagged.
+    let mut store = f.store();
+    let run = ExperimentRuntime::new(&mut store, f.paths.clone())
+        .unwrap()
+        .with_check_launcher(Box::new(EventFileLaunch::one(metric_payload(2))))
+        .run(&f.root, input(command("/usr/bin/true", &[])))
+        .unwrap();
+    assert!(run.attempts[0].event_ingestion_error.is_none());
+}
