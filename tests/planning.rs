@@ -1279,6 +1279,58 @@ fn real_cli_planner_artifact_boundary_roundtrips_across_processes() {
     assert!(events.contains("EXECUTION_PLAN_IMPORTED"));
     assert!(events.contains("EXECUTION_PLAN_VALIDATED"));
 }
+/// Real CLI/process regression for agentctl issue #2: `agentctl plan prepare`
+/// and `agentctl plan context` are the exact commands from the original bug
+/// report, and `serialized_bytes` is the exact field that looked mismatched.
+/// An unrelated file in the workspace, well past the runtime's old (and since
+/// removed) 2 MiB per-file workspace-capture ceiling, must not affect the
+/// `PlannerPacket` producer at all: `PlanningLimits.bytes` and workspace
+/// source capture are separate contracts (Stage 2A/2B/2C). This exercises
+/// that across real process boundaries, reusing the established `cli_json`
+/// cross-process pattern above rather than a parallel harness.
+#[test]
+fn real_cli_plan_context_is_unaffected_by_an_in_budget_oversized_workspace_file() {
+    let f = Fixture::new();
+    fs::write(
+        f.root.join("src/oversized.bin"),
+        vec![0u8; 2 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+    cli_json(&f, &["init", "--json"]);
+    cli_json(&f, &["repo", "init", "--json"]);
+    cli_json(&f, &["repo", "index", "--json"]);
+    let value = cli_json(
+        &f,
+        &[
+            "plan",
+            "prepare",
+            "--objective",
+            "Add deterministic cache invalidation to repository indexing",
+            "--query",
+            "cache invalidation",
+            "--json",
+        ],
+    );
+    let prepared: PlannerPacket = decode(value.clone());
+    assert!(
+        prepared.serialized_bytes <= PlanningLimits::default().bytes,
+        "producer-side PlannerPacket sizing must be unaffected by the oversized workspace file: {}",
+        prepared.serialized_bytes
+    );
+    assert_eq!(
+        cli_json(
+            &f,
+            &[
+                "plan",
+                "context",
+                prepared.request.request_id.as_str(),
+                "--json"
+            ]
+        ),
+        value,
+        "re-reading the frozen context via a separate real CLI process must reproduce it exactly"
+    );
+}
 #[test]
 fn stored_planner_text_and_verification_commands_are_never_executed() {
     let f = Fixture::new();

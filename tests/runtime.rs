@@ -1929,6 +1929,409 @@ fn run_planner_rejects_workspace_exceeding_file_count_limit() {
         "diagnostic must report the observed file count: {message}"
     );
 }
+/// Mirrors the byte/file totals `source::collect` would observe for a
+/// workspace (excluding the top-level `.git` directory), so boundary fixtures
+/// below can land exactly on a limit rather than guessing. Not a
+/// reimplementation of capture's scope/symlink/protected-path checks --
+/// fixtures here are plain files with no symlinks or protected paths.
+fn workspace_totals(root: &Path) -> (usize, u64) {
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.parent() == Some(root) && path.file_name().unwrap() == ".git" {
+                continue;
+            }
+            let meta = entry.metadata().unwrap();
+            if meta.is_dir() {
+                pending.push(path);
+            } else {
+                count += 1;
+                bytes += meta.len();
+            }
+        }
+    }
+    (count, bytes)
+}
+/// Parses the first run of ASCII digits following `prefix` in a diagnostic
+/// message, e.g. `field(msg, "captured=")` for `"...(captured=123, file=456)"`.
+fn field(message: &str, prefix: &str) -> u64 {
+    let start = message.find(prefix).unwrap_or_else(|| {
+        panic!("diagnostic is missing {prefix:?}: {message}");
+    }) + prefix.len();
+    message[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap()
+}
+/// Grows `.git/index` past `target_bytes` by feeding `git update-index
+/// --index-info` synthetic entries that reuse the repository's empty-blob
+/// object and name paths that are never created on disk. Git accepts and
+/// stages these without ever touching the working tree, so repository
+/// discovery (`rev-parse`, `status`) keeps succeeding right up to the read
+/// that must fail -- reaching the GIT_INDEX_BYTES diagnostic deterministically
+/// and in well under a second, unlike staging hundreds of thousands of real
+/// files or replacing `.git/index` with bytes Git itself would refuse to
+/// parse. Paths stay at a single 250-byte component (under the 255-byte
+/// filesystem name limit) so `status` never has to stat a name the OS would
+/// reject as too long.
+fn inflate_git_index_past(root: &Path, target_bytes: u64) {
+    use std::io::Write;
+    let blob = Command::new("git")
+        .current_dir(root)
+        .args(["hash-object", "-w", "--stdin"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        blob.status.success(),
+        "{}",
+        String::from_utf8_lossy(&blob.stderr)
+    );
+    let blob = String::from_utf8(blob.stdout).unwrap();
+    let blob = blob.trim_end();
+    const PATH_LEN: usize = 250;
+    // Empirically, a 250-byte path yields a ~320-byte index entry (a 62-byte
+    // fixed header plus the NUL-terminated path, padded to a multiple of 8).
+    // The +1000-entry margin absorbs that estimate comfortably past the target.
+    const ENTRY_BYTES: u64 = 320;
+    let entries = target_bytes / ENTRY_BYTES + 1000;
+    let mut feed = String::new();
+    for i in 0..entries {
+        let prefix = format!("p{i:07}");
+        feed.push_str("100644 ");
+        feed.push_str(blob);
+        feed.push('\t');
+        feed.push_str(&prefix);
+        feed.push_str(&"x".repeat(PATH_LEN - prefix.len()));
+        feed.push('\n');
+    }
+    let mut child = Command::new("git")
+        .current_dir(root)
+        .args(["update-index", "--index-info"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(feed.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+}
+/// The `.git/index` read during workspace capture shares `read_file`'s bounded
+/// reader with ordinary source files, but its size ceiling is a distinct
+/// invariant from the aggregate workspace-content budget (Stage 2C). This
+/// grows the on-disk index past its 16 MiB ceiling with synthetic entries that
+/// are never realized as real files, proving the diagnostic path is reachable
+/// without replacing `.git/index` with something Git itself would refuse to
+/// open (which would surface as a generic Git discovery failure long before
+/// `source::capture` ever inspects the index's size).
+#[test]
+fn run_planner_reports_git_index_diagnostic_for_oversized_index() {
+    let f = Fixture::new();
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    inflate_git_index_past(&f.root, 16 * 1024 * 1024);
+    let index_bytes = fs::metadata(f.root.join(".git/index")).unwrap().len();
+    assert!(index_bytes > 16 * 1024 * 1024);
+    let mut store = f.store();
+    let err = Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p)),
+                seen: seen(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("runtime git index read") && message.contains("16777216-byte limit"),
+        "diagnostic must name the git index read and the governing 16 MiB limit, not a generic or workspace-capture message: {message}"
+    );
+    assert!(
+        message.contains(&format!("size={index_bytes}")),
+        "diagnostic must report the observed index size: {message}"
+    );
+}
+/// Aggregation, not any single file, drives the workspace-capture budget:
+/// three files that would each comfortably fit alone -- all well past the
+/// obsolete 2 MiB per-file ceiling Stage 2B removed -- must still fail closed
+/// once their combined content crosses the real 64 MiB aggregate.
+/// `fs::read_dir` order is unspecified, so this asserts only the arithmetic
+/// invariant the check enforces (captured-so-far plus the offending file's
+/// size is what crossed the budget) and that the offending file is one of the
+/// three created here, rather than assuming a specific traversal order.
+#[test]
+fn run_planner_rejects_workspace_where_several_valid_files_exceed_aggregate_in_sum() {
+    let f = Fixture::new();
+    const MIB: u64 = 1024 * 1024;
+    let sizes = [30 * MIB, 30 * MIB, 10 * MIB]; // 70 MiB combined > 64 MiB aggregate
+    for (i, size) in sizes.iter().enumerate() {
+        fs::write(
+            f.root.join(format!("src/big{i}.bin")),
+            vec![0u8; *size as usize],
+        )
+        .unwrap();
+    }
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    let mut store = f.store();
+    let err = Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p)),
+                seen: seen(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("runtime workspace capture") && message.contains("67108864-byte limit"),
+        "diagnostic must name workspace capture and the 64 MiB aggregate limit: {message}"
+    );
+    let captured = field(&message, "captured=");
+    let file = field(&message, "file=");
+    assert!(
+        sizes.contains(&file),
+        "offending file size must be one of the created files: file={file} sizes={sizes:?}"
+    );
+    assert!(
+        captured <= 64 * MIB,
+        "captured-so-far must itself stay within budget: captured={captured}"
+    );
+    assert!(
+        captured + file > 64 * MIB,
+        "aggregation invariant violated: captured-so-far plus the offending file must be what crossed the budget: captured={captured} file={file}"
+    );
+}
+/// The aggregate byte budget is a `<=` boundary: exactly `WORKSPACE_CAPTURE_BYTES`
+/// of real content must be accepted. The fixture's own baseline files already
+/// consume part of that budget, so the filler file here is sized to land the
+/// *workspace total* exactly on the boundary, not just the filler file alone.
+#[test]
+fn run_planner_accepts_workspace_at_exact_aggregate_byte_boundary() {
+    let f = Fixture::new();
+    const TARGET: u64 = 64 * 1024 * 1024;
+    let (_, existing) = workspace_totals(&f.root);
+    assert!(existing < TARGET);
+    fs::write(
+        f.root.join("src/filler.bin"),
+        vec![0u8; (TARGET - existing) as usize],
+    )
+    .unwrap();
+    let (_, total) = workspace_totals(&f.root);
+    assert_eq!(
+        total, TARGET,
+        "fixture must land exactly on the 64 MiB boundary"
+    );
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    let mut store = f.store();
+    Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p)),
+                seen: seen(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap();
+}
+/// One byte past the same boundary must fail closed. Because the workspace's
+/// total content is exactly `WORKSPACE_CAPTURE_BYTES + 1` regardless of
+/// `read_dir` order, the check's own running-total arithmetic guarantees
+/// `captured + file` always equals that same total -- proof sketch: if the
+/// first `k` files processed already summed past the budget while any earlier
+/// prefix did not, and the full workspace exceeds the budget by exactly one
+/// byte, the unprocessed remainder (if any) would have to contribute a
+/// negative amount to close that gap, which is impossible, so the failing
+/// file is always the traversal's last one and the two fields always sum to
+/// budget+1. This asserts that arithmetic invariant rather than a specific
+/// offending filename.
+#[test]
+fn run_planner_rejects_workspace_one_byte_past_aggregate_byte_boundary() {
+    let f = Fixture::new();
+    const TARGET: u64 = 64 * 1024 * 1024;
+    let (_, existing) = workspace_totals(&f.root);
+    assert!(existing < TARGET);
+    fs::write(
+        f.root.join("src/filler.bin"),
+        vec![0u8; (TARGET - existing + 1) as usize],
+    )
+    .unwrap();
+    let (_, total) = workspace_totals(&f.root);
+    assert_eq!(total, TARGET + 1);
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    let mut store = f.store();
+    let err = Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p)),
+                seen: seen(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("runtime workspace capture") && message.contains("67108864-byte limit"),
+        "{message}"
+    );
+    let captured = field(&message, "captured=");
+    let file = field(&message, "file=");
+    assert_eq!(
+        captured + file,
+        TARGET + 1,
+        "regardless of traversal order, captured+file must equal the fixture's exact one-byte overage: {message}"
+    );
+}
+/// The file-count ceiling is also a boundary the runtime must accept exactly
+/// at, not just reject one past (the existing regression above already proves
+/// the reject side: 20001 files observes `count=20000` and fails). This
+/// constructs a workspace with exactly 20000 files in total, baseline files
+/// included, and confirms capture -- and the whole planner job-creation path
+/// -- succeeds.
+#[test]
+fn run_planner_accepts_workspace_at_exact_file_count_boundary() {
+    let f = Fixture::new();
+    const TARGET: usize = 20_000;
+    let (existing, _) = workspace_totals(&f.root);
+    assert!(existing < TARGET);
+    fs::create_dir_all(f.root.join("src/many")).unwrap();
+    for i in 0..(TARGET - existing) {
+        fs::write(f.root.join(format!("src/many/f{i}.txt")), b"x").unwrap();
+    }
+    let (count, _) = workspace_totals(&f.root);
+    assert_eq!(
+        count, TARGET,
+        "fixture must land exactly on the 20000-file boundary"
+    );
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    let mut store = f.store();
+    Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p)),
+                seen: seen(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap();
+}
+/// Combined Stage 2E acceptance for Issue #2's originally confusing symptoms:
+/// a `PlannerPacket` sized close to its configured planning byte budget (not
+/// trivially small, as in the Stage 2B regression above) must still be
+/// produced, frozen, and consumed by the runtime -- reaching planner job
+/// creation -- even though the workspace separately contains an unrelated
+/// file well past the old, now-removed 2 MiB per-file ceiling but comfortably
+/// inside the real 64 MiB aggregate.
+#[test]
+fn run_planner_reaches_job_creation_with_near_limit_packet_and_in_budget_oversized_file() {
+    let f = Fixture::new();
+    let natural = f.prepare().serialized_bytes;
+    let limits = PlanningLimits {
+        bytes: (natural + 32).clamp(4096, 131072),
+        ..PlanningLimits::default()
+    };
+    // Unrelated to packet sizing: an in-budget file past the old 2 MiB ceiling
+    // must not affect workspace capture during the same `run planner` call.
+    fs::write(
+        f.root.join("src/oversized.bin"),
+        vec![0u8; 2 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+    let prepared = f
+        .store()
+        .prepare_plan(
+            &f.root,
+            RequestDraft {
+                objective: "Implement cache persistence graph CLI regression support".into(),
+                query: Some("cache".into()),
+                scope: vec![ScopePath::Directory { path: "src".into() }],
+                constraints: vec!["No Git history mutation".into()],
+                definition_of_done: vec!["Cache API graph CLI regression checks pass".into()],
+                verification: Some(requirements("integration")),
+                invariant_refs: vec![],
+                provenance: PlanningProvenance {
+                    actor: "human".into(),
+                    source_refs: vec!["objective".into()],
+                    provider: None,
+                },
+            },
+            limits,
+        )
+        .unwrap();
+    assert!(prepared.serialized_bytes <= limits.bytes);
+    assert!(
+        prepared.serialized_bytes as f64 >= limits.bytes as f64 * 0.9,
+        "packet should sit near its configured budget, not far under it: {} of {}",
+        prepared.serialized_bytes,
+        limits.bytes
+    );
+    let p = artifact(&prepared);
+    let mut store = f.store();
+    let view = Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p)),
+                seen: seen(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap();
+    assert_eq!(view.state, PlanState::Validated);
+}
 /// Content-addressed artifact readback shares `read_regular_file` with workspace
 /// capture and git-index reads, but its size ceiling is a distinct, unrelated
 /// invariant (the CAS's own bound on a single stored blob, keyed by the size
