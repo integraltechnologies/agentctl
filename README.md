@@ -101,8 +101,10 @@ Alpha limitations to know about:
 - The runtime supports modest repositories: up to 20,000 files and 64 MiB, with no
   symlinks, hardlinks, or submodules in the checkout. Verifier diffs are limited to
   128 KiB.
-- The code graph is syntactic and single-file. It resolves only a narrow set of
-  references.
+- The code graph is syntactic. It resolves a relation only when exactly one
+  declaration is visible: in-file lexical scope and methods, and Rust qualified
+  paths across files. Imports, re-exports, and calls on variables stay
+  unresolved.
 - Process-tree cleanup on macOS and Linux is best effort, and resource limits are
   mostly per process. See [docs/security.md](docs/security.md#known-limitations).
 - agentctl never commits or pushes. You review and commit results yourself.

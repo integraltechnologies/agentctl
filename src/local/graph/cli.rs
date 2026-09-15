@@ -11,7 +11,7 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
                 json,
                 &stats,
                 &format!(
-                    "{} discovered; {} indexed ({} existing changed), {} reused, {} deleted, {} failed\n{} entities, {} edges; {} ms",
+                    "{} discovered; {} indexed ({} existing changed), {} reused, {} deleted, {} failed\n{} entities, {} edges ({} resolved workspace-wide); {} ms\nGeneration: {}",
                     stats.discovered,
                     stats.indexed,
                     stats.changed,
@@ -20,7 +20,9 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
                     stats.failed,
                     stats.entities,
                     stats.edges,
-                    stats.duration_ms
+                    stats.resolved,
+                    stats.duration_ms,
+                    generation_line(stats.generation.as_ref())
                 ),
             )?;
             require(
@@ -34,7 +36,7 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
                 json,
                 &status,
                 &format!(
-                    "Repository: {}\nWorkspace: {}\nIndex: {}\n{} indexed files, {} stale, {} failed; {} entities, {} edges\nLast index: {}\nBackends: {}",
+                    "Repository: {}\nWorkspace: {}\nIndex: {}\n{} indexed files, {} stale, {} failed; {} entities, {} edges\nLast index: {}\nGeneration: {}\nBackends: {}",
                     status.repository_id.as_str(),
                     status.workspace_id.as_str(),
                     if status.fresh {
@@ -51,6 +53,7 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
                         "{} ({})",
                         m.indexed_at_ms, m.version
                     )),
+                    generation_line(status.generation()),
                     status
                         .backends
                         .iter()
@@ -204,6 +207,13 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
             "invalid graph command; run agentctl --help".into(),
         )),
     }
+}
+
+fn generation_line(generation: Option<&GraphGeneration>) -> String {
+    generation.map_or(
+        "none (index predates generations; run repo index)".into(),
+        |g| format!("{} ({})", g.sequence, g.fingerprint),
+    )
 }
 
 fn entity_line(e: &Entity) -> String {

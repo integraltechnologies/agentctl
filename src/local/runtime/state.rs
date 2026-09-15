@@ -69,6 +69,10 @@ pub struct RuntimeJob {
     pub route: Option<routing::RouteSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<prompt::PromptProvenance>,
+    /// What agentctl intentionally supplied to this job, byte-accounted. Absent
+    /// on jobs recorded before manifests existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_manifest: Option<manifest::ContextManifest>,
     #[serde(default)]
     pub ownership: Option<AgentOwnership>,
     #[serde(default)]

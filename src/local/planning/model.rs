@@ -55,6 +55,10 @@ pub struct PlanningSource {
     pub observation: RepositorySourceState,
     pub policy_hash: String,
     pub graph_version: String,
+    /// The ontology generation the context was compiled against. Absent only in
+    /// requests prepared before generations existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_generation: Option<graph::GraphGeneration>,
     pub support: Vec<graph::Provenance>,
     pub guarantee: SourceGuarantee,
 }
@@ -115,6 +119,9 @@ impl Default for PlanningLimits {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceExcerpt {
+    /// The graph entity whose range this excerpt shows (absent in older packets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<GraphEntityId>,
     pub provenance: graph::Provenance,
     pub start_byte: usize,
     pub end_byte: usize,

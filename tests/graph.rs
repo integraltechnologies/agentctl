@@ -1110,3 +1110,119 @@ fn every_language_adapter_invalidates_changed_failed_and_deleted_files() {
         assert!(f.store().index_status(&f.root).unwrap().fresh);
     }
 }
+
+// Regression coverage for the QUALIFIED_PATH resolver: it must never drop a
+// qualified path's leading segment and treat a unique match on the remaining
+// suffix as proof of identity. agentctl has no Cargo.toml/workspace metadata,
+// so an unrecognized leading segment (an external crate, an unresolved
+// re-export, or simply a typo) can never be safely distinguished from a real
+// local crate name — the resolver must abstain rather than guess.
+
+#[test]
+fn unmatched_qualified_path_prefix_does_not_resolve_across_unrelated_crate_roots() {
+    // Two independent crate-shaped roots in one workspace. `crate_a` calls
+    // `ext::helpers::run()`; `ext` resolves to nothing agentctl knows about,
+    // but `crate_b` happens to declare an unrelated `helpers::run`.
+    let f = Fixture::new(&[
+        (
+            "crate_a/src/lib.rs",
+            "pub fn caller() { ext::helpers::run(); }",
+        ),
+        ("crate_b/src/lib.rs", "pub mod helpers { pub fn run() {} }"),
+    ]);
+    assert_eq!(f.index().failed, 0);
+    let store = f.store();
+    // The unrelated declaration exists and is exactly the kind of target the
+    // old first-segment-drop fallback would have guessed.
+    assert_eq!(
+        store
+            .graph(&f.root)
+            .unwrap()
+            .symbols("run", SearchMode::Exact, 10)
+            .unwrap()
+            .data
+            .len(),
+        1
+    );
+    let calls = store
+        .graph(&f.root)
+        .unwrap()
+        .relations("caller", false, Some(RelationKind::Calls), 10)
+        .unwrap()
+        .data;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].target_name, "ext::helpers::run");
+    assert!(
+        calls[0].target.is_none(),
+        "an unresolved external-looking prefix must never fall back to an unrelated crate's declaration: {calls:#?}"
+    );
+}
+
+#[test]
+fn unmatched_qualified_path_abstains_even_when_the_deep_suffix_is_unique() {
+    // A longer unmatched prefix whose remaining suffix (after dropping just
+    // the first segment) would still uniquely identify workspace code. The
+    // resolver must not walk further down the path looking for a unique
+    // match either.
+    let f = Fixture::new(&[
+        (
+            "crate_a/src/lib.rs",
+            "pub fn caller() { unknown::modx::suby::run_deep(); }",
+        ),
+        (
+            "crate_b/src/lib.rs",
+            "pub mod modx { pub mod suby { pub fn run_deep() {} } }",
+        ),
+    ]);
+    assert_eq!(f.index().failed, 0);
+    let store = f.store();
+    assert_eq!(
+        store
+            .graph(&f.root)
+            .unwrap()
+            .symbols("run_deep", SearchMode::Exact, 10)
+            .unwrap()
+            .data
+            .len(),
+        1
+    );
+    let calls = store
+        .graph(&f.root)
+        .unwrap()
+        .relations("caller", false, Some(RelationKind::Calls), 10)
+        .unwrap()
+        .data;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].target_name, "unknown::modx::suby::run_deep");
+    assert!(calls[0].target.is_none(), "{calls:#?}");
+}
+
+#[test]
+fn qualified_path_naming_an_actual_local_crate_directory_still_abstains() {
+    // Even when the leading segment textually matches the directory name of
+    // a real crate elsewhere in the workspace, agentctl has no Cargo.toml or
+    // workspace metadata proving that segment names that crate rather than
+    // being coincidental. Resolution must not be granted on name coincidence
+    // alone.
+    let f = Fixture::new(&[
+        (
+            "crate_a/src/lib.rs",
+            "pub fn caller() { crate_b::helpers::run(); }",
+        ),
+        ("crate_b/src/lib.rs", "pub mod helpers { pub fn run() {} }"),
+    ]);
+    assert_eq!(f.index().failed, 0);
+    let store = f.store();
+    let calls = store
+        .graph(&f.root)
+        .unwrap()
+        .relations("caller", false, Some(RelationKind::Calls), 10)
+        .unwrap()
+        .data;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].target_name, "crate_b::helpers::run");
+    assert!(
+        calls[0].target.is_none(),
+        "a crate-shaped leading segment must not resolve without structural proof of crate identity: {calls:#?}"
+    );
+}

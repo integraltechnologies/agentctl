@@ -9,7 +9,7 @@ use super::{
     store::{RegisteredRepository, RegisteredWorkspace},
 };
 
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 pub const APPLICATION_ID: i64 = 0x41475443; // AGTC
 
 const INITIAL: &str = r#"
@@ -123,6 +123,7 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
         (9, "experiment_events"),
         (10, "experiment_decisions"),
         (11, "experiment_decision_cursors"),
+        (12, "graph_resolution"),
     ]
     .into_iter()
     .filter(|(v, _)| *v <= version)
@@ -334,6 +335,24 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
             require(n == 1, format!("database is missing trigger {name}"))?;
         }
     }
+    if version >= 12 {
+        connection.prepare(
+            "SELECT workspace_id,edge_id,source_id,target_id,kind,rule FROM graph_resolutions LIMIT 0",
+        )?;
+        connection.prepare("SELECT path_hint FROM graph_edges LIMIT 0")?;
+        for name in [
+            "graph_edges_hinted",
+            "graph_resolutions_outgoing",
+            "graph_resolutions_incoming",
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing index {name}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -400,6 +419,32 @@ fn migrate_transaction(connection: &mut Connection) -> Result<()> {
     if header(&transaction)? == 10 {
         check_version(&transaction, 10)?;
         transaction.execute_batch(include_str!("runtime/experiment_cursor_schema.sql"))?;
+    }
+    if header(&transaction)? == 11 {
+        check_version(&transaction, 11)?;
+        // Lossless and additive: graph payloads are untouched. Path hints already
+        // live in each edge record, so the new column is backfilled from them and
+        // every workspace's resolutions are derived now; the facts (and so the
+        // graph generation) do not change. Records from an older index version
+        // carry no hints and stay stale by version until `repo index`.
+        let hinted = transaction
+            .prepare("SELECT 1 FROM pragma_table_info('graph_edges') WHERE name='path_hint'")?
+            .exists([])?;
+        if !hinted {
+            transaction.execute_batch("ALTER TABLE graph_edges ADD COLUMN path_hint TEXT;")?;
+        }
+        transaction.execute_batch(include_str!("graph/resolution_schema.sql"))?;
+        transaction.execute(
+            "UPDATE graph_edges SET path_hint=json_extract(record_json,'$.path_hint') WHERE target_id IS NULL AND path_hint IS NULL",
+            [],
+        )?;
+        let workspaces: Vec<String> = transaction
+            .prepare("SELECT workspace_id FROM graph_indexes ORDER BY workspace_id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        for workspace in workspaces {
+            super::graph::rebuild_resolutions(&transaction, &workspace)?;
+        }
     }
     check(&transaction)?;
     require(

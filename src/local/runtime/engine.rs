@@ -153,6 +153,7 @@ impl<'a> Runtime<'a> {
         role: AgentRole,
         source: &SourceSnapshot,
         artifact: Value,
+        inventory: manifest::ContextInventory,
         lease: &WorkspaceLease,
         expected_policy_hash: &str,
     ) -> Result<(RuntimeJob, Value)> {
@@ -247,6 +248,7 @@ impl<'a> Runtime<'a> {
                 role,
                 source,
                 artifact.clone(),
+                inventory.clone(),
                 lease,
                 &resolved.profile,
                 snapshot,
@@ -275,6 +277,7 @@ impl<'a> Runtime<'a> {
         role: AgentRole,
         source: &SourceSnapshot,
         artifact: Value,
+        inventory: manifest::ContextInventory,
         lease: &WorkspaceLease,
         profile: &routing::RoleProfile,
         route: routing::RouteSnapshot,
@@ -303,6 +306,7 @@ impl<'a> Runtime<'a> {
         )?;
         let compiled = prompt::compile(profile, &route.project_policy_hash, &input)?;
         let prompt_provenance = compiled.provenance.clone();
+        let context_manifest = manifest::for_job(&input, request, &prompt_provenance, inventory)?;
         input.compiled = Some(compiled);
         let mut job = RuntimeJob {
             planner_usage: None,
@@ -310,6 +314,7 @@ impl<'a> Runtime<'a> {
             availability_failure: None,
             route: Some(route),
             prompt: Some(prompt_provenance),
+            context_manifest: Some(context_manifest),
             ownership: Some(ownership),
             task_id: task.cloned(),
             job_id: job_id.clone(),
@@ -644,15 +649,10 @@ impl<'a> Runtime<'a> {
         info: &RepositoryInfo,
         task: &planning::TaskInspection,
         source: &SourceSnapshot,
-    ) -> Result<Value> {
-        let query = task
-            .packet
-            .objective
-            .split_whitespace()
-            .take(20)
-            .collect::<Vec<_>>()
-            .join(" ");
-        let mut graph = self.store.graph(&info.root)?.context(
+    ) -> Result<(Value, manifest::ContextInventory)> {
+        let query = graph::objective_query(&task.packet.objective);
+        let allowed = |path: &str| task.packet.read_scope.iter().any(|s| permits(s, path));
+        let mut graph = self.store.graph(&info.root)?.context_within(
             &query,
             graph::ContextLimits {
                 primary: 3,
@@ -660,11 +660,11 @@ impl<'a> Runtime<'a> {
                 neighbors: 6,
                 tests: 3,
             },
+            &allowed,
         )?;
-        let allowed = |path: &str| task.packet.read_scope.iter().any(|s| permits(s, path));
-        graph.primary.retain(|e| allowed(&e.entity.provenance.path));
-        graph.neighbors.retain(|e| allowed(&e.provenance.path));
-        graph.tests.retain(|e| allowed(&e.provenance.path));
+        // Scope filtering also drops every association and summary that referred
+        // to an out-of-scope entity; relations are withheld entirely.
+        graph.retain_files(allowed);
         graph.relations.clear();
         let memory = self.store.memory_for_task(
             &info.root,
@@ -676,20 +676,54 @@ impl<'a> Runtime<'a> {
                 bytes: 4096,
             },
         )?;
+        let mut inventory = manifest::ContextInventory::default();
+        inventory.graph(&graph);
+        inventory.memory(&memory);
+        inventory.invariants = task.invariants.keys().cloned().collect();
         let mut files = vec![];
         for (path, file) in source.files.iter().filter(|(p, _)| allowed(p)).take(16) {
             let bytes = self.artifacts.get(&file.content)?;
             let text = std::str::from_utf8(&bytes).map_err(|_| {
                 Error::Invalid("task context contains binary source; narrow its read scope".into())
             })?;
+            inventory.paths.push(manifest::SuppliedSource {
+                path: path.clone(),
+                kind: manifest::SuppliedKind::File,
+                start_line: None,
+                end_line: None,
+                content_hash: Some(file.content.hash.clone()),
+                truncated: text.len() > 4096,
+            });
             files.push(json!({"path":path,"hash":file.content.hash,"text":text.chars().take(4096).collect::<String>(),"truncated":text.len()>4096}));
         }
-        Ok(
+        Ok((
             json!({"task":task.packet,"contract":task.contract,"invariants":task.invariants,"constraints":task.constraints,"graph":graph,"memory":memory,"files":files,"result_schema":schemars::schema_for!(ResultPacket),"instruction":"Return ResultPacket with this invocation's job_id and task_id. evidence must be []; agentctl captures evidence independently."}),
-        )
+            inventory,
+        ))
     }
-    fn diff_input(&self, reference: &ArtifactRef) -> Result<Value> {
+    /// The bounded verifier diff and, for the manifest, the changed paths it
+    /// carries (bound by their after-state, or before-state for deletions).
+    fn diff_input(
+        &self,
+        reference: &ArtifactRef,
+    ) -> Result<(Value, Vec<manifest::SuppliedSource>)> {
         let diff: CapturedDiff = self.artifacts.decode(reference)?;
+        let paths = diff
+            .changes
+            .iter()
+            .map(|c| manifest::SuppliedSource {
+                path: c.path.clone(),
+                kind: manifest::SuppliedKind::Diff,
+                start_line: None,
+                end_line: None,
+                content_hash: c
+                    .after
+                    .as_ref()
+                    .or(c.before.as_ref())
+                    .map(|f| f.content.hash.clone()),
+                truncated: false,
+            })
+            .collect();
         let mut changes = vec![];
         for c in &diff.changes {
             let text = |file: &Option<source::FileState>| -> Result<Option<String>> {
@@ -718,7 +752,7 @@ impl<'a> Runtime<'a> {
             serde_json::to_vec(&value)?.len() <= 128 * 1024,
             "exact diff exceeds 128 KiB verifier context; split/replan task",
         )?;
-        Ok(value)
+        Ok((value, paths))
     }
     fn evidence(
         &mut self,
@@ -914,7 +948,8 @@ impl<'a> Runtime<'a> {
         )?;
         let (template_id, _) = self.identity()?;
         let template = super::planner::template(&prepared, template_id.as_str())?;
-        let (mut job,value) = self.invoke(&info,None,Some(request),None,AgentRole::Planner,&source,json!({"planner_packet":prepared,"output_template":template,"packet_schema":schemars::schema_for!(PlanPacket),"hash_helper":{"executable":std::env::current_exe()?,"argv":["run","packet-hashes"],"stdin":"the exact PlanPacket JSON"},"instruction":"Return an ExecutionPlan envelope shaped like output_template. Decompose tasks as needed with unique IDs and one contract per task; preserve the frozen source and request. Recompute task_packet_hash and plan_packet_hash using the read-only hash_helper (scratch files in TMPDIR are allowed). Hashes are BLAKE3 of typed compact serde serialization, not raw JSON formatting. Do not activate or write source. All output still undergoes Stage 4 validation."}),&lease,&prepared.request.source.policy_hash)?;
+        let inventory = manifest::ContextInventory::planner(&prepared);
+        let (mut job,value) = self.invoke(&info,None,Some(request),None,AgentRole::Planner,&source,json!({"planner_packet":prepared,"output_template":template,"packet_schema":schemars::schema_for!(PlanPacket),"hash_helper":{"executable":std::env::current_exe()?,"argv":["run","packet-hashes"],"stdin":"the exact PlanPacket JSON"},"instruction":"Return an ExecutionPlan envelope shaped like output_template. Decompose tasks as needed with unique IDs and one contract per task; preserve the frozen source and request. Recompute task_packet_hash and plan_packet_hash using the read-only hash_helper (scratch files in TMPDIR are allowed). Hashes are BLAKE3 of typed compact serde serialization, not raw JSON formatting. Do not activate or write source. All output still undergoes Stage 4 validation."}),inventory,&lease,&prepared.request.source.policy_hash)?;
         let result = (|| {
             require(
                 source::capture(root, &self.artifacts)? == source,
@@ -1175,7 +1210,7 @@ impl<'a> Runtime<'a> {
                 return self.integrate(info, plan, run, &current, lease);
             }
             let task=tasks.into_iter().find(|t|t.structurally_ready).ok_or_else(||Error::Invalid("no runnable task; unverified/rejected/interrupted work requires planner decision".into()))?;
-            let artifact = self.task_input(info, &task, &current)?;
+            let (artifact, inventory) = self.task_input(info, &task, &current)?;
             self.expected(&info.root, &run.expected)?;
             if task.state == TaskState::Planned {
                 self.store.transition_task(
@@ -1203,6 +1238,7 @@ impl<'a> Runtime<'a> {
                 AgentRole::Executor,
                 &current,
                 artifact,
+                inventory,
                 lease,
                 &run.policy_hash,
             );
@@ -1362,7 +1398,13 @@ impl<'a> Runtime<'a> {
                     task_id: pending.task_id.clone(),
                     executor_job_id: pending.executor.clone(),
                 };
-                let artifact = json!({"task":task,"contract":inspection.contract,"invariants":inspection.invariants,"target":target,"evidence":pending.evidence,"evidence_records":self.evidence_input(info,&pending.evidence)?,"diff":self.diff_input(&pending.diff)?,"verification_schema":schemars::schema_for!(VerificationPacket)});
+                let (diff, paths) = self.diff_input(&pending.diff)?;
+                let inventory = manifest::ContextInventory {
+                    paths,
+                    invariants: inspection.invariants.keys().cloned().collect(),
+                    ..Default::default()
+                };
+                let artifact = json!({"task":task,"contract":inspection.contract,"invariants":inspection.invariants,"target":target,"evidence":pending.evidence,"evidence_records":self.evidence_input(info,&pending.evidence)?,"diff":diff,"verification_schema":schemars::schema_for!(VerificationPacket)});
                 event(
                     self.store,
                     info,
@@ -1379,6 +1421,7 @@ impl<'a> Runtime<'a> {
                     AgentRole::Verifier,
                     &after,
                     artifact,
+                    inventory,
                     lease,
                     &run.policy_hash,
                 )?;
@@ -1487,7 +1530,13 @@ impl<'a> Runtime<'a> {
             .into_iter()
             .flat_map(|t| t.invariants)
             .collect();
-        let artifact = json!({"plan":plan.packet,"contract":plan.metadata.integration,"invariants":invariants,"target":target,"evidence":evidence,"evidence_records":self.evidence_input(info,&evidence)?,"diff":self.diff_input(&reference)?,"verification_schema":schemars::schema_for!(VerificationPacket)});
+        let (diff, paths) = self.diff_input(&reference)?;
+        let inventory = manifest::ContextInventory {
+            paths,
+            invariants: invariants.keys().cloned().collect(),
+            ..Default::default()
+        };
+        let artifact = json!({"plan":plan.packet,"contract":plan.metadata.integration,"invariants":invariants,"target":target,"evidence":evidence,"evidence_records":self.evidence_input(info,&evidence)?,"diff":diff,"verification_schema":schemars::schema_for!(VerificationPacket)});
         let (_, value) = self.invoke(
             info,
             Some(&run.plan_id),
@@ -1496,6 +1545,7 @@ impl<'a> Runtime<'a> {
             AgentRole::Verifier,
             current,
             artifact,
+            inventory,
             lease,
             &run.policy_hash,
         )?;

@@ -55,7 +55,7 @@ Usage:
   agentctl experiment decisions <experiment-id> [--json]
   agentctl experiment wakeups <experiment-id> [--json]
   agentctl plan prepare <--objective TEXT|--objective-file PATH|--request-file PATH> [--query TEXT] [--bytes N] [--notes N] [--json]
-  agentctl plan context <request-id> [--json]
+  agentctl plan context <request-id> [--manifest] [--json]
   agentctl plan import <plan.json> [--json]
   agentctl plan <validate|activate|show|export|tasks|ready|blocked> <plan-id> [--json]
   agentctl plan list [--all] [--limit N] [--json]

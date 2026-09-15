@@ -168,7 +168,9 @@ pub struct MemoryProvenance {
     pub author_job_id: Option<JobId>,
 }
 
-/// A normalized repository-relative file or directory subtree. No glob syntax.
+/// A normalized repository-relative file or directory subtree, matched
+/// literally: `app/[slug]` is the directory named `[slug]`, never a pattern.
+/// `*` and `?` are refused rather than silently matched literally.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ScopePath {

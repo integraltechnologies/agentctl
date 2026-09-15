@@ -159,6 +159,69 @@ fn ids_and_scope_paths_reject_ambiguous_or_unbounded_values() {
     value.validate().unwrap();
 }
 
+/// Issue #1: names a repository really contains are literal. Framework route
+/// segments and pattern metacharacters are accepted wherever a path is observed
+/// (reported changes, file events); authored scopes accept them too but refuse
+/// the `*`/`?` wildcards; traversal and platform-ambiguous forms stay rejected.
+#[test]
+fn observed_paths_are_literal_while_authored_scopes_refuse_wildcards() {
+    let observed = |path: &str| {
+        let mut result = samples()["result"].clone();
+        result["changed_paths"] = json!([path]);
+        let mut event = samples()["agent-event"].clone();
+        event["event"]["path"] = json!(path);
+        let parsed = (
+            decode::<ResultPacket>(result.clone()).validate(),
+            decode::<AgentEvent>(event.clone()).validate(),
+        );
+        if parsed.0.is_ok() {
+            schema::validate_json("result", &result.to_string()).unwrap();
+            schema::validate_json("agent-event", &event.to_string()).unwrap();
+        }
+        parsed.0.is_ok() && parsed.1.is_ok()
+    };
+    let authored = |path: &str| {
+        let mut value = task("a", &[]);
+        value.write_scope = vec![ScopePath::File { path: path.into() }];
+        value.read_scope = vec![ScopePath::Directory { path: path.into() }];
+        value.validate().is_ok()
+    };
+    for literal in [
+        "app/[slug]/page.tsx",
+        "app/[...slug]/page.tsx",
+        "app/[[...slug]]/page.tsx",
+        "app/(customer)/s/[slug]/actions.ts",
+        "app/@modal/(.)photo/[id]/page.tsx",
+        "src/routes/[[lang]]/+page.svelte",
+        "lib/{brace}/100%_done/it's here.ts",
+        "lib/$param/~tilde/#hash!/x.ts",
+    ] {
+        assert!(observed(literal), "{literal:?}");
+        assert!(authored(literal), "{literal:?}");
+    }
+    for wildcard in ["lib/star*/x.ts", "lib/q?/x.ts", "src/**"] {
+        assert!(observed(wildcard), "{wildcard:?}");
+        assert!(!authored(wildcard), "{wildcard:?}");
+    }
+    for bad in [
+        "",
+        " ",
+        "/abs/[slug]",
+        "../[slug]",
+        "app/[slug]/../x",
+        "app//[slug]",
+        "app/./[slug]",
+        "app/[slug]/",
+        "C:\\[slug]",
+        "app\\[slug]",
+        "app/[slug]:stream",
+        "app/[slug]\n/x",
+    ] {
+        assert!(!observed(bad), "{bad:?}");
+        assert!(!authored(bad), "{bad:?}");
+    }
+}
+
 #[test]
 fn versions_and_unknown_fields_fail_closed() {
     for kind in schema::DOCUMENT_TYPES {

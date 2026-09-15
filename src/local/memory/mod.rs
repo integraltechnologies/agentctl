@@ -471,7 +471,9 @@ fn validate_link(c: &Connection, info: &RepositoryInfo, link: &MemoryLink) -> Re
                 "graph link is absent from the current workspace index",
             )
         }
-        MemoryLink::File { path } => crate::validation::repo_path(path).map_err(Error::from),
+        MemoryLink::File { path } => {
+            crate::validation::literal_repo_path(path).map_err(Error::from)
+        }
         MemoryLink::Invariant { key } | MemoryLink::Tag { value: key } => {
             GraphEntityId::new(key.clone())
                 .map(|_| ())

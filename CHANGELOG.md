@@ -7,8 +7,59 @@ to storage, configuration, or the CLI.
 
 ## [Unreleased]
 
+### Added
+
+- Context manifests. Every planner, executor, and verifier job records what
+  agentctl supplied: identities, the graph generation, the repository paths and
+  ranges (hash-bound), graph entity, memory, and invariant IDs, and exact byte
+  accounting by category that sums to the compiled prompt. Manifests copy no
+  repository content, and provider-hidden context is marked unobserved rather
+  than estimated. `agentctl plan context <id> --manifest` prints one for a
+  prepared PlannerPacket.
+- Graph generations: a content-derived fingerprint plus a monotonic
+  per-workspace sequence. It is reported by `repo index`, recorded in index
+  events, and bound into graph context, PlannerPackets, and job manifests.
+  Import and activation reject a planning source bound to a generation the
+  workspace never reached.
+- Conservative relation resolution. In-file resolution covers lexical scope
+  (shadowing-aware) and enclosing-type methods. Rust qualified paths also
+  resolve across files. Each resolved relation names its rule, and ambiguous
+  names stay unresolved.
+
+### Changed
+
+- Graph context and PlannerPacket composition:
+  - IDF ranking without stopwords, with separate implementation and test
+    lanes;
+  - primary selection that spans files, and neighbors spread across files;
+  - tests offered with their association basis;
+  - resolved relations only, plus bounded summaries of unresolved call sites;
+  - provenance written once per file;
+  - excerpts bound to entities;
+  - value-ordered truncation that sheds graph noise before implementation
+    excerpts;
+  - scoped requests and tasks select within their scope.
+
+  On the Issue #3 request at the default 32 KiB budget, the packet now reaches
+  the source-capture implementation with excerpts. It carries 0 unresolved
+  relation records (previously 52% of the packet) and about 54% fewer
+  provenance bytes.
+- The graph index version is now `agentctl-graph-2`, so the first
+  `repo index` after upgrading re-derives every file. Requests prepared by
+  earlier versions stay readable but cannot seed new plans; prepare again.
+- Database schema 12 adds workspace-level relation resolution. The migration
+  is additive and lossless.
+
 ### Fixed
 
+- `repo index`, runtime capture, and every other consumer of repository paths
+  now treat paths literally (issue #1). Next.js-style names such as `[slug]`,
+  `[...slug]`, `[[...slug]]`, `(group)` and `@slot`, and other characters that
+  pattern APIs give meaning, are ordinary filename characters. Previously a
+  single such path made `repo index` fail, and would have blocked runtime
+  capture. Traversal, absolute paths, empty segments, backslashes, `:` and
+  control characters are still rejected. Authored scopes still refuse the
+  `*`/`?` wildcards.
 - Runtime source capture no longer reads, counts, or walks Git-ignored
   content. A large ignored build tree such as `target/` no longer exhausts the
   64 MiB workspace capture budget and blocks `agentctl run planner` (issue #3).
@@ -26,6 +77,14 @@ to storage, configuration, or the CLI.
   the worktree, so the snapshot records a hash of it (the file Git resolves,
   shared by linked worktrees). Changing it fails closed as `SOURCE_DRIFT`
   rather than silently hiding a change.
+- `QUALIFIED_PATH` resolution no longer drops the leading segment of an
+  unmatched Rust qualified path (e.g. `ext::helpers::run`) to retry the match
+  against the remaining suffix. Without Cargo/workspace metadata, agentctl
+  cannot tell an external crate, an unresolved re-export, or a typo apart from
+  a real local crate name, so a unique match on the shortened suffix was not
+  evidence that the target was correct; it could bind a call to an unrelated
+  declaration elsewhere in the workspace that merely shared that suffix. Such
+  paths now stay unresolved.
 
 ### Changed
 

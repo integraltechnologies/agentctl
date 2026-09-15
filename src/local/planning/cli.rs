@@ -153,11 +153,20 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
         );
     }
     if command == "context" {
-        require(args.len() == 1, "plan context requires a request ID")?;
+        require(
+            args.len() == 1 || args.len() == 2 && args[1] == "--manifest",
+            "plan context <request-id> [--manifest]",
+        )?;
         let packet = store.planning_context(
             &root,
             &PlanningRequestId::new(args[0]).map_err(Error::Invalid)?,
         )?;
+        if args.len() == 2 {
+            // Derived deterministically from the immutable packet; describes it
+            // without copying repository content.
+            let manifest = crate::local::runtime::manifest::for_packet(&packet)?;
+            return output(json, &manifest, &serde_json::to_string_pretty(&manifest)?);
+        }
         return output(json, &packet, &serde_json::to_string_pretty(&packet)?);
     }
     let id = PlanId::new(

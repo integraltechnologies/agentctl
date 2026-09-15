@@ -52,7 +52,7 @@
       ]
     },
     "ScopePath": {
-      "description": "A normalized repository-relative file or directory subtree. No glob syntax.",
+      "description": "A normalized repository-relative file or directory subtree, matched\nliterally: `app/[slug]` is the directory named `[slug]`, never a pattern.\n`*` and `?` are refused rather than silently matched literally.",
       "oneOf": [
         {
           "type": "object",

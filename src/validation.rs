@@ -68,17 +68,39 @@ fn unique<T: Ord>(values: &[T], field: &'static str) -> Result<(), ValidationErr
     )
 }
 
-pub(crate) fn repo_path(path: &str) -> Result<(), ValidationError> {
+/// A literal repository-relative path, as a repository contains it: normalized
+/// (not absolute; no empty, `.` or `..` segments) and free of control
+/// characters, backslashes and `:` (Windows separators, drive-relative paths and
+/// alternate data streams). Every other character, including `[ ] { } ( ) @ * ?
+/// % _`, is an ordinary filename character. No agentctl interface gives a
+/// repository path pattern semantics, so `app/[slug]/page.tsx` can only ever
+/// name that one file.
+pub(crate) fn literal_repo_path(path: &str) -> Result<(), ValidationError> {
     ensure(
         !path.trim().is_empty()
             && !path
                 .chars()
-                .any(|c| c.is_control() || "\\:*?[]{}".contains(c))
+                .any(|c| c.is_control() || c == '\\' || c == ':')
             && path
                 .split('/')
                 .all(|p| !p.is_empty() && p != "." && p != ".."),
         "path",
-        "must be a normalized repository-relative path without globs or traversal",
+        "must be a normalized repository-relative path without traversal, backslashes, ':' or control characters",
+    )
+}
+
+/// An authored reference to a repository path (task, request and contract
+/// scopes, protected paths, command directories). Matched literally like every
+/// repository path, but `*` and `?` are refused: no portable (Windows-valid)
+/// filename contains them, and in an authored scope they almost always mean an
+/// intended glob, which literal matching would silently turn into a scope that
+/// matches nothing.
+pub(crate) fn repo_path(path: &str) -> Result<(), ValidationError> {
+    literal_repo_path(path)?;
+    ensure(
+        !path.contains(['*', '?']),
+        "path",
+        "is matched literally; '*' and '?' wildcards are not supported (name a file or directory subtree)",
     )
 }
 
@@ -195,7 +217,8 @@ impl Validate for ResultPacket {
             nonempty(&failure.summary, "result.failure.summary")?;
         }
         for path in &self.changed_paths {
-            repo_path(path)?;
+            // Reported names are compared with literally captured paths.
+            literal_repo_path(path)?;
         }
         unique(&self.changed_paths, "result.changed_paths")?;
         unique(&self.changed_entities, "result.changed_entities")?;
@@ -211,7 +234,7 @@ impl Validate for LocationRef {
             "requires a path or graph entity",
         )?;
         if let Some(path) = &self.path {
-            repo_path(path)?;
+            literal_repo_path(path)?;
         }
         if let Some(line) = self.line {
             ensure(
@@ -524,7 +547,7 @@ impl Validate for AgentEvent {
             }
             AgentEventKind::PlanStepStarted { step } => nonempty(step, "event.step")?,
             AgentEventKind::FileRead { path } | AgentEventKind::FileEdited { path } => {
-                repo_path(path)?
+                literal_repo_path(path)?
             }
             AgentEventKind::ToolStarted {
                 invocation_id,

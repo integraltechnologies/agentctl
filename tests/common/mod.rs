@@ -70,8 +70,27 @@ pub fn strip_experiment_decisions(c: &rusqlite::Connection) {
     )
     .unwrap();
 }
+/// Removes the additive v12 graph-resolution schema so a test can restore an
+/// older accepted schema. Every older downgrade path strips it first.
+#[allow(dead_code)]
+pub fn strip_graph_resolutions(c: &rusqlite::Connection) {
+    c.execute_batch(
+        "DROP TABLE IF EXISTS graph_resolutions; DROP INDEX IF EXISTS graph_edges_hinted; DELETE FROM schema_migrations WHERE version=12;",
+    )
+    .unwrap();
+    let hinted = c
+        .prepare("SELECT 1 FROM pragma_table_info('graph_edges') WHERE name='path_hint'")
+        .unwrap()
+        .exists([])
+        .unwrap();
+    if hinted {
+        c.execute_batch("ALTER TABLE graph_edges DROP COLUMN path_hint;")
+            .unwrap();
+    }
+}
 #[allow(dead_code)]
 pub fn strip_experiment_decision_cursors(c: &rusqlite::Connection) {
+    strip_graph_resolutions(c);
     for name in [
         "experiment_decision_cursors_insert",
         "experiment_decision_cursors_update",

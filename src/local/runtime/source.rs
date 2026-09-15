@@ -463,7 +463,8 @@ fn listed_entry(
         !relative.ends_with('/') && !relative.split('/').any(|s| s == ".git"),
         "runtime does not support nested repositories/submodules",
     )?;
-    crate::validation::repo_path(relative)?;
+    // Git reports literal names; capture must observe `[slug]` like any name.
+    crate::validation::literal_repo_path(relative)?;
     require(
         relative.split('/').count() <= 64,
         "runtime tree depth exceeds limit",

@@ -1839,6 +1839,236 @@ fn planner_output_reuses_stage4_import_and_never_activates_partially() {
         assert_eq!(input.lock().unwrap()[0].role, AgentRole::Planner);
     }
 }
+/// Issue #1 through the runtime: a literal framework path is captured, written by
+/// the executor, reported, diffed and verified as exactly that path, and a
+/// sibling a pattern reading of `[slug]` would match is never touched.
+#[test]
+fn runtime_captures_executes_and_verifies_literal_framework_paths() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.root.join("src/app/[slug]")).unwrap();
+    fs::create_dir_all(f.root.join("src/app/s")).unwrap();
+    fs::write(
+        f.root.join("src/app/[slug]/page.ts"),
+        "export function cacheSlugPage(): number { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        f.root.join("src/app/s/page.ts"),
+        "export function cacheDecoyPage(): number { return 2; }\n",
+    )
+    .unwrap();
+    git(&f.root, &["add", "."]);
+    git(&f.root, &["commit", "--quiet", "-m", "literal routes"]);
+    assert_eq!(f.store().index_repository(&f.root).unwrap().failed, 0);
+    let prepared = f.prepare();
+    let mut p = artifact(&prepared);
+    p.packet.tasks.truncate(1);
+    p.packet.tasks[0].write_scope = vec![ScopePath::File {
+        path: "src/app/[slug]/page.ts".into(),
+    }];
+    p.metadata.contracts.truncate(1);
+    p.metadata.contracts[0].task_packet_hash = hash(&p.packet.tasks[0]).unwrap();
+    p.metadata.integration.plan_packet_hash = hash(&p.packet).unwrap();
+    f.store().import_execution_plan(&f.root, &p).unwrap();
+    f.store()
+        .activate_execution_plan(&f.root, &p.packet.plan_id)
+        .unwrap();
+    let inputs = seen();
+    let run = f.run(&p, Mode::Pass, inputs.clone(), false).unwrap();
+    assert_eq!(run.state, RunState::Complete);
+    let inputs = inputs.lock().unwrap();
+    let verifier = inputs
+        .iter()
+        .find(|i| i.role == AgentRole::Verifier && i.task_id.is_some())
+        .unwrap();
+    let changes = verifier.artifact["diff"]["changes"].as_array().unwrap();
+    let paths: Vec<&str> = changes
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["src/app/[slug]/page.ts"]);
+    assert!(
+        fs::read_to_string(f.root.join("src/app/[slug]/page.ts"))
+            .unwrap()
+            .contains("accepted fixture change for task:0")
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("src/app/s/page.ts")).unwrap(),
+        "export function cacheDecoyPage(): number { return 2; }\n"
+    );
+    // The accepted change re-indexes under its literal path.
+    let found = f
+        .store()
+        .graph(&f.root)
+        .unwrap()
+        .entities_in_file("src/app/[slug]/page.ts", 10)
+        .unwrap()
+        .data;
+    assert!(found.iter().any(|e| e.name == "cacheSlugPage"));
+}
+/// Every provider job records a deterministic manifest of what agentctl issued:
+/// its byte accounting reproduces the compiled prompt exactly, each category is
+/// the size of that part of the issued input, and no repository content is
+/// copied into it.
+#[test]
+fn provider_jobs_record_exact_content_free_context_manifests() {
+    let f = Fixture::new();
+    fs::write(
+        f.root.join("src/api.rs"),
+        "pub fn cache_api() { let _ = \"MANIFEST_SOURCE_CANARY\"; }\n",
+    )
+    .unwrap();
+    git(&f.root, &["add", "."]);
+    git(&f.root, &["commit", "--quiet", "-m", "canary"]);
+    f.store().index_repository(&f.root).unwrap();
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    let inputs = seen();
+    {
+        let mut store = f.store();
+        Runtime::new(
+            &mut store,
+            f.paths.clone(),
+            f.config.clone(),
+            BTreeMap::from([(
+                "test".into(),
+                Box::new(Fake {
+                    mode: Mode::Planner(Box::new(p.clone())),
+                    seen: inputs.clone(),
+                }) as Box<dyn ProviderAdapter>,
+            )]),
+        )
+        .unwrap()
+        .plan(&f.root, &prepared.request.request_id)
+        .unwrap();
+    }
+    f.store()
+        .activate_execution_plan(&f.root, &p.packet.plan_id)
+        .unwrap();
+    assert_eq!(
+        f.run(&p, Mode::Pass, inputs.clone(), false).unwrap().state,
+        RunState::Complete
+    );
+    let inputs = inputs.lock().unwrap();
+    let jobs = f.store().runtime_jobs(&f.root, None).unwrap();
+    let mut roles = std::collections::BTreeSet::new();
+    for job in &jobs {
+        let m = job.context_manifest.as_ref().expect("issued job manifest");
+        let prompt = job.prompt.as_ref().unwrap();
+        let input = inputs.iter().find(|i| i.job_id == job.job_id).unwrap();
+        roles.insert(format!("{:?}", job.role));
+        assert_eq!(m.version, manifest::MANIFEST_VERSION);
+        assert_eq!(
+            (
+                m.role,
+                m.job_id.as_ref(),
+                m.plan_id.as_ref(),
+                m.task_id.as_ref(),
+                m.request_id.as_ref()
+            ),
+            (
+                job.role,
+                Some(&job.job_id),
+                job.plan_id.as_ref(),
+                job.task_id.as_ref(),
+                job.request_id.as_ref()
+            )
+        );
+        let compiled = &input.compiled.as_ref().unwrap().bytes;
+        assert_eq!(
+            (m.bytes.total, prompt.bytes),
+            (compiled.len(), compiled.len())
+        );
+        assert_eq!(
+            m.bytes.categories.iter().map(|c| c.bytes).sum::<usize>(),
+            compiled.len()
+        );
+        assert_eq!(
+            m.bytes.provider_hidden,
+            manifest::HiddenContext::NotObserved
+        );
+        let value = serde_json::to_value(input).unwrap();
+        for c in m
+            .bytes
+            .categories
+            .iter()
+            .filter(|c| c.category != "framing" && c.category != "instructions")
+        {
+            let part = c.category.split('.').fold(&value, |v, key| &v[key]);
+            assert_eq!(
+                serde_json::to_vec(part).unwrap().len(),
+                c.bytes,
+                "{}",
+                c.category
+            );
+        }
+        assert!(
+            !serde_json::to_string(m)
+                .unwrap()
+                .contains("MANIFEST_SOURCE_CANARY")
+        );
+        match job.role {
+            AgentRole::Planner => {
+                assert_eq!(m.graph_generation, prepared.request.source.graph_generation);
+                assert!(m.graph_generation.is_some());
+                assert!(
+                    m.bytes
+                        .categories
+                        .iter()
+                        .any(|c| c.category == "artifact.planner_packet.context.graph.relations")
+                );
+                assert!(
+                    m.paths
+                        .iter()
+                        .any(|s| s.kind == manifest::SuppliedKind::GraphFacts)
+                );
+                assert_eq!(
+                    m,
+                    &manifest::for_job(
+                        input,
+                        job.request_id.as_ref(),
+                        prompt,
+                        manifest::ContextInventory::planner(&prepared)
+                    )
+                    .unwrap()
+                );
+            }
+            AgentRole::Executor => {
+                assert!(String::from_utf8_lossy(compiled).contains("MANIFEST_SOURCE_CANARY"));
+                assert!(m.paths.iter().any(|s| s.path == "src/api.rs"
+                    && s.kind == manifest::SuppliedKind::File
+                    && s.content_hash.is_some()));
+                assert!(m.graph_generation.is_some());
+                assert!(
+                    m.bytes
+                        .categories
+                        .iter()
+                        .any(|c| c.category == "artifact.files")
+                );
+            }
+            AgentRole::Verifier => {
+                assert!(!m.paths.is_empty());
+                assert!(
+                    m.paths
+                        .iter()
+                        .all(|s| s.kind == manifest::SuppliedKind::Diff)
+                );
+                assert!(
+                    m.bytes
+                        .categories
+                        .iter()
+                        .any(|c| c.category.starts_with("artifact.diff."))
+                );
+            }
+        }
+    }
+    assert_eq!(roles.len(), 3);
+    // Jobs recorded before manifests existed remain readable.
+    let mut legacy = serde_json::to_value(&jobs[0]).unwrap();
+    legacy.as_object_mut().unwrap().remove("context_manifest");
+    let job: RuntimeJob = serde_json::from_value(legacy).unwrap();
+    assert!(job.context_manifest.is_none());
+}
 /// `--bytes` only bounds the frozen `PlannerPacket` (selected graph/memory/excerpt
 /// content). `run planner` separately calls `source::capture`, which walks and reads
 /// *every* file in the workspace tree (for provenance/journaling). `source::capture`
@@ -3018,7 +3248,7 @@ fn v6_runtime_migration_is_additive_atomic_and_missing_guards_fail_closed() {
     );
     c.execute_batch("DROP TABLE runtime_jobs").unwrap();
     drop(c);
-    assert_eq!(f.store().status().unwrap().schema_version, 11);
+    assert_eq!(f.store().status().unwrap().schema_version, 12);
     assert_eq!(
         f.store()
             .execution_plan(&f.root, &p.packet.plan_id)
@@ -3504,7 +3734,7 @@ fn old_v7_runtime_metadata_remains_inspectable_without_silent_ownership_backfill
         c.query_row::<String, _, _>("SELECT record_json FROM runtime_runs", [], |r| r.get(0))
             .unwrap()
     );
-    assert_eq!(f.store().status().unwrap().schema_version, 11);
+    assert_eq!(f.store().status().unwrap().schema_version, 12);
     assert!(
         f.store()
             .runtime_jobs(&f.root, None)

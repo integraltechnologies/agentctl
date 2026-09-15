@@ -58,7 +58,7 @@ agentctl code file <path>              # entities in a file
 agentctl code locate <text>            # deterministic ranked lookup over names, paths, containers, signatures
 agentctl code refs <symbol>            # resolved references
 agentctl code callers <symbol>         # resolved callers
-agentctl code tests <symbol>           # lexical test candidates
+agentctl code tests <symbol>           # tests with resolved or lexical-container links
 agentctl code neighbors <symbol> [--depth N] [--neighbors N]
 agentctl code impact <symbol>          # known structural dependents
 agentctl code context <text> [--limit N] [--depth N] [--neighbors N] [--tests N] \
@@ -71,10 +71,23 @@ agentctl code context <text> [--limit N] [--depth N] [--neighbors N] [--tests N]
   changed, deleted, or stale, the query is refused with an instruction to run
   `repo index`. Partial indexes answer from successfully indexed files and are
   marked partial.
-- **Precision:** results are syntactic, not compiler truth. Most imports and
-  calls stay unresolved. Only unique same-module Rust `self::` paths are resolved.
-  Test links are lexical candidates, not proven coverage. `impact` reports known
-  dependents, not everything a change could break.
+- **Precision:** results are syntactic, not compiler truth. A relation is
+  resolved only when exactly one compatible declaration is visible. That covers
+  in-file lexical scope (shadowing-aware), `self.`/`Self::`/`this.` methods, and
+  Rust qualified paths across files. Every resolved relation names its rule.
+  Imports, re-exports, and calls on variables stay unresolved. Context lists
+  unresolved call sites only as bounded per-entity name summaries. Test links
+  state their basis (resolved call, via a helper, shared container, or
+  lexical), not proven coverage. `impact` reports known dependents, not
+  everything a change could break.
+- **Ranking:** `locate` and `context` weight query terms by IDF after dropping
+  stopwords. Implementation and tests rank separately, and primary context
+  spans files. See [architecture.md](architecture.md#code-graph).
+- **Generations:** each `repo index` reports the graph generation, a
+  content-derived fingerprint plus a per-workspace sequence that only advances
+  when indexed facts change. Planning binds it.
+- **Literal paths:** repository paths are always literal. `app/[slug]/page.tsx`,
+  `app/[...slug]`, `(group)` and `@slot` index and query like any other name.
 - **Discovery:** follows workspace `.gitignore`/`.ignore` rules. It skips
   symlinks, nested repositories, common build and dependency directories
   (`target`, `node_modules`, `.venv`, `vendor`, `dist`, `build`, `__pycache__`),
@@ -129,6 +142,7 @@ agentctl plan prepare --objective TEXT [--query TEXT] [--bytes N] [--notes N]
 agentctl plan prepare --objective-file PATH
 agentctl plan prepare --request-file PATH       # a strict RequestDraft JSON document
 agentctl plan context <request-id>              # the frozen planner input
+agentctl plan context <request-id> --manifest   # its context manifest: categories, bytes, paths, IDs
 agentctl plan import <execution-plan.json>      # externally produced plan → VALIDATED
 agentctl plan validate <plan-id>
 agentctl plan activate <plan-id>                # revalidate and make ACTIVE (one per workspace)

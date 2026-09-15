@@ -82,8 +82,9 @@ dependency list, so there is no separate edge list that could disagree. Each
 TaskPacket carries the following:
 
 - an objective;
-- separate read and write scopes (normalized repository-relative paths, without
-  globs or traversal);
+- separate read and write scopes (normalized repository-relative paths, matched
+  literally: `app/[slug]` is the directory named `[slug]`; traversal and the
+  `*`/`?` wildcards are refused);
 - graph references;
 - critical invariant references;
 - a definition of done;
@@ -188,9 +189,55 @@ involved.
   Database-level failures roll back the whole pass.
 - **Freshness.** Queries rehash the discovered source in a read snapshot and
   refuse stale results.
-- **Precision.** Imports and most calls remain unresolved. Only unique same-module
-  Rust `self::` paths are resolved. There is no macro expansion, type checking,
-  or cross-file resolution.
+- **Literal paths.** Discovered repository paths are literal names. Characters
+  that routing conventions or pattern APIs give meaning (`[slug]`, `[...slug]`,
+  `[[...slug]]`, `(group)`, `@slot`, `{}`, `%`, `_`, and on Unix `*`/`?`) are
+  ordinary filename characters throughout discovery, indexing, queries, planner
+  context, runtime capture, and reported changes. No interface gives a
+  repository path pattern semantics: SQL `LIKE` input is escaped, Git receives
+  no pathspecs, and sandbox profiles quote paths as literals. Traversal, absolute
+  paths, empty segments, backslashes, `:` and control characters stay rejected,
+  and authored scopes additionally refuse the `*`/`?` wildcards.
+- **Resolution.** Every rule is syntactic and requires exactly one compatible
+  candidate; anything ambiguous stays unresolved, and each resolved relation
+  names its rule. `LEXICAL_SCOPE`: bare Rust and Python calls to the unique
+  declaration visible in the file's scope chain (never through a parameter,
+  `let` or assignment that shadows the name; Rust `use super::*` reaches the
+  enclosing module), plus `self::`/`super::` paths. `ENCLOSING_TYPE`:
+  `self.m()`, `this.m()`, `Self::m` and `Type::m` to a method of a type in the
+  same file. `QUALIFIED_PATH`: Rust `module::f`, `Type::f` and
+  `crate::`/`super::`/`self::` paths into other files, matched by unique suffix
+  of a normalized module path (`mod.rs`/`lib.rs` and `impl` headers
+  normalized). A qualified path whose leading segment names no module or crate
+  root agentctl can identify from repository structure — an external crate, an
+  unresolved re-export, or a typo — stays unresolved; a unique match on the
+  remaining suffix elsewhere in the workspace is not treated as evidence of
+  identity, since agentctl parses no Cargo.toml or workspace metadata to prove
+  what that segment names. Cross-file resolutions live in a derived table
+  rebuilt in the index transaction, so re-deriving one file never cascades
+  away another file's relations. Imports and re-exports are not followed,
+  macros are not expanded, and there is no type inference.
+- **Generations.** Each index pass records a generation: a fingerprint over the
+  index version and every indexed file's path, content hash, backend, and
+  diagnostic, plus a per-workspace sequence that advances only when the
+  fingerprint changes. Graph context, PlannerPackets, job manifests, and
+  `INDEX_COMPLETED` events carry it. Import and activation reject a planning
+  source bound to a generation the workspace has not reached.
+- **Ranking.** Queries drop English stopwords and apply a small symmetric
+  stemmer. Terms are weighted by integer IDF over the workspace's entities,
+  fields by name > container > path > signature, and precise names over long
+  ones. Distinct matched terms are coordinated, and entities are scaled by how
+  much of the query's IDF mass their file's declarations cover. The strongest
+  implementation matches credit what they resolve to. Implementation and test
+  entities rank in separate lanes: primary context is implementation first,
+  with one slot kept for another file whenever one qualifies, and tests follow
+  with an association basis (`CALLS`, `CALLS_VIA_HELPER`, `CONTAINER`,
+  `LEXICAL`). Neighbors are resolved relations of the primary entities, spread
+  across files. Relations in context are resolved only; unresolved call sites
+  are summarized per entity as bounded name lists. Context packets write
+  provenance once per file in a source table. A scoped request or task selects
+  within its scope. Ranking scans the workspace's entities twice per query
+  (bounded memory; O(entities) time).
 - **Bounds.** Up to 20,000 supported files, 100,000 visited entries, depth 64,
   2 MiB per file, 200,000 syntax nodes per file, and a 2-second parse budget. Limits
   are explicit failures.
@@ -246,6 +293,13 @@ objective ─▶ plan prepare ─▶ PlannerPacket (frozen) ─▶ planner ─�
   bounded graph context, trusted memory, the project policy snapshot, and exact
   source excerpts, and its serialized size is part of the packet. Every project
   invariant is attached as critical. Rereading the packet returns identical bytes.
+  Excerpts are bound to the entities they show: primary implementation first,
+  then up to two implementation neighbors, then up to two tests. Over budget,
+  the least valuable material goes first: unresolved summaries, relations, test
+  excerpts, neighbors, extra tests, memory, secondary excerpts, the last test,
+  extra primaries, the last excerpt, and finally the last primary. Nothing is
+  kept once what it refers to is gone. `plan context <id> --manifest` prints
+  the packet's context manifest.
 - **ExecutionPlan.** A PlanPacket plus metadata. The metadata holds one
   **verification contract** per task and a final **integration contract**. A
   verification contract is bound to the task's packet hash, requires an
@@ -381,6 +435,23 @@ The routing decision is recorded on each job, so history never consults newer
 configuration. That record contains the resolved route, fallback history, field
 sources, and the profile, policy, prompt, and context hashes and byte counts.
 
+Each job also records a **context manifest**. It describes what agentctl
+intentionally supplied without copying any of it:
+
+- role and job, plan, task, and request identity;
+- graph version and generation;
+- the repository paths and ranges supplied, each bound by content hash and
+  labeled as an excerpt, file, diff, or graph facts only;
+- graph entity, memory, and invariant identifiers;
+- exact byte accounting of the compiled provider input. Instructions, one
+  category per context field, and JSON framing sum exactly to the prompt's
+  bytes.
+
+Provider-side system prompts, tools, and tokenization are marked
+`NOT_OBSERVED` and never estimated. `context_deltas` is reserved and empty.
+Manifests are deterministic, and building one fails closed if its accounting
+does not reproduce the compiled prompt.
+
 `runtime::prompt` combines a short role instruction delta, the configured
 instruction fragments, and the bounded canonical input with the expected output
 contract. Identical inputs produce identical bytes. If the complete prompt exceeds
@@ -470,7 +541,12 @@ distributions.
 
 - Execution within a workspace is serialized. There are no managed parallel
   worktrees.
-- The code graph is syntactic and single-file.
+- The code graph is syntactic. Cross-file resolution covers Rust qualified
+  paths only (no import or re-export following, macros, or type inference).
+  Python and TypeScript relations resolve only within a file, and method calls
+  on variables stay unresolved.
+- Ranking scans a workspace's entities twice per query. A changing index pass
+  rebuilds workspace resolution in time proportional to path-hinted relations.
 - Only Claude Code and Codex CLI adapters exist. Codex usage is unknown, and
   usage arrives at job end.
 - Worker execution requires macOS or Linux with the required sandbox primitives.

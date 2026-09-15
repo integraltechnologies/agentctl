@@ -107,9 +107,10 @@ pub(crate) fn absolute_path(path: &Path) -> Result<()> {
     )
 }
 
-/// Security-sensitive repository-relative path: normalized, no traversal, globs,
-/// drive letters, alternate data streams (`:`), backslashes/UNC or control
-/// characters (`validation::repo_path`), plus — on Windows — device names
+/// Security-sensitive repository-relative path: normalized, no traversal, `*`/`?`
+/// wildcards, drive letters, alternate data streams (`:`), backslashes/UNC or
+/// control characters (`validation::repo_path`; matched literally, so `[slug]`
+/// is an ordinary directory name), plus — on Windows — device names
 /// (`CON`, `NUL`, `COM1`, ... with any extension) and trailing dots/spaces, which
 /// would otherwise name something other than the checked string.
 pub(crate) fn safe_relative(path: &str) -> Result<()> {

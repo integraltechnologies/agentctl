@@ -4,8 +4,10 @@ pub mod files;
 mod model;
 mod parser;
 mod query;
+mod resolve;
+mod wire;
 pub use model::*;
-pub use query::{GraphQuery, QueryResult, SearchMode};
+pub use query::{GraphQuery, QueryResult, SearchMode, objective_query};
 
 use super::{
     Error, Result, now_ms,
@@ -41,12 +43,16 @@ impl Store {
             entities: 0,
             edges: 0,
             duration_ms: 0,
+            resolved: 0,
+            generation: None,
         };
+        let previous = old_metadata.as_ref().and_then(|m| m.generation.clone());
         let initial = IndexMetadata {
             version: INDEX_VERSION.into(),
             indexed_at_ms: now_ms()?,
             source: info.source.clone(),
             stats: stats.clone(),
+            generation: previous.clone(),
         };
         tx.execute("INSERT INTO graph_indexes(workspace_id,repo_id,metadata_json) VALUES (?1,?2,?3) ON CONFLICT(workspace_id) DO UPDATE SET metadata_json=excluded.metadata_json",
             params![info.workspace_id.as_str(), info.repository_id.as_str(), serde_json::to_string(&initial)?])?;
@@ -123,7 +129,7 @@ impl Store {
                 }
                 for edge in derivation.edges {
                     tx.execute(
-                        "INSERT INTO graph_edges VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        "INSERT INTO graph_edges(workspace_id,edge_id,path,source_id,target_id,kind,record_json,path_hint) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                         params![
                             info.workspace_id.as_str(),
                             edge.id,
@@ -133,7 +139,8 @@ impl Store {
                                 .as_ref()
                                 .map(crate::protocol::GraphEntityId::as_str),
                             serde_json::to_string(&edge.kind)?,
-                            serde_json::to_string(&edge)?
+                            serde_json::to_string(&edge)?,
+                            edge.path_hint
                         ],
                     )?;
                 }
@@ -157,13 +164,37 @@ impl Store {
                 && after.source.head_commit == info.source.head_commit,
             "Git source identity changed during indexing; transaction rolled back, retry",
         )?;
+        // The generation advances only when the indexed facts actually change.
+        // Workspace resolution is rebuilt whenever any file was re-derived, even
+        // with identical content: re-deriving a file cascades away its rows.
+        let fingerprint = fingerprint(&tx, &info)?;
+        let changed = previous
+            .as_ref()
+            .is_none_or(|g| g.fingerprint != fingerprint);
+        if changed || stats.indexed > 0 || stats.deleted > 0 {
+            resolve::rebuild(&tx, info.workspace_id.as_str())?;
+        }
+        let generation = match previous {
+            Some(g) if !changed => g,
+            prior => GraphGeneration {
+                sequence: prior.map_or(1, |g| g.sequence + 1),
+                fingerprint,
+            },
+        };
         (stats.entities, stats.edges) = counts(&tx, &info)?;
+        stats.resolved = tx.query_row(
+            "SELECT count(*) FROM graph_resolutions WHERE workspace_id=?1",
+            [info.workspace_id.as_str()],
+            |r| r.get(0),
+        )?;
+        stats.generation = Some(generation.clone());
         stats.duration_ms = started.elapsed().as_millis() as u64;
         let metadata = IndexMetadata {
             version: INDEX_VERSION.into(),
             indexed_at_ms: now_ms()?,
             source: after.source,
             stats: stats.clone(),
+            generation: Some(generation),
         };
         tx.execute(
             "UPDATE graph_indexes SET metadata_json=?2 WHERE workspace_id=?1",
@@ -248,6 +279,20 @@ fn stored_files(
         .map(|r| r.map(|f| (f.path.clone(), f)).map_err(Error::from)).collect()
 }
 
+/// Re-derives one workspace's cross-file resolutions from its stored facts
+/// (used by the index pass and by the schema migration that introduced them).
+pub(crate) fn rebuild_resolutions(connection: &Connection, workspace: &str) -> Result<()> {
+    resolve::rebuild(connection, workspace)
+}
+
+/// The persisted generation of the workspace's index, without rehashing sources.
+pub(crate) fn generation(
+    connection: &Connection,
+    info: &RepositoryInfo,
+) -> Result<Option<GraphGeneration>> {
+    Ok(metadata(connection, info)?.and_then(|m| m.generation))
+}
+
 fn metadata(connection: &Connection, info: &RepositoryInfo) -> Result<Option<IndexMetadata>> {
     let json: Option<String> = connection
         .query_row(
@@ -258,6 +303,25 @@ fn metadata(connection: &Connection, info: &RepositoryInfo) -> Result<Option<Ind
         .optional()?;
     json.map(|s| serde_json::from_str(&s).map_err(Error::from))
         .transpose()
+}
+
+/// Content-derived identity of the indexed facts: the index version plus every
+/// indexed file's path, hash, backend and diagnostic, in path order.
+fn fingerprint(connection: &Connection, info: &RepositoryInfo) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut part = |s: &str| {
+        hasher.update(&(s.len() as u64).to_le_bytes());
+        hasher.update(s.as_bytes());
+    };
+    part("graph-generation-v1");
+    part(INDEX_VERSION);
+    for file in stored_files(connection, info)?.values() {
+        part(&file.path);
+        part(file.content_hash.as_deref().unwrap_or("\0unreadable"));
+        part(&file.backend);
+        part(file.diagnostic.as_deref().unwrap_or(""));
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 fn counts(connection: &Connection, info: &RepositoryInfo) -> Result<(usize, usize)> {

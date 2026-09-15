@@ -4,6 +4,7 @@ pub(crate) mod cli;
 pub mod config;
 pub mod credentials;
 pub(crate) mod liveness;
+pub mod manifest;
 pub mod process;
 pub mod prompt;
 pub mod provider;

@@ -170,6 +170,18 @@ pub(super) fn source_matches(
         s.observation.worktree_fingerprint.is_none() && s.graph_version == graph::INDEX_VERSION,
         "unsupported planning source guarantee/version",
     )?;
+    if let Some(bound) = &s.graph_generation {
+        // Generations only advance; a bound generation this workspace has not
+        // reached, or a same-sequence fingerprint mismatch, is foreign state.
+        let current = graph::generation(c, info)?;
+        require(
+            current.as_ref().is_some_and(|g| {
+                bound.sequence < g.sequence
+                    || bound.sequence == g.sequence && bound.fingerprint == g.fingerprint
+            }),
+            "planning source names an ontology generation this workspace never reached; prepare a new request",
+        )?;
+    }
     require(
         s.policy_hash == hash(policy)?,
         "project policy changed; prepare a new request",

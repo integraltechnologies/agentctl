@@ -115,7 +115,9 @@ fn discover_selected(root: &Path, selected: Option<String>) -> Result<Vec<String
                 .ok_or_else(|| Error::Invalid("index requires UTF-8 paths".into()))?
                 .to_string();
             if Language::for_path(&path).is_some() {
-                crate::validation::repo_path(&path)?;
+                // A discovered name is literal: `app/[slug]/page.tsx` is a file
+                // under a directory named `[slug]`, never a pattern.
+                crate::validation::literal_repo_path(&path)?;
                 require(
                     paths.len() < MAX_FILES,
                     "index exceeds 20000 supported files",
@@ -129,7 +131,7 @@ fn discover_selected(root: &Path, selected: Option<String>) -> Result<Vec<String
 }
 
 pub(crate) fn read(root: &Path, path: &str) -> Result<(String, String)> {
-    crate::validation::repo_path(path)?;
+    crate::validation::literal_repo_path(path)?;
     let mut absolute = root.to_path_buf();
     for component in Path::new(path).components() {
         absolute.push(component);
