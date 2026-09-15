@@ -356,6 +356,18 @@ cases every worker launch would be refused.
   tool subprocesses.
 - Source snapshots are careful sequential observations, not atomic filesystem
   snapshots. External edits between observations cannot be proven absent.
+- Source snapshots do not look inside directories that the repository ignores
+  as a whole, such as `target/` or `node_modules/` (see
+  [cli.md](cli.md#running-plans)). An executor's writes inside such a directory
+  are therefore neither scope violations nor part of the verified diff.
+  Individually ignored files and every ignore-rule file are observed, so an
+  executor cannot create a new ignored location unnoticed. `.git/info/exclude`,
+  which lives outside the worktree, is recorded by content hash, so changing it
+  fails closed as `SOURCE_DRIFT`. Ignored files are
+  observed by metadata only: a change is detected by size, mode, identity, and
+  change times rather than by content hash, and their content is never captured
+  or placed in agent context. If checks consume an ignored directory, such as
+  `node_modules/`, deny writes to it with `[[protected]]`.
 - Local authorization is machine-local orchestration authority. It is not user
   authentication and does not protect against the machine owner.
 

@@ -1415,6 +1415,15 @@ enum Mode {
     WrongJob,
     WrongEvidence,
     Scope,
+    /// Performs the in-scope edit, then, outside the write scope, plants a
+    /// self-ignoring `.gitignore` that turns a new directory into one Git (and
+    /// `git status`) never enters, and hides a file inside it.
+    PlantGitignore,
+    /// Performs the in-scope edit, then moves the ignore boundary from outside
+    /// the worktree: appends a rule to the repository-local `info/exclude` (the
+    /// file Git itself resolves) that makes a new directory one Git never enters,
+    /// and hides a file inside it.
+    HideWithInfoExclude,
     VerifierDrift,
     IntegrationDrift,
     Planner(Box<ExecutionPlan>),
@@ -1479,6 +1488,30 @@ impl ProviderAdapter for Fake {
                     ),
                 )
                 .unwrap();
+                if matches!(self.mode, Mode::PlantGitignore) {
+                    let tests = process.workspace.join("tests");
+                    fs::create_dir_all(tests.join("unit")).unwrap();
+                    fs::write(tests.join(".gitignore"), ".gitignore\nunit/\n").unwrap();
+                    fs::write(tests.join("unit/conftest.py"), "import builtins\n").unwrap();
+                }
+                if matches!(self.mode, Mode::HideWithInfoExclude) {
+                    let o = git_output(
+                        &process.workspace,
+                        &[
+                            "rev-parse",
+                            "--path-format=absolute",
+                            "--git-path",
+                            "info/exclude",
+                        ],
+                    );
+                    let exclude = PathBuf::from(String::from_utf8(o.stdout).unwrap().trim_end());
+                    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+                    let prior = fs::read_to_string(&exclude).unwrap_or_default();
+                    fs::write(&exclude, format!("{prior}/hidden/\n")).unwrap();
+                    let hidden = process.workspace.join("hidden");
+                    fs::create_dir_all(&hidden).unwrap();
+                    fs::write(hidden.join("conftest.py"), "import builtins\n").unwrap();
+                }
                 serde_json::to_value(ResultPacket {
                     version: ProtocolVersion::V1,
                     task_id: task.task_id,
@@ -1933,7 +1966,8 @@ fn run_planner_rejects_workspace_exceeding_file_count_limit() {
 /// workspace (excluding the top-level `.git` directory), so boundary fixtures
 /// below can land exactly on a limit rather than guessing. Not a
 /// reimplementation of capture's scope/symlink/protected-path checks --
-/// fixtures here are plain files with no symlinks or protected paths.
+/// fixtures here are plain files with no symlinks or protected paths, and no
+/// Git-ignored files, so every file on disk outside `.git` is observed source.
 fn workspace_totals(root: &Path) -> (usize, u64) {
     let mut count = 0usize;
     let mut bytes = 0u64;
@@ -2381,6 +2415,286 @@ fn oversized_workspace_file_changes_are_still_detected_as_source_drift() {
     let inputs = seen();
     assert!(f.run(&p, Mode::Pass, inputs.clone(), false).is_err());
     assert!(inputs.lock().unwrap().is_empty());
+    let run = f
+        .store()
+        .runtime_status(&f.root, &p.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, RunState::Blocked);
+    assert!(run.reason.unwrap().contains("SOURCE_DRIFT"));
+}
+/// Creates a sparse file: it has the given apparent size (which is what workspace
+/// capture budgets) without costing disk space or I/O to create.
+fn sparse(path: &Path, bytes: u64) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::File::create(path).unwrap().set_len(bytes).unwrap();
+}
+/// Plain Git with host configuration (including any `core.excludesFile`) disabled.
+fn git_output(root: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .current_dir(root)
+        .args(["-c", "core.excludesFile=/dev/null"])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+/// Git's own verdict, independent of agentctl, on whether a path is ignored.
+fn git_ignored(root: &Path, path: &str) -> bool {
+    git_output(root, &["check-ignore", "--quiet", "--", path])
+        .status
+        .success()
+}
+/// Total size of the files Git itself lists as tracked, plus untracked and not
+/// ignored: an oracle independent of agentctl's capture. It is exact for
+/// fixtures with no individually ignored files, whose only ignored entries are
+/// whole directories.
+fn git_source_bytes(root: &Path) -> u64 {
+    let o = git_output(
+        root,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    o.stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            fs::metadata(root.join(std::str::from_utf8(p).unwrap()))
+                .unwrap()
+                .len()
+        })
+        .sum()
+}
+/// `agentctl run planner` for the fixture's standard request through the real
+/// runtime: workspace capture, planner job creation, invocation, and plan import.
+fn run_planner(f: &Fixture) -> local::Result<ExecutionPlanView> {
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    let mut store = f.store();
+    Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p)),
+                seen: seen(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+}
+/// Regression for agentctl issue #3. While dogfooding, a ~124 MiB Git-ignored
+/// `target/debug/libagentctl.rlib` exhausted the 64 MiB workspace capture budget
+/// and blocked `agentctl run planner`, even though the frozen planner context was
+/// valid. Ignored content now never costs capture budget, however large. That
+/// holds both inside a directory the repository ignores as a whole (never walked)
+/// and for an individually ignored file (observed by metadata only). Both rules
+/// live in a nested, committed `.gitignore`, under names that look nothing like
+/// build output. The ignored directory's other entries mimic the rest of a real
+/// `target/`: a hardlinked binary and a symlink, which capture refuses wherever
+/// it reads content.
+#[test]
+fn run_planner_ignores_git_ignored_artifact_larger_than_capture_budget() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.root.join("data")).unwrap();
+    fs::write(f.root.join("data/.gitignore"), "/snapshot/\n*.pack\n").unwrap();
+    sparse(&f.root.join("data/local.pack"), 128 * 1024 * 1024);
+    assert!(git_ignored(&f.root, "data/local.pack"));
+    git(&f.root, &["add", "data/.gitignore"]);
+    git(
+        &f.root,
+        &["commit", "--quiet", "-m", "ignore local snapshots"],
+    );
+    f.store().index_repository(&f.root).unwrap();
+    sparse(
+        &f.root.join("data/snapshot/archive.pack"),
+        128 * 1024 * 1024,
+    );
+    #[cfg(unix)]
+    {
+        let snapshot = f.root.join("data/snapshot");
+        fs::write(snapshot.join("tool"), "x").unwrap();
+        fs::hard_link(snapshot.join("tool"), snapshot.join("tool-3f2a")).unwrap();
+        std::os::unix::fs::symlink("/", snapshot.join("root")).unwrap();
+    }
+    assert!(
+        git_ignored(&f.root, "data/snapshot/archive.pack"),
+        "Git itself must classify the artifact as ignored"
+    );
+    assert_eq!(run_planner(&f).unwrap().state, PlanState::Validated);
+}
+/// Control for the test above: the identical artifact at the identical path,
+/// without the ignore rule, is included source and still fails closed on the
+/// unchanged aggregate budget. So it is the repository's ignore rule, not the
+/// artifact's name or location, that removes it from capture.
+#[test]
+fn run_planner_still_rejects_the_same_artifact_when_it_is_not_ignored() {
+    let f = Fixture::new();
+    sparse(
+        &f.root.join("data/snapshot/archive.pack"),
+        128 * 1024 * 1024,
+    );
+    assert!(!git_ignored(&f.root, "data/snapshot/archive.pack"));
+    let message = run_planner(&f).unwrap_err().to_string();
+    assert!(
+        message.contains("runtime workspace capture") && message.contains("67108864-byte limit"),
+        "{message}"
+    );
+    assert!(
+        message.contains("data/snapshot/archive.pack") && message.contains("file=134217728"),
+        "{message}"
+    );
+}
+/// Excluding ignored files does not relax the budget for included ones. Included
+/// files that together exceed 64 MiB still fail closed, and the diagnostic's
+/// running total counts only included content: the 128 MiB ignored artifact
+/// alongside contributes nothing. Capture proceeds in sorted path order, so the
+/// offending file (the last included path) is deterministic.
+#[test]
+fn run_planner_rejects_included_files_exceeding_budget_alongside_ignored_artifacts() {
+    let f = Fixture::new();
+    const MIB: u64 = 1024 * 1024;
+    fs::write(f.root.join(".gitignore"), "/cache/\n").unwrap();
+    sparse(&f.root.join("cache/blob.bin"), 128 * MIB);
+    sparse(&f.root.join("src/zz-a.bin"), 40 * MIB);
+    sparse(&f.root.join("src/zz-b.bin"), 30 * MIB);
+    assert!(git_ignored(&f.root, "cache/blob.bin"));
+    let included = git_source_bytes(&f.root);
+    assert!(included > 64 * MIB && included < 128 * MIB);
+    let message = run_planner(&f).unwrap_err().to_string();
+    assert!(
+        message.contains("runtime workspace capture") && message.contains("67108864-byte limit"),
+        "{message}"
+    );
+    assert!(message.contains("while reading src/zz-b.bin"), "{message}");
+    assert_eq!(field(&message, "file="), 30 * MIB, "{message}");
+    assert_eq!(
+        field(&message, "captured=") + 30 * MIB,
+        included,
+        "the running total must count exactly the included files: {message}"
+    );
+}
+/// The whole executor, check, and verifier pipeline completes with a huge ignored
+/// build artifact in the checkout (the dogfood shape), and drift in a captured
+/// file still blocks verification.
+#[test]
+fn runtime_completes_with_ignored_artifacts_and_still_blocks_captured_drift() {
+    for (mode, complete) in [(Mode::Pass, true), (Mode::VerifierDrift, false)] {
+        let f = Fixture::new();
+        fs::write(f.root.join(".gitignore"), "/target/\n").unwrap();
+        git(&f.root, &["add", ".gitignore"]);
+        git(&f.root, &["commit", "--quiet", "-m", "ignore build output"]);
+        f.store().index_repository(&f.root).unwrap();
+        sparse(
+            &f.root.join("target/debug/libagentctl.rlib"),
+            124 * 1024 * 1024,
+        );
+        let p = f.plan();
+        let result = f.run(&p, mode, seen(), false);
+        if complete {
+            assert_eq!(result.unwrap().state, RunState::Complete);
+        } else {
+            let message = result.unwrap_err().to_string();
+            assert!(message.contains("SOURCE_DRIFT"), "{message}");
+            assert_eq!(
+                f.store()
+                    .execution_plan(&f.root, &p.packet.plan_id)
+                    .unwrap()
+                    .state,
+                PlanState::Active
+            );
+        }
+    }
+}
+/// An executor that hides a new file inside a directory it has just made opaque,
+/// using a self-ignoring `.gitignore` outside its write scope, is still caught.
+/// The hidden file is never walked, but the planted rule file is, so the captured
+/// diff carries exactly that scope violation even though `git status` shows
+/// nothing. Skipping ignored directories must not open a blind spot the executor
+/// can create for itself.
+#[test]
+fn executor_planting_a_self_ignoring_gitignore_is_a_scope_violation() {
+    let f = Fixture::new();
+    let p = f.plan();
+    let message = f
+        .run(&p, Mode::PlantGitignore, seen(), false)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("outside allowed scope"), "{message}");
+    assert!(
+        git_ignored(&f.root, "tests/.gitignore") && git_ignored(&f.root, "tests/unit/conftest.py"),
+        "Git itself must no longer report the planted files"
+    );
+    let status = git_output(&f.root, &["status", "--porcelain", "--untracked-files=all"]);
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains("tests/"),
+        "git status must not report the plant"
+    );
+    let run = f
+        .store()
+        .runtime_status(&f.root, &p.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, RunState::Blocked);
+    let hash = f
+        .store()
+        .events(None, None, None, 1000)
+        .unwrap()
+        .iter()
+        .find_map(|e| match &e.entry {
+            local::store::JournalEntry::Runtime { phase, detail, .. }
+                if phase == "DIFF_CAPTURED" =>
+            {
+                Some(detail.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let diff: CapturedDiff = serde_json::from_slice(
+        &fs::read(
+            f.paths
+                .data_root
+                .join("runtime/blobs")
+                .join(hash.strip_prefix("blake3:").unwrap()),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(diff.scope_violations, vec!["tests/.gitignore"]);
+}
+/// Regression for the Issue #3 re-verification finding. `.git/info/exclude`
+/// lives outside the worktree, so capture never walks it, yet it moves the
+/// ignore boundary. The executor appends a rule there that makes a new directory
+/// one Git never enters, and hides a file in it outside its write scope. Neither
+/// the rule nor the hidden file is worktree content, and Git (including
+/// `git status`) no longer reports either. The snapshot records a hash of the
+/// exclude rules Git resolves, so the captured diff fails closed as
+/// `SOURCE_DRIFT` instead of accepting the in-scope edit alone.
+#[test]
+fn executor_hiding_content_by_editing_info_exclude_fails_closed() {
+    let f = Fixture::new();
+    let p = f.plan();
+    let message = f
+        .run(&p, Mode::HideWithInfoExclude, seen(), false)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("SOURCE_DRIFT"), "{message}");
+    assert!(
+        git_ignored(&f.root, "hidden/conftest.py"),
+        "Git itself must no longer report the hidden file"
+    );
+    let status = git_output(&f.root, &["status", "--porcelain", "--untracked-files=all"]);
+    assert!(!String::from_utf8_lossy(&status.stdout).contains("hidden/"));
     let run = f
         .store()
         .runtime_status(&f.root, &p.packet.plan_id)

@@ -287,9 +287,13 @@ there are no persistent or cross-session workers.
 1. **Adoption.** The runtime rejects plans with pre-existing manual jobs. It
    requires the prepared baseline and the current checkout to be clean and
    committed, with a fresh graph. It then captures a full source snapshot: a
-   manifest of every file (including ignored files) with content hashes and
-   modes, plus HEAD and the Git index hash. The snapshot is taken twice and the
-   two captures must match.
+   manifest of every tracked and non-ignored untracked file with content
+   hashes and modes, the metadata (never the content) of individually ignored
+   files, and HEAD and the Git index hash. Directories that the repository
+   ignores as a whole, such as build output and dependency caches, are not
+   walked. The snapshot is taken twice and the two captures must match. It is
+   an integrity observation for drift and scope checks, not agent context:
+   agents receive only bounded, scope-filtered context.
 2. **Execution.** A workspace lock serializes every task and check within the
    workspace, so there are no concurrent writers and no automatic worktrees. For
    each ready task, the runtime checks readiness, routing, scope, drift, and
@@ -347,14 +351,19 @@ fallback. Finished jobs free capacity. Experiments are not agents.
 
 | Limit | Value |
 | --- | --- |
-| Files in a captured checkout | 20,000 (25,000 entries), 64 MiB total, 2 MiB per file, depth 64 |
+| Files in a captured checkout | 20,000 captured source files (64 MiB of content in total); 20,000 individually ignored files (metadata only); depth 64 |
 | Expanded verifier diff | 128 KiB |
 | Compiled provider input | 256 KiB |
 | Role process timeout | `runtime.timeout_ms` (default 10 minutes, maximum 1 hour) |
 | Captured stdout/stderr | 4 MiB each |
 
 Symlinks, hardlinks, nested repositories or submodules, special files, and
-read-denied files in the checkout make capture fail closed.
+read-denied files among the captured source files make capture fail closed.
+Capture never reads individually ignored files (it records their metadata only)
+and never walks directories ignored as a whole, so none of these conditions
+applies there. The snapshot also records a hash of the repository-local exclude
+rules (`info/exclude`, as Git resolves it), so changing them fails closed as
+`SOURCE_DRIFT`.
 
 ## Routing and prompt compilation
 

@@ -5,6 +5,38 @@ loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 agentctl is alpha software; versions before `1.0.0` may include breaking changes
 to storage, configuration, or the CLI.
 
+## [Unreleased]
+
+### Fixed
+
+- Runtime source capture no longer reads, counts, or walks Git-ignored
+  content. A large ignored build tree such as `target/` no longer exhausts the
+  64 MiB workspace capture budget and blocks `agentctl run planner` (issue #3).
+  Snapshots now observe the checkout the way Git walks it:
+  - tracked files (even ones an ignore rule matches) and untracked, non-ignored
+    files are captured by content, as before;
+  - individually ignored files are observed by metadata only, so they cost no
+    capture budget and never become agent context, but creating or changing
+    one is still drift and a scope violation;
+  - directories an ignore rule matches as a whole are never walked.
+
+  Ignore rules come from the repository's `.gitignore` files and
+  `.git/info/exclude`; `core.excludesFile` is not applied. The 64 MiB /
+  20,000-file aggregate bounds are unchanged. `.git/info/exclude` lives outside
+  the worktree, so the snapshot records a hash of it (the file Git resolves,
+  shared by linked worktrees). Changing it fails closed as `SOURCE_DRIFT`
+  rather than silently hiding a change.
+
+### Changed
+
+- Ignored symlinks, hardlinks, nested repositories, and read-denied paths no
+  longer make a run refuse. They are still refused among captured source files.
+- Executor writes inside ignored directories are no longer observed.
+- At most 20,000 individually ignored files are observed per capture; beyond
+  that, the run refuses.
+- A run whose stored baseline was captured by 0.1.0-alpha.2 and included
+  ignored files reports `SOURCE_DRIFT` and needs an explicit replan.
+
 ## [0.1.0-alpha.2]
 
 ### Fixed

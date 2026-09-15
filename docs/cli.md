@@ -220,11 +220,25 @@ provider and cannot bypass project `allowed_providers`. If the machine-wide
 `max_agents` limit is reached, the launch fails with `AGENT_CAPACITY_EXCEEDED`.
 That failure is not treated as a provider failure and does not trigger fallback.
 
-The runtime supports repositories of up to 20,000 files and 64 MiB, with at most
-2 MiB per file. Verifier diffs are limited to 128 KiB and provider input to
-256 KiB. Symlinks, hardlinks, nested repositories or submodules, and read-denied
-files in the checkout cause the run to refuse. Ignored files are included in
-source snapshots.
+Source snapshots observe the checkout the way Git walks it:
+- **Source files** are captured by content: every tracked file, even one an
+  ignore rule also matches, and every untracked file that is not ignored.
+- **Individually ignored files** that Git reaches, such as `.env` or a stray
+  `*.log`, are observed by metadata only (size, mode, identity, and change
+  times). Their content is never read, stored, counted, or given to agents, but
+  creating, changing, or deleting one is still drift and a diff change.
+- **Directories that an ignore rule matches as a whole**, such as `target/` or
+  `node_modules/`, are never entered, by Git or by agentctl. Changes inside them
+  count neither as drift nor as diff changes.
+
+Ignore rules come from the repository's `.gitignore` files and
+`.git/info/exclude`. `core.excludesFile` is not applied. `.git/info/exclude` lives
+outside the worktree, so the snapshot records a hash of it: the file Git itself
+resolves, which linked worktrees share. Any change to it is `SOURCE_DRIFT`. Captured source may total
+up to 20,000 files and 64 MiB, and up to 20,000 individually ignored files may be
+observed. Verifier diffs are limited to 128 KiB and provider input to 256 KiB.
+Symlinks, hardlinks, nested repositories or submodules, and read-denied files
+among the captured source files cause the run to refuse.
 
 ## Experiments
 

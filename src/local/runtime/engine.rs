@@ -704,7 +704,14 @@ impl<'a> Runtime<'a> {
                     })
                     .transpose()
             };
-            changes.push(json!({"path":c.path,"before":text(&c.before)?,"after":text(&c.after)?,"before_state":c.before,"after_state":c.after}));
+            let mut change = json!({"path":c.path,"before":text(&c.before)?,"after":text(&c.after)?,"before_state":c.before,"after_state":c.after});
+            // An individually ignored file is observed by metadata alone; its
+            // content is never captured, so the verifier sees only that it changed.
+            if c.before_ignored.is_some() || c.after_ignored.is_some() {
+                change["ignored_before"] = json!(c.before_ignored);
+                change["ignored_after"] = json!(c.after_ignored);
+            }
+            changes.push(change);
         }
         let value = json!({"binding":diff,"artifact":reference,"changes":changes});
         require(
