@@ -1806,6 +1806,186 @@ fn planner_output_reuses_stage4_import_and_never_activates_partially() {
         assert_eq!(input.lock().unwrap()[0].role, AgentRole::Planner);
     }
 }
+/// `--bytes` only bounds the frozen `PlannerPacket` (selected graph/memory/excerpt
+/// content). `run planner` separately calls `source::capture`, which walks and reads
+/// *every* file in the workspace tree (for provenance/journaling). `source::capture`
+/// bounds capture by the real invariant -- 64 MiB / 20000 files in aggregate -- rather
+/// than an arbitrary fixed per-file ceiling, so an irrelevant file larger than the old
+/// 2 MiB cap no longer fails a capture that comfortably fits the aggregate budget.
+/// Regression for the producer/runtime mismatch in agentctl issue #2 (Stage 2B).
+#[test]
+fn run_planner_succeeds_with_irrelevant_oversized_workspace_file_in_budget() {
+    let f = Fixture::new();
+    // Unrecognized extension: invisible to graph indexing/freshness (Language::for_path
+    // returns None), yet source::capture still observes it for full workspace identity.
+    fs::write(
+        f.root.join("src/oversized.bin"),
+        vec![0u8; 2 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+    let prepared = f.prepare();
+    assert!(
+        prepared.serialized_bytes < PlanningLimits::default().bytes,
+        "frozen packet stays well under the 32 KiB budget: {}",
+        prepared.serialized_bytes
+    );
+    let p = artifact(&prepared);
+    let mut store = f.store();
+    Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p)),
+                seen: seen(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap();
+}
+/// Capture must stay bounded: a single file that alone exceeds the 64 MiB aggregate
+/// workspace budget still fails closed. Regression for agentctl issue #2 (Stage 2C):
+/// this used to surface as the same ambiguous "runtime file/artifact exceeds size
+/// limit" message shared with git-index reads and CAS artifact readback, which was
+/// impossible to distinguish from a `PlannerPacket`/artifact size problem. The
+/// diagnostic must now name workspace/source capture specifically and report the
+/// governing byte limit, the offending path, and the offending file's actual size.
+#[test]
+fn run_planner_rejects_workspace_exceeding_aggregate_capture_budget() {
+    let f = Fixture::new();
+    fs::write(f.root.join("src/huge.bin"), vec![0u8; 64 * 1024 * 1024 + 1]).unwrap();
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    let mut store = f.store();
+    let err = Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p)),
+                seen: seen(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("runtime workspace capture") && message.contains("67108864-byte limit"),
+        "diagnostic must name workspace/source capture and the 64 MiB governing limit, not a generic artifact/size message: {message}"
+    );
+    assert!(
+        message.contains("src/huge.bin"),
+        "diagnostic must name the offending workspace-relative path: {message}"
+    );
+    assert!(
+        message.contains("file=67108865"),
+        "diagnostic must report the offending file's actual size: {message}"
+    );
+}
+/// The workspace file-count ceiling is a distinct failure mode from the aggregate
+/// byte budget above: same subsystem, different dimension. Its diagnostic must name
+/// workspace capture, the governing 20000-file limit, and the observed count -- not
+/// collapse into the byte-budget message or the generic artifact/size message.
+#[test]
+fn run_planner_rejects_workspace_exceeding_file_count_limit() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.root.join("src/many")).unwrap();
+    for i in 0..=20_000 {
+        fs::write(f.root.join(format!("src/many/f{i}.txt")), b"x").unwrap();
+    }
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    let mut store = f.store();
+    let err = Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p)),
+                seen: seen(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .plan(&f.root, &prepared.request.request_id)
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("runtime workspace capture") && message.contains("20000-file limit"),
+        "diagnostic must name workspace capture and the governing file-count limit, not a generic message: {message}"
+    );
+    assert!(
+        message.contains("count=20000"),
+        "diagnostic must report the observed file count: {message}"
+    );
+}
+/// Content-addressed artifact readback shares `read_regular_file` with workspace
+/// capture and git-index reads, but its size ceiling is a distinct, unrelated
+/// invariant (the CAS's own bound on a single stored blob, keyed by the size
+/// recorded at write time). A corrupted/oversized `ArtifactRef` must fail with a
+/// diagnostic naming artifact readback -- not the shared generic read error, and
+/// not the workspace-capture or `PlannerPacket` messages -- and it must fail before
+/// ever opening the (possibly nonexistent) backing file, since the recorded size
+/// alone is enough to know the read is refused.
+#[test]
+fn artifact_readback_reports_its_own_limit_without_reading_content() {
+    let f = Fixture::new();
+    let artifacts = Artifacts::new(&f.paths.data_root.join("test-artifacts")).unwrap();
+    let oversized = ArtifactRef {
+        hash: format!("blake3:{}", "a".repeat(64)),
+        bytes: 64 * 1024 * 1024 + 1,
+    };
+    let message = artifacts.get(&oversized).unwrap_err().to_string();
+    assert!(
+        message.contains("runtime artifact readback") && message.contains("67108864-byte limit"),
+        "diagnostic must name artifact readback and the governing 64 MiB limit: {message}"
+    );
+    assert!(
+        message.contains("recorded=67108865"),
+        "diagnostic must report the recorded/expected size: {message}"
+    );
+}
+/// A large-but-in-budget file is captured with its real content identity (not
+/// excluded, not represented as bounded metadata only) -- so a later change to it is
+/// still caught as source drift, exactly like any other tracked file.
+#[test]
+fn oversized_workspace_file_changes_are_still_detected_as_source_drift() {
+    let f = Fixture::new();
+    fs::write(
+        f.root.join("src/oversized.bin"),
+        vec![0u8; 2 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+    git(&f.root, &["add", "src/oversized.bin"]);
+    git(&f.root, &["commit", "--quiet", "-m", "add oversized file"]);
+    f.store().index_repository(&f.root).unwrap();
+    let p = f.plan();
+    fs::write(
+        f.root.join("src/oversized.bin"),
+        vec![1u8; 2 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+    let inputs = seen();
+    assert!(f.run(&p, Mode::Pass, inputs.clone(), false).is_err());
+    assert!(inputs.lock().unwrap().is_empty());
+    let run = f
+        .store()
+        .runtime_status(&f.root, &p.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, RunState::Blocked);
+    assert!(run.reason.unwrap().contains("SOURCE_DRIFT"));
+}
 #[test]
 fn runtime_owned_plan_rejects_legacy_api_verifier_and_completion_spoofs() {
     let f = Fixture::new();

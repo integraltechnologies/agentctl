@@ -6,6 +6,17 @@ use std::{
     io::{Read, Write},
 };
 
+/// Aggregate ceiling on workspace source capture (all files combined), distinct from
+/// [`ArtifactRef`] readback and from `PlanningLimits.bytes` (which bounds only the
+/// frozen `PlannerPacket`, not the full-workspace observation captured alongside it).
+const WORKSPACE_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
+/// Ceiling on the number of files a single workspace capture may observe.
+const WORKSPACE_CAPTURE_FILES: usize = 20_000;
+/// Ceiling on the `.git/index` file read during workspace capture.
+const GIT_INDEX_BYTES: u64 = 16 * 1024 * 1024;
+/// Ceiling on a single content-addressed artifact readback from the local CAS.
+const ARTIFACT_READBACK_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactRef {
@@ -130,7 +141,14 @@ impl Artifacts {
         // Atomic publication briefly has two links to the same fully synced
         // inode. Source files remain hardlink-rejected; artifact bytes are also
         // authenticated by length/hash before use.
-        let bytes = read_regular_file(&self.path(reference)?, 64 * 1024 * 1024, true)?;
+        require(
+            reference.bytes <= ARTIFACT_READBACK_BYTES,
+            format!(
+                "runtime artifact readback exceeds {ARTIFACT_READBACK_BYTES}-byte limit (recorded={})",
+                reference.bytes
+            ),
+        )?;
+        let bytes = read_regular_file(&self.path(reference)?, ARTIFACT_READBACK_BYTES, true)?;
         require(
             bytes.len() as u64 == reference.bytes && graph::content_hash(&bytes) == reference.hash,
             "artifact content/hash mismatch",
@@ -242,12 +260,31 @@ fn collect(root: &Path, artifacts: &Artifacts) -> Result<SourceSnapshot> {
                     .any(|p| p.deny_read && inside(&relative, &p.path)),
                 "runtime cannot capture protected read-denied source; narrow the checkout",
             )?;
-            let bytes = read_file(&path, 2 * 1024 * 1024)?;
-            total += bytes.len() as u64;
             require(
-                total <= 64 * 1024 * 1024 && files.len() < 20_000,
-                "runtime workspace capture exceeds 64 MiB/20000 files",
+                files.len() < WORKSPACE_CAPTURE_FILES,
+                format!(
+                    "runtime workspace capture exceeds {WORKSPACE_CAPTURE_FILES}-file limit (count={})",
+                    files.len()
+                ),
             )?;
+            // A file's individual size is not itself meaningful; only the aggregate
+            // capture budget is. Bounding each read by the remaining budget (rather
+            // than a fixed per-file ceiling) keeps capture bounded overall while not
+            // letting one irrelevant large file fail a capture that fits comfortably
+            // within the real 64 MiB workspace limit. `meta.len()` is already in hand
+            // from the symlink check above, so this attributes the failure (subsystem,
+            // path, captured-so-far, this file's size) before ever touching the file's
+            // contents; `read_file` still re-checks the same budget as a TOCTOU backstop.
+            let remaining = WORKSPACE_CAPTURE_BYTES.saturating_sub(total);
+            let file_len = meta.len();
+            require(
+                file_len <= remaining,
+                format!(
+                    "runtime workspace capture exceeds {WORKSPACE_CAPTURE_BYTES}-byte limit while reading {relative} (captured={total}, file={file_len})"
+                ),
+            )?;
+            let bytes = read_file(&path, remaining)?;
+            total += bytes.len() as u64;
             #[cfg(unix)]
             let mode = {
                 use std::os::unix::fs::PermissionsExt;
@@ -266,7 +303,12 @@ fn collect(root: &Path, artifacts: &Artifacts) -> Result<SourceSnapshot> {
     }
     let index = info.git_directory.join("index");
     let index_hash = if index.exists() {
-        graph::content_hash(&read_file(&index, 16 * 1024 * 1024)?)
+        let len = fs::metadata(&index)?.len();
+        require(
+            len <= GIT_INDEX_BYTES,
+            format!("runtime git index read exceeds {GIT_INDEX_BYTES}-byte limit (size={len})"),
+        )?;
+        graph::content_hash(&read_file(&index, GIT_INDEX_BYTES)?)
     } else {
         graph::content_hash(&[])
     };
