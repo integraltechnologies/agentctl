@@ -82,7 +82,7 @@ agentctl puts a durable control plane underneath the harnesses:
 
 ## Current status
 
-agentctl is **alpha** software (version 0.1.0-alpha.1). It is usable for small,
+agentctl is **alpha** software (version 0.1.0-alpha.2). It is usable for small,
 well-scoped repositories, but expect rough edges and breaking changes.
 
 | Platform | Worker execution | Notes |

@@ -5,6 +5,24 @@ loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 agentctl is alpha software; versions before `1.0.0` may include breaking changes
 to storage, configuration, or the CLI.
 
+## [0.1.0-alpha.2]
+
+### Fixed
+
+- Fixed planner startup failures (`runtime file/artifact exceeds size limit`)
+  caused by workspace files larger than an obsolete 2 MiB per-file capture
+  ceiling. Workspace capture now relies solely on the existing bounded
+  aggregate budget (64 MiB total, 20,000 files) rather than an unrelated
+  per-file cliff.
+- Runtime size-limit errors now identify the responsible subsystem (workspace
+  capture, file count, git index, or artifact readback) along with the
+  observed and limit values, instead of a generic message.
+
+### Added
+
+- Boundary and end-to-end regression coverage for planner execution and
+  workspace capture size limits.
+
 ## [0.1.0-alpha.1]
 
 First alpha release. Local, provider-agnostic engineering control plane for
