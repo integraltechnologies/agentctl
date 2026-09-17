@@ -20,6 +20,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
+/// Reused by the runtime to validate planner-approved context scope additions.
+pub(crate) use validation::safe_scope;
 use validation::*;
 
 pub fn hash(value: &impl serde::Serialize) -> Result<String> {
@@ -27,6 +29,10 @@ pub fn hash(value: &impl serde::Serialize) -> Result<String> {
 }
 pub fn size(value: &impl serde::Serialize) -> Result<usize> {
     Ok(serde_json::to_vec(value)?.len())
+}
+/// Nonblank, NUL-free text of at most `max` bytes (planning's text rule).
+pub(crate) fn validate_text(value: &str, max: usize, name: &str) -> Result<()> {
+    text(value, max, name)
 }
 
 impl Store {
@@ -127,6 +133,7 @@ impl Store {
         mutable(&view)?;
         quiescent(&tx, &info, id)?;
         tx.execute("UPDATE execution_plans SET state='CANCELLED',updated_at_ms=?3 WHERE repo_id=?1 AND plan_id=?2",params![info.repository_id.as_str(),id.as_str(),now_ms()?])?;
+        graph::close_for_plan(&tx, &info, id, None, graph::DecisionReason::PlanCancelled)?;
         audit(
             &tx,
             &info,
@@ -167,6 +174,7 @@ impl Store {
         )?;
         validate(&tx, &info, &replacement.plan)?;
         tx.execute("UPDATE execution_plans SET state='SUPERSEDED',superseded_by=?3,updated_at_ms=?4 WHERE repo_id=?1 AND plan_id=?2",params![info.repository_id.as_str(),old.as_str(),new.as_str(),now_ms()?])?;
+        graph::close_for_plan(&tx, &info, old, None, graph::DecisionReason::PlanSuperseded)?;
         audit(
             &tx,
             &info,
@@ -271,6 +279,32 @@ impl Store {
         proof: &VerificationPacket,
         source: &SourceStateRef,
     ) -> Result<()> {
+        self.complete_plan(start, id, proof, source, false)
+            .map(|_| ())
+    }
+
+    /// Runtime completion: the plan's verified ontology candidate is accepted
+    /// in the same transaction that completes the plan, so neither can commit
+    /// without the other. Returns the accepted generation, if the plan changed
+    /// the accepted facts.
+    pub(crate) fn complete_execution_plan_accepting(
+        &mut self,
+        start: &Path,
+        id: &PlanId,
+        proof: &VerificationPacket,
+        source: &SourceStateRef,
+    ) -> Result<Option<String>> {
+        self.complete_plan(start, id, proof, source, true)
+    }
+
+    fn complete_plan(
+        &mut self,
+        start: &Path,
+        id: &PlanId,
+        proof: &VerificationPacket,
+        source: &SourceStateRef,
+        accept: bool,
+    ) -> Result<Option<String>> {
         source.validate()?;
         let info = graph::checked_workspace(self, start)?;
         let tx = self
@@ -308,8 +342,13 @@ impl Store {
         )?;
         tx.execute("UPDATE execution_plans SET state='COMPLETE',updated_at_ms=?3,integration_json=?4,final_source_json=?5 WHERE repo_id=?1 AND plan_id=?2",params![info.repository_id.as_str(),id.as_str(),now_ms()?,integration_json,final_source_json])?;
         drop(permit);
+        let accepted = if accept {
+            graph::accept_for_plan(&tx, &info, id, hash(proof)?, hash(source)?)?
+        } else {
+            None
+        };
         tx.commit()?;
-        Ok(())
+        Ok(accepted)
     }
 }
 

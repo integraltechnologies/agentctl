@@ -136,6 +136,11 @@ impl PlanPacket {
             })?;
             packet.validate()?;
             ensure(
+                packet.context_request.is_none(),
+                "task.verification",
+                "a verifier context request is not a verification decision",
+            )?;
+            ensure(
                 matches!(&packet.target, VerificationTarget::Packet { task_id: target, .. } if target == task_id),
                 "task.verification.target",
                 "requires packet verification for this task",
@@ -174,6 +179,11 @@ impl PlanPacket {
             "every task must be VERIFIED",
         )?;
         integration.validate()?;
+        ensure(
+            integration.context_request.is_none(),
+            "plan.completion",
+            "a verifier context request is not a verification decision",
+        )?;
         ensure(
             matches!(&integration.target, VerificationTarget::Integration { plan_id, .. } if plan_id == &self.plan_id),
             "plan.completion.target",

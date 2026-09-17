@@ -1378,7 +1378,7 @@ fn v8_to_v9_migration_preserves_experiment_history_and_fabricates_no_events() {
     raw.pragma_update(None, "user_version", 8).unwrap();
     drop(raw);
     let reopened = f.store();
-    assert_eq!(reopened.status().unwrap().schema_version, 12);
+    assert_eq!(reopened.status().unwrap().schema_version, 13);
     let preserved = reopened
         .experiment_status(&f.root, &run.experiment_id)
         .unwrap()

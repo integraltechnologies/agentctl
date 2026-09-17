@@ -70,10 +70,28 @@ pub fn strip_experiment_decisions(c: &rusqlite::Connection) {
     )
     .unwrap();
 }
-/// Removes the additive v12 graph-resolution schema so a test can restore an
+/// Removes the additive v13 ontology-lifecycle schema so a test can restore an
 /// older accepted schema. Every older downgrade path strips it first.
 #[allow(dead_code)]
+pub fn strip_ontology_lifecycle(c: &rusqlite::Connection) {
+    c.execute_batch(
+        "DROP TABLE IF EXISTS ontology_generations; DROP TABLE IF EXISTS ontology_blobs; DELETE FROM schema_migrations WHERE version=13;",
+    )
+    .unwrap();
+    let hashed = c
+        .prepare("SELECT 1 FROM pragma_table_info('graph_entities') WHERE name='text_hash'")
+        .unwrap()
+        .exists([])
+        .unwrap();
+    if hashed {
+        c.execute_batch("ALTER TABLE graph_entities DROP COLUMN text_hash;")
+            .unwrap();
+    }
+}
+/// Removes the additive v12 graph-resolution schema (and everything newer).
+#[allow(dead_code)]
 pub fn strip_graph_resolutions(c: &rusqlite::Connection) {
+    strip_ontology_lifecycle(c);
     c.execute_batch(
         "DROP TABLE IF EXISTS graph_resolutions; DROP INDEX IF EXISTS graph_edges_hinted; DELETE FROM schema_migrations WHERE version=12;",
     )
@@ -123,6 +141,29 @@ pub fn strip_runtime(c: &rusqlite::Connection) {
             .unwrap();
     }
     c.execute_batch("DROP TABLE IF EXISTS runtime_jobs; DROP TABLE IF EXISTS runtime_runs; DELETE FROM schema_migrations WHERE version=7;").unwrap();
+}
+
+/// A human's deliberate Stage-3 decision: accept the workspace's open ontology
+/// candidate (an observed change that indexing alone never makes canonical).
+#[allow(dead_code)]
+pub fn accept_observation(
+    store: &mut agentctl::local::store::Store,
+    root: &std::path::Path,
+) -> String {
+    let id = store
+        .ontology_status(root)
+        .unwrap()
+        .candidate
+        .expect("an open ontology candidate")
+        .generation_id;
+    store
+        .accept_generation(
+            root,
+            &id,
+            Some("deliberate acceptance of the observed change"),
+        )
+        .unwrap();
+    id
 }
 
 pub fn decode<T: DeserializeOwned>(value: Value) -> T {
@@ -233,6 +274,10 @@ pub fn samples() -> BTreeMap<&'static str, Value> {
         (
             "memory-provenance",
             json!({"version": "1", "trust_class": "AGENT_NOTE", "source_refs": ["task:a"], "evidence": [], "author_job_id": "job:executor-a"}),
+        ),
+        (
+            "context-request",
+            json!({"version": "1", "task_id": "a", "job_id": "job:executor-a", "reason": "The parser caller is not in the issued context", "items": [{"kind": "SYMBOL_RELATIONS", "entity_id": "entity:parser", "relation": "CALLERS"}, {"kind": "FILE_RANGE", "path": "src/parser.rs", "start_line": 1, "end_line": 40}], "max_bytes": 4096}),
         ),
     ])
 }

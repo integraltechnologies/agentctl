@@ -398,6 +398,7 @@ fn build_spec(
         class: WorkerClass::Tool,
         cache_root: paths.cache_root.clone(),
         security: security.tightened(&policy.security),
+        issued: None,
         lock_fd: lease.fd(),
     })
 }

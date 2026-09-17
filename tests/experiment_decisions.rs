@@ -1142,7 +1142,7 @@ fn v9_to_v11_migration_preserves_experiment_and_event_history_and_adds_empty_dec
     raw.pragma_update(None, "user_version", 9).unwrap();
     drop(raw);
     let reopened = f.store();
-    assert_eq!(reopened.status().unwrap().schema_version, 12);
+    assert_eq!(reopened.status().unwrap().schema_version, 13);
     let preserved = reopened
         .experiment_status(&f.root, &run.experiment_id)
         .unwrap()
@@ -1204,7 +1204,7 @@ fn v10_to_v11_migration_preserves_decisions_and_wakeups_and_adds_empty_cursor_st
     raw.pragma_update(None, "user_version", 10).unwrap();
     drop(raw);
     let mut reopened = f.store();
-    assert_eq!(reopened.status().unwrap().schema_version, 12);
+    assert_eq!(reopened.status().unwrap().schema_version, 13);
     let decisions_after = reopened
         .experiment_decisions(&f.root, &run.experiment_id)
         .unwrap();

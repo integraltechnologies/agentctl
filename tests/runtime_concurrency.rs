@@ -469,6 +469,7 @@ impl ProviderAdapter for Controlled {
                     evidence: vec![],
                     notes: None,
                     failure: None,
+                    context_request: None,
                 })
                 .unwrap()
             }
@@ -495,6 +496,7 @@ impl ProviderAdapter for Controlled {
                     requirement_refs,
                     invariant_refs: vec![],
                     notes: None,
+                    context_request: None,
                 })
                 .unwrap()
             }

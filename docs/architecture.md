@@ -50,7 +50,7 @@ around one provider.
 | Paths & config | `src/local/paths.rs`, `src/local/config.rs` | XDG locations, safe file handling, machine and project configuration |
 | Repository | `src/local/repository.rs` | Git discovery, repository/workspace identity, hardened Git subprocesses |
 | Store | `src/local/store.rs`, `src/local/migrations.rs` | SQLite ownership, migrations, guarded transitions, journal |
-| Code graph | `src/local/graph/` | Tree-sitter extraction, incremental indexing, bounded queries |
+| Code graph | `src/local/graph/` | Tree-sitter extraction, incremental indexing, bounded queries, ontology generation lifecycle and semantic deltas |
 | Memory | `src/local/memory/` | trust-classified engineering memory with provenance |
 | Planning | `src/local/planning/` | planning requests, planner input, plan import, lifecycle, completion gate |
 | Runtime | `src/local/runtime/` | engine, routing, prompt compilation, provider adapters, source capture, experiments |
@@ -61,10 +61,10 @@ around one provider.
 ## Protocol
 
 The public contracts are the documents that pass between agentctl and planners,
-executors, and verifiers, plus the durable records built from them. There are 13,
+executors, and verifiers, plus the durable records built from them. There are 14,
 each with a generated JSON Schema in `schemas/`: plans, tasks, results,
 verification, resume, evidence, jobs, agent events, probes, token usage,
-experiments, experiment events, and memory provenance.
+experiments, experiment events, memory provenance, and context requests.
 
 - Every document carries `"version": "1"`. Enums are `SCREAMING_SNAKE_CASE`, and
   fields are `snake_case`.
@@ -133,7 +133,7 @@ WAL, `synchronous=FULL`, and a bounded busy timeout. Writers use
 SQLite snapshot (including WAL contents), not by copying the main file while it is
 in use.
 
-**Migrations.** The current schema version is 11. Migrations are additive and
+**Migrations.** The current schema version is 13. Migrations are additive and
 transactional, and they run on writable opens. They verify their required guards,
 refuse databases from newer versions or with foreign or unversioned content, and
 roll back entirely on conflict. Migrations never repair or synthesize history.
@@ -222,7 +222,8 @@ involved.
   diagnostic, plus a per-workspace sequence that advances only when the
   fingerprint changes. Graph context, PlannerPackets, job manifests, and
   `INDEX_COMPLETED` events carry it. Import and activation reject a planning
-  source bound to a generation the workspace has not reached.
+  source bound to a generation the workspace has not reached. Which generation
+  is *trusted* is decided separately; see [Ontology lifecycle](#ontology-lifecycle).
 - **Ranking.** Queries drop English stopwords and apply a small symmetric
   stemmer. Terms are weighted by integer IDF over the workspace's entities,
   fields by name > container > path > signature, and precise names over long
@@ -246,6 +247,209 @@ Tree-sitter was chosen over language-server-backed tools (richer resolution, but
 extra processes, toolchains, and runtime surface) and application-level repo maps
 (useful compact context, but not a storage and provenance API). The core never
 handles Tree-sitter nodes directly, so adding a language means adding one adapter.
+
+## Ontology lifecycle
+
+The live graph tables materialize the most recent index pass. That is an
+*observation* of the worktree, not canonical truth. Canonical truth is the
+workspace's single **accepted generation**: a durable pointer to an immutable
+snapshot of the facts. `src/local/graph/lifecycle.rs` owns the pointer and the
+lifecycle; `src/local/graph/delta.rs` owns snapshots and semantic deltas.
+
+```text
+index pass ─▶ CANDIDATE ─┬─ accept ─────────────────▶ ACCEPTED ── later acceptance ─▶ RETIRED
+                         ├─ reject ─────────────────▶ REJECTED
+                         └─ superseded / plan closed ▶ ABANDONED
+```
+
+- **Records.** Every observation that changes what is recorded becomes a row in
+  `ontology_generations`: generation ID, a per-workspace **ordinal** (lifecycle
+  order, never repeated), the graph generation (sequence and fingerprint), the
+  snapshot, file/entity/relation counts, file failures, the HEAD/dirty
+  observation, the origin (`EXTERNAL`, or `RUNTIME` with plan and task), the
+  accepted generation it was compared with (`base`), the delta, and the
+  acceptance and closure decisions with reason, time, superseding generation,
+  plan, task, verification hash and final-source hash. Transitions append an
+  `ONTOLOGY_GENERATION_CHANGED` journal entry in the same transaction.
+- **Guards.** SQL triggers allow only `CANDIDATE → ACCEPTED | REJECTED |
+  ABANDONED` and `ACCEPTED → RETIRED`, forbid changing identity columns, and
+  forbid deletion. Partial unique indexes allow at most one `ACCEPTED` and one
+  `CANDIDATE` row per workspace, so the canonical pointer is always a single
+  complete row. Nothing is ever deleted; closed records stay inspectable.
+- **Observation.** An index pass that leaves the recorded generation unchanged
+  records nothing. Otherwise it snapshots the live facts, supersedes any open
+  candidate (`ABANDONED`, reason `SUPERSEDED`), and records a new row:
+  - no accepted generation yet, a complete pass (no file failures), external
+    origin: **accepted** as `BOOTSTRAP`;
+  - facts identical to the accepted generation (same fingerprint and an empty
+    delta), complete: **accepted** as `IDENTICAL_TO_ACCEPTED`, retiring the
+    previous row. A revert is therefore a new position with the old
+    fingerprint and a later sequence and ordinal, never a return to the old
+    row;
+  - anything else: a **candidate** with a delta against the accepted
+    generation.
+
+  An explicit (external) index of an unchanged generation opens a new
+  candidate only when nobody could otherwise decide it: its latest record is
+  closed, or it is a runtime candidate. The runtime never reopens anything.
+- **Who may accept.** `agentctl ontology accept` accepts an external candidate
+  that is still the indexed generation, whose worktree still hashes to it, with
+  no file failures, and whose `base` is still the accepted generation.
+  Runtime candidates are accepted only at their plan's acceptance boundary.
+  Acceptance retires the previous generation in the same transaction and is
+  idempotent. Planning (`plan prepare`) and runtime adoption require the
+  indexed generation to *be* the accepted generation, and a plan's bound
+  generation to equal it.
+
+### Snapshots and semantic deltas
+
+A snapshot is a manifest of per-file fact chunks in `ontology_blobs`, a
+content-addressed, immutable table verified by hash and length on every read.
+Unchanged files share chunks across generations, so a generation costs roughly
+the size of the files whose facts changed. A chunk holds, for one file, its
+content hash, backend and diagnostic; each entity's kind, name, qualified name,
+key, path, line range, signature, visibility and **text hash**; and the file's
+distinct resolved relations (source, kind, target, target path, rules).
+`CONTAINS`/`TEST_RELATED_TO` links (implied by entity facts) and unresolved
+call sites are not relation facts. Snapshots live in SQLite, not the runtime
+CAS, so a generation row and its snapshot commit atomically and the graph layer
+does not depend on the runtime.
+
+The **text hash** is BLAKE3 over a declaration's own source: the declaration
+plus the comment, attribute and decorator lines directly above it, with nested
+declarations (and their attached lines) cut out together with the whitespace
+around them. An edit is attributed to the innermost declaration containing it,
+and adding or removing a member does not by itself modify its container.
+Whitespace inside a declaration is significant. Text hashes are computed when a
+file is parsed and stored with its entity rows.
+
+A **semantic delta** (`SemanticDelta`, version `1`) is a pure function of two
+snapshots of one workspace indexed by the same graph version, stored as an
+artifact when a candidate is recorded and derivable on demand between any two
+records. It contains:
+
+- `entities`: `ADDED` and `REMOVED` with the full facts, and `MODIFIED` with
+  before/after facts and the changed fields (`SIGNATURE`, `VISIBILITY`, `TEXT`,
+  `KEY`). A range-only move is not a change. The `FILE` entity's text is not
+  compared; file content changes are reported per file;
+- `relations`: distinct resolved relations `ADDED` or `REMOVED`. Call-site
+  multiplicity and positions are not facts. A relation can change in a file
+  whose bytes did not (for example when another file makes a qualified path
+  ambiguous and graph resolution abstains);
+- `files`: every file whose content or facts differ, with its content change
+  (`ADDED`, `REMOVED`, `MODIFIED`, `UNCHANGED`) and counts of entity and
+  relation changes, so files with semantic changes are directly queryable;
+- `summary` counts, and both endpoints (generation ID, generation, snapshot).
+
+Output is sorted, so identical inputs give identical bytes. Files whose chunks
+are identical are skipped without being read. Across different graph versions
+no delta is derived (`UNAVAILABLE`); a delta over 64 MiB is recorded as
+unavailable as well.
+
+### Cross-generation identity
+
+Two entities in different generations are the same entity only when both hold:
+
+1. they have the same graph entity ID, which already binds repository, path,
+   language, kind, lexical qualified name and duplicate ordinal; and
+2. their `(path, kind, qualified name)` group holds exactly one declaration in
+   **both** generations (`identity: UNIQUE`).
+
+Consequences:
+
+- a body edit, a signature or visibility edit, a doc-comment or attribute
+  edit, and a line shift keep identity (`MODIFIED`, or no change for a pure
+  shift);
+- a rename, a file move, and a move into another container change the ID, so
+  they are reported as `REMOVED` plus `ADDED`. agentctl makes no rename or move
+  claim, because no structural evidence proves one;
+- methods of different types have different qualified names and never match;
+- a group with several same-named declarations is ordinal-numbered in file
+  order, so its IDs prove nothing about which declaration they name. Unless the
+  group's facts are unchanged as a multiset, every member is reported as
+  `REMOVED` and `ADDED` with `identity: DUPLICATE_ORDINAL`, and so is every
+  relation touching one of them, even if the relation's IDs are unchanged.
+
+No similarity measure, heuristic, or model is used.
+
+### The acceptance boundary
+
+For runtime work, the boundary is **plan completion**:
+
+1. After a task's verifier `PASS`, the runtime re-indexes. The result is the
+   plan's candidate (origin `RUNTIME`, plan and task); the previous one is
+   superseded. It is the working ontology for the plan's downstream tasks, but
+   it is not accepted: those tasks' context comes from it, and the next task's
+   verification still lies ahead.
+2. When every task is verified, integration checks and the integration verifier
+   run. Only when that proof is `PASS` does
+   `complete_execution_plan_accepting` complete the plan **and** promote the
+   candidate in one transaction. It requires the indexed generation to be an
+   open candidate that this plan's runtime itself recorded (same sequence and
+   fingerprint, whatever the latest record's label), the index to rehash clean
+   against the worktree, and the worktree to equal the verified final state.
+   The decision records the plan, the verification hash and the final
+   source-state hash.
+3. A plan whose tasks left the accepted facts unchanged promotes nothing.
+
+Per-task acceptance was rejected: the accepted ontology would then describe
+intermediate states that no integration verification covered.
+
+### Rejection, abandonment, and external changes
+
+| Event | Effect on the ontology |
+| --- | --- |
+| task verifier `REJECT` | the plan's open candidate becomes `REJECTED` (`VERIFICATION_REJECTED`); the rejected edit is never indexed by the runtime |
+| integration verifier `REJECT` | the candidate becomes `REJECTED` (`INTEGRATION_REJECTED`) |
+| verifier `BLOCKED`, executor or verifier crash, interrupted jobs, drift | nothing: the candidate stays open and unaccepted; the run blocks |
+| plan cancelled or superseded | an open candidate of that plan becomes `ABANDONED` |
+| a later observation | the open candidate becomes `ABANDONED` (`SUPERSEDED`, naming its successor) |
+| `ontology reject` | an external candidate becomes `REJECTED`; the live index still holds its facts, so planning refuses until the source is restored or a new observation is accepted |
+
+When source changes without an agentctl transition, `repo index` records a
+candidate and planning refuses until someone runs `ontology accept` or restores
+the source. If a run stops for good, a human `repo index` turns its state into
+an external candidate that can be inspected and accepted; the delta then
+includes whatever unverified edits the worktree holds.
+
+### Crash consistency
+
+- Snapshot, delta, lifecycle row, supersession and journal entry are written
+  inside the index transaction, so a crash leaves either the previous state or
+  the complete observation. Blobs are only ever inserted; a rolled-back pass
+  leaves none behind.
+- A crash after a task's `TASK_VERIFIED` checkpoint but before its re-index is
+  repaired on resume by the existing refresh (runtime origin).
+- A crash before integration verification leaves the candidate open;
+  resuming re-runs integration and accepts once. A crash after integration
+  verification is recovered from the recorded verifier output and goes through
+  the same completion transaction.
+- Plan completion and promotion commit together. A failure inside it rolls
+  both back (the plan stays `ACTIVE`, the accepted pointer is unchanged). A
+  crash after it leaves a completed plan with its candidate accepted; resuming
+  only finishes the run record.
+- The accepted pointer can therefore never name an incomplete, failed or
+  mismatched observation: the row is complete when inserted, promotion checks
+  the live generation, file failures and base, and the unique index forbids two
+  accepted rows.
+
+### Relationship to the context relay
+
+Context bases and ContextDeltas stay bound to the graph generation (sequence and
+fingerprint) they were derived from, and every round revalidates it. The
+lifecycle adds:
+
+- a base is issued only when the indexed generation is the accepted one or an
+  open candidate that this plan's runtime recorded; an unexplained external
+  observation blocks issuance (`SOURCE_DRIFT`);
+- every observation that changes the indexed facts moves the indexed
+  generation away from the one a ledger is bound to, and acceptance or
+  rejection never moves it back. An old base or delta can therefore never be
+  reused against a different accepted generation, even when a revert restores
+  the old fingerprint (its sequence differs). Old artifacts remain inspectable
+  through `run context`;
+- verifier independence, issued visibility and manifest accounting are
+  unchanged. Semantic deltas are not issued to workers.
 
 ## Engineering memory
 
@@ -352,9 +556,10 @@ there are no persistent or cross-session workers.
    workspace, so there are no concurrent writers and no automatic worktrees. For
    each ready task, the runtime checks readiness, routing, scope, drift, and
    concurrency, then launches an executor. The executor receives its TaskPacket
-   and contract, invariants, constraints, and bounded scope-filtered graph,
-   memory, and source context. It does not receive other tasks or any
-   conversation.
+   and contract, invariants, constraints, and the **planner-authored context**
+   described in [Context relay](#context-relay) — nothing the runtime chose on
+   its own. It does not receive other tasks or any conversation. An executor
+   that lacks context requests it through the relay instead of exploring.
 3. **Capture.** After the executor exits, agentctl computes the actual diff
    (additions, deletions, content and mode changes) against the snapshot and
    checks it against the write scope. The executor's self-reported changed paths
@@ -368,12 +573,105 @@ there are no persistent or cross-session workers.
 5. **Verification.** A fresh verifier receives only the task, its contract,
    invariants, the actual diff, and captured evidence. It never sees the executor's
    response or transcript. Its decision is validated against the issued target and
-   the unchanged source. Only `PASS` makes the task `VERIFIED`, and accepted
-   changes then refresh the graph before downstream context is built.
+   the unchanged source. Only `PASS` makes the task `VERIFIED`, and verified
+   changes then refresh the index as the plan's ontology candidate before
+   downstream context is built. The candidate is not yet accepted truth.
 6. **Integration.** When all tasks are `VERIFIED`, the runtime computes the
    combined baseline-to-final diff, runs the integration checks, and launches a
    separate fresh integration verifier. Completion goes through the same guarded
-   completion gate used by imported plans.
+   completion gate used by imported plans, and promotes the plan's ontology
+   candidate in the same transaction (see
+   [The acceptance boundary](#the-acceptance-boundary)).
+
+### Context relay
+
+The planner is the authority over what a worker initially sees. Two ideas are
+kept apart:
+
+- **`read_scope` is an authorization envelope**: the paths a task may *request*
+  context from. It is not content, and a Directory scope injects nothing.
+- **Issued context is actual visibility**: what a job was really given, byte for
+  byte, recorded in its context manifest.
+
+An executor's base context is materialized only by dereferencing planner
+references, in the planner's own order:
+
+| Planner reference | Issued |
+| --- | --- |
+| `graph_entities` | identity and structural facts, the entity's bounded definition excerpt, and its resolved relations one hop away *inside the envelope* as identity-only stubs (at most 8 per direction; the rest are counted, not named) |
+| `read_scope` File entries | bounded file content |
+| `write_scope` File entries inside the read envelope | bounded file content (a write target the executor must edit) |
+| contract `memory_refs` | the memory entry, revalidated (active, visible, not stale) |
+| `verification.requirement_refs` | the task's canonical checks and their argv |
+
+No objective-derived graph search, no lexical memory search, and no
+directory file-fill runs. Excerpts and files share one bounded budget, and
+truncation is explicit.
+
+A worker that cannot finish safely returns a typed **ContextRequest** (protocol
+document `context-request`) instead of exploring: `status = BLOCKED`,
+`failure.code = CONTEXT_REQUIRED`, no reported changes, and 1–16 items drawn
+from a deliberately narrow vocabulary — `SYMBOL_DEFINITION`, `SYMBOL_BY_NAME`,
+`SYMBOL_RELATIONS` (callers/callees), `RELATED_TESTS`, `NEIGHBORHOOD` (depth
+≤ 2), `FILE_RANGE` (≤ 400 lines) and `MEMORY`. Failure text alone never means
+this, and a request that reports edits is invalid. There is no repository
+search language.
+
+`runtime::context` resolves a request deterministically against the ontology
+snapshot and the captured source — no model is involved in retrieving a
+definition, callers, related tests, a neighborhood, a file range, or a memory
+fact. Each item is answered, then judged:
+
+- every path an answer touches is inside the envelope → **granted**;
+- any path outside it → **escalated** to the planner (never granted silently);
+- unresolvable (absent, stale, ambiguous name, not source, binary, range past
+  end of file), or over a budget → **denied**, and the task blocks.
+
+Issued source stays hash-bound, which matters while a captured change is not
+yet indexed (only accepted work refreshes the ontology). Source text — a
+definition excerpt or a file range — is checked against the captured snapshot
+before it is issued, so asking for the definition of a symbol in the file the
+executor just changed fails closed as `STALE` rather than returning text that
+was never in the diff. Identity facts (relation, neighborhood and test stubs)
+carry the content hash they were derived from and no source.
+
+A grant becomes a **ContextDelta**: a hash-bound artifact carrying typed facts
+and exact source only (no prose, no reasons), bound to the request hash, the
+ontology generation, the source state, the requesting job and the round. The
+run record keeps a per-subject **ledger** (`executor:<task>`, `verifier:<task>`,
+`integration`) of every round: the request, its resolution, the delta, and any
+planner decision.
+
+Expansion never resumes a conversation. Each granted round launches a **fresh
+provider job** whose input is the original base context plus the accumulated
+deltas, with explicit lineage. Between rounds the ontology generation and the
+captured source are revalidated, so a delta is never issued on stale
+assumptions. An executor requesting context must leave the workspace unchanged:
+a request with a non-empty diff fails closed, because this runtime has no safe
+rollback primitive.
+
+Everything is bounded by machine-owned maxima (see
+[configuration.md](configuration.md#runtimecontext)): rounds per task, bytes per
+round, cumulative bytes per subject, and escalations per task. A worker cannot
+raise them by asking.
+
+**Planner escalation.** An out-of-envelope request blocks the run with
+`NEEDS_PLANNER_CONTEXT_APPROVAL`. `agentctl run context <plan-id>` prints the
+request, the resolution, the paths outside the envelope and a decision
+template; `agentctl run context decide` consumes an explicit decision document.
+An approval names 1–8 read-scope additions, which are revalidated (policy hash,
+source and generation, the planning request's own scope, protected paths,
+symlinks, contract exclusions) and then re-resolved before any delta exists; the
+task returns to `PLANNED` so `run resume` re-issues it. A denial leaves the task
+blocked for a replan. The executor has no path to this decision: its own output
+can never widen its scope.
+
+**Verifier relay.** A verifier can also lack context, and its relay is
+independent: its requests are derived from verifier-visible material only, it
+never inherits the executor's requests, reasons or transcript, it has its own
+round budget, and it cannot escalate to the planner (out-of-envelope requests
+are denied). A verifier context request is neither PASS nor REJECT and never
+becomes a task transition.
 
 ### Concurrency
 
@@ -406,7 +704,10 @@ fallback. Finished jobs free capacity. Experiments are not agents.
 | Limit | Value |
 | --- | --- |
 | Files in a captured checkout | 20,000 captured source files (64 MiB of content in total); 20,000 individually ignored files (metadata only); depth 64 |
-| Expanded verifier diff | 128 KiB |
+| Expanded verifier diff | 128 KiB; it carries hunks with 3 lines of context, so it scales with the change, not with file size |
+| Issued base context | 64 KiB of source text in total; 6 KiB per definition excerpt; 16 KiB per issued file |
+| Context request | 1–16 items, 1 KiB reason, ≤ 32 KiB requested |
+| Context rounds and bytes | machine-owned: `[runtime.context]`, hard maxima 4 executor rounds, 2 verifier rounds, 32 KiB per round, 96 KiB per subject, 2 escalations |
 | Compiled provider input | 256 KiB |
 | Role process timeout | `runtime.timeout_ms` (default 10 minutes, maximum 1 hour) |
 | Captured stdout/stderr | 4 MiB each |
@@ -443,14 +744,20 @@ intentionally supplied without copying any of it:
 - the repository paths and ranges supplied, each bound by content hash and
   labeled as an excerpt, file, diff, or graph facts only;
 - graph entity, memory, and invariant identifiers;
+- every issued repository item traced to the authority that selected it
+  (`PLANNER_GRAPH_ENTITY`, `PLANNER_READ_FILE`, `PLANNER_WRITE_TARGET`,
+  `PLANNER_MEMORY_REF`, `PLANNER_VERIFICATION_REF`, `CONTEXT_DELTA`) with its
+  exact serialized bytes, so supplied bytes trace back to planner intent;
+- the context round, and every ContextDelta issued to the job by ID, artifact
+  hash, bytes, round, requesting job and whether a planner approved it;
+- the repository read visibility the job ran with;
 - exact byte accounting of the compiled provider input. Instructions, one
   category per context field, and JSON framing sum exactly to the prompt's
   bytes.
 
 Provider-side system prompts, tools, and tokenization are marked
-`NOT_OBSERVED` and never estimated. `context_deltas` is reserved and empty.
-Manifests are deterministic, and building one fails closed if its accounting
-does not reproduce the compiled prompt.
+`NOT_OBSERVED` and never estimated. Manifests are deterministic, and building
+one fails closed if its accounting does not reproduce the compiled prompt.
 
 `runtime::prompt` combines a short role instruction delta, the configured
 instruction fragments, and the bounded canonical input with the expected output
@@ -541,6 +848,17 @@ distributions.
 
 - Execution within a workspace is serialized. There are no managed parallel
   worktrees.
+- Context expansion is deliberately narrow: typed items over ontology entities,
+  literal paths and memory IDs. There is no semantic repository search, and a
+  request for anything outside the task's read scope needs a planner decision
+  rather than being resolved automatically.
+- Verifiers cannot escalate to the planner; an out-of-envelope verifier request
+  is denied and blocks the task.
+- Planner escalation is consumed through an explicit decision document
+  (`agentctl run context decide`). agentctl does not itself launch a planner job
+  to answer an escalation.
+- Hard issued-context visibility is opt-in; the default keeps the workspace
+  readable (see [security.md](security.md#issued-context-visibility)).
 - The code graph is syntactic. Cross-file resolution covers Rust qualified
   paths only (no import or re-export following, macros, or type inference).
   Python and TypeScript relations resolve only within a file, and method calls
@@ -552,5 +870,13 @@ distributions.
 - Worker execution requires macOS or Linux with the required sandbox primitives.
 - Source observations are sequential, not atomic. Local authority is not user
   authentication.
-- Runtime artifacts are retained indefinitely; there is no garbage collection.
+- Runtime artifacts and ontology snapshots are retained indefinitely; there is
+  no garbage collection.
+- Semantic deltas are syntactic. They say what changed in the extracted facts,
+  not what a change could affect, and they make no rename or move claims.
+  Imports, unresolved call sites and macro-generated items are not delta facts.
+- Snapshotting reads every entity row on each index pass that records a new
+  generation (O(entities)).
+- The first complete index of a workspace is accepted without review, and so is
+  a re-observation whose facts equal the accepted generation.
 - Repository relocation is not tracked.

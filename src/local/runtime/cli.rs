@@ -168,6 +168,23 @@ pub(crate) fn run(
             super::super::cli::output(json_mode,&value,&serde_json::to_string_pretty(&value)?)
         }
         ["run","cancel",id] => Store::open(&paths.database,machine.busy_timeout_ms)?.runtime_cancel(&root,&PlanId::new(*id).map_err(Error::Invalid)?),
+        // The context relay: inspect it, then decide an escalated request. A
+        // decision is an operator/planner document, never provider output.
+        ["run","context","decide",id,file] => {
+            let mut store=Store::open(&paths.database,machine.busy_timeout_ms)?;
+            let bytes=source::read_file(Path::new(file),64*1024)?;
+            let decision:context::ContextDecision=serde_json::from_slice(&bytes)?;
+            require(decision.plan_id.as_str()==*id,"decision names another plan")?;
+            let run=Runtime::new(&mut store,paths.clone(),machine.runtime.clone(),BTreeMap::new())?.decide_context(&root,&decision)?;
+            let value=serde_json::to_value(&run)?;
+            super::super::cli::output(json_mode,&value,&serde_json::to_string_pretty(&value)?)
+        }
+        ["run","context",id] => {
+            let store=Store::read_only(&paths.database,machine.busy_timeout_ms)?;
+            let artifacts=Artifacts::new(&paths.data_root.join("runtime/blobs"))?;
+            let value=context::report(&store,&artifacts,&root,&PlanId::new(*id).map_err(Error::Invalid)?,&machine.runtime.context)?;
+            super::super::cli::output(json_mode,&value,&serde_json::to_string_pretty(&value)?)
+        }
         ["run",command,id] if ["plan","resume","planner"].contains(command) => {
             let mut store=Store::open(&paths.database,machine.busy_timeout_ms)?;
             let adapters:BTreeMap<String,Box<dyn ProviderAdapter>>=machine.runtime.providers.iter().map(|(name,p)| {
@@ -178,7 +195,7 @@ pub(crate) fn run(
             let value=if *command=="planner" {serde_json::to_value(runtime.plan(&root,&planning::PlanningRequestId::new(*id).map_err(Error::Invalid)?)?)?}else{serde_json::to_value(runtime.run(&root,&PlanId::new(*id).map_err(Error::Invalid)?)?)?};
             super::super::cli::output(json_mode,&value,&serde_json::to_string_pretty(&value)?)
         }
-        _=>Err(Error::Invalid("expected run planner <request-id>, run plan <plan-id> [--dry-run], run resume/status/cancel <plan-id>, or provider list/doctor".into())),
+        _=>Err(Error::Invalid("expected run planner <request-id>, run plan <plan-id> [--dry-run], run resume/status/cancel/context <plan-id>, run context decide <plan-id> <decision.json>, or provider list/doctor".into())),
     }
 }
 fn version(executable: &Path) -> Result<String> {

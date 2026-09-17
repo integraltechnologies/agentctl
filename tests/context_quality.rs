@@ -880,7 +880,12 @@ fn v11_to_v12_migration_is_lossless_and_derives_resolution_immediately() {
     };
     assert_eq!(resolution(&f), Some(ResolutionRule::QualifiedPath));
     let next = f.store().index_repository(&f.root).unwrap();
-    assert_eq!((next.indexed, next.resolved), (0, 1));
+    // Schema 13 leaves pre-snapshot entities without body hashes, so this pass
+    // re-derives both files once; the facts and the generation do not change.
+    assert_eq!(
+        (next.indexed, next.changed, next.resolved),
+        (next.discovered, next.discovered, 1)
+    );
     assert_eq!(next.generation.as_ref(), before.generation());
     assert_eq!(resolution(&f), Some(ResolutionRule::QualifiedPath));
     assert!(

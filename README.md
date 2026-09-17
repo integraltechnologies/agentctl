@@ -33,7 +33,10 @@ database that you own.
 - **Repository intelligence.** An incremental, content-hashed code graph for Rust,
   Python, TypeScript, and JavaScript supports symbol lookup, ranked location,
   callers, tests, impact, and bounded context packets. It runs locally, without a
-  language server or a model.
+  language server or a model. Its facts are generational: an observed change
+  becomes accepted truth only through verification or an explicit
+  `agentctl ontology accept`, and `agentctl ontology delta` shows exactly which
+  declarations and relations changed.
 - **Structured engineering memory.** Durable decisions, derived facts, observed
   evidence, and agent notes carry explicit trust and provenance. Low-trust notes
   never silently become authority.
@@ -99,8 +102,17 @@ Alpha limitations to know about:
   reported.
 - Tasks within a workspace run one at a time. There are no parallel worktrees.
 - The runtime supports modest repositories: up to 20,000 files and 64 MiB, with no
-  symlinks, hardlinks, or submodules in the checkout. Verifier diffs are limited to
-  128 KiB.
+  symlinks, hardlinks, or submodules in the checkout. Verifier diffs carry exact
+  hunks with bounded context, so they scale with the size of a change rather than
+  the size of the files it touches, and are capped at 128 KiB.
+- Context expansion is deliberately narrow. A worker asks for specific symbols,
+  relations, tests, file ranges or memory entries; there is no semantic
+  repository search. A request for anything outside the task's read scope is
+  never granted automatically: it blocks the run for an explicit planner
+  decision (`agentctl run context`). Verifiers cannot escalate at all.
+- Hard issued-context confinement (`[runtime.context] visibility = "issued"`) is
+  opt-in; the default still lets a worker read the workspace. See
+  [docs/security.md](docs/security.md#issued-context-visibility).
 - The code graph is syntactic. It resolves a relation only when exactly one
   declaration is visible: in-file lexical scope and methods, and Rust qualified
   paths across files. Imports, re-exports, and calls on variables stay
@@ -263,6 +275,11 @@ git status && git diff                # agentctl never commits; review and commi
 agentctl analytics summary
 ```
 
+If you edit files yourself between plans, `agentctl repo index` records the
+change as an ontology candidate. Inspect it with `agentctl ontology delta` and
+accept it with `agentctl ontology accept <generation-id>` before preparing the
+next plan.
+
 If a task is rejected or blocked, the run stops. Prepare a replacement plan and
 link it with `agentctl run replace <old-plan-id> <new-plan-id>`, or resume an
 interrupted run with `agentctl run resume <plan-id>`. See [docs/cli.md](docs/cli.md).
@@ -278,15 +295,23 @@ planning ── planner worker ──▶ ExecutionPlan (task DAG + verification 
    ▼
 for each task whose prerequisites are VERIFIED:
    executor worker ──▶ actual diff captured and scope-checked
+      └─ needs more context? typed request ──▶ deterministic resolution inside the
+         planner's envelope ──▶ delta ──▶ fresh executor job (outside it: planner decides)
    project checks  ──▶ evidence (sandboxed, offline)
    verifier worker ──▶ PASS → VERIFIED (unlocks dependents) │ REJECT → blocked, replan
    ▼
 integration: combined diff + integration checks + fresh integration verifier
    ▼
-COMPLETE
+COMPLETE  (and, in the same transaction, the plan's ontology candidate becomes
+           the accepted generation)
 ```
 
-agentctl owns the canonical state at every step. Provider workers receive bounded,
+agentctl owns the canonical state at every step. The planner decides what a
+worker starts with: a task's `read_scope` authorizes what it may *request*,
+while its issued context is only what the plan actually references. A worker
+that lacks context says so in a typed request instead of exploring, and
+agentctl resolves it deterministically, hands the result to a fresh job, and
+records exactly what every job received. Provider workers receive bounded,
 explicit inputs, return strict JSON, and are discarded. Their claims are checked
 against what actually happened on disk and in the checks. Every transition is
 recorded in an append-only journal and guarded in the database. An interrupted run

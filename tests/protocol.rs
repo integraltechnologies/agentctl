@@ -29,7 +29,7 @@ fn every_public_document_roundtrips_and_validates() {
         "evidence" => EvidenceRecord, "agent-job" => AgentJob, "agent-event" => AgentEvent,
         "probe" => ProbeSnapshot, "token-usage" => TokenUsageEvent,
         "experiment" => ExperimentSpec, "experiment-event" => ExperimentEvent,
-        "memory-provenance" => MemoryProvenance);
+        "memory-provenance" => MemoryProvenance, "context-request" => ContextRequest);
     roundtrip(verification(true));
     roundtrip(finding());
     roundtrip(EvidenceRef(EvidenceId::new("evidence:1").unwrap()));
@@ -826,7 +826,7 @@ fn assert_local_refs_resolve(node: &Value, root: &Value) {
 fn schemas_are_deterministic_self_contained_and_match_checked_in_output() {
     let first = schema::schemas();
     let second = schema::schemas();
-    assert_eq!(first.len(), 13);
+    assert_eq!(first.len(), 14);
     for (name, document) in first {
         let json = serde_json::to_value(&document).unwrap();
         assert_eq!(

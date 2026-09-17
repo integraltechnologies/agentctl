@@ -1,6 +1,9 @@
 use super::*;
 use serde::Serialize;
-use std::{collections::BTreeSet, env};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+};
 
 pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
     let root = env::current_dir()?;
@@ -25,11 +28,18 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
                     generation_line(stats.generation.as_ref())
                 ),
             )?;
+            if !json {
+                println!(
+                    "{}",
+                    crate::local::terminal::human(&lifecycle_line(&store.ontology_status(&root)?))
+                );
+            }
             require(
                 stats.failed == 0,
                 "index is partial: file failures invalidated old facts; inspect repo index --status",
             )
         }
+        ["ontology", command, rest @ ..] => ontology(store, &root, command, rest, json),
         ["repo", "index", "--status"] => {
             let status = store.index_status(&root)?;
             output(
@@ -207,6 +217,264 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
             "invalid graph command; run agentctl --help".into(),
         )),
     }
+}
+
+fn ontology(
+    store: &mut Store,
+    root: &Path,
+    command: &str,
+    args: &[&str],
+    json: bool,
+) -> Result<()> {
+    let mut positional = vec![];
+    let mut flags = BTreeMap::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if let Some(name) = arg.strip_prefix("--") {
+            let value = rest
+                .next()
+                .ok_or_else(|| Error::Invalid(format!("--{name} needs a value")))?;
+            require(
+                flags.insert(name, *value).is_none(),
+                format!("repeated --{name}"),
+            )?;
+        } else {
+            positional.push(*arg);
+        }
+    }
+    let allowed: &[&str] = match command {
+        "status" | "show" => &[],
+        "list" => &["limit"],
+        "delta" => &["from", "to", "change", "path", "limit"],
+        "accept" | "reject" => &["reason"],
+        _ => {
+            return Err(Error::Invalid(
+                "unknown ontology command; run agentctl --help".into(),
+            ));
+        }
+    };
+    if let Some(flag) = flags.keys().find(|f| !allowed.contains(f)) {
+        return Err(Error::Invalid(format!(
+            "unknown flag --{flag} for ontology {command}"
+        )));
+    }
+    let limit = flags
+        .get("limit")
+        .map(|v| {
+            v.parse::<usize>()
+                .ok()
+                .filter(|n| (1..=10_000).contains(n))
+                .ok_or_else(|| Error::Invalid("--limit must be 1–10000".into()))
+        })
+        .transpose()?;
+    let one = |what: &str| -> Result<&str> {
+        match positional.as_slice() {
+            [id] => Ok(id),
+            _ => Err(Error::Invalid(format!("ontology {command} needs {what}"))),
+        }
+    };
+    match command {
+        "status" => {
+            require(positional.is_empty(), "ontology status takes no arguments")?;
+            let status = store.ontology_status(root)?;
+            output(json, &status, &lifecycle_line(&status))
+        }
+        "list" => {
+            require(positional.is_empty(), "ontology list takes no arguments")?;
+            let records = store.ontology_generations(root, limit.unwrap_or(20).min(1000))?;
+            let lines: Vec<_> = records.iter().map(record_line).collect();
+            output(json, &records, &lines.join("\n"))
+        }
+        "show" => {
+            let record = store.ontology_generation(root, one("a generation ID")?)?;
+            output(json, &record, &record_line(&record))
+        }
+        "delta" => {
+            let delta = match (flags.get("from"), flags.get("to"), positional.as_slice()) {
+                (Some(from), Some(to), []) => store.ontology_diff(root, from, to)?,
+                (None, None, [id]) => store.ontology_delta(root, id)?,
+                (None, None, []) => {
+                    let candidate = store.ontology_status(root)?.candidate.ok_or_else(|| {
+                        Error::Invalid(
+                            "no open candidate; name a generation or use --from/--to".into(),
+                        )
+                    })?;
+                    store.ontology_delta(root, &candidate.generation_id)?
+                }
+                _ => {
+                    return Err(Error::Invalid(
+                        "ontology delta takes one generation ID, or both --from and --to".into(),
+                    ));
+                }
+            };
+            let change = flags
+                .get("change")
+                .map(|c| {
+                    serde_json::from_value::<Change>(serde_json::Value::String((*c).into()))
+                        .map_err(|_| {
+                            Error::Invalid("--change must be ADDED, REMOVED or MODIFIED".into())
+                        })
+                })
+                .transpose()?;
+            let selected = delta.select(change, flags.get("path").copied(), limit.unwrap_or(200));
+            output(json, &selected, &delta_lines(&delta, &selected))
+        }
+        "accept" => {
+            let record = store.accept_generation(
+                root,
+                one("a generation ID")?,
+                flags.get("reason").copied(),
+            )?;
+            output(json, &record, &format!("Accepted {}", record_line(&record)))
+        }
+        _ => {
+            let reason = flags
+                .get("reason")
+                .ok_or_else(|| Error::Invalid("ontology reject needs --reason TEXT".into()))?;
+            let record = store.reject_generation(root, one("a generation ID")?, reason)?;
+            output(json, &record, &format!("Rejected {}", record_line(&record)))
+        }
+    }
+}
+
+fn record_line(r: &OntologyGeneration) -> String {
+    let origin = match &r.origin {
+        GenerationOrigin::External => "external".to_string(),
+        GenerationOrigin::Runtime { plan_id, task_id } => format!(
+            "runtime {}{}",
+            plan_id.as_str(),
+            task_id
+                .as_ref()
+                .map(|t| format!("/{}", t.as_str()))
+                .unwrap_or_default()
+        ),
+    };
+    let decision = r
+        .closure
+        .as_ref()
+        .or(r.acceptance.as_ref())
+        .map(|d| format!(" [{:?}]", d.reason))
+        .unwrap_or_default();
+    let delta = match &r.delta {
+        DeltaStatus::NoBase => "no base".to_string(),
+        DeltaStatus::Unavailable { reason } => format!("delta unavailable: {reason}"),
+        DeltaStatus::Recorded { summary: s, .. } => format!(
+            "vs {}: entities +{} -{} ~{}, relations +{} -{}, {} files ({} semantic){}",
+            r.base.as_deref().unwrap_or("-"),
+            s.entities_added,
+            s.entities_removed,
+            s.entities_modified,
+            s.relations_added,
+            s.relations_removed,
+            s.files,
+            s.semantic_files,
+            if s.unproven_identity > 0 {
+                format!(", {} with unproven identity", s.unproven_identity)
+            } else {
+                String::new()
+            }
+        ),
+    };
+    format!(
+        "{}  {:?}{}  sequence {}  {}\n  {} files, {} entities, {} relations; {}",
+        r.generation_id,
+        r.state,
+        decision,
+        r.generation.sequence,
+        origin,
+        r.files,
+        r.entities,
+        r.relations,
+        delta
+    )
+}
+
+fn lifecycle_line(s: &OntologyStatus) -> String {
+    let accepted = s.accepted.as_ref().map_or("none".into(), |a| {
+        format!("{} (sequence {})", a.generation_id, a.generation.sequence)
+    });
+    let mut lines = vec![format!("Accepted ontology: {accepted}")];
+    if s.live_accepted {
+        lines.push("Indexed generation is the accepted generation.".into());
+    } else if let Some(observed) = &s.observed {
+        lines.push(format!(
+            "Indexed generation is NOT accepted: {}",
+            record_line(observed)
+        ));
+        if observed.state == GenerationState::Candidate {
+            lines.push(format!(
+                "Inspect: agentctl ontology delta {id}\nAccept:  agentctl ontology accept {id}",
+                id = observed.generation_id
+            ));
+        }
+    } else {
+        lines.push("Indexed generation has no lifecycle record; run agentctl repo index".into());
+    }
+    lines.join("\n")
+}
+
+fn delta_lines(full: &SemanticDelta, selected: &SemanticDelta) -> String {
+    let s = &full.summary;
+    let mut lines = vec![format!(
+        "{} (sequence {}) -> {} (sequence {})\nentities +{} -{} ~{}; relations +{} -{}; {} files ({} semantic); {} unproven identity",
+        full.from.generation_id,
+        full.from.generation.sequence,
+        full.to.generation_id,
+        full.to.generation.sequence,
+        s.entities_added,
+        s.entities_removed,
+        s.entities_modified,
+        s.relations_added,
+        s.relations_removed,
+        s.files,
+        s.semantic_files,
+        s.unproven_identity
+    )];
+    for f in &selected.files {
+        lines.push(format!(
+            "file {:?}  {}  ({} entity, {} relation changes)",
+            f.content, f.path, f.entities, f.relations
+        ));
+    }
+    for e in &selected.entities {
+        let fields = if e.fields.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {}",
+                e.fields
+                    .iter()
+                    .map(|f| format!("{f:?}").to_uppercase())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        lines.push(format!(
+            "entity {:?}{}  {:?} {}  {}{}",
+            e.change,
+            if e.identity == IdentityBasis::DuplicateOrdinal {
+                " (unproven identity)"
+            } else {
+                ""
+            },
+            e.kind,
+            e.qualified_name,
+            e.path,
+            fields
+        ));
+    }
+    for r in &selected.relations {
+        lines.push(format!(
+            "relation {:?}  {:?} {} -> {}  ({} -> {})",
+            r.change,
+            r.kind,
+            r.source.as_str(),
+            r.target.as_str(),
+            r.source_path,
+            r.target_path
+        ));
+    }
+    lines.join("\n")
 }
 
 fn generation_line(generation: Option<&GraphGeneration>) -> String {

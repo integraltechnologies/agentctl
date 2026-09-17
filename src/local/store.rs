@@ -117,6 +117,12 @@ pub enum JournalEntry {
     IndexCompleted {
         stats: super::graph::IndexStats,
     },
+    OntologyGenerationChanged {
+        generation_id: String,
+        state: super::graph::GenerationState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<super::graph::DecisionReason>,
+    },
     RepositoryObserved {
         /// Frozen v1 observation, retained verbatim across the identity migration.
         repository: serde_json::Value,

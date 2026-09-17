@@ -42,6 +42,97 @@ impl ConcurrencyConfig {
         )
     }
 }
+/// Hard maxima of the Stage 2 context relay. Configuration may choose values
+/// inside them; worker output, planner output and project policy cannot.
+pub const HARD_MAX_CONTEXT_ROUNDS: u32 = 4;
+pub const HARD_MAX_VERIFIER_CONTEXT_ROUNDS: u32 = 2;
+pub const HARD_MAX_CONTEXT_ROUND_BYTES: u32 = protocol_max_request_bytes();
+pub const HARD_MAX_CONTEXT_TASK_BYTES: u32 = 96 * 1024;
+pub const HARD_MAX_CONTEXT_ESCALATIONS: u32 = 2;
+const fn protocol_max_request_bytes() -> u32 {
+    crate::protocol::MAX_CONTEXT_REQUEST_BYTES
+}
+
+/// What repository content a provider job can read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextVisibility {
+    /// The whole workspace is readable (the default until provider dogfood
+    /// proves the relay; see docs/security.md).
+    #[default]
+    Workspace,
+    /// Executor and verifier jobs read only the repository files actually
+    /// issued to them (opt-in).
+    Issued,
+}
+
+/// Machine-owned budgets of the planner-mediated context relay
+/// (`[runtime.context]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextConfig {
+    /// Granted context rounds per executor task (fresh re-issues).
+    #[serde(default = "default_context_rounds")]
+    pub max_rounds: u32,
+    /// Granted context rounds per verification (packet or integration).
+    #[serde(default = "default_verifier_context_rounds")]
+    pub verifier_max_rounds: u32,
+    /// Bytes one round's ContextDelta may carry.
+    #[serde(default = "default_context_round_bytes")]
+    pub max_round_bytes: u32,
+    /// Cumulative ContextDelta bytes per task or verification.
+    #[serde(default = "default_context_task_bytes")]
+    pub max_task_bytes: u32,
+    /// Planner escalations per executor task.
+    #[serde(default = "default_context_escalations")]
+    pub max_escalations: u32,
+    #[serde(default)]
+    pub visibility: ContextVisibility,
+}
+fn default_context_rounds() -> u32 {
+    2
+}
+fn default_verifier_context_rounds() -> u32 {
+    1
+}
+fn default_context_round_bytes() -> u32 {
+    16 * 1024
+}
+fn default_context_task_bytes() -> u32 {
+    48 * 1024
+}
+fn default_context_escalations() -> u32 {
+    1
+}
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            max_rounds: default_context_rounds(),
+            verifier_max_rounds: default_verifier_context_rounds(),
+            max_round_bytes: default_context_round_bytes(),
+            max_task_bytes: default_context_task_bytes(),
+            max_escalations: default_context_escalations(),
+            visibility: ContextVisibility::default(),
+        }
+    }
+}
+impl ContextConfig {
+    pub fn validate(&self) -> Result<()> {
+        require(
+            self.max_rounds <= HARD_MAX_CONTEXT_ROUNDS
+                && self.verifier_max_rounds <= HARD_MAX_VERIFIER_CONTEXT_ROUNDS
+                && self.max_escalations <= HARD_MAX_CONTEXT_ESCALATIONS,
+            "runtime.context: max_rounds 0–4, verifier_max_rounds 0–2, max_escalations 0–2",
+        )?;
+        require(
+            (1024..=HARD_MAX_CONTEXT_ROUND_BYTES).contains(&self.max_round_bytes)
+                && (1024..=HARD_MAX_CONTEXT_TASK_BYTES).contains(&self.max_task_bytes)
+                && self.max_round_bytes <= self.max_task_bytes,
+            "runtime.context: max_round_bytes 1024–32768, max_task_bytes 1024–98304, round ≤ task",
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -60,6 +151,9 @@ pub struct RuntimeConfig {
     /// Machine-owned worker security authority (`[runtime.security]`).
     #[serde(default)]
     pub security: crate::local::security::SecurityConfig,
+    /// Machine-owned context-relay budgets and visibility (`[runtime.context]`).
+    #[serde(default)]
+    pub context: ContextConfig,
 }
 fn timeout() -> u64 {
     600_000
@@ -77,6 +171,7 @@ impl Default for RuntimeConfig {
             max_correction_rounds: rounds(),
             concurrency: ConcurrencyConfig::default(),
             security: Default::default(),
+            context: ContextConfig::default(),
         }
     }
 }
@@ -85,6 +180,7 @@ impl RuntimeConfig {
         routing::validate_patches(&self.profiles)?;
         self.concurrency.validate()?;
         self.security.validate()?;
+        self.context.validate()?;
         require(
             (1..=3_600_000).contains(&self.timeout_ms),
             "runtime timeout must be 1–3600000 ms",

@@ -12,6 +12,7 @@ pub const MANIFEST_VERSION: &str = "agentctl-context-manifest-1";
 /// paths relative to the job input); every other value is one leaf category.
 const EXPANDED: &[&str] = &[
     "artifact",
+    "artifact.context",
     "artifact.planner_packet",
     "artifact.planner_packet.request",
     "artifact.planner_packet.context",
@@ -42,10 +43,63 @@ pub struct ContextManifest {
     pub graph_entities: Vec<GraphEntityId>,
     pub memory: Vec<String>,
     pub invariants: Vec<String>,
-    /// Reserved for identifiers of later context deltas; always empty here.
-    pub context_deltas: Vec<String>,
+    /// Every approved ContextDelta issued to this job, in round order (empty in
+    /// manifests recorded before the relay).
+    #[serde(default)]
+    pub context_deltas: Vec<DeltaManifest>,
     pub truncated: bool,
     pub bindings: ManifestBindings,
+    /// The job's context round: 0 is the base issue, n the n-th fresh re-issue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_round: Option<u32>,
+    /// Each issued repository item traced to the authority that selected it,
+    /// with its exact serialized bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issued: Vec<IssuedItem>,
+    /// Repository read visibility the job was launched with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_visibility: Option<ContextVisibility>,
+}
+
+/// Why an item is in a worker's context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Authority {
+    /// A TaskPacket graph entity.
+    PlannerGraphEntity,
+    /// An explicit File read scope.
+    PlannerReadFile,
+    /// A File write target inside the read envelope.
+    PlannerWriteTarget,
+    /// A contract memory reference.
+    PlannerMemoryRef,
+    /// A task verification requirement.
+    PlannerVerificationRef,
+    /// An approved ContextDelta item.
+    ContextDelta,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuedItem {
+    pub authority: Authority,
+    /// Entity ID, repository path, memory ID or requirement name.
+    pub reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_id: Option<String>,
+    pub bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeltaManifest {
+    pub delta_id: String,
+    /// Content hash of the persisted delta artifact.
+    pub hash: String,
+    pub bytes: usize,
+    pub round: u32,
+    pub parent_job_id: JobId,
+    pub planner_approved: bool,
 }
 
 /// Exact accounting of the bytes agentctl itself sends. `total` is the compiled
@@ -119,6 +173,12 @@ pub struct ContextInventory {
     pub graph_version: Option<String>,
     pub graph_generation: Option<graph::GraphGeneration>,
     pub truncated: bool,
+    pub issued: Vec<IssuedItem>,
+    pub deltas: Vec<DeltaManifest>,
+    pub round: Option<u32>,
+    pub visibility: Option<ContextVisibility>,
+    /// Executor write scope, used only to confine writes under issued visibility.
+    pub write_scope: Vec<ScopePath>,
 }
 
 impl ContextInventory {
@@ -268,13 +328,16 @@ pub fn for_job(
         graph_entities: inventory.graph_entities,
         memory: inventory.memory,
         invariants: inventory.invariants,
-        context_deltas: vec![],
+        context_deltas: inventory.deltas,
         truncated: inventory.truncated || compiled.context_truncated.unwrap_or(false),
         bindings: ManifestBindings {
             prompt_hash: Some(compiled.prompt_hash.clone()),
             context_hash: compiled.context_hash.clone(),
             source_hash: compiled.source_hash.clone(),
         },
+        context_round: inventory.round,
+        issued: inventory.issued,
+        context_visibility: inventory.visibility,
     })
 }
 
@@ -319,5 +382,8 @@ pub fn for_packet(p: &planning::PlannerPacket) -> Result<ContextManifest> {
             context_hash: planning::hash(p)?,
             source_hash: planning::hash(&p.request.source)?,
         },
+        context_round: None,
+        issued: vec![],
+        context_visibility: None,
     })
 }

@@ -114,6 +114,7 @@ fn analytics_full_planner_reject_explicit_correction_fallback_and_guarded_comple
         ],
     );
     store.index_repository(&f.root).unwrap();
+    common::accept_observation(&mut store, &f.root);
     let mut replacement = artifact(&f.prepare());
     replacement.packet.plan_id = PlanId::new("plan:analytics-correction").unwrap();
     for t in &mut replacement.packet.tasks {
@@ -1427,6 +1428,21 @@ enum Mode {
     VerifierDrift,
     IntegrationDrift,
     Planner(Box<ExecutionPlan>),
+    /// Stage 3: each executor declares a new function that calls the file's
+    /// existing one, so every task changes the ontology.
+    Declare,
+    /// `Declare`, but the integration verifier moves the source (drift).
+    DeclareThenIntegrationDrift,
+    /// `Declare`, but the packet verifier rejects the named task.
+    DeclareRejecting(&'static str),
+}
+impl Mode {
+    fn declares(&self) -> bool {
+        matches!(
+            self,
+            Mode::Declare | Mode::DeclareThenIntegrationDrift | Mode::DeclareRejecting(_)
+        )
+    }
 }
 struct Fake {
     mode: Mode,
@@ -1480,14 +1496,13 @@ impl ProviderAdapter for Fake {
                     task.write_scope[0].path()
                 };
                 let prior = fs::read_to_string(process.workspace.join(path)).unwrap_or_default();
-                fs::write(
-                    process.workspace.join(path),
-                    format!(
-                        "{prior}// accepted fixture change for {}\n",
-                        task.task_id.as_str()
-                    ),
-                )
-                .unwrap();
+                let change = if self.mode.declares() {
+                    let stem = path.trim_start_matches("src/").trim_end_matches(".rs");
+                    format!("\npub fn declared_{stem}() {{\n    cache_{stem}();\n}}\n")
+                } else {
+                    format!("// accepted fixture change for {}\n", task.task_id.as_str())
+                };
+                fs::write(process.workspace.join(path), format!("{prior}{change}")).unwrap();
                 if matches!(self.mode, Mode::PlantGitignore) {
                     let tests = process.workspace.join("tests");
                     fs::create_dir_all(tests.join("unit")).unwrap();
@@ -1526,16 +1541,22 @@ impl ProviderAdapter for Fake {
                     evidence: vec![],
                     notes: None,
                     failure: None,
+                    context_request: None,
                 })
                 .unwrap()
             }
             AgentRole::Verifier => {
                 if matches!(self.mode, Mode::VerifierDrift)
-                    || matches!(self.mode, Mode::IntegrationDrift) && input.task_id.is_none()
+                    || matches!(
+                        self.mode,
+                        Mode::IntegrationDrift | Mode::DeclareThenIntegrationDrift
+                    ) && input.task_id.is_none()
                 {
                     fs::write(process.workspace.join("drift.txt"), "external edit").unwrap();
                 }
-                let reject = matches!(self.mode, Mode::Reject);
+                let reject = matches!(self.mode, Mode::Reject)
+                    || matches!(self.mode, Mode::DeclareRejecting(t)
+                        if input.task_id.as_ref().map(TaskId::as_str) == Some(t));
                 let target: VerificationTarget =
                     serde_json::from_value(input.artifact["target"].clone()).unwrap();
                 let requirements = if input.task_id.is_some() {
@@ -1576,6 +1597,7 @@ impl ProviderAdapter for Fake {
                     requirement_refs: requirements,
                     invariant_refs: vec![],
                     notes: None,
+                    context_request: None,
                 })
                 .unwrap()
             }
@@ -1691,10 +1713,25 @@ fn full_diamond_runtime_captures_verifies_refreshes_and_completes() {
         );
         assert_eq!(input.workspace_id, result.workspace_id);
     }
-    assert!(
-        inputs[2].artifact["files"]
-            .to_string()
-            .contains("accepted fixture change for task:0")
+    // Accepted source reaches downstream context through planner references,
+    // not through file injection: the next task's executor is issued the
+    // reindexed symbol (bound to the new content hash) and its own planner-named
+    // write target, never the previous task's file.
+    let issued = &inputs[2].artifact["context"];
+    assert_eq!(
+        issued["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["src/graph.rs"]
+    );
+    assert_eq!(
+        issued["symbols"][0]["entity"]["content_hash"]
+            .as_str()
+            .unwrap(),
+        local::graph::content_hash(&fs::read(f.root.join("src/api.rs")).unwrap())
     );
     assert!(inputs[1].artifact.get("notes").is_none());
     assert!(
@@ -1860,6 +1897,7 @@ fn runtime_captures_executes_and_verifies_literal_framework_paths() {
     git(&f.root, &["add", "."]);
     git(&f.root, &["commit", "--quiet", "-m", "literal routes"]);
     assert_eq!(f.store().index_repository(&f.root).unwrap().failed, 0);
+    common::accept_observation(&mut f.store(), &f.root);
     let prepared = f.prepare();
     let mut p = artifact(&prepared);
     p.packet.tasks.truncate(1);
@@ -1921,6 +1959,7 @@ fn provider_jobs_record_exact_content_free_context_manifests() {
     git(&f.root, &["add", "."]);
     git(&f.root, &["commit", "--quiet", "-m", "canary"]);
     f.store().index_repository(&f.root).unwrap();
+    common::accept_observation(&mut f.store(), &f.root);
     let prepared = f.prepare();
     let p = artifact(&prepared);
     let inputs = seen();
@@ -2034,16 +2073,33 @@ fn provider_jobs_record_exact_content_free_context_manifests() {
                 );
             }
             AgentRole::Executor => {
+                // The planner-selected symbol lives in src/api.rs, so every
+                // executor is issued that definition as a hash-bound excerpt,
+                // plus its own planner-named write target as a whole file.
                 assert!(String::from_utf8_lossy(compiled).contains("MANIFEST_SOURCE_CANARY"));
                 assert!(m.paths.iter().any(|s| s.path == "src/api.rs"
-                    && s.kind == manifest::SuppliedKind::File
+                    && s.kind == manifest::SuppliedKind::Excerpt
                     && s.content_hash.is_some()));
+                assert!(
+                    m.paths
+                        .iter()
+                        .any(|s| s.kind == manifest::SuppliedKind::File
+                            && s.content_hash.is_some()
+                            && input.artifact["task"]["write_scope"][0]["path"] == json!(s.path))
+                );
                 assert!(m.graph_generation.is_some());
+                assert_eq!(m.context_round, Some(0));
+                assert!(m.context_deltas.is_empty());
                 assert!(
                     m.bytes
                         .categories
                         .iter()
-                        .any(|c| c.category == "artifact.files")
+                        .any(|c| c.category == "artifact.context.files")
+                );
+                assert!(
+                    m.issued
+                        .iter()
+                        .any(|i| i.authority == manifest::Authority::PlannerGraphEntity)
                 );
             }
             AgentRole::Verifier => {
@@ -3248,7 +3304,7 @@ fn v6_runtime_migration_is_additive_atomic_and_missing_guards_fail_closed() {
     );
     c.execute_batch("DROP TABLE runtime_jobs").unwrap();
     drop(c);
-    assert_eq!(f.store().status().unwrap().schema_version, 12);
+    assert_eq!(f.store().status().unwrap().schema_version, 13);
     assert_eq!(
         f.store()
             .execution_plan(&f.root, &p.packet.plan_id)
@@ -3495,6 +3551,8 @@ fn correction_requires_explicit_replacement_and_stops_at_configured_bound() {
         &["commit", "--quiet", "-m", "human replan baseline"],
     );
     f.store().index_repository(&f.root).unwrap();
+    // Stage 3: preserving the rejected edit is the human's explicit decision.
+    common::accept_observation(&mut f.store(), &f.root);
     let mut replacement = artifact(&f.prepare());
     replacement.packet.plan_id = PlanId::new("plan:correction").unwrap();
     for task in &mut replacement.packet.tasks {
@@ -3734,7 +3792,7 @@ fn old_v7_runtime_metadata_remains_inspectable_without_silent_ownership_backfill
         c.query_row::<String, _, _>("SELECT record_json FROM runtime_runs", [], |r| r.get(0))
             .unwrap()
     );
-    assert_eq!(f.store().status().unwrap().schema_version, 12);
+    assert_eq!(f.store().status().unwrap().schema_version, 13);
     assert!(
         f.store()
             .runtime_jobs(&f.root, None)
@@ -4715,4 +4773,559 @@ fn installed_native_auth_preflight_without_api_keys() {
         assert!(status.authenticated, "{provider}: {}", status.guidance);
         assert!(!status.api_key_required);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: the runtime's ontology acceptance boundary.
+// ---------------------------------------------------------------------------
+
+type States = Vec<(u64, local::graph::GenerationState)>;
+
+impl Fixture {
+    fn ontology(&self) -> local::graph::OntologyStatus {
+        self.store().ontology_status(&self.root).unwrap()
+    }
+    fn generation_states(&self) -> States {
+        let mut v: States = self
+            .store()
+            .ontology_generations(&self.root, 100)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.ordinal, g.state))
+            .collect();
+        v.reverse();
+        v
+    }
+    /// Journaled transitions of one generation into `state`.
+    fn transitions_to(&self, id: &str, state: local::graph::GenerationState) -> usize {
+        self.store()
+            .events(None, None, None, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                matches!(&e.entry, local::store::JournalEntry::OntologyGenerationChanged {
+                    generation_id, state: s, ..
+                } if generation_id == id && *s == state)
+            })
+            .count()
+    }
+}
+
+/// The functions each task of the fixture plan declares, as Stage-1 names them.
+fn declared(stems: &[&str]) -> std::collections::BTreeSet<String> {
+    stems
+        .iter()
+        .map(|s| format!("src::{s}::declared_{s}"))
+        .collect()
+}
+
+fn added_functions(delta: &local::graph::SemanticDelta) -> std::collections::BTreeSet<String> {
+    delta
+        .entities
+        .iter()
+        .filter(|e| e.change == local::graph::Change::Added)
+        .map(|e| e.qualified_name.clone())
+        .collect()
+}
+
+#[test]
+fn a_verified_plan_advances_accepted_ontology_exactly_once_at_integration() {
+    use local::graph::{Change, DecisionReason, GenerationOrigin, GenerationState as G};
+    let f = Fixture::new();
+    let base = f.ontology().accepted.unwrap();
+    let p = f.plan();
+    assert_eq!(
+        p.metadata.source.graph_generation.as_ref(),
+        Some(&base.generation)
+    );
+    assert_eq!(
+        f.run(&p, Mode::Declare, seen(), false).unwrap().state,
+        RunState::Complete
+    );
+    // Independent oracle: the functions really are in the worktree.
+    for stem in ["api", "graph", "cli", "regression"] {
+        let text = fs::read_to_string(f.root.join(format!("src/{stem}.rs"))).unwrap();
+        assert!(text.contains(&format!("pub fn declared_{stem}()")));
+    }
+    let status = f.ontology();
+    assert!(status.live_accepted && status.candidate.is_none());
+    let accepted = status.accepted.unwrap();
+    assert_eq!(
+        accepted.origin,
+        GenerationOrigin::Runtime {
+            plan_id: p.packet.plan_id.clone(),
+            task_id: Some(TaskId::new("task:3").unwrap()),
+        }
+    );
+    let decision = accepted.acceptance.clone().unwrap();
+    assert_eq!(decision.reason, DecisionReason::IntegrationVerified);
+    assert_eq!(decision.plan_id.as_ref(), Some(&p.packet.plan_id));
+    assert!(decision.verification_hash.unwrap().starts_with("blake3:"));
+    assert!(decision.source_hash.unwrap().starts_with("blake3:"));
+    // One candidate per verified task; only the last, fully integrated one
+    // was accepted, and the bootstrap generation was retired by it.
+    assert_eq!(
+        f.generation_states(),
+        vec![
+            (1, G::Retired),
+            (2, G::Abandoned),
+            (3, G::Abandoned),
+            (4, G::Abandoned),
+            (5, G::Accepted),
+        ]
+    );
+    assert_eq!(f.transitions_to(&accepted.generation_id, G::Accepted), 1);
+    // The accepted delta is exactly the four declared functions and their calls.
+    let delta = f
+        .store()
+        .ontology_delta(&f.root, &accepted.generation_id)
+        .unwrap();
+    assert_eq!(delta.from.generation_id, base.generation_id);
+    assert_eq!(
+        added_functions(&delta),
+        declared(&["api", "graph", "cli", "regression"])
+    );
+    assert!(delta.entities.iter().all(|e| e.change == Change::Added));
+    assert_eq!(delta.relations.len(), 4);
+    assert!(delta.relations.iter().all(|r| r.change == Change::Added
+        && r.kind == local::graph::RelationKind::Calls
+        && r.source_path == r.target_path));
+    assert_eq!((delta.summary.files, delta.summary.semantic_files), (4, 4));
+    // Each superseded intermediate candidate still describes its verified prefix.
+    let history = f.store().ontology_generations(&f.root, 100).unwrap();
+    for (ordinal, stems) in [
+        (2, &["api"][..]),
+        (3, &["api", "graph"][..]),
+        (4, &["api", "graph", "cli"][..]),
+    ] {
+        let record = history.iter().find(|g| g.ordinal == ordinal).unwrap();
+        assert_eq!(
+            record.closure.as_ref().unwrap().reason,
+            DecisionReason::Superseded
+        );
+        let delta = f
+            .store()
+            .ontology_delta(&f.root, &record.generation_id)
+            .unwrap();
+        assert_eq!(
+            added_functions(&delta),
+            declared(stems),
+            "ordinal {ordinal}"
+        );
+    }
+    // Resuming a completed plan is idempotent.
+    assert_eq!(
+        f.run(&p, Mode::Declare, seen(), false).unwrap().state,
+        RunState::Complete
+    );
+    assert_eq!(f.generation_states().len(), 5);
+    assert_eq!(f.transitions_to(&accepted.generation_id, G::Accepted), 1);
+    let completions = f
+        .store()
+        .events(None, None, None, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(&e.entry, local::store::JournalEntry::Runtime { phase, .. } if phase == "ONTOLOGY_GENERATION_ACCEPTED"))
+        .count();
+    assert_eq!(completions, 1);
+    // Planning continues from the accepted post-plan generation.
+    assert_eq!(
+        f.prepare().request.source.graph_generation.as_ref(),
+        Some(&accepted.generation)
+    );
+}
+
+#[test]
+fn task_verified_work_is_not_accepted_until_integration_passes() {
+    use local::graph::{DecisionReason, GenerationState as G};
+    let f = Fixture::new();
+    let base = f.ontology().accepted.unwrap();
+    let p = f.plan();
+    let error = f
+        .run(&p, Mode::DeclareThenIntegrationDrift, seen(), false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("SOURCE_DRIFT"), "{error}");
+    assert!(
+        f.store()
+            .execution_tasks(&f.root, &p.packet.plan_id)
+            .unwrap()
+            .iter()
+            .all(|t| t.state == TaskState::Verified)
+    );
+    // Every task passed verification, but the integration boundary did not:
+    // accepted truth still describes the baseline.
+    let status = f.ontology();
+    assert_eq!(status.accepted.as_ref(), Some(&base));
+    assert!(!status.live_accepted);
+    let candidate = status.candidate.unwrap();
+    assert_eq!(candidate.plan(), Some(&p.packet.plan_id));
+    assert_eq!(status.live.as_ref(), Some(&candidate.generation));
+    assert!(
+        f.store()
+            .accept_generation(&f.root, &candidate.generation_id, None)
+            .is_err(),
+        "a runtime candidate is not manually acceptable"
+    );
+    assert!(
+        f.store()
+            .reject_generation(&f.root, &candidate.generation_id, "no")
+            .is_err()
+    );
+    assert!(
+        f.store()
+            .prepare_plan(&f.root, request_draft(), PlanningLimits::default())
+            .is_err()
+    );
+    // Resuming the blocked run changes nothing.
+    assert!(f.run(&p, Mode::Declare, seen(), false).is_err());
+    assert_eq!(f.ontology().candidate.as_ref(), Some(&candidate));
+    // A human's explicit observation hands the verified-but-unintegrated
+    // state to a human decision (the plan can no longer complete) ...
+    f.store().index_repository(&f.root).unwrap();
+    let external = f.ontology().candidate.unwrap();
+    assert_ne!(external.generation_id, candidate.generation_id);
+    assert_eq!(external.generation, candidate.generation);
+    assert_eq!(external.origin, local::graph::GenerationOrigin::External);
+    let superseded = f
+        .store()
+        .ontology_generation(&f.root, &candidate.generation_id)
+        .unwrap();
+    assert_eq!(superseded.state, G::Abandoned);
+    assert_eq!(
+        superseded.closure.unwrap().reason,
+        DecisionReason::Superseded
+    );
+    assert_eq!(f.ontology().accepted.as_ref(), Some(&base));
+    // ... who may restore the baseline, which re-observes accepted facts ...
+    git(&f.root, &["stash", "--quiet"]);
+    f.store().index_repository(&f.root).unwrap();
+    let restored = f.ontology();
+    assert!(restored.live_accepted);
+    let accepted = restored.accepted.unwrap();
+    assert_eq!(accepted.generation.fingerprint, base.generation.fingerprint);
+    assert_eq!(
+        accepted.acceptance.unwrap().reason,
+        DecisionReason::IdenticalToAccepted
+    );
+    // ... or keep the work and accept it deliberately, after which planning
+    // (e.g. a correction plan) proceeds.
+    git(&f.root, &["stash", "pop", "--quiet"]);
+    f.store().index_repository(&f.root).unwrap();
+    let kept = f.ontology().candidate.unwrap();
+    assert_eq!(
+        kept.generation.fingerprint,
+        candidate.generation.fingerprint
+    );
+    f.store()
+        .accept_generation(&f.root, &kept.generation_id, Some("keep verified work"))
+        .unwrap();
+    assert!(
+        f.store()
+            .prepare_plan(&f.root, request_draft(), PlanningLimits::default())
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_rejected_task_never_advances_accepted_ontology() {
+    use local::graph::{DecisionReason, GenerationState as G};
+    // The first task rejected: nothing was ever indexed for this plan.
+    let f = Fixture::new();
+    let base = f.ontology().accepted.unwrap();
+    let p = f.plan();
+    assert!(
+        f.run(&p, Mode::DeclareRejecting("task:0"), seen(), false)
+            .is_err()
+    );
+    assert_eq!(f.generation_states(), vec![(1, G::Accepted)]);
+    assert_eq!(f.ontology().accepted.as_ref(), Some(&base));
+    // A later task rejected: the verified prefix's candidate is closed as
+    // rejected, because the plan can no longer complete.
+    let f = Fixture::new();
+    let base = f.ontology().accepted.unwrap();
+    let p = f.plan();
+    assert!(
+        f.run(&p, Mode::DeclareRejecting("task:1"), seen(), false)
+            .is_err()
+    );
+    let states = f
+        .store()
+        .execution_tasks(&f.root, &p.packet.plan_id)
+        .unwrap();
+    assert_eq!(states[0].state, TaskState::Verified);
+    assert_eq!(states[1].state, TaskState::Rejected);
+    assert_eq!(
+        f.generation_states(),
+        vec![(1, G::Accepted), (2, G::Rejected)]
+    );
+    let status = f.ontology();
+    assert_eq!(status.accepted.as_ref(), Some(&base));
+    assert!(status.candidate.is_none());
+    let rejected = status.observed.unwrap();
+    let closure = rejected.closure.unwrap();
+    assert_eq!(closure.reason, DecisionReason::VerificationRejected);
+    assert_eq!(closure.task_id, Some(TaskId::new("task:1").unwrap()));
+    // The rejected task's edit was never indexed: the index is stale against it.
+    let index = f.store().index_status(&f.root).unwrap();
+    assert_eq!(index.stale_files, vec!["src/graph.rs".to_string()]);
+    let delta = f
+        .store()
+        .ontology_delta(&f.root, &rejected.generation_id)
+        .unwrap();
+    assert_eq!(added_functions(&delta), declared(&["api"]));
+    // Resuming changes nothing.
+    assert!(f.run(&p, Mode::Declare, seen(), false).is_err());
+    assert_eq!(
+        f.generation_states(),
+        vec![(1, G::Accepted), (2, G::Rejected)]
+    );
+}
+
+#[test]
+fn a_controller_crash_around_candidates_resumes_to_exactly_one_acceptance() {
+    use local::graph::GenerationState as G;
+    // at=2: after task:0 was verified and indexed; at=5: after every task
+    // was verified, before integration verification. `reindex`: a human
+    // observes the (unchanged) worktree while the controller is gone, which
+    // relabels the open candidate as external; integration still accepts the
+    // live generation it verified.
+    for (at, open, reindex) in [(2, 2, false), (5, 5, false), (5, 5, true)] {
+        let f = Fixture::new();
+        let base = f.ontology().accepted.unwrap();
+        let p = f.plan();
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut s = f.store();
+            Runtime::new(
+                &mut s,
+                f.paths.clone(),
+                f.config.clone(),
+                BTreeMap::from([(
+                    "test".into(),
+                    Box::new(Fake {
+                        mode: Mode::Declare,
+                        seen: seen(),
+                    }) as Box<dyn ProviderAdapter>,
+                )]),
+            )
+            .unwrap()
+            .with_check_launcher(Box::new(CrashCheck { count: 0, at }))
+            .run(&f.root, &p.packet.plan_id)
+            .unwrap();
+        }));
+        assert!(crash.is_err());
+        let status = f.ontology();
+        assert_eq!(status.accepted.as_ref(), Some(&base), "at={at}");
+        let candidate = status.candidate.unwrap();
+        assert_eq!(candidate.ordinal, open as u64, "at={at}");
+        assert_eq!(candidate.plan(), Some(&p.packet.plan_id));
+        if reindex {
+            f.store().index_repository(&f.root).unwrap();
+            assert_eq!(f.ontology().candidate.unwrap().ordinal, 6);
+        }
+        assert_eq!(
+            f.run(&p, Mode::Declare, seen(), false).unwrap().state,
+            RunState::Complete
+        );
+        let accepted = f.ontology().accepted.unwrap();
+        assert_eq!(accepted.ordinal, if reindex { 6 } else { 5 }, "at={at}");
+        assert_eq!(
+            accepted.acceptance.as_ref().unwrap().reason,
+            local::graph::DecisionReason::IntegrationVerified
+        );
+        assert_eq!(f.transitions_to(&accepted.generation_id, G::Accepted), 1);
+        assert_eq!(
+            f.generation_states()
+                .iter()
+                .filter(|(_, s)| *s == G::Accepted)
+                .count(),
+            1
+        );
+        let delta = f
+            .store()
+            .ontology_delta(&f.root, &accepted.generation_id)
+            .unwrap();
+        assert_eq!(
+            added_functions(&delta),
+            declared(&["api", "graph", "cli", "regression"])
+        );
+    }
+}
+
+#[test]
+fn promotion_and_plan_completion_commit_together_or_not_at_all() {
+    use local::graph::GenerationState as G;
+    // A failure inside the completion transaction (here: the promotion
+    // itself) rolls back plan completion and promotion together.
+    let f = Fixture::new();
+    let base = f.ontology().accepted.unwrap();
+    let p = f.plan();
+    common::sql(&f.paths.database)
+        .execute_batch(
+            "CREATE TRIGGER inject_promotion_failure BEFORE UPDATE ON ontology_generations
+             WHEN NEW.state='ACCEPTED' BEGIN SELECT RAISE(ABORT,'injected promotion failure'); END;",
+        )
+        .unwrap();
+    let error = f
+        .run(&p, Mode::Declare, seen(), false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("injected promotion failure"), "{error}");
+    assert_eq!(
+        f.store()
+            .execution_plan(&f.root, &p.packet.plan_id)
+            .unwrap()
+            .state,
+        PlanState::Active
+    );
+    let status = f.ontology();
+    assert_eq!(status.accepted.as_ref(), Some(&base));
+    let candidate = status.candidate.unwrap();
+    assert_eq!(candidate.state, G::Candidate);
+    assert_eq!(f.transitions_to(&base.generation_id, G::Retired), 0);
+    assert_eq!(f.transitions_to(&candidate.generation_id, G::Accepted), 0);
+
+    // A failure right after the completion transaction committed (the run
+    // record) leaves a completed plan with its candidate accepted; resuming
+    // finishes the record without a second acceptance.
+    let f = Fixture::new();
+    let p = f.plan();
+    common::sql(&f.paths.database)
+        .execute_batch(
+            "CREATE TRIGGER inject_record_failure BEFORE UPDATE ON runtime_runs
+             WHEN json_extract(NEW.record_json,'$.state')='COMPLETE'
+             BEGIN SELECT RAISE(ABORT,'injected record failure'); END;",
+        )
+        .unwrap();
+    assert!(f.run(&p, Mode::Declare, seen(), false).is_err());
+    assert_eq!(
+        f.store()
+            .execution_plan(&f.root, &p.packet.plan_id)
+            .unwrap()
+            .state,
+        PlanState::Complete
+    );
+    let accepted = f.ontology().accepted.unwrap();
+    assert_eq!(accepted.ordinal, 5);
+    common::sql(&f.paths.database)
+        .execute_batch("DROP TRIGGER inject_record_failure;")
+        .unwrap();
+    assert_eq!(
+        f.run(&p, Mode::Declare, seen(), false).unwrap().state,
+        RunState::Complete
+    );
+    assert_eq!(f.ontology().accepted.as_ref(), Some(&accepted));
+    assert_eq!(f.transitions_to(&accepted.generation_id, G::Accepted), 1);
+}
+
+#[test]
+fn runtime_adoption_requires_the_plan_to_be_bound_to_accepted_ontology() {
+    let f = Fixture::new();
+    let p = f.plan();
+    // An external observation that nobody accepted, then restored: the plan's
+    // bound generation is no longer the accepted position.
+    fs::write(
+        f.root.join("src/api.rs"),
+        "pub fn cache_api() { let _ = 1; }\n",
+    )
+    .unwrap();
+    f.store().index_repository(&f.root).unwrap();
+    git(&f.root, &["checkout", "--quiet", "--", "src"]);
+    f.store().index_repository(&f.root).unwrap();
+    let status = f.ontology();
+    assert!(status.live_accepted);
+    assert_ne!(
+        p.metadata.source.graph_generation.as_ref(),
+        Some(&status.accepted.as_ref().unwrap().generation)
+    );
+    let error = f
+        .run(&p, Mode::Declare, seen(), false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("SOURCE_DRIFT") && error.contains("not the accepted generation"),
+        "{error}"
+    );
+    // Nothing was executed, so nothing was observed.
+    assert_eq!(f.generation_states().len(), 3);
+}
+
+fn request_draft() -> RequestDraft {
+    RequestDraft {
+        objective: "Implement cache persistence graph CLI regression support".into(),
+        query: Some("cache".into()),
+        scope: vec![ScopePath::Directory { path: "src".into() }],
+        constraints: vec![],
+        definition_of_done: vec!["done".into()],
+        verification: Some(requirements("integration")),
+        invariant_refs: vec![],
+        provenance: PlanningProvenance {
+            actor: "human".into(),
+            source_refs: vec!["objective".into()],
+            provider: None,
+        },
+    }
+}
+
+#[test]
+fn an_unexplained_observation_during_a_run_blocks_further_context() {
+    use local::graph::GenerationState as G;
+    let f = Fixture::new();
+    let base = f.ontology().accepted.unwrap();
+    let p = f.plan();
+    // Controller lost after task:0 was verified and observed.
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut s = f.store();
+        Runtime::new(
+            &mut s,
+            f.paths.clone(),
+            f.config.clone(),
+            BTreeMap::from([(
+                "test".into(),
+                Box::new(Fake {
+                    mode: Mode::Declare,
+                    seen: seen(),
+                }) as Box<dyn ProviderAdapter>,
+            )]),
+        )
+        .unwrap()
+        .with_check_launcher(Box::new(CrashCheck { count: 0, at: 2 }))
+        .run(&f.root, &p.packet.plan_id)
+        .unwrap();
+    }));
+    assert!(crash.is_err());
+    let runtime_candidate = f.ontology().candidate.unwrap();
+    // task:1's edit was captured but not yet verified when the controller
+    // died. A human's reindex now observes that unverified work.
+    assert!(
+        fs::read_to_string(f.root.join("src/graph.rs"))
+            .unwrap()
+            .contains("declared_graph")
+    );
+    f.store().index_repository(&f.root).unwrap();
+    let external = f.ontology().candidate.unwrap();
+    assert_eq!(external.origin, local::graph::GenerationOrigin::External);
+    assert_ne!(external.generation, runtime_candidate.generation);
+    let delta = f
+        .store()
+        .ontology_delta(&f.root, &external.generation_id)
+        .unwrap();
+    assert_eq!(added_functions(&delta), declared(&["api", "graph"]));
+    let inputs = seen();
+    let error = f
+        .run(&p, Mode::Declare, inputs.clone(), false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("neither accepted nor this plan's verified candidate"),
+        "{error}"
+    );
+    assert!(inputs.lock().unwrap().is_empty(), "no job was issued");
+    // The verifier was refused context from that observation; accepted truth
+    // and the recorded history are unchanged.
+    assert_eq!(f.ontology().accepted.as_ref(), Some(&base));
+    assert_eq!(
+        f.generation_states(),
+        vec![(1, G::Accepted), (2, G::Abandoned), (3, G::Candidate)]
+    );
 }

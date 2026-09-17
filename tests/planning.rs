@@ -462,6 +462,7 @@ fn packet_proof(f: &Fixture, p: &ExecutionPlan, i: usize, pass: bool) -> Verific
         requirement_refs: vec!["unit".into()],
         invariant_refs: t.invariant_refs.clone(),
         notes: None,
+        context_request: None,
     }
 }
 fn final_proof(f: &Fixture, p: &ExecutionPlan) -> VerificationPacket {
@@ -486,6 +487,7 @@ fn final_proof(f: &Fixture, p: &ExecutionPlan) -> VerificationPacket {
         requirement_refs: vec!["integration".into()],
         invariant_refs: p.packet.tasks[0].invariant_refs.clone(),
         notes: None,
+        context_request: None,
     }
 }
 fn final_source() -> SourceStateRef {
@@ -894,6 +896,8 @@ fn stale_source_graph_policy_and_memory_references_are_rejected() {
     assert!(f.store().import_execution_plan(&f.root, &p).is_err());
     f.store().index_repository(&f.root).unwrap();
     assert!(f.store().import_execution_plan(&f.root, &p).is_err());
+    // Stage 3: the reindexed edit is a candidate until deliberately accepted.
+    common::accept_observation(&mut f.store(), &f.root);
     let fresh = f.prepare();
     let mut p = artifact(&fresh, "fresh", false);
     p.metadata.contracts[0].memory_refs.push(derived.id);
@@ -1134,7 +1138,7 @@ fn v4_migration_is_additive_reopen_safe_and_preserves_memory_graph_events() {
         f.store().memory_show(&f.root, &m.id, false).unwrap().entry,
         m
     );
-    assert_eq!(f.store().status().unwrap().schema_version, 12);
+    assert_eq!(f.store().status().unwrap().schema_version, 13);
     assert_eq!(
         c.prepare("PRAGMA foreign_key_check")
             .unwrap()
@@ -1430,6 +1434,7 @@ fn historical_observation_remains_usable_but_superseded_memory_is_excluded() {
         &format!("{CODE}\n// later observation\n"),
     );
     f.store().index_repository(&f.root).unwrap();
+    common::accept_observation(&mut f.store(), &f.root);
     let prepared = f.prepare();
     assert!(
         prepared
@@ -1900,7 +1905,7 @@ fn v5_completion_guard_migration_preserves_plan_payloads_and_events() {
     downgrade_completion(&c);
     assert!(Store::read_only(&f.db, 5000).is_err());
     let s = f.store();
-    assert_eq!(s.status().unwrap().schema_version, 12);
+    assert_eq!(s.status().unwrap().schema_version, 13);
     let view = s.execution_plan(&f.root, &p.packet.plan_id).unwrap();
     assert_eq!(
         serde_json::to_value(&view.plan).unwrap(),
@@ -2040,7 +2045,7 @@ fn legacy_complete_valid_history_migrates_without_live_checkout_and_preserves_by
     let before = legacy_snapshot(&c);
     // A historical completion must not depend on current policy/source freshness.
     fs::rename(&f.root, f.temp.0.join("moved-checkout")).unwrap();
-    assert_eq!(f.store().status().unwrap().schema_version, 12);
+    assert_eq!(f.store().status().unwrap().schema_version, 13);
     let after = legacy_snapshot(&c);
     assert_eq!(&after[2..], &before[2..]);
     assert_eq!(completion_events(&c), 1);
@@ -2059,7 +2064,7 @@ fn legacy_complete_valid_history_migrates_without_live_checkout_and_preserves_by
             .status()
             .unwrap()
             .schema_version,
-        12
+        13
     );
 }
 
@@ -2153,7 +2158,7 @@ fn legacy_complete_sibling_and_unbound_packet_ownership_fail_migration() {
         .unwrap();
     }
     // Explicitly restoring the genuine original records permits a later retry.
-    assert_eq!(f.store().status().unwrap().schema_version, 12);
+    assert_eq!(f.store().status().unwrap().schema_version, 13);
     assert_eq!(completion_events(&c), 1);
 }
 
@@ -2256,7 +2261,10 @@ fn legacy_complete_mixed_valid_and_invalid_plans_roll_back_entire_upgrade() {
 fn legacy_complete_empty_migration_still_allows_normal_v6_completion() {
     let f = Fixture::new();
     downgrade_completion(&f.sql());
-    assert_eq!(f.store().status().unwrap().schema_version, 12);
+    assert_eq!(f.store().status().unwrap().schema_version, 13);
+    // An upgraded database has no ontology lifecycle yet; one index pass
+    // records (and, being complete, bootstraps) the accepted generation.
+    f.store().index_repository(&f.root).unwrap();
     let p = completed_plan(&f, "after-migration");
     assert_eq!(
         f.store()

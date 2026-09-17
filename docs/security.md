@@ -30,6 +30,10 @@ The goals are:
   outside the paths its role is granted;
 - a worker cannot read agentctl state, well-known credential stores, or files
   outside its granted read roots;
+- a worker cannot silently widen the context it was issued: additional context
+  comes only from a typed, bounded, auditable request that agentctl resolves
+  inside the planner's envelope (see
+  [issued-context visibility](#issued-context-visibility));
 - a worker does not inherit the controller's ambient environment;
 - checks and experiments cannot reach provider credentials, and are offline unless
   explicitly allowed;
@@ -197,6 +201,49 @@ the workspace or scratch directory falls inside a denied path.
 `PATH` for workers is the controller's `PATH` with relative and empty entries
 removed, and with any entry under the workspace or agentctl state removed, so a
 repository cannot shadow `cargo` or `git`.
+
+## Issued-context visibility
+
+A task's `read_scope` is an **authorization envelope**: the paths the task may
+request context from. The **issued context** is what a job was actually given,
+recorded in its context manifest. The two are deliberately distinct, and a
+worker cannot widen its own issued context: it asks, and agentctl resolves the
+request deterministically inside the envelope or blocks for a planner decision
+(see [architecture.md](architecture.md#context-relay)).
+
+`[runtime.context] visibility` chooses how strongly the *filesystem* enforces
+that distinction:
+
+| Mode | Repository reads of an executor/verifier job |
+| --- | --- |
+| `workspace` (default) | the whole workspace, as before |
+| `issued` | only the repository files issued to that job in full, plus (for a writable executor) its write scope |
+
+Under `issued`, the workspace tree and the repository's Git directories are not
+read roots, so `.git` cannot be used to recover unissued source, and the
+executor's write roots are its planner-authored write scope rather than the
+whole workspace. Checks and experiments are unaffected: they keep the
+read-only workspace access they need. agentctl state, credentials and the
+control plane stay denied exactly as before.
+
+**The default is `workspace`, and `issued` is opt-in.** Before the default can
+flip, the following must be settled:
+
+- **Provider dogfood.** Both Claude Code and Codex must be shown to work
+  through the relay under confinement — including whatever they read at startup
+  in the working directory and in `.git`. This has not been measured with real
+  provider processes yet, and a provider that needs an unissued path would fail
+  closed rather than degrade.
+- **Planner jobs.** `issued` applies to executor and verifier jobs. Planner
+  jobs still run with workspace visibility, because the planner is the authority
+  that decides what to issue and its packet carries excerpts rather than whole
+  files.
+- **Write scopes are readable.** The backends grant read access to write roots,
+  so a Directory write scope is readable under `issued`. Strict read
+  confinement needs File write scopes.
+- **Linux write targets.** Landlock rules need an existing path, so a write
+  target that does not exist yet cannot be granted on Linux; such a task must
+  create files under a granted directory instead.
 
 ## Environment isolation
 

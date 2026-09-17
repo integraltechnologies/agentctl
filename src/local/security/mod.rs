@@ -531,6 +531,18 @@ pub struct DeniedPath {
     pub reason: &'static str,
 }
 
+/// Stage 2 issued-context visibility of a provider frontend: instead of the
+/// whole workspace (and its Git directories), only the repository files issued
+/// to the job are readable, and a writable job may write only its write scope
+/// (which the backends also make readable). Checks and experiments never use it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IssuedVisibility {
+    /// Absolute paths of files issued in full.
+    pub read_files: Vec<PathBuf>,
+    /// Absolute paths of the executor's write scope (files or subtrees).
+    pub write_paths: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FilesystemPolicy {
     pub workspace: PathBuf,
@@ -1009,9 +1021,29 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
             push_unique(&mut fs_policy.read_roots, real);
         }
     }
-    push_unique(&mut fs_policy.read_roots, workspace.clone());
-    for git in &spec.git_directories {
-        push_unique(&mut fs_policy.read_roots, canonical_or_self(git));
+    let issued = spec
+        .issued
+        .as_ref()
+        .filter(|_| spec.class == WorkerClass::ProviderFrontend);
+    let inside_workspace = |path: &Path| -> Result<PathBuf> {
+        let real = canonical_or_self(path);
+        require(
+            real.starts_with(&workspace) && real != workspace,
+            "issued visibility paths must lie strictly inside the workspace",
+        )?;
+        Ok(real)
+    };
+    if let Some(visibility) = issued {
+        // Only what was issued; the workspace tree and Git object store stay
+        // unreadable, so neither can recover unissued source.
+        for file in &visibility.read_files {
+            push_unique(&mut fs_policy.read_files, inside_workspace(file)?);
+        }
+    } else {
+        push_unique(&mut fs_policy.read_roots, workspace.clone());
+        for git in &spec.git_directories {
+            push_unique(&mut fs_policy.read_roots, canonical_or_self(git));
+        }
     }
     let (exe_roots, exe_files) = executable_roots(&program, &path_var, real_home.as_deref());
     for root in exe_roots {
@@ -1025,7 +1057,14 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
     fs_policy.write_roots = device_roots;
     push_unique(&mut fs_policy.write_roots, scratch.clone());
     if spec.writable {
-        push_unique(&mut fs_policy.write_roots, workspace.clone());
+        match issued {
+            Some(visibility) => {
+                for path in &visibility.write_paths {
+                    push_unique(&mut fs_policy.write_roots, inside_workspace(path)?);
+                }
+            }
+            None => push_unique(&mut fs_policy.write_roots, workspace.clone()),
+        }
     }
 
     let auth_files: Vec<PathBuf> = spec
@@ -1106,7 +1145,9 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
         if !denied.iter().any(|d| d.path == path) {
             denied.push(DeniedPath {
                 path,
-                read: false,
+                // Under issued visibility Git metadata is also unreadable: its
+                // object store would otherwise recover unissued source.
+                read: issued.is_some(),
                 metadata: false,
                 write: true,
                 except: vec![],
@@ -1489,6 +1530,7 @@ pub fn self_test(config: &SecurityConfig) -> std::result::Result<(), String> {
         experiment_event_file: None,
         class: WorkerClass::Tool,
         security: config.clone(),
+        issued: None,
         lock_fd: None,
     };
     let mut process = NativeProcess::launch(&spec).map_err(|e| e.to_string())?;
@@ -1695,6 +1737,102 @@ mod tests {
         );
     }
 
+    /// Opt-in issued visibility: a provider frontend then reads only the files
+    /// it was actually issued and writes only its planner-authored write scope.
+    /// The workspace tree and the Git object store both stop being readable, so
+    /// neither can recover unissued source. Tool workers (checks, experiments)
+    /// are never confined this way, and a path outside the workspace is refused
+    /// rather than granted.
+    #[test]
+    fn issued_visibility_grants_only_issued_files_and_closes_the_git_escape_hatch() {
+        let base = std::env::temp_dir().join(format!(
+            "agentctl-issued-policy-{}-{}",
+            std::process::id(),
+            crate::local::now_ms().unwrap()
+        ));
+        fs::create_dir_all(base.join("repo/src")).unwrap();
+        fs::create_dir_all(base.join("repo/.git")).unwrap();
+        fs::create_dir_all(base.join("state/data/scratch")).unwrap();
+        let base = fs::canonicalize(&base).unwrap();
+        for name in ["issued.rs", "unissued.rs"] {
+            fs::write(base.join("repo/src").join(name), "pub fn f() {}\n").unwrap();
+        }
+        let (workspace, git) = (base.join("repo"), base.join("repo/.git"));
+        let (issued, unissued) = (
+            base.join("repo/src/issued.rs"),
+            base.join("repo/src/unissued.rs"),
+        );
+        let mut spec = ProcessSpec {
+            project_policy_hash: None,
+            native_auth: None,
+            api_key: None,
+            executable: "/bin/sh".into(),
+            args: vec![],
+            input: vec![],
+            cwd: workspace.clone(),
+            workspace: workspace.clone(),
+            scratch: base.join("state/data/scratch"),
+            data_root: base.join("state/data"),
+            config_root: base.join("state/config"),
+            cache_root: base.join("state/cache"),
+            writable: true,
+            network: false,
+            timeout_ms: 1000,
+            git_directories: vec![git.clone()],
+            protected: vec![],
+            credential_env: vec![],
+            experiment_event_file: None,
+            class: WorkerClass::ProviderFrontend,
+            security: SecurityConfig::default(),
+            issued: None,
+            lock_fd: None,
+        };
+        // The default: the whole workspace is readable and writable.
+        let open = compile(&spec).unwrap();
+        assert!(open.filesystem.read_roots.contains(&workspace));
+        assert!(open.filesystem.write_roots.contains(&workspace));
+        assert!(open.filesystem.read_roots.contains(&git));
+        // Issued: only what was issued, and only the write scope is writable.
+        spec.issued = Some(IssuedVisibility {
+            read_files: vec![issued.clone()],
+            write_paths: vec![issued.clone()],
+        });
+        let confined = compile(&spec).unwrap();
+        assert!(!confined.filesystem.read_roots.contains(&workspace));
+        assert!(!confined.filesystem.read_roots.contains(&git));
+        assert!(confined.filesystem.read_files.contains(&issued));
+        assert!(!confined.filesystem.read_files.contains(&unissued));
+        assert_eq!(
+            confined
+                .filesystem
+                .write_roots
+                .iter()
+                .filter(|w| w.starts_with(&workspace))
+                .collect::<Vec<_>>(),
+            vec![&issued]
+        );
+        assert!(
+            confined
+                .filesystem
+                .denied
+                .iter()
+                .any(|d| d.path == git && d.read && d.write),
+            "the Git object store must not be an escape hatch"
+        );
+        // Checks and experiments keep the workspace access they require.
+        spec.class = WorkerClass::Tool;
+        let tool = compile(&spec).unwrap();
+        assert!(tool.filesystem.read_roots.contains(&workspace));
+        // Issuing a path outside the workspace fails closed.
+        spec.class = WorkerClass::ProviderFrontend;
+        spec.issued = Some(IssuedVisibility {
+            read_files: vec![base.join("state/data/secret")],
+            write_paths: vec![],
+        });
+        assert!(compile(&spec).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn keychain_access_is_granted_only_to_native_provider_frontends() {
         let base = std::env::temp_dir().join(format!(
@@ -1727,6 +1865,7 @@ mod tests {
             experiment_event_file: None,
             class: WorkerClass::Tool,
             security: SecurityConfig::default(),
+            issued: None,
             lock_fd: None,
         };
         let home = std::env::var_os("HOME").map(|h| canonical_or_self(Path::new(&h)));

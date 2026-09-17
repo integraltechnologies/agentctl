@@ -57,6 +57,9 @@ impl Store {
             graph.freshness.fresh,
             "planning requires a complete fresh graph; inspect repo index --status",
         )?;
+        // A planner reasons only against accepted ontology truth, never against
+        // an observed candidate that nobody has accepted.
+        graph::require_accepted(&self.connection, &info, graph.generation.as_ref())?;
         // File budget: primary implementation first, then the strongest test, then
         // implementation neighbors, then remaining tests.
         let mut files = BTreeSet::new();

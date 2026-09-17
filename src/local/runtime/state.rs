@@ -43,6 +43,11 @@ pub struct RunRecord {
     pub pending: Option<PendingTask>,
     pub reason: Option<String>,
     pub correction_round: u32,
+    /// Context-relay ledgers keyed by worker subject (`executor:<task>`,
+    /// `verifier:<task>`, `integration`). Absent in runs recorded before the
+    /// relay, and omitted while empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub context: BTreeMap<String, context::ContextLedger>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -73,6 +78,11 @@ pub struct RuntimeJob {
     /// on jobs recorded before manifests existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_manifest: Option<manifest::ContextManifest>,
+    /// The typed ContextRequest artifact this job returned instead of a result
+    /// or decision. Such a job finished its protocol exchange but is never an
+    /// accepted executor or a verification decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_request: Option<ArtifactRef>,
     #[serde(default)]
     pub ownership: Option<AgentOwnership>,
     #[serde(default)]

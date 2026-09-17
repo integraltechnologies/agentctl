@@ -55,7 +55,7 @@ pub enum EntityKind {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RelationKind {
     Contains,
@@ -105,7 +105,7 @@ pub struct Entity {
 
 /// How a relation's target was determined. Every rule is syntactic and requires
 /// exactly one compatible candidate; anything ambiguous stays unresolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ResolutionRule {
     /// A bare or `self::`/`super::` path to the unique declaration visible in the

@@ -40,6 +40,24 @@ pub(super) fn planning_reference(
     Ok(view.entry)
 }
 
+/// A memory entry as it currently stands for a context-relay dereference: the
+/// live entry, its status and its validity, or `None` when it is absent or
+/// belongs to another workspace. The caller decides whether it may be issued.
+pub(crate) fn issued_reference(
+    c: &Connection,
+    info: &RepositoryInfo,
+    id: &MemoryId,
+) -> Result<Option<(MemoryEntry, MemoryStatus, Validity)>> {
+    let Some(view) = load(c, info, id)? else {
+        return Ok(None);
+    };
+    if visible(info, &view.entry, false).is_err() {
+        return Ok(None);
+    }
+    let validity = query::validity(c, info, &view.entry).0;
+    Ok(Some((view.entry, view.status, validity)))
+}
+
 impl Store {
     /// Explicit trust selection is required. DERIVED/OBSERVED use mechanical constructors.
     pub fn add_memory(

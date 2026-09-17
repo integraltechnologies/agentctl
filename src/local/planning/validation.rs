@@ -112,7 +112,7 @@ pub(super) fn permits(scope: &ScopePath, path: &str) -> bool {
 fn overlap(a: &ScopePath, b: &ScopePath) -> bool {
     permits(a, b.path()) || permits(b, a.path())
 }
-pub(super) fn safe_scope(
+pub(crate) fn safe_scope(
     root: &Path,
     policy: &ProjectConfig,
     p: &ScopePath,

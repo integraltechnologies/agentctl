@@ -38,6 +38,9 @@ pub struct ProcessSpec {
     pub cache_root: PathBuf,
     /// Effective machine-owned security policy (a project can only tighten it).
     pub security: security::SecurityConfig,
+    /// Issued-context visibility of a provider frontend (opt-in); `None` keeps
+    /// the whole workspace readable.
+    pub issued: Option<security::IssuedVisibility>,
     /// Inherited by the entire child family so a controller crash cannot release
     /// the workspace lease while an orphan can still edit files.
     pub(crate) lock_fd: Option<i32>,
@@ -419,6 +422,7 @@ mod tests {
                 class: security::WorkerClass::Tool,
                 cache_root: self.0.join("cache"),
                 security: Default::default(),
+                issued: None,
                 lock_fd: None,
             }
         }

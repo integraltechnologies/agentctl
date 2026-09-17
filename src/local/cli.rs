@@ -92,9 +92,11 @@ pub fn run(args: &[&str]) -> Result<()> {
             };
             super::memory::cli::run(&mut store, command, rest, json_mode)
         }
-        graph @ (["repo", "index", ..] | ["code", ..]) => {
+        graph @ (["repo", "index", ..] | ["code", ..] | ["ontology", ..]) => {
             let config = load_machine(&paths)?;
-            let mut store = if graph == ["repo", "index"] {
+            let mut store = if graph == ["repo", "index"]
+                || matches!(graph, ["ontology", "accept" | "reject", ..])
+            {
                 Store::open(&paths.database, config.busy_timeout_ms)?
             } else {
                 Store::read_only(&paths.database, config.busy_timeout_ms)?

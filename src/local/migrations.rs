@@ -9,7 +9,7 @@ use super::{
     store::{RegisteredRepository, RegisteredWorkspace},
 };
 
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 pub const APPLICATION_ID: i64 = 0x41475443; // AGTC
 
 const INITIAL: &str = r#"
@@ -124,6 +124,7 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
         (10, "experiment_decisions"),
         (11, "experiment_decision_cursors"),
         (12, "graph_resolution"),
+        (13, "ontology_lifecycle"),
     ]
     .into_iter()
     .filter(|(v, _)| *v <= version)
@@ -353,6 +354,30 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
             require(n == 1, format!("database is missing index {name}"))?;
         }
     }
+    if version >= 13 {
+        connection.prepare("SELECT hash,bytes,body FROM ontology_blobs LIMIT 0")?;
+        connection.prepare(
+            "SELECT generation_id,repo_id,workspace_id,ordinal,sequence,fingerprint,snapshot,plan_id,state,record_json FROM ontology_generations LIMIT 0",
+        )?;
+        connection.prepare("SELECT text_hash FROM graph_entities LIMIT 0")?;
+        for (kind, name) in [
+            ("trigger", "ontology_blobs_no_update"),
+            ("trigger", "ontology_blobs_no_delete"),
+            ("trigger", "ontology_generations_insert"),
+            ("trigger", "ontology_generations_update"),
+            ("trigger", "ontology_generations_delete"),
+            ("index", "ontology_generations_accepted"),
+            ("index", "ontology_generations_candidate"),
+            ("index", "ontology_generations_by_plan"),
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type=?1 AND name=?2",
+                [kind, name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing {kind} {name}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -445,6 +470,21 @@ fn migrate_transaction(connection: &mut Connection) -> Result<()> {
         for workspace in workspaces {
             super::graph::rebuild_resolutions(&transaction, &workspace)?;
         }
+    }
+    if header(&transaction)? == 12 {
+        check_version(&transaction, 12)?;
+        // Additive and lossless: no fact, generation, or history is rewritten,
+        // and no lifecycle record is synthesized (that would need source the
+        // migration must not read). Existing entities keep a NULL text hash,
+        // so the next `repo index` re-derives them and records the workspace's
+        // first generation, which is accepted as BOOTSTRAP only if complete.
+        let hashed = transaction
+            .prepare("SELECT 1 FROM pragma_table_info('graph_entities') WHERE name='text_hash'")?
+            .exists([])?;
+        if !hashed {
+            transaction.execute_batch("ALTER TABLE graph_entities ADD COLUMN text_hash TEXT;")?;
+        }
+        transaction.execute_batch(include_str!("graph/lifecycle_schema.sql"))?;
     }
     check(&transaction)?;
     require(

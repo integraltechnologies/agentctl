@@ -85,7 +85,8 @@ agentctl code context <text> [--limit N] [--depth N] [--neighbors N] [--tests N]
   spans files. See [architecture.md](architecture.md#code-graph).
 - **Generations:** each `repo index` reports the graph generation, a
   content-derived fingerprint plus a per-workspace sequence that only advances
-  when indexed facts change. Planning binds it.
+  when indexed facts change. Planning binds it, and only an *accepted*
+  generation can be planned against (see [Ontology lifecycle](#ontology-lifecycle)).
 - **Literal paths:** repository paths are always literal. `app/[slug]/page.tsx`,
   `app/[...slug]`, `(group)` and `@slot` index and query like any other name.
 - **Discovery:** follows workspace `.gitignore`/`.ignore` rules. It skips
@@ -94,6 +95,50 @@ agentctl code context <text> [--limit N] [--depth N] [--neighbors N] [--tests N]
   and project `deny_read` paths.
 - **Limits:** result limits are 1–100. `context` defaults to 5 primaries, depth 1,
   20 neighbors, 80 relations, and 8 tests; the maximums are 10, 3, 100, 400, and 20.
+
+## Ontology lifecycle
+
+Indexing is an observation. It never makes a changed repository canonical by
+itself: `repo index` prints whether the indexed generation is the accepted one,
+and planning (`plan prepare`) and `run plan` refuse to start from a generation
+that is not accepted.
+
+```bash
+agentctl ontology status                        # accepted generation, open candidate, indexed generation
+agentctl ontology list [--limit N]              # recorded generations, newest first (default 20)
+agentctl ontology show <generation-id>          # one record: state, origin, provenance, delta summary
+agentctl ontology delta [<generation-id>]       # the recorded delta (default: the open candidate)
+agentctl ontology delta --from <id> --to <id>   # a delta between any two recorded generations
+    [--change ADDED|REMOVED|MODIFIED] [--path PATH] [--limit N]   # filters (limit per section, default 200)
+agentctl ontology accept <generation-id> [--reason TEXT]
+agentctl ontology reject <generation-id> --reason TEXT
+```
+
+- **Bootstrap:** the first complete `repo index` of a workspace (no file
+  failures) is accepted automatically, because there is no earlier truth to
+  protect. A database upgraded from schema 12 has no generations yet; run
+  `repo index` once.
+- **Manual changes:** after you edit files yourself, `repo index` records a
+  `CANDIDATE` with a semantic delta against the accepted generation. Inspect it
+  with `ontology delta`, then `ontology accept <id>` (or restore the source,
+  or `ontology reject <id> --reason ...`). Acceptance requires the candidate to
+  still be the indexed generation and the worktree to still match it; a stale
+  or superseded candidate is refused. Accepting or rejecting twice is a no-op.
+- **Reverts:** re-indexing source whose facts equal the accepted generation is
+  accepted automatically (`IDENTICAL_TO_ACCEPTED`) as a new generation with a
+  later sequence; old context bound to the earlier position stays unusable.
+- **Runtime work:** candidates produced by `run plan` are accepted only when
+  the plan completes after integration verification passes, never manually.
+  If such a run stops for good, `repo index` hands its state to you as an
+  ordinary external candidate.
+- **Deltas** list entity changes (`ADDED`, `REMOVED`, `MODIFIED` with the
+  changed facts: `SIGNATURE`, `VISIBILITY`, `TEXT`, `KEY`), distinct resolved
+  relation changes (`ADDED`, `REMOVED`), and per-file content and change
+  counts. Renames and moves are reported as removal plus addition. Entries whose
+  identity cannot be proven (same-named duplicates) carry
+  `identity: DUPLICATE_ORDINAL`. A delta describes what changed, not what the
+  change could affect. With `--json`, the output is the typed `SemanticDelta`
+  (filters narrow the entries; `summary` always describes the whole delta).
 
 ## Engineering memory
 
@@ -202,6 +247,9 @@ agentctl run status <plan-id>
 agentctl run resume <plan-id>
 agentctl run cancel <plan-id>             # request cancellation from another terminal
 agentctl run replace <old-plan-id> <validated-replacement-id>
+
+agentctl run context <plan-id>                          # context relay: budgets, rounds, pending decision
+agentctl run context decide <plan-id> <decision.json>   # approve or deny an escalated request
 ```
 
 `run plan` is a foreground controller. For an **ACTIVE** plan, it does the
@@ -222,12 +270,60 @@ agentctl never commits, pushes, resets, or cleans your checkout. Review and comm
 the resulting changes yourself. Commit before preparing the next plan, because
 each plan needs a clean baseline.
 
+A completed plan also advances the accepted ontology: each verified task
+refreshes the index as the plan's candidate, and the candidate becomes the
+accepted generation in the same transaction that completes the plan. A plan
+that stops short of completion leaves the accepted generation unchanged. To keep
+what it left in the worktree, run `repo index`, inspect the candidate's delta
+(it includes any unverified edits), and accept it deliberately.
+
 To correct rejected or blocked work, prepare a replacement plan and link it with
 `run replace`. The replacement stays `VALIDATED` until you activate it. The
 number of replacement rounds is bounded by `max_correction_rounds`. `run resume`
 continues from durable checkpoints without replaying conversations: `VERIFIED`
 tasks never run again, and jobs whose controller was lost are marked interrupted
 and require review.
+
+### The context relay
+
+Workers are given what the plan references, not a directory dump: a task's
+`read_scope` authorizes what it may *request*, while the issued context is what
+it actually received. A worker that cannot finish returns a typed context
+request, and agentctl resolves it deterministically inside that envelope,
+issuing a fresh job with the original context plus the approved delta. See
+[architecture.md](architecture.md#context-relay) for the full lifecycle and
+[configuration.md](configuration.md#runtimecontext) for the budgets.
+
+`agentctl run context <plan-id>` is read-only. It prints, per subject
+(`executor:<task>`, `verifier:<task>`, `integration`): the relay state, rounds
+used against the limit, granted and remaining bytes, escalations, any
+planner-approved scope additions, and every round's request, resolution and
+delta.
+
+A request that needs a path outside the task's read scope is never granted
+automatically. The run blocks with `NEEDS_PLANNER_CONTEXT_APPROVAL`, and the
+report includes the paths involved and a decision template to fill in:
+
+```json
+{
+  "version": "agentctl-context-decision-1",
+  "plan_id": "plan:1",
+  "task_id": "task:2",
+  "request_hash": "blake3:…",
+  "decision": "APPROVE",
+  "read_scope_additions": [{ "kind": "FILE", "path": "src/security/mod.rs" }],
+  "reason": "The caller the task must update lives here",
+  "actor": "planner"
+}
+```
+
+`agentctl run context decide <plan-id> <decision.json>` consumes it. An
+approval adds 1–8 read-scope paths, which are revalidated against project
+policy, protected paths, symlinks, the planning request's own scope and the
+task's exclusions, and the request is then re-resolved under the wider
+envelope; the task returns to `PLANNED`, so `agentctl run resume` re-issues it
+as a fresh job. `"decision": "DENY"` leaves the task blocked for a replan.
+Executor output can never approve its own expansion.
 
 `--override` applies to the current command only. It must name a configured
 provider and cannot bypass project `allowed_providers`. If the machine-wide

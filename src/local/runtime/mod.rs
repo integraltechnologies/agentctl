@@ -2,7 +2,9 @@
 pub(super) mod auth;
 pub(crate) mod cli;
 pub mod config;
+pub mod context;
 pub mod credentials;
+pub mod diffview;
 pub(crate) mod liveness;
 pub mod manifest;
 pub mod process;

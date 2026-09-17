@@ -1,11 +1,22 @@
 //! Content-bound, workspace-specific repository intelligence. No source execution.
 pub(crate) mod cli;
+mod delta;
 pub mod files;
+mod lifecycle;
 mod model;
 mod parser;
 mod query;
 mod resolve;
 mod wire;
+pub use delta::{
+    Change, ContentChange, DeltaSummary, EntityChange, EntityFacts, EntityField, FactsRef,
+    FileChange, GenerationPoint, IdentityBasis, RelationChange, SemanticDelta,
+};
+pub use lifecycle::{
+    DecisionReason, DeltaStatus, GenerationDecision, GenerationOrigin, GenerationState,
+    OntologyGeneration, OntologyStatus,
+};
+pub(crate) use lifecycle::{accept_for_plan, close_for_plan, require_accepted, require_issuable};
 pub use model::*;
 pub use query::{GraphQuery, QueryResult, SearchMode, objective_query};
 
@@ -23,8 +34,20 @@ use std::{
 };
 
 impl Store {
-    /// File derivations, index metadata, and the aggregate journal event commit together.
+    /// An explicit observation of the workspace (`agentctl repo index`). The
+    /// result becomes accepted ontology truth only through the lifecycle rules
+    /// in `lifecycle.rs`; otherwise it is recorded as a candidate.
     pub fn index_repository(&mut self, start: &Path) -> Result<IndexStats> {
+        self.index_observed(start, &GenerationOrigin::External)
+    }
+
+    /// File derivations, index metadata, the generation's lifecycle record and
+    /// the aggregate journal event commit together.
+    pub(crate) fn index_observed(
+        &mut self,
+        start: &Path,
+        origin: &GenerationOrigin,
+    ) -> Result<IndexStats> {
         let started = Instant::now();
         let info = checked_workspace(self, start)?;
         let candidates = files::discover(&info.root)?;
@@ -33,6 +56,12 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = stored_files(&tx, &info)?;
         let old_metadata = metadata(&tx, &info)?;
+        // Facts indexed before ontology snapshots carry no text hashes; their
+        // files are re-derived so every generation can be snapshotted.
+        let unhashed: BTreeSet<String> = tx
+            .prepare("SELECT DISTINCT path FROM graph_entities WHERE workspace_id=?1 AND text_hash IS NULL")?
+            .query_map([info.workspace_id.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
         let mut stats = IndexStats {
             discovered: candidates.len(),
             indexed: 0,
@@ -79,6 +108,7 @@ impl Store {
                 && previous.is_some_and(|f| {
                     f.content_hash == hash && f.backend == backend && f.diagnostic.is_none()
                 })
+                && !unhashed.contains(path)
             {
                 stats.reused += 1;
                 continue;
@@ -86,7 +116,7 @@ impl Store {
             stats.indexed += 1;
             stats.changed += usize::from(previous.is_some());
             let derivation = observed.and_then(|(hash, source)| {
-                parser::extract(
+                let derivation = parser::extract(
                     &source,
                     Provenance {
                         repository_id: info.repository_id.clone(),
@@ -96,7 +126,9 @@ impl Store {
                         language,
                         backend: backend.clone(),
                     },
-                )
+                )?;
+                let texts = delta::text_hashes(&source, &derivation.entities)?;
+                Ok((derivation, texts))
             });
             let diagnostic = derivation
                 .as_ref()
@@ -112,10 +144,10 @@ impl Store {
                 "INSERT INTO indexed_files VALUES (?1,?2,?3,?4,?5)",
                 params![info.workspace_id.as_str(), path, hash, backend, diagnostic],
             )?;
-            if let Ok(derivation) = derivation {
-                for entity in derivation.entities {
+            if let Ok((derivation, texts)) = derivation {
+                for (entity, text) in derivation.entities.into_iter().zip(texts) {
                     tx.execute(
-                        "INSERT INTO graph_entities VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        "INSERT INTO graph_entities(workspace_id,entity_id,path,name,qualified_name,kind,record_json,text_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                         params![
                             info.workspace_id.as_str(),
                             entity.id.as_str(),
@@ -123,7 +155,8 @@ impl Store {
                             entity.name,
                             entity.qualified_name,
                             serde_json::to_string(&entity.kind)?,
-                            serde_json::to_string(&entity)?
+                            serde_json::to_string(&entity)?,
+                            text
                         ],
                     )?;
                 }
@@ -194,7 +227,7 @@ impl Store {
             indexed_at_ms: now_ms()?,
             source: after.source,
             stats: stats.clone(),
-            generation: Some(generation),
+            generation: Some(generation.clone()),
         };
         tx.execute(
             "UPDATE graph_indexes SET metadata_json=?2 WHERE workspace_id=?1",
@@ -213,6 +246,7 @@ impl Store {
                 stats: stats.clone(),
             },
         )?;
+        lifecycle::observe(&tx, &info, origin, &generation, &stats, &metadata.source)?;
         tx.commit()?;
         Ok(stats)
     }
@@ -225,6 +259,22 @@ impl Store {
 
     /// A single-use, hash-checked SQLite read snapshot. Build a new query for each request.
     pub fn graph(&self, start: &Path) -> Result<GraphQuery<'_>> {
+        self.graph_snapshot(start, true)
+    }
+
+    /// A read snapshot for dereferencing planner references and context
+    /// requests, which tolerates an index that is stale relative to the
+    /// worktree: a verifier is issued context while the executor's captured
+    /// edits are deliberately not yet indexed (only accepted work refreshes the
+    /// ontology). Staleness cannot produce a wrong answer, because every issued
+    /// fact stays bound to the content hash it was derived from and is
+    /// rechecked against the captured source before it is issued; a row that no
+    /// longer matches fails closed instead.
+    pub(crate) fn graph_for_issue(&self, start: &Path) -> Result<GraphQuery<'_>> {
+        self.graph_snapshot(start, false)
+    }
+
+    fn graph_snapshot(&self, start: &Path, fresh: bool) -> Result<GraphQuery<'_>> {
         let info = checked_workspace(self, start)?;
         let tx = self.connection.unchecked_transaction()?;
         let mut freshness = status(&tx, &info)?;
@@ -233,7 +283,7 @@ impl Store {
             "workspace has no code index; run agentctl repo index",
         )?;
         require(
-            freshness.stale_files.is_empty(),
+            !fresh || freshness.stale_files.is_empty(),
             format!(
                 "code index is stale ({} paths/version changes); run agentctl repo index or repo index --status",
                 freshness.stale_files.len()

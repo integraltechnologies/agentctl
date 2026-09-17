@@ -441,6 +441,42 @@ impl GraphQuery<'_> {
         Ok(entity)
     }
 
+    /// The ontology generation this snapshot observed.
+    pub(crate) fn generation(&self) -> Option<&GraphGeneration> {
+        self.freshness.generation()
+    }
+
+    /// One entity by ID from this snapshot (context-relay dereference).
+    pub(crate) fn entity(&self, id: &GraphEntityId) -> Result<Option<Entity>> {
+        self.load(&mut Cache::new(), id)
+    }
+
+    /// Exact ID, name or qualified-name matches, at most `limit`. Several
+    /// matches are reported, never resolved by guessing.
+    pub(crate) fn exact_matches(&self, name: &str, limit: usize) -> Result<Vec<Entity>> {
+        self.find(name, SearchMode::Exact, limit)
+    }
+
+    /// Resolved structural relations (no containment/test-container links) of
+    /// an entity in one direction, in deterministic edge order.
+    pub(crate) fn resolved_edges(
+        &self,
+        id: &GraphEntityId,
+        incoming: bool,
+        limit: usize,
+    ) -> Result<Vec<Edge>> {
+        self.resolved(id, incoming, limit)
+    }
+
+    /// Tests associated with `target` by the Stage 1 association rules.
+    pub(crate) fn associated_tests(
+        &self,
+        target: &Entity,
+        limit: usize,
+    ) -> Result<Vec<(Entity, AssociationBasis)>> {
+        self.test_entities(target, limit)
+    }
+
     pub fn symbols(
         self,
         name: &str,

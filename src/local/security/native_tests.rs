@@ -91,6 +91,7 @@ impl Fixture {
             experiment_event_file: None,
             class: WorkerClass::Tool,
             security: SecurityConfig::default(),
+            issued: None,
             lock_fd: None,
         }
     }

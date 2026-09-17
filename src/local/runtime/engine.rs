@@ -17,6 +17,25 @@ pub struct Runtime<'a> {
     policy_observer: Option<PolicyObserver>,
 }
 type PolicyObserver = Box<dyn FnMut(&str)>;
+/// Outcome of relaying one worker context request.
+enum Relay {
+    /// A ContextDelta was approved; re-issue the work as a fresh job.
+    Granted,
+    /// Something outside the envelope is needed; a planner must decide.
+    Escalated,
+    Denied(String),
+}
+/// One fresh verification, with its own independent context relay. `build`
+/// composes the issued artifact from the diff material, this verifier's own
+/// deltas and its relay budget; executor request history is never in it.
+struct Verification<'a> {
+    task: Option<&'a TaskId>,
+    diff: &'a ArtifactRef,
+    invariants: Vec<String>,
+    /// The paths this verification may request context from.
+    envelope: Vec<ScopePath>,
+    build: &'a dyn Fn(Value, Value, Value) -> Value,
+}
 impl<'a> Runtime<'a> {
     pub fn new(
         store: &'a mut Store,
@@ -122,6 +141,7 @@ impl<'a> Runtime<'a> {
             class: crate::local::security::WorkerClass::ProviderFrontend,
             cache_root: self.paths.cache_root.clone(),
             security: self.config.security.tightened(&policy.security),
+            issued: None,
             lock_fd: lease.fd(),
         })
     }
@@ -306,6 +326,23 @@ impl<'a> Runtime<'a> {
         )?;
         let compiled = prompt::compile(profile, &route.project_policy_hash, &input)?;
         let prompt_provenance = compiled.provenance.clone();
+        // Opt-in hard visibility: a worker may read only the repository files
+        // issued to it in full, plus (when writable) its own write scope.
+        let issued = (self.config.context.visibility == ContextVisibility::Issued
+            && role != AgentRole::Planner)
+            .then(|| crate::local::security::IssuedVisibility {
+                read_files: inventory
+                    .paths
+                    .iter()
+                    .filter(|p| p.kind == manifest::SuppliedKind::File && !p.truncated)
+                    .map(|p| info.root.join(&p.path))
+                    .collect(),
+                write_paths: inventory
+                    .write_scope
+                    .iter()
+                    .map(|s| info.root.join(s.path()))
+                    .collect(),
+            });
         let context_manifest = manifest::for_job(&input, request, &prompt_provenance, inventory)?;
         input.compiled = Some(compiled);
         let mut job = RuntimeJob {
@@ -315,6 +352,7 @@ impl<'a> Runtime<'a> {
             route: Some(route),
             prompt: Some(prompt_provenance),
             context_manifest: Some(context_manifest),
+            context_request: None,
             ownership: Some(ownership),
             task_id: task.cloned(),
             job_id: job_id.clone(),
@@ -370,6 +408,7 @@ impl<'a> Runtime<'a> {
         let mut launched = false;
         let result: Result<Value> = (|| {
             let mut spec = self.process_spec(info, job_id.as_str(), role, lease, project)?;
+            spec.issued = issued.clone();
             spec.writable &= !profile.read_only;
             spec.network &= profile.network;
             spec.timeout_ms = profile.timeout_ms;
@@ -526,10 +565,13 @@ impl<'a> Runtime<'a> {
                 AgentRole::Executor => {
                     let result: ResultPacket = serde_json::from_value(value.clone())?;
                     result.validate()?;
+                    // A typed context request is the one accepted non-success:
+                    // validation already bound it to this job and forbade edits.
                     require(
                         Some(&result.task_id) == task
                             && result.executor_job_id == job_id
-                            && result.status == ResultStatus::Succeeded
+                            && (result.status == ResultStatus::Succeeded
+                                || result.context_request.is_some())
                             && result.evidence.is_empty(),
                         "executor result has incorrect issued identity/status or invented evidence",
                     )?;
@@ -543,7 +585,9 @@ impl<'a> Runtime<'a> {
                             && serde_json::to_value(&proof.evidence)? == input.artifact["evidence"],
                         "verifier result does not match issued job/target/captured evidence",
                     )?;
-                    job.reported_verification = Some(proof.decision);
+                    // A context request is not a decision and is never counted.
+                    job.reported_verification =
+                        proof.context_request.is_none().then_some(proof.decision);
                 }
                 AgentRole::Planner => {
                     let output: planning::ExecutionPlan = serde_json::from_value(value.clone())?;
@@ -625,7 +669,12 @@ impl<'a> Runtime<'a> {
     ) -> Result<Option<(RuntimeJob, VerificationPacket, JobInput)>> {
         for job in self.store.runtime_jobs(&info.root, Some(plan))? {
             session::validate_job(self.store, info, &job)?;
-            if job.role != AgentRole::Verifier || job.state != RuntimeJobState::Succeeded {
+            // A job that only requested context reached no decision, so it can
+            // never be recovered as verification proof.
+            if job.role != AgentRole::Verifier
+                || job.state != RuntimeJobState::Succeeded
+                || job.context_request.is_some()
+            {
                 continue;
             }
             let input: JobInput = self.artifacts.decode(&job.input)?;
@@ -644,62 +693,46 @@ impl<'a> Runtime<'a> {
         }
         Ok(None)
     }
+    /// The executor's issued input: planner-authored base context plus every
+    /// approved ContextDelta, in round order. The runtime never selects
+    /// repository material of its own, and a Directory read scope contributes
+    /// no files: it authorizes what the executor may *request*.
     fn task_input(
         &self,
-        info: &RepositoryInfo,
         task: &planning::TaskInspection,
-        source: &SourceSnapshot,
+        base: &context::IssuedContext,
+        deltas: &[(context::ContextDelta, ArtifactRef)],
+        relay: Value,
+        round: u32,
     ) -> Result<(Value, manifest::ContextInventory)> {
-        let query = graph::objective_query(&task.packet.objective);
-        let allowed = |path: &str| task.packet.read_scope.iter().any(|s| permits(s, path));
-        let mut graph = self.store.graph(&info.root)?.context_within(
-            &query,
-            graph::ContextLimits {
-                primary: 3,
-                depth: 1,
-                neighbors: 6,
-                tests: 3,
-            },
-            &allowed,
-        )?;
-        // Scope filtering also drops every association and summary that referred
-        // to an out-of-scope entity; relations are withheld entirely.
-        graph.retain_files(allowed);
-        graph.relations.clear();
-        let memory = self.store.memory_for_task(
-            &info.root,
-            &task.packet,
-            memory::MemoryLimits {
-                canonical: 3,
-                facts: 3,
-                notes: 0,
-                bytes: 4096,
-            },
-        )?;
-        let mut inventory = manifest::ContextInventory::default();
-        inventory.graph(&graph);
-        inventory.memory(&memory);
-        inventory.invariants = task.invariants.keys().cloned().collect();
-        let mut files = vec![];
-        for (path, file) in source.files.iter().filter(|(p, _)| allowed(p)).take(16) {
-            let bytes = self.artifacts.get(&file.content)?;
-            let text = std::str::from_utf8(&bytes).map_err(|_| {
-                Error::Invalid("task context contains binary source; narrow its read scope".into())
-            })?;
-            inventory.paths.push(manifest::SuppliedSource {
-                path: path.clone(),
-                kind: manifest::SuppliedKind::File,
-                start_line: None,
-                end_line: None,
-                content_hash: Some(file.content.hash.clone()),
-                truncated: text.len() > 4096,
-            });
-            files.push(json!({"path":path,"hash":file.content.hash,"text":text.chars().take(4096).collect::<String>(),"truncated":text.len()>4096}));
-        }
+        let mut inventory = manifest::ContextInventory {
+            invariants: task.invariants.keys().cloned().collect(),
+            write_scope: task.packet.write_scope.clone(),
+            visibility: Some(self.config.context.visibility),
+            ..Default::default()
+        };
+        context::inventory(&mut inventory, Some(base), deltas, round)?;
+        let issued: Vec<&context::ContextDelta> = deltas.iter().map(|(d, _)| d).collect();
         Ok((
-            json!({"task":task.packet,"contract":task.contract,"invariants":task.invariants,"constraints":task.constraints,"graph":graph,"memory":memory,"files":files,"result_schema":schemars::schema_for!(ResultPacket),"instruction":"Return ResultPacket with this invocation's job_id and task_id. evidence must be []; agentctl captures evidence independently."}),
+            json!({"task":task.packet,"contract":task.contract,"invariants":task.invariants,"constraints":task.constraints,"context":base,"deltas":issued,"context_relay":relay,"result_schema":schemars::schema_for!(ResultPacket),"instruction":"Implement this TaskPacket from the issued context. `context` is everything agentctl issued for the planner's references (selected symbols with bounded definitions and in-envelope relation stubs, named files, selected memory, the task's checks); `deltas` is context approved in later rounds. read_scope is an authorization envelope for context requests, not content you already hold nor an invitation to browse the repository. If you cannot complete the task safely from it, make NO edits and return a ResultPacket with status BLOCKED, failure.code CONTEXT_REQUIRED, empty changed_paths, and a context_request naming issued entity IDs or literal paths within context_relay's budgets. Otherwise return ResultPacket with this invocation's job_id and task_id; evidence must be [], and agentctl captures evidence independently."}),
             inventory,
         ))
+    }
+    /// What the relay tells a worker about its remaining context budget. These
+    /// are machine-owned numbers; a worker cannot raise them by asking.
+    fn relay_state(&self, ledger: &context::ContextLedger, max_rounds: u32) -> Value {
+        let limits = &self.config.context;
+        json!({
+            "round": ledger.rounds_used(),
+            "max_rounds": max_rounds,
+            "rounds_remaining": max_rounds.saturating_sub(ledger.rounds_used()),
+            "max_request_bytes": limits.max_round_bytes,
+            "granted_bytes": ledger.granted_bytes,
+            "task_bytes_remaining": (limits.max_task_bytes as usize).saturating_sub(ledger.granted_bytes),
+            "escalations_used": ledger.escalations,
+            "item_kinds": ["SYMBOL_DEFINITION","SYMBOL_BY_NAME","SYMBOL_RELATIONS","RELATED_TESTS","NEIGHBORHOOD","FILE_RANGE","MEMORY"],
+            "policy": "agentctl resolves a request deterministically inside your read scope; anything outside it is not granted automatically and blocks the task for a planner decision.",
+        })
     }
     /// The bounded verifier diff and, for the manifest, the changed paths it
     /// carries (bound by their after-state, or before-state for deletions).
@@ -708,51 +741,7 @@ impl<'a> Runtime<'a> {
         reference: &ArtifactRef,
     ) -> Result<(Value, Vec<manifest::SuppliedSource>)> {
         let diff: CapturedDiff = self.artifacts.decode(reference)?;
-        let paths = diff
-            .changes
-            .iter()
-            .map(|c| manifest::SuppliedSource {
-                path: c.path.clone(),
-                kind: manifest::SuppliedKind::Diff,
-                start_line: None,
-                end_line: None,
-                content_hash: c
-                    .after
-                    .as_ref()
-                    .or(c.before.as_ref())
-                    .map(|f| f.content.hash.clone()),
-                truncated: false,
-            })
-            .collect();
-        let mut changes = vec![];
-        for c in &diff.changes {
-            let text = |file: &Option<source::FileState>| -> Result<Option<String>> {
-                file.as_ref()
-                    .map(|f| {
-                        String::from_utf8(self.artifacts.get(&f.content)?).map_err(|_| {
-                            Error::Invalid(
-                                "binary diff cannot be verified by this bounded text runtime"
-                                    .into(),
-                            )
-                        })
-                    })
-                    .transpose()
-            };
-            let mut change = json!({"path":c.path,"before":text(&c.before)?,"after":text(&c.after)?,"before_state":c.before,"after_state":c.after});
-            // An individually ignored file is observed by metadata alone; its
-            // content is never captured, so the verifier sees only that it changed.
-            if c.before_ignored.is_some() || c.after_ignored.is_some() {
-                change["ignored_before"] = json!(c.before_ignored);
-                change["ignored_after"] = json!(c.after_ignored);
-            }
-            changes.push(change);
-        }
-        let value = json!({"binding":diff,"artifact":reference,"changes":changes});
-        require(
-            serde_json::to_vec(&value)?.len() <= 128 * 1024,
-            "exact diff exceeds 128 KiB verifier context; split/replan task",
-        )?;
-        Ok((value, paths))
+        diffview::view(&diff, reference, &self.artifacts)
     }
     fn evidence(
         &mut self,
@@ -1020,6 +1009,7 @@ impl<'a> Runtime<'a> {
                 pending: None,
                 reason: None,
                 correction_round: round,
+                context: BTreeMap::new(),
             };
             let adoption = (|| {
                 require(
@@ -1033,6 +1023,14 @@ impl<'a> Runtime<'a> {
                     self.store.index_status(root)?.fresh,
                     "SOURCE_DRIFT: graph/source assumptions changed; replan",
                 )?;
+                // The plan must have been prepared against the accepted
+                // ontology, and the index must still materialize it.
+                graph::require_accepted(
+                    &self.store.connection,
+                    &info,
+                    view.plan.metadata.source.graph_generation.as_ref(),
+                )
+                .map_err(|e| Error::Invalid(format!("SOURCE_DRIFT: {e}")))?;
                 for file in &view.plan.metadata.source.support {
                     require(
                         current
@@ -1098,18 +1096,221 @@ impl<'a> Runtime<'a> {
                 self.store,
                 &info,
                 &run,
-                if run
-                    .reason
-                    .as_ref()
-                    .is_some_and(|s| s.contains("SOURCE_DRIFT"))
-                {
-                    "SOURCE_DRIFT_DETECTED"
-                } else {
-                    "BLOCKED_NEEDS_PLANNER"
+                match run.reason.as_deref().unwrap_or_default() {
+                    reason if reason.contains("SOURCE_DRIFT") => "SOURCE_DRIFT_DETECTED",
+                    reason if reason.contains("NEEDS_PLANNER_CONTEXT_APPROVAL") => {
+                        "NEEDS_PLANNER_CONTEXT_APPROVAL"
+                    }
+                    _ => "BLOCKED_NEEDS_PLANNER",
                 },
             )?;
             return Err(error);
         }
+        Ok(run)
+    }
+    /// Consumes a planner's explicit decision on an escalated context request.
+    /// This is the only path that can widen a task's relay envelope: executor
+    /// output has no route to it, and an approval is revalidated (policy,
+    /// source, ontology generation, request scope, exclusions) and re-resolved
+    /// before any delta exists. Denial leaves the task blocked.
+    pub fn decide_context(
+        &mut self,
+        root: &Path,
+        decision: &context::ContextDecision,
+    ) -> Result<RunRecord> {
+        decision.check()?;
+        let info = graph::checked_workspace(self.store, root)?;
+        let _lease = self.lease(&info)?;
+        let plan = decision.plan_id.clone();
+        let _permit = auth::authorize(
+            &self.store.connection,
+            &info.repository_id,
+            plan.as_str(),
+            &session::for_plan(self.store, &info, &plan)?.id,
+        )?;
+        let mut run = load_run(self.store, &info, &plan)?
+            .ok_or_else(|| Error::Invalid("runtime plan not found".into()))?;
+        let key = context::subject_key(AgentRole::Executor, Some(&decision.task_id));
+        let ledger = run
+            .context
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| Error::Invalid("task has no context relay ledger".into()))?;
+        require(
+            ledger.state == context::LedgerState::NeedsPlannerContextApproval,
+            "no escalated context request awaits a decision for this task",
+        )?;
+        let round = ledger
+            .rounds
+            .last()
+            .cloned()
+            .ok_or_else(|| Error::Invalid("escalated ledger has no round".into()))?;
+        require(
+            round.outcome == context::RoundOutcome::Escalated
+                && round.request.hash == decision.request_hash,
+            "decision names another context request",
+        )?;
+        let decision_ref = self.artifacts.json(decision)?;
+        if decision.decision == context::DecisionKind::Deny {
+            let entry = run.context.get_mut(&key).expect("issued ledger");
+            entry.state = context::LedgerState::PlannerDenied;
+            if let Some(last) = entry.rounds.last_mut() {
+                last.outcome = context::RoundOutcome::PlannerDenied;
+                last.decision = Some(decision_ref);
+            }
+            run.state = RunState::Blocked;
+            run.reason = Some(format!(
+                "CONTEXT_ESCALATION_DENIED: {}",
+                decision.reason.chars().take(512).collect::<String>()
+            ));
+            save_run(self.store, &info, &run, "CONTEXT_ESCALATION_DENIED")?;
+            event(
+                self.store,
+                &info,
+                Some(&plan),
+                Some(&round.job_id),
+                "CONTEXT_ESCALATION_DENIED",
+                &json!({"subject":key,"actor":decision.actor}).to_string(),
+            )?;
+            return Ok(run);
+        }
+        let view = self.store.execution_plan(root, &plan)?;
+        let task = self
+            .store
+            .execution_tasks(root, &plan)?
+            .into_iter()
+            .find(|t| t.packet.task_id == decision.task_id)
+            .ok_or_else(|| Error::Invalid("decision names an unknown task".into()))?;
+        let policy = ProjectConfig::load(&info.root)?;
+        require(
+            planning::hash(&policy)? == run.policy_hash,
+            "SOURCE_DRIFT: canonical policy changed; replan required",
+        )?;
+        let current = self.expected(&info.root, &run.expected)?;
+        let base = ledger
+            .base
+            .clone()
+            .ok_or_else(|| Error::Invalid("escalated ledger has no issued base".into()))?;
+        self.revalidate(&info, &base, &current)?;
+        let prepared = self
+            .store
+            .planning_context(root, &view.plan.metadata.request_id)?;
+        for scope in &decision.read_scope_additions {
+            planning::safe_scope(&info.root, &policy, scope, false)?;
+            require(
+                prepared.request.intent.scope.is_empty()
+                    || prepared
+                        .request
+                        .intent
+                        .scope
+                        .iter()
+                        .any(|parent| permits(parent, scope.path())),
+                "approved scope exceeds the planning request's own scope",
+            )?;
+            require(
+                !task.contract.exclusions.iter().any(|excluded| {
+                    permits(excluded, scope.path()) || permits(scope, excluded.path())
+                }),
+                "approved scope contradicts a verification contract exclusion",
+            )?;
+        }
+        let envelope = context::Envelope {
+            scopes: [
+                task.packet.read_scope.clone(),
+                ledger.approved_scope.clone(),
+                decision.read_scope_additions.clone(),
+            ]
+            .concat(),
+            memory: task.contract.memory_refs.clone(),
+        };
+        let request: ContextRequest = self.artifacts.decode(&round.request)?;
+        request.validate()?;
+        let limits = self.config.context;
+        let budget = context::Budget {
+            request_max_bytes: request.max_bytes as usize,
+            round_limit: (request.max_bytes as usize).min(limits.max_round_bytes as usize),
+            task_remaining: (limits.max_task_bytes as usize).saturating_sub(ledger.granted_bytes),
+            rounds_used: ledger.rounds_used(),
+            max_rounds: limits.max_rounds,
+            escalations_used: 0,
+            max_escalations: 0,
+        };
+        let (resolution, items) = context::resolve(
+            &*self.store,
+            &info,
+            &self.artifacts,
+            &current,
+            &key,
+            base.graph_generation.as_ref(),
+            &envelope,
+            &request,
+            &round.request.hash,
+            budget,
+        )?;
+        require(
+            resolution.verdict == context::Verdict::Granted,
+            format!(
+                "the approved scope still does not resolve this request within budget ({:?}); deny it or replan",
+                resolution.code
+            ),
+        )?;
+        let delta = context::delta(
+            &plan,
+            Some(&decision.task_id),
+            AgentRole::Executor,
+            &round.job_id,
+            ledger.rounds_used() + 1,
+            &resolution,
+            context::Grant::PlannerApproved {
+                decision_hash: decision_ref.hash.clone(),
+                scope_additions: decision.read_scope_additions.clone(),
+            },
+            items,
+        )?;
+        let reference = context::DeltaRef {
+            delta_id: delta.delta_id.clone(),
+            artifact: self.artifacts.json(&delta)?,
+            bytes: delta.bytes,
+        };
+        let resolution_ref = self.artifacts.json(&resolution)?;
+        let entry = run.context.get_mut(&key).expect("issued ledger");
+        entry.state = context::LedgerState::Open;
+        entry
+            .approved_scope
+            .extend(decision.read_scope_additions.clone());
+        entry.granted_bytes += delta.bytes;
+        if let Some(last) = entry.rounds.last_mut() {
+            last.outcome = context::RoundOutcome::Approved;
+            last.decision = Some(decision_ref);
+            last.resolution = resolution_ref;
+            last.delta = Some(reference);
+        }
+        // Back to PLANNED so `run resume` re-issues the task as a fresh job.
+        if self
+            .store
+            .task(&info.repository_id, &decision.task_id)?
+            .is_some_and(|t| t.state == TaskState::Blocked)
+        {
+            self.store.transition_task(
+                &info.repository_id,
+                &decision.task_id,
+                TaskState::Blocked,
+                TaskState::Planned,
+                None,
+                now_ms()?,
+            )?;
+        }
+        run.state = RunState::Running;
+        run.reason = None;
+        save_run(self.store, &info, &run, "CONTEXT_ESCALATION_APPROVED")?;
+        event(
+            self.store,
+            &info,
+            Some(&plan),
+            Some(&round.job_id),
+            "CONTEXT_ESCALATION_APPROVED",
+            &json!({"subject":key,"delta":delta.delta_id,"bytes":delta.bytes,"actor":decision.actor,"additions":decision.read_scope_additions.len()}).to_string(),
+        )?;
         Ok(run)
     }
     /// Explicit human/orchestrator decision; never an automatic retry. Stage 4
@@ -1186,8 +1387,12 @@ impl<'a> Runtime<'a> {
         // VERIFIED checkpoint and before its refresh. Recheck source first.
         if run.pending.is_none() && !run.accepted.is_empty() {
             self.expected(&info.root, &run.expected)?;
+            let origin = graph::GenerationOrigin::Runtime {
+                plan_id: run.plan_id.clone(),
+                task_id: None,
+            };
             require(
-                self.store.index_repository(&info.root)?.failed == 0,
+                self.store.index_observed(&info.root, &origin)?.failed == 0,
                 "accepted source could not be indexed",
             )?;
         }
@@ -1210,31 +1415,113 @@ impl<'a> Runtime<'a> {
                 return self.integrate(info, plan, run, &current, lease);
             }
             let task=tasks.into_iter().find(|t|t.structurally_ready).ok_or_else(||Error::Invalid("no runnable task; unverified/rejected/interrupted work requires planner decision".into()))?;
-            let (artifact, inventory) = self.task_input(info, &task, &current)?;
+            self.execute_task(info, run, &task, lease)?;
+        }
+    }
+    /// Runs one ready task to a captured result. While the executor reports
+    /// CONTEXT_REQUIRED and the relay grants it, each round is a brand-new
+    /// provider job issued the same base context plus the approved deltas.
+    fn execute_task(
+        &mut self,
+        info: &RepositoryInfo,
+        run: &mut RunRecord,
+        task: &planning::TaskInspection,
+        lease: &WorkspaceLease,
+    ) -> Result<()> {
+        let id = task.packet.task_id.clone();
+        let key = context::subject_key(AgentRole::Executor, Some(&id));
+        let limits = self.config.context;
+        loop {
+            let current = self.expected(&info.root, &run.expected)?;
+            let ledger = run
+                .context
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    context::ContextLedger::new(AgentRole::Executor, Some(id.clone()))
+                })
+                .clone();
+            require(
+                ledger.state == context::LedgerState::Open,
+                format!(
+                    "task context relay is {:?}; an explicit planner decision is required (agentctl run context)",
+                    ledger.state
+                ),
+            )?;
+            let envelope = context::Envelope {
+                scopes: [
+                    task.packet.read_scope.clone(),
+                    ledger.approved_scope.clone(),
+                ]
+                .concat(),
+                memory: task.contract.memory_refs.clone(),
+            };
+            let base = match &ledger.base {
+                Some(base) => {
+                    self.revalidate(info, base, &current)?;
+                    self.artifacts.decode(&base.artifact)?
+                }
+                None => {
+                    graph::require_issuable(&self.store.connection, info, &run.plan_id)?;
+                    let built = context::base_executor(
+                        &*self.store,
+                        info,
+                        &self.artifacts,
+                        &current,
+                        task,
+                        &envelope,
+                    )?;
+                    let base = context::BaseRef {
+                        artifact: self.artifacts.json(&built)?,
+                        graph_generation: built.graph_generation.clone(),
+                        source_hash: built.source_hash.clone(),
+                    };
+                    run.context.get_mut(&key).expect("issued ledger").base = Some(base);
+                    save_run(self.store, info, run, "CONTEXT_BASE_ISSUED")?;
+                    built
+                }
+            };
+            let ledger = run.context.get(&key).cloned().expect("issued ledger");
+            let deltas = self.issued_deltas(&ledger)?;
+            let round = ledger.rounds_used();
+            let relay = self.relay_state(&ledger, limits.max_rounds);
+            let (artifact, inventory) = self.task_input(task, &base, &deltas, relay, round)?;
             self.expected(&info.root, &run.expected)?;
-            if task.state == TaskState::Planned {
+            let state = self
+                .store
+                .task(&info.repository_id, &id)?
+                .ok_or_else(|| Error::Invalid("runnable task disappeared".into()))?
+                .state;
+            if state == TaskState::Planned {
                 self.store.transition_task(
                     &info.repository_id,
-                    &task.packet.task_id,
+                    &id,
                     TaskState::Planned,
                     TaskState::Ready,
                     None,
                     now_ms()?,
                 )?;
             }
-            self.store.transition_task(
-                &info.repository_id,
-                &task.packet.task_id,
-                TaskState::Ready,
-                TaskState::Executing,
-                None,
-                now_ms()?,
-            )?;
+            if state != TaskState::Executing {
+                self.store.transition_task(
+                    &info.repository_id,
+                    &id,
+                    TaskState::Ready,
+                    TaskState::Executing,
+                    None,
+                    now_ms()?,
+                )?;
+            }
+            let previous: BTreeSet<JobId> = self
+                .store
+                .runtime_jobs(&info.root, Some(&run.plan_id))?
+                .into_iter()
+                .map(|j| j.job_id)
+                .collect();
             let invocation = self.invoke(
                 info,
                 Some(&run.plan_id),
                 None,
-                Some(&task.packet.task_id),
+                Some(&id),
                 AgentRole::Executor,
                 &current,
                 artifact,
@@ -1250,10 +1537,10 @@ impl<'a> Runtime<'a> {
                     .store
                     .runtime_jobs(&info.root, Some(&run.plan_id))?
                     .into_iter()
-                    .filter(|j| j.role == AgentRole::Executor)
+                    .filter(|j| j.role == AgentRole::Executor && !previous.contains(&j.job_id))
                     .find_map(|j| {
                         let input: JobInput = self.artifacts.decode(&j.input).ok()?;
-                        (input.task_id.as_ref() == Some(&task.packet.task_id)).then_some(j.job_id)
+                        (input.task_id.as_ref() == Some(&id)).then_some(j.job_id)
                     })
                     .ok_or_else(|| {
                         Error::Invalid(format!(
@@ -1290,6 +1577,40 @@ impl<'a> Runtime<'a> {
                 &reference.hash,
             )?;
             let (job, value) = invocation?;
+            let reported: ResultPacket = serde_json::from_value(value)?;
+            if let Some(request) = &reported.context_request {
+                // Fail closed: a context request must not leave unverified work
+                // behind, and this runtime has no safe rollback primitive.
+                require(
+                    diff.changes.is_empty(),
+                    "CONTEXT_REQUEST_WITH_EDITS: an executor requesting context must leave the workspace unchanged; its changes are retained but never accepted",
+                )?;
+                match self.relay(
+                    info,
+                    run,
+                    &key,
+                    &envelope,
+                    &job,
+                    request,
+                    &current,
+                    limits.max_rounds,
+                    limits.max_escalations,
+                )? {
+                    Relay::Granted => continue,
+                    Relay::Escalated => {
+                        return Err(Error::Invalid(format!(
+                            "NEEDS_PLANNER_CONTEXT_APPROVAL: task {} requested context outside its read scope; decide it with agentctl run context",
+                            id.as_str()
+                        )));
+                    }
+                    Relay::Denied(code) => {
+                        return Err(Error::Invalid(format!(
+                            "CONTEXT_REQUEST_DENIED: {code}; task {} remains blocked",
+                            id.as_str()
+                        )));
+                    }
+                }
+            }
             require(
                 diff.scope_violations.is_empty(),
                 "executor wrote outside allowed scope; result retained but not accepted",
@@ -1301,7 +1622,6 @@ impl<'a> Runtime<'a> {
                     .any(|c| task.contract.exclusions.iter().any(|s| permits(s, &c.path))),
                 "executor violated verification contract exclusions",
             )?;
-            let reported: ResultPacket = serde_json::from_value(value)?;
             require(
                 reported.changed_paths.iter().collect::<BTreeSet<_>>()
                     == diff.changes.iter().map(|c| &c.path).collect(),
@@ -1309,14 +1629,14 @@ impl<'a> Runtime<'a> {
             )?;
             self.store.transition_task(
                 &info.repository_id,
-                &task.packet.task_id,
+                &id,
                 TaskState::Executing,
                 TaskState::AwaitingVerification,
                 None,
                 now_ms()?,
             )?;
             run.pending = Some(PendingTask {
-                task_id: task.packet.task_id,
+                task_id: id,
                 executor: job.job_id,
                 before: diff.before,
                 after: diff.after,
@@ -1326,7 +1646,213 @@ impl<'a> Runtime<'a> {
                 proof: None,
             });
             save_run(self.store, info, run, "TASK_EXECUTION_COMPLETED")?;
+            return Ok(());
         }
+    }
+    /// Between context rounds the ontology generation and the captured source
+    /// a base context was derived from must still hold, or the relay would
+    /// issue a delta derived from stale assumptions.
+    fn revalidate(
+        &self,
+        info: &RepositoryInfo,
+        base: &context::BaseRef,
+        current: &SourceSnapshot,
+    ) -> Result<()> {
+        // Freshness is deliberately not required here: a verifier is issued
+        // context while the captured edits are not yet indexed. What must hold
+        // is that the ontology generation and the captured source are the ones
+        // the base was derived from; every issued fact is additionally bound to
+        // its own content hash when it is resolved.
+        require(
+            graph::generation(&self.store.connection, info)? == base.graph_generation,
+            "SOURCE_DRIFT: ontology generation changed between context rounds; replan required",
+        )?;
+        require(
+            context::source_hash(current)? == base.source_hash,
+            "SOURCE_DRIFT: workspace changed between context rounds; replan required",
+        )
+    }
+    /// The approved deltas of a subject, each rechecked against the base it
+    /// extends, in round order.
+    fn issued_deltas(
+        &self,
+        ledger: &context::ContextLedger,
+    ) -> Result<Vec<(context::ContextDelta, ArtifactRef)>> {
+        let base = ledger
+            .base
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("context ledger has no issued base".into()))?;
+        let mut deltas = vec![];
+        for reference in ledger.deltas() {
+            let delta: context::ContextDelta = self.artifacts.decode(&reference.artifact)?;
+            require(
+                delta.graph_generation == base.graph_generation
+                    && delta.source_hash == base.source_hash,
+                "SOURCE_DRIFT: an approved context delta was derived from other source/ontology state; replan required",
+            )?;
+            deltas.push((delta, reference.artifact.clone()));
+        }
+        Ok(deltas)
+    }
+    /// Persists a worker's context request, resolves it deterministically, and
+    /// records the outcome. Nothing outside the envelope is ever granted here.
+    #[allow(clippy::too_many_arguments)]
+    fn relay(
+        &mut self,
+        info: &RepositoryInfo,
+        run: &mut RunRecord,
+        key: &str,
+        envelope: &context::Envelope,
+        job: &RuntimeJob,
+        request: &ContextRequest,
+        source: &SourceSnapshot,
+        max_rounds: u32,
+        max_escalations: u32,
+    ) -> Result<Relay> {
+        let ledger = run
+            .context
+            .get(key)
+            .cloned()
+            .ok_or_else(|| Error::Invalid("context relay ledger missing".into()))?;
+        require(
+            request.job_id == job.job_id && request.task_id == ledger.task_id,
+            "context request does not match its issued job and task",
+        )?;
+        let plan = run.plan_id.clone();
+        let request_ref = self.artifacts.json(request)?;
+        let mut requester = job.clone();
+        requester.context_request = Some(request_ref.clone());
+        save_job(self.store, info, &requester, "CONTEXT_REQUESTED")?;
+        let round = ledger.rounds_used();
+        event(
+            self.store,
+            info,
+            Some(&plan),
+            Some(&job.job_id),
+            "CONTEXT_REQUESTED",
+            &json!({"subject":key,"round":round,"items":request.items.len(),"max_bytes":request.max_bytes,"request":request_ref.hash}).to_string(),
+        )?;
+        let limits = self.config.context;
+        let budget = context::Budget {
+            request_max_bytes: request.max_bytes as usize,
+            round_limit: (request.max_bytes as usize).min(limits.max_round_bytes as usize),
+            task_remaining: (limits.max_task_bytes as usize).saturating_sub(ledger.granted_bytes),
+            rounds_used: round,
+            max_rounds,
+            escalations_used: ledger.escalations,
+            max_escalations,
+        };
+        let generation = ledger
+            .base
+            .as_ref()
+            .and_then(|b| b.graph_generation.clone());
+        let (resolution, items) = context::resolve(
+            &*self.store,
+            info,
+            &self.artifacts,
+            source,
+            key,
+            generation.as_ref(),
+            envelope,
+            request,
+            &request_ref.hash,
+            budget,
+        )?;
+        let mut record = context::RoundRecord {
+            round,
+            job_id: job.job_id.clone(),
+            request: request_ref,
+            resolution: self.artifacts.json(&resolution)?,
+            outcome: context::RoundOutcome::Denied,
+            delta: None,
+            decision: None,
+        };
+        let (relay, phase, detail) = match resolution.verdict {
+            context::Verdict::Granted => {
+                let delta = context::delta(
+                    &plan,
+                    ledger.task_id.as_ref(),
+                    ledger.role,
+                    &job.job_id,
+                    round + 1,
+                    &resolution,
+                    context::Grant::Automatic,
+                    items,
+                )?;
+                let detail = json!({"subject":key,"round":round+1,"delta":delta.delta_id,"bytes":delta.bytes,"items":delta.items.len(),"grant":"AUTOMATIC"});
+                record.outcome = context::RoundOutcome::Granted;
+                record.delta = Some(context::DeltaRef {
+                    delta_id: delta.delta_id.clone(),
+                    artifact: self.artifacts.json(&delta)?,
+                    bytes: delta.bytes,
+                });
+                (Relay::Granted, "CONTEXT_DELTA_GRANTED", detail)
+            }
+            context::Verdict::Escalate => {
+                let outside: BTreeSet<&String> = resolution
+                    .items
+                    .iter()
+                    .filter(|i| i.outcome == context::ItemOutcome::OutsideEnvelope)
+                    .flat_map(|i| &i.paths)
+                    .collect();
+                record.outcome = context::RoundOutcome::Escalated;
+                (
+                    Relay::Escalated,
+                    "NEEDS_PLANNER_CONTEXT_APPROVAL",
+                    json!({"subject":key,"round":round,"outside":outside,"bytes":resolution.bytes}),
+                )
+            }
+            context::Verdict::Denied => {
+                let code = resolution.code.clone().unwrap_or_else(|| "DENIED".into());
+                // Name the first item that could not be issued, so the blocked
+                // state explains itself without opening the artifact.
+                let offender = resolution
+                    .items
+                    .iter()
+                    .find(|i| i.outcome != context::ItemOutcome::Granted)
+                    .map(|i| {
+                        format!(
+                            " (item {} {:?}{})",
+                            i.index,
+                            i.outcome,
+                            i.detail
+                                .as_deref()
+                                .map(|d| format!(": {d}"))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_default();
+                record.outcome = context::RoundOutcome::Denied;
+                (
+                    Relay::Denied(format!("{code}{offender}")),
+                    "CONTEXT_REQUEST_DENIED",
+                    json!({"subject":key,"round":round,"code":code,"bytes":resolution.bytes}),
+                )
+            }
+        };
+        let entry = run.context.get_mut(key).expect("issued ledger");
+        if let Some(delta) = &record.delta {
+            entry.granted_bytes += delta.bytes;
+        }
+        match record.outcome {
+            context::RoundOutcome::Escalated => {
+                entry.state = context::LedgerState::NeedsPlannerContextApproval;
+                entry.escalations += 1;
+            }
+            context::RoundOutcome::Denied => entry.state = context::LedgerState::Denied,
+            _ => {}
+        }
+        entry.rounds.push(record);
+        save_run(self.store, info, run, phase)?;
+        event(
+            self.store,
+            info,
+            Some(&plan),
+            Some(&job.job_id),
+            phase,
+            &detail.to_string(),
+        )?;
+        Ok(relay)
     }
     fn verify_pending(
         &mut self,
@@ -1398,35 +1924,29 @@ impl<'a> Runtime<'a> {
                     task_id: pending.task_id.clone(),
                     executor_job_id: pending.executor.clone(),
                 };
-                let (diff, paths) = self.diff_input(&pending.diff)?;
-                let inventory = manifest::ContextInventory {
-                    paths,
-                    invariants: inspection.invariants.keys().cloned().collect(),
-                    ..Default::default()
-                };
-                let artifact = json!({"task":task,"contract":inspection.contract,"invariants":inspection.invariants,"target":target,"evidence":pending.evidence,"evidence_records":self.evidence_input(info,&pending.evidence)?,"diff":diff,"verification_schema":schemars::schema_for!(VerificationPacket)});
-                event(
-                    self.store,
+                let records = self.evidence_input(info, &pending.evidence)?;
+                let (packet, contract, invariants) = (
+                    task.clone(),
+                    inspection.contract.clone(),
+                    inspection.invariants.clone(),
+                );
+                let evidence = pending.evidence.clone();
+                let build = move |diff: Value, deltas: Value, relay: Value| json!({"task":packet,"contract":contract,"invariants":invariants,"target":target,"evidence":evidence,"evidence_records":records,"diff":diff,"deltas":deltas,"context_relay":relay,"verification_schema":schemars::schema_for!(VerificationPacket)});
+                let (verifier, proof) = self.verify(
                     info,
-                    Some(&run.plan_id),
-                    None,
-                    "VERIFICATION_STARTED",
-                    "fresh packet verifier; no executor transcript",
-                )?;
-                let (job, value) = self.invoke(
-                    info,
-                    Some(&run.plan_id),
-                    None,
-                    Some(&pending.task_id),
-                    AgentRole::Verifier,
+                    run,
+                    Verification {
+                        task: Some(&pending.task_id),
+                        diff: &pending.diff,
+                        invariants: inspection.invariants.keys().cloned().collect(),
+                        envelope: [task.read_scope.clone(), task.write_scope.clone()].concat(),
+                        build: &build,
+                    },
                     &after,
-                    artifact,
-                    inventory,
                     lease,
-                    &run.policy_hash,
                 )?;
-                pending.verifier = Some(job.job_id);
-                pending.proof = Some(serde_json::from_value(value)?);
+                pending.verifier = Some(verifier);
+                pending.proof = Some(proof);
                 run.pending = Some(pending.clone());
                 save_run(self.store, info, run, "VERIFIER_OUTPUT_CAPTURED")?;
             }
@@ -1445,12 +1965,27 @@ impl<'a> Runtime<'a> {
                 Some(proof),
                 now_ms()?,
             )?;
+            if next == TaskState::Rejected {
+                // This plan can no longer complete, so its candidate never can
+                // become accepted; say so durably.
+                graph::close_for_plan(
+                    &self.store.connection,
+                    info,
+                    &run.plan_id,
+                    Some(&pending.task_id),
+                    graph::DecisionReason::VerificationRejected,
+                )?;
+            }
             require(
                 next == TaskState::Verified,
                 "verifier rejected/blocked task; dependents remain locked; explicit correction plan required",
             )?;
         }
         run.expected = pending.after.clone();
+        let origin = graph::GenerationOrigin::Runtime {
+            plan_id: run.plan_id.clone(),
+            task_id: Some(pending.task_id.clone()),
+        };
         run.accepted.insert(
             pending.task_id,
             AcceptedTask {
@@ -1464,11 +1999,123 @@ impl<'a> Runtime<'a> {
         );
         run.pending = None;
         save_run(self.store, info, run, "TASK_VERIFIED")?;
+        // Task-verified work refreshes the working ontology as this plan's
+        // candidate; it becomes accepted truth only at plan completion.
         require(
-            self.store.index_repository(&info.root)?.failed == 0,
+            self.store.index_observed(&info.root, &origin)?.failed == 0,
             "accepted source could not be indexed; planner review required",
         )?;
         Ok(())
+    }
+    /// Runs a fresh verifier over a captured transition, relaying bounded
+    /// context on a budget of its own. A verifier request is derived only from
+    /// verifier-visible material: it never inherits the executor's requests,
+    /// reasons or transcript, and it is neither PASS nor REJECT.
+    fn verify(
+        &mut self,
+        info: &RepositoryInfo,
+        run: &mut RunRecord,
+        verification: Verification<'_>,
+        source: &SourceSnapshot,
+        lease: &WorkspaceLease,
+    ) -> Result<(JobId, VerificationPacket)> {
+        let key = context::subject_key(AgentRole::Verifier, verification.task);
+        let limits = self.config.context;
+        loop {
+            let ledger = run
+                .context
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    context::ContextLedger::new(AgentRole::Verifier, verification.task.cloned())
+                })
+                .clone();
+            require(
+                ledger.state == context::LedgerState::Open,
+                format!(
+                    "verification context relay is {:?}; explicit planner decision required",
+                    ledger.state
+                ),
+            )?;
+            match &ledger.base {
+                // The verifier's base is the captured transition it verifies.
+                Some(base) => self.revalidate(info, base, source)?,
+                None => {
+                    graph::require_issuable(&self.store.connection, info, &run.plan_id)?;
+                    let base = context::BaseRef {
+                        artifact: verification.diff.clone(),
+                        graph_generation: graph::generation(&self.store.connection, info)?,
+                        source_hash: context::source_hash(source)?,
+                    };
+                    run.context.get_mut(&key).expect("issued ledger").base = Some(base);
+                    save_run(self.store, info, run, "VERIFIER_CONTEXT_BASE_ISSUED")?;
+                }
+            }
+            let ledger = run.context.get(&key).cloned().expect("issued ledger");
+            let deltas = self.issued_deltas(&ledger)?;
+            let round = ledger.rounds_used();
+            let (diff, paths) = self.diff_input(verification.diff)?;
+            let mut inventory = manifest::ContextInventory {
+                paths,
+                invariants: verification.invariants.clone(),
+                visibility: Some(limits.visibility),
+                ..Default::default()
+            };
+            context::inventory(&mut inventory, None, &deltas, round)?;
+            let artifact = (verification.build)(
+                diff,
+                json!(deltas.iter().map(|(d, _)| d).collect::<Vec<_>>()),
+                self.relay_state(&ledger, limits.verifier_max_rounds),
+            );
+            event(
+                self.store,
+                info,
+                Some(&run.plan_id),
+                None,
+                "VERIFICATION_STARTED",
+                "fresh verifier; no executor transcript or context-request history",
+            )?;
+            let (job, value) = self.invoke(
+                info,
+                Some(&run.plan_id),
+                None,
+                verification.task,
+                AgentRole::Verifier,
+                source,
+                artifact,
+                inventory,
+                lease,
+                &run.policy_hash,
+            )?;
+            let proof: VerificationPacket = serde_json::from_value(value)?;
+            if let Some(request) = &proof.context_request {
+                let envelope = context::Envelope {
+                    scopes: verification.envelope.clone(),
+                    memory: vec![],
+                };
+                // Verifier relay is automatic-only: a verifier cannot escalate
+                // to the planner, so anything outside its envelope is denied.
+                let outcome = self.relay(
+                    info,
+                    run,
+                    &key,
+                    &envelope,
+                    &job,
+                    request,
+                    source,
+                    limits.verifier_max_rounds,
+                    0,
+                )?;
+                let code = match outcome {
+                    Relay::Granted => continue,
+                    Relay::Denied(code) => code,
+                    Relay::Escalated => "ESCALATION_NOT_PERMITTED".into(),
+                };
+                return Err(Error::Invalid(format!(
+                    "VERIFIER_CONTEXT_REQUEST_DENIED: {code}; verification reached no decision"
+                )));
+            }
+            return Ok((job.job_id, proof));
+        }
     }
     fn integrate(
         &mut self,
@@ -1483,15 +2130,7 @@ impl<'a> Runtime<'a> {
             "runtime lacks authentic packet acceptance records",
         )?;
         if let Some((_, proof, _)) = self.completed_verifier(info, &run.plan_id, None, current)? {
-            self.expected(&info.root, &run.expected)?;
-            self.store.complete_execution_plan(
-                &info.root,
-                &run.plan_id,
-                &proof,
-                &current.source_ref()?,
-            )?;
-            run.state = RunState::Complete;
-            return save_run(self.store, info, run, "PLAN_RUNTIME_COMPLETED");
+            return self.complete(info, run, current, &proof);
         }
         let baseline: SourceSnapshot = self.artifacts.decode(&run.baseline)?;
         let diff = source::diff(
@@ -1530,34 +2169,70 @@ impl<'a> Runtime<'a> {
             .into_iter()
             .flat_map(|t| t.invariants)
             .collect();
-        let (diff, paths) = self.diff_input(&reference)?;
-        let inventory = manifest::ContextInventory {
-            paths,
-            invariants: invariants.keys().cloned().collect(),
-            ..Default::default()
-        };
-        let artifact = json!({"plan":plan.packet,"contract":plan.metadata.integration,"invariants":invariants,"target":target,"evidence":evidence,"evidence_records":self.evidence_input(info,&evidence)?,"diff":diff,"verification_schema":schemars::schema_for!(VerificationPacket)});
-        let (_, value) = self.invoke(
+        let records = self.evidence_input(info, &evidence)?;
+        let keys: Vec<String> = invariants.keys().cloned().collect();
+        let envelope: Vec<ScopePath> = plan
+            .packet
+            .tasks
+            .iter()
+            .flat_map(|t| t.read_scope.iter().chain(&t.write_scope).cloned())
+            .collect();
+        let (packet, contract) = (plan.packet.clone(), plan.metadata.integration.clone());
+        let issued = evidence.clone();
+        let build = move |diff: Value, deltas: Value, relay: Value| json!({"plan":packet,"contract":contract,"invariants":invariants,"target":target,"evidence":issued,"evidence_records":records,"diff":diff,"deltas":deltas,"context_relay":relay,"verification_schema":schemars::schema_for!(VerificationPacket)});
+        let (_, proof) = self.verify(
             info,
-            Some(&run.plan_id),
-            None,
-            None,
-            AgentRole::Verifier,
+            run,
+            Verification {
+                task: None,
+                diff: &reference,
+                invariants: keys,
+                envelope,
+                build: &build,
+            },
             current,
-            artifact,
-            inventory,
             lease,
-            &run.policy_hash,
         )?;
-        let proof: VerificationPacket = serde_json::from_value(value)?;
+        self.complete(info, run, current, &proof)
+    }
+    /// The acceptance boundary: plan completion and promotion of the plan's
+    /// ontology candidate commit in one transaction, and only after an
+    /// integration PASS over the unchanged final source.
+    fn complete(
+        &mut self,
+        info: &RepositoryInfo,
+        run: &mut RunRecord,
+        current: &SourceSnapshot,
+        proof: &VerificationPacket,
+    ) -> Result<()> {
         self.expected(&info.root, &run.expected)?;
-        self.store.complete_execution_plan(
+        if proof.decision == VerificationDecision::Reject {
+            graph::close_for_plan(
+                &self.store.connection,
+                info,
+                &run.plan_id,
+                None,
+                graph::DecisionReason::IntegrationRejected,
+            )?;
+        }
+        let accepted = self.store.complete_execution_plan_accepting(
             &info.root,
             &run.plan_id,
-            &proof,
+            proof,
             &current.source_ref()?,
         )?;
         run.state = RunState::Complete;
-        save_run(self.store, info, run, "PLAN_RUNTIME_COMPLETED")
+        save_run(self.store, info, run, "PLAN_RUNTIME_COMPLETED")?;
+        if let Some(generation) = accepted {
+            event(
+                self.store,
+                info,
+                Some(&run.plan_id),
+                None,
+                "ONTOLOGY_GENERATION_ACCEPTED",
+                &generation,
+            )?;
+        }
+        Ok(())
     }
 }

@@ -9,6 +9,55 @@ to storage, configuration, or the CLI.
 
 ### Added
 
+- Ontology generation lifecycle. Indexing is now an observation: every index
+  pass that changes the indexed facts is recorded as a generation with an
+  immutable snapshot, and a workspace has exactly one *accepted* generation.
+  Changes become accepted only deliberately (`agentctl ontology accept`) or,
+  for runtime work, in the same transaction that completes a plan after its
+  integration verification passes. Task-verified work is the plan's
+  candidate until then. The first complete index of a workspace, and a
+  re-observation identical to the accepted facts (for example a revert), are
+  accepted automatically. Candidates are superseded by later observations,
+  rejected by verification rejections or `agentctl ontology reject`, and
+  abandoned with their plan; all history stays inspectable.
+- Semantic deltas (`SemanticDelta`, version 1): the deterministic difference
+  between two generations — entities added, removed, or modified (with the
+  changed signature, visibility, text or key facts), distinct resolved
+  relations added or removed, and per-file content and change counts.
+  Identity across generations requires the same entity ID and a unique
+  declaration of that path, kind and name in both generations; renames and
+  moves are reported as removal plus addition, and same-named duplicates as
+  unproven (`DUPLICATE_ORDINAL`). Doc comments and attributes count as part of
+  the declaration below them, and nested declarations are excluded from their
+  container's text.
+- `agentctl ontology status|list|show|delta|accept|reject`, with `--json`
+  output and `delta` filters (`--change`, `--path`, `--limit`,
+  `--from`/`--to`).
+
+- Planner-mediated context relay. A task's `read_scope` is an authorization
+  envelope, not content: an executor's context is materialized only from
+  planner-authored references (graph entities with bounded definitions and
+  in-envelope relation stubs, explicit File read scopes, File write targets,
+  contract memory references, and the task's checks). A worker that cannot
+  finish returns a typed `ContextRequest` (new `context-request` protocol
+  document) instead of exploring; agentctl resolves it deterministically
+  against the ontology snapshot and captured source, inside the envelope and
+  within machine-owned budgets, and issues a hash-bound `ContextDelta` to a
+  *fresh* provider job carrying the original base context plus the accumulated
+  deltas. Requests needing paths outside the envelope are never granted
+  automatically: the run blocks with `NEEDS_PLANNER_CONTEXT_APPROVAL` for an
+  explicit decision (`agentctl run context`, `agentctl run context decide`).
+  Budgets, rounds and escalations are configured under `[runtime.context]`
+  with compiled-in hard maxima.
+- Independent verifier context relay: a verifier may request context from
+  verifier-visible material only, on its own round budget, never inheriting the
+  executor's requests, reasons or transcript. Such a request is neither PASS nor
+  REJECT and never becomes a task transition.
+- Opt-in issued-context visibility (`[runtime.context] visibility = "issued"`):
+  executor and verifier jobs may then read only the repository files issued to
+  them (plus an executor's write scope), with the workspace tree and Git
+  directories removed from their read roots. The default remains `workspace`
+  pending provider dogfood; see docs/security.md.
 - Context manifests. Every planner, executor, and verifier job records what
   agentctl supplied: identities, the graph generation, the repository paths and
   ranges (hash-bound), graph entity, memory, and invariant IDs, and exact byte
@@ -49,6 +98,17 @@ to storage, configuration, or the CLI.
   earlier versions stay readable but cannot seed new plans; prepare again.
 - Database schema 12 adds workspace-level relation resolution. The migration
   is additive and lossless.
+- Database schema 13 adds the ontology lifecycle (`ontology_generations`,
+  content-addressed `ontology_blobs`, and a per-entity text hash). The
+  migration is additive and lossless and synthesizes no history; the first
+  `repo index` afterwards re-derives each file once (facts and generation are
+  unchanged) and records the accepted baseline.
+- `plan prepare` and `run plan` now require the indexed generation to be the
+  accepted one, and a plan to be bound to it. After editing files yourself,
+  run `repo index` and `ontology accept` before preparing a plan.
+- Context relay bases are issued only from the accepted generation or the
+  running plan's own candidate; an unexplained observation during a run blocks
+  with `SOURCE_DRIFT`.
 
 ### Fixed
 
