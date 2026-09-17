@@ -2,6 +2,7 @@
 pub(crate) mod cli;
 mod delta;
 pub mod files;
+mod impact;
 mod lifecycle;
 mod model;
 mod parser;
@@ -11,6 +12,12 @@ mod wire;
 pub use delta::{
     Change, ContentChange, DeltaSummary, EntityChange, EntityFacts, EntityField, FactsRef,
     FileChange, GenerationPoint, IdentityBasis, RelationChange, SemanticDelta,
+};
+pub(crate) use impact::proposed as proposed_impact;
+pub use impact::{
+    BoundaryReason, ImpactAuthority, ImpactBasis, ImpactBoundary, ImpactClass, ImpactEdge,
+    ImpactItem, ImpactLimits, ImpactOrigin, ImpactOutlook, ImpactReport, ImpactRequest, ImpactSeed,
+    ImpactStep, ImpactSummary,
 };
 pub use lifecycle::{
     DecisionReason, DeltaStatus, GenerationDecision, GenerationOrigin, GenerationState,

@@ -246,6 +246,7 @@ fn ontology(
         "status" | "show" => &[],
         "list" => &["limit"],
         "delta" => &["from", "to", "change", "path", "limit"],
+        "impact" => &["from", "to", "symbol", "plan", "depth", "limit", "tests"],
         "accept" | "reject" => &["reason"],
         _ => {
             return Err(Error::Invalid(
@@ -319,6 +320,7 @@ fn ontology(
             let selected = delta.select(change, flags.get("path").copied(), limit.unwrap_or(200));
             output(json, &selected, &delta_lines(&delta, &selected))
         }
+        "impact" => impact(store, root, &positional, &flags, limit, json),
         "accept" => {
             let record = store.accept_generation(
                 root,
@@ -519,4 +521,192 @@ fn output(json: bool, value: &impl Serialize, human: &str) -> Result<()> {
         println!("{}", crate::local::terminal::human(human));
     }
     Ok(())
+}
+
+/// `agentctl ontology impact` — the evidence-backed consequences of an observed
+/// or proposed change. It reports; it never changes scope or state.
+fn impact(
+    store: &mut Store,
+    root: &Path,
+    positional: &[&str],
+    flags: &BTreeMap<&str, &str>,
+    limit: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let number = |name: &str| -> Result<Option<usize>> {
+        flags
+            .get(name)
+            .map(|v| {
+                v.parse::<usize>()
+                    .map_err(|_| Error::Invalid(format!("--{name} must be a whole number")))
+            })
+            .transpose()
+    };
+    let mut limits = ImpactLimits::default();
+    if let Some(depth) = number("depth")? {
+        limits.depth = depth;
+    }
+    if let Some(items) = limit {
+        limits.items = items;
+    }
+    if let Some(tests) = number("tests")? {
+        limits.tests = tests;
+    }
+    let request = match (
+        flags.get("symbol"),
+        flags.get("from"),
+        flags.get("to"),
+        positional,
+    ) {
+        (Some(symbol), None, None, []) => ImpactRequest::Symbols(vec![(*symbol).into()]),
+        (None, Some(from), Some(to), []) => ImpactRequest::Diff {
+            from: (*from).into(),
+            to: (*to).into(),
+        },
+        (None, None, None, [id]) => ImpactRequest::Generation((*id).into()),
+        (None, None, None, []) => ImpactRequest::Generation(
+            store
+                .ontology_status(root)?
+                .candidate
+                .ok_or_else(|| {
+                    Error::Invalid(
+                        "no open candidate; name a generation, or use --from/--to or --symbol"
+                            .into(),
+                    )
+                })?
+                .generation_id,
+        ),
+        _ => {
+            return Err(Error::Invalid(
+                "ontology impact takes one generation ID, or both --from and --to, or --symbol NAME"
+                    .into(),
+            ));
+        }
+    };
+    match flags.get("plan") {
+        Some(plan) => {
+            let plan = crate::protocol::PlanId::new(*plan).map_err(Error::Invalid)?;
+            let outlook = store.plan_impact(root, &plan, &request, limits)?;
+            let text = outlook_lines(&outlook);
+            output(json, &outlook, &text)
+        }
+        None => {
+            let report = store.ontology_impact(root, &request, limits)?;
+            let text = impact_lines(&report);
+            output(json, &report, &text)
+        }
+    }
+}
+
+fn impact_lines(r: &ImpactReport) -> String {
+    let mut lines = vec![format!(
+        "Generation {} (sequence {})",
+        r.generation.fingerprint, r.generation.sequence
+    )];
+    for seed in &r.seeds {
+        lines.push(format!(
+            "seed     {} {}  {}{}",
+            seed.qualified_name,
+            seed.path,
+            serde_json::to_string(&seed.origin).unwrap_or_default(),
+            if seed.skipped {
+                "  [not traversed]"
+            } else {
+                ""
+            }
+        ));
+    }
+    for item in &r.items {
+        lines.push(format!(
+            "{:?} d{} {} {}\n    {}",
+            item.class,
+            item.distance,
+            item.qualified_name,
+            item.path,
+            evidence_line(item)
+        ));
+    }
+    for boundary in &r.boundaries {
+        lines.push(format!(
+            "boundary {} {}  {}",
+            boundary.qualified_name,
+            boundary.path,
+            serde_json::to_string(&boundary.reason).unwrap_or_default()
+        ));
+    }
+    let s = &r.summary;
+    lines.push(format!(
+        "{} seeds ({} not traversed, {} omitted); {} items in {} files (direct {}, contract {}, verification {}, containment {}, cross-file {}, {} omitted); {} boundaries ({} omitted); max distance {}\n{}",
+        s.seeds,
+        s.seeds_skipped,
+        s.seeds_omitted,
+        s.items,
+        s.files,
+        s.direct,
+        s.contract,
+        s.verification,
+        s.containment,
+        s.cross_file,
+        s.items_omitted,
+        s.boundaries,
+        s.boundaries_omitted,
+        s.max_distance,
+        r.meaning
+    ));
+    lines.join("\n")
+}
+
+/// The chain read from the seed outwards. Each hop names the relation the
+/// reached entity has *to* the entity before it, so the arrow points at the
+/// source of truth: `seed <-[CALLS]- caller`.
+fn evidence_line(item: &ImpactItem) -> String {
+    let short = |id: &crate::protocol::GraphEntityId| {
+        let text = id.as_str();
+        text.strip_prefix("graph:").map_or_else(
+            || text.to_string(),
+            |h| format!("graph:{}", &h[..12.min(h.len())]),
+        )
+    };
+    let mut chain = vec![
+        item.evidence
+            .first()
+            .map_or(String::new(), |s| short(&s.from)),
+    ];
+    for step in &item.evidence {
+        chain.push(format!(
+            "<-[{}]- {}",
+            match &step.edge {
+                ImpactEdge::Relation { kind, removed, .. } =>
+                    format!("{:?}{}", kind, if *removed { " removed" } else { "" }),
+                ImpactEdge::Containment => "CONTAINS".into(),
+                ImpactEdge::TestAssociation { basis } => format!("TEST:{basis:?}"),
+            },
+            short(&step.entity)
+        ));
+    }
+    chain.join(" ")
+}
+
+fn outlook_lines(o: &ImpactOutlook) -> String {
+    format!(
+        "{}\nDeclared write scope: {}\nOutside declared scope: {} items in {} files{}\nAuthority: {:?} — impact never widens read or write scope.",
+        impact_lines(&o.report),
+        if o.scope.is_empty() {
+            "none declared".to_string()
+        } else {
+            o.scope
+                .iter()
+                .map(|s| s.path().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+        o.outside_scope_items,
+        o.outside_scope.len(),
+        if o.outside_scope.is_empty() {
+            String::new()
+        } else {
+            format!("\n  {}", o.outside_scope.join("\n  "))
+        },
+        o.authority
+    )
 }

@@ -468,6 +468,56 @@ impl GraphQuery<'_> {
         self.resolved(id, incoming, limit)
     }
 
+    /// The `FILE` entity of an indexed path, if the path is indexed.
+    pub(super) fn file_entity(&self, path: &str) -> Result<Option<Entity>> {
+        Ok(self
+            .entity_rows("SELECT record_json FROM graph_entities WHERE workspace_id=?1 AND path=?2 AND kind='\"FILE\"' ORDER BY entity_id LIMIT ?3", path, 1)?
+            .pop())
+    }
+
+    /// Unresolved syntactic relations elsewhere in the workspace whose target
+    /// name is, or ends with, `name`. A name match is never a dependency; this
+    /// count exists so impact analysis can state the open question explicitly.
+    pub(super) fn unresolved_references(
+        &self,
+        name: &str,
+        paths: usize,
+    ) -> Result<(usize, Vec<String>)> {
+        if name.is_empty() {
+            return Ok((0, vec![]));
+        }
+        let escaped = name
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let rows: Vec<(String, i64)> = self
+            .tx
+            .prepare(
+                "SELECT e.path,COUNT(*) FROM graph_edges e WHERE e.workspace_id=?1 AND e.target_id IS NULL \
+                 AND e.kind IN ('\"CALLS\"','\"REFERENCES\"','\"IMPLEMENTS\"') \
+                 AND (json_extract(e.record_json,'$.target_name')=?2 \
+                      OR json_extract(e.record_json,'$.target_name') LIKE ?3 ESCAPE '\\' \
+                      OR json_extract(e.record_json,'$.target_name') LIKE ?4 ESCAPE '\\') \
+                 AND NOT EXISTS (SELECT 1 FROM graph_resolutions r WHERE r.workspace_id=e.workspace_id AND r.edge_id=e.edge_id) \
+                 GROUP BY e.path ORDER BY e.path",
+            )?
+            .query_map(
+                params![
+                    self.info.workspace_id.as_str(),
+                    name,
+                    format!("%::{escaped}"),
+                    format!("%.{escaped}")
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?
+            .collect::<std::result::Result<_, _>>()?;
+        let count = rows.iter().map(|(_, n)| *n as usize).sum();
+        Ok((
+            count,
+            rows.into_iter().map(|(p, _)| p).take(paths).collect(),
+        ))
+    }
+
     /// Tests associated with `target` by the Stage 1 association rules.
     pub(crate) fn associated_tests(
         &self,

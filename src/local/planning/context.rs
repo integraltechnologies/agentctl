@@ -6,6 +6,19 @@ use crate::local::memory::MemoryId;
 const NEIGHBOR_EXCERPTS: usize = 2;
 const TEST_EXCERPTS: usize = 2;
 
+/// Prospective-impact bounds for a planner packet. Deliberately far tighter
+/// than a standalone report: the planner needs to know that consequences exist
+/// outside its neighborhood, not the whole impact graph.
+const PLAN_IMPACT_SEEDS: usize = 4;
+const PLAN_IMPACT: graph::ImpactLimits = graph::ImpactLimits {
+    depth: 2,
+    seeds: PLAN_IMPACT_SEEDS,
+    items: 8,
+    tests: 2,
+    boundaries: 4,
+    fanout: 32,
+};
+
 impl Store {
     /// Prepare once and retain the exact bounded artifact; reading it never rebuilds context.
     pub fn prepare_plan(
@@ -79,6 +92,25 @@ impl Store {
             }
         }
         graph.truncated |= graph.retain_files(|path| files.contains(path));
+        // Prospective impact of editing what the planner is about to reason
+        // about, read from the same accepted generation. Discovery is not
+        // authorization: nothing here changes the request's scope.
+        let seeds: Vec<graph::Entity> = graph
+            .primary
+            .iter()
+            .map(|p| p.entity.clone())
+            .take(PLAN_IMPACT_SEEDS)
+            .collect();
+        let impact = if seeds.is_empty() {
+            None
+        } else {
+            let report = graph::proposed_impact(&self.graph(start)?, &seeds, PLAN_IMPACT)?;
+            let scope = intent.scope.clone();
+            let covered = scope.clone();
+            Some(graph::ImpactOutlook::new(report, scope, &|path| {
+                covered.iter().any(|s| permits(s, path))
+            }))
+        };
         let memory = self.memory_for_code(start, &graph, limits.memory)?;
         let excerpts = excerpts(&info, &graph, limits)?;
         let request_id: String = self.connection.query_row(
@@ -104,6 +136,7 @@ impl Store {
                 created_at_ms: now_ms()?,
             },
             context: PlanningContext {
+                impact,
                 truncated: graph.truncated
                     || memory.truncated
                     || excerpts.iter().any(|e| e.truncated),
@@ -253,9 +286,10 @@ fn excerpts(
 }
 
 /// Removes the least valuable optional record, then everything that referred to
-/// it. Order: unresolved summaries, relations, test excerpts, neighbors (with
-/// their excerpts), tests beyond the first, memory, secondary excerpts, the last
-/// test, primaries beyond the first, the final excerpt, the final primary.
+/// it. Order: the impact outlook, unresolved summaries, relations, test
+/// excerpts, neighbors (with their excerpts), tests beyond the first, memory,
+/// secondary excerpts, the last test, primaries beyond the first, the final
+/// excerpt, the final primary.
 fn shed(c: &mut PlanningContext) -> bool {
     let g = &mut c.graph;
     let test_excerpt = c.excerpts.iter().rposition(|x| {
@@ -263,32 +297,34 @@ fn shed(c: &mut PlanningContext) -> bool {
             .as_ref()
             .is_some_and(|id| g.tests.iter().any(|t| &t.id == id))
     });
-    let dropped = if g.unresolved.pop().is_some() || g.relations.pop().is_some() {
-        true
-    } else if let Some(i) = test_excerpt {
-        c.excerpts.remove(i);
-        true
-    } else if g.neighbors.pop().is_some() {
-        true
-    } else if g.tests.len() > 1 {
-        g.tests.pop();
-        true
-    } else if c.memory.items.pop().is_some() {
-        c.memory.truncated = true;
-        true
-    } else if c.excerpts.len() > 1 {
-        c.excerpts.pop();
-        true
-    } else if g.tests.pop().is_some() {
-        true
-    } else if g.primary.len() > 1 {
-        g.primary.pop();
-        true
-    } else if c.excerpts.pop().is_some() {
-        true
-    } else {
-        g.primary.pop().is_some()
-    };
+    let dropped =
+        if c.impact.take().is_some() || g.unresolved.pop().is_some() || g.relations.pop().is_some()
+        {
+            true
+        } else if let Some(i) = test_excerpt {
+            c.excerpts.remove(i);
+            true
+        } else if g.neighbors.pop().is_some() {
+            true
+        } else if g.tests.len() > 1 {
+            g.tests.pop();
+            true
+        } else if c.memory.items.pop().is_some() {
+            c.memory.truncated = true;
+            true
+        } else if c.excerpts.len() > 1 {
+            c.excerpts.pop();
+            true
+        } else if g.tests.pop().is_some() {
+            true
+        } else if g.primary.len() > 1 {
+            g.primary.pop();
+            true
+        } else if c.excerpts.pop().is_some() {
+            true
+        } else {
+            g.primary.pop().is_some()
+        };
     if dropped {
         g.prune();
         let ids = g.entity_ids();

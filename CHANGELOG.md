@@ -33,6 +33,29 @@ to storage, configuration, or the CLI.
 - `agentctl ontology status|list|show|delta|accept|reject`, with `--json`
   output and `delta` filters (`--change`, `--path`, `--limit`,
   `--from`/`--to`).
+- Semantic impact analysis (`ImpactReport`, version 1): given an observed
+  `SemanticDelta` or a proposed edit, the bounded set of existing code that
+  could be affected, with a machine-inspectable evidence chain for every
+  claim. Evidence is only resolved relations, containment of an added or
+  removed declaration, and Stage-1 test associations (basis carried); nothing
+  is derived from lexical similarity, name coincidence or graph proximity.
+  Items are classed `DIRECT_DEPENDENCY`, `CONTRACT_EXPOSURE`,
+  `VERIFICATION_RELEVANCE` or `CONTAINMENT_OWNERSHIP`; open questions are kept
+  apart as boundaries (`UNPROVEN_IDENTITY`, `UNRESOLVED_REFERENCES`,
+  `UNDETERMINED_PROPAGATION`, `DEPTH_LIMIT`, `FANOUT_LIMIT`, `ENTITY_ABSENT`).
+  Traversal is deterministic, cycle-safe and bounded, and goes past the first
+  hop only where the ontology proves the change is re-exposed, so a body edit
+  reaches its direct callers while a signature change can travel through an
+  exported relay. Analysis is bound to the generation it names and fails
+  closed when that generation is not the indexed one.
+- `agentctl ontology impact [<generation-id> | --from <id> --to <id> |
+  --symbol NAME] [--plan <plan-id>] [--depth N] [--limit N] [--tests N]`,
+  with `--json` output. Read-only: it changes no lifecycle state.
+- `plan prepare` now attaches a bounded impact outlook for the entities the
+  planner selected, read against the request's own scope, so a planner sees
+  consequences outside its intended neighborhood. It is advisory: it carries
+  no source text, adds no file to the request's support set, never widens read
+  or write scope, and is the first record shed under the byte budget.
 
 - Planner-mediated context relay. A task's `read_scope` is an authorization
   envelope, not content: an executor's context is materialized only from

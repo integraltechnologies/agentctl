@@ -103,7 +103,9 @@ pub(super) fn resolve_invariants(
         Ok((key.clone(),content))
     }).collect()
 }
-pub(super) fn permits(scope: &ScopePath, path: &str) -> bool {
+/// Whether a scope entry covers a repository-relative path. Used outside
+/// planning only to read an impact report against a declared scope.
+pub(crate) fn permits(scope: &ScopePath, path: &str) -> bool {
     match scope {
         ScopePath::File { path: p } => p == path,
         ScopePath::Directory { path: p } => inside(path, p),

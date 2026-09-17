@@ -37,6 +37,13 @@ database that you own.
   becomes accepted truth only through verification or an explicit
   `agentctl ontology accept`, and `agentctl ontology delta` shows exactly which
   declarations and relations changed.
+- **Semantic impact.** `agentctl ontology impact` answers what a proposed or
+  observed change could affect, with an inspectable evidence chain behind every
+  claim (resolved relations, containment of an added or removed declaration, or
+  a test association). Traversal is deterministic, cycle-safe and bounded, and
+  it stops where the ontology stops proving things: open questions are reported
+  as explicit boundaries rather than as impact. Planning gets a small advisory
+  outlook of consequences outside its own scope; it never widens authority.
 - **Structured engineering memory.** Durable decisions, derived facts, observed
   evidence, and agent notes carry explicit trust and provenance. Low-trust notes
   never silently become authority.
@@ -279,6 +286,14 @@ If you edit files yourself between plans, `agentctl repo index` records the
 change as an ontology candidate. Inspect it with `agentctl ontology delta` and
 accept it with `agentctl ontology accept <generation-id>` before preparing the
 next plan.
+
+Before acting on a change, ask what it could reach:
+
+```bash
+agentctl ontology impact --symbol <qualified-name>   # a proposed edit
+agentctl ontology impact                             # the open candidate's observed change
+agentctl ontology impact <generation-id> --plan <plan-id>
+```
 
 If a task is rejected or blocked, the run stops. Prepare a replacement plan and
 link it with `agentctl run replace <old-plan-id> <new-plan-id>`, or resume an

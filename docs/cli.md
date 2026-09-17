@@ -140,6 +140,21 @@ agentctl ontology reject <generation-id> --reason TEXT
   change could affect. With `--json`, the output is the typed `SemanticDelta`
   (filters narrow the entries; `summary` always describes the whole delta).
 
+- **Impact** (`ontology impact`) answers what an observed or proposed change
+  could affect, with the evidence for each claim. Name a generation (or omit it
+  for the open candidate), or use `--from`/`--to`, or `--symbol NAME` to analyze
+  a prospective edit. `--depth N` bounds the evidence hops (1–4, default 2),
+  `--limit N` the items, `--tests N` the associated tests. `--plan <plan-id>`
+  additionally reads the result against that plan's declared write scope and
+  lists the impacted files it never declared. Items are classed
+  `DIRECT_DEPENDENCY`, `CONTRACT_EXPOSURE`, `VERIFICATION_RELEVANCE` or
+  `CONTAINMENT_OWNERSHIP` and each carries its evidence chain; open questions
+  are listed separately as boundaries (`UNPROVEN_IDENTITY`,
+  `UNRESOLVED_REFERENCES`, `UNDETERMINED_PROPAGATION`, `DEPTH_LIMIT`,
+  `FANOUT_LIMIT`, `ENTITY_ABSENT`). A delta is analyzable only while it
+  describes the indexed generation. The command is read-only: it changes no
+  lifecycle state and grants no read or write authority.
+
 ## Engineering memory
 
 Memory belongs to a repository by default, so it is shared by linked worktrees.

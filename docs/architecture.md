@@ -451,6 +451,98 @@ lifecycle adds:
 - verifier independence, issued visibility and manifest accounting are
   unchanged. Semantic deltas are not issued to workers.
 
+## Semantic impact
+
+A delta says what changed. Impact analysis answers the next question — *what
+existing code or behavior could that plausibly affect, and what proves it?* —
+over the same Stage-1 ontology, with no second graph, no embeddings and no
+model. The invariant is that **no impact claim exists without a machine
+inspectable evidence path through already-observed facts**, and that anything
+the ontology cannot prove is represented rather than guessed.
+
+### Evidence model
+
+Every reported item carries an ordered chain of hops from a seed. A hop is one
+of three observed facts, and nothing else can create one:
+
+- a **resolved relation** (`CALLS`, `REFERENCES`, `IMPLEMENTS`, `IMPORTS`,
+  `DEPENDS_ON`) with the resolution rules that produced it. Unresolved
+  syntactic relations never form a hop;
+- **containment**, used only for the container of a declaration that was added
+  or removed, whose composition therefore changed;
+- a **Stage-1 test association**, carrying its `AssociationBasis` so a
+  container guess is never read as proven coverage.
+
+Items are typed by what the evidence shows:
+
+| Class | What it claims |
+| --- | --- |
+| `DIRECT_DEPENDENCY` | One resolved relation away from a changed entity. |
+| `CONTRACT_EXPOSURE` | Reached through a node the ontology proves re-exposes the change. |
+| `VERIFICATION_RELEVANCE` | A test associated with a changed or affected entity: a candidate check, not proven coverage. |
+| `CONTAINMENT_OWNERSHIP` | A container whose composition changed. |
+
+Uncertainty is deliberately *not* a class. It is a separate `boundaries` list,
+so an open question can never be mistaken for a claim: `UNPROVEN_IDENTITY`
+(a duplicate-ordinal seed, which is never traversed), `UNRESOLVED_REFERENCES`
+(unresolved relations elsewhere that merely *name* the symbol),
+`UNDETERMINED_PROPAGATION` (the node has dependents but propagation through it
+is unproven), `DEPTH_LIMIT`, `FANOUT_LIMIT` and `ENTITY_ABSENT`.
+
+### Seeds and change sensitivity
+
+Seeds come from a Stage-3 `SemanticDelta`, or from named entities analyzed as a
+prospective change. The delta's rule table is:
+
+- an **entity change** always seeds that entity. A `MODIFIED` entity whose only
+  changed field is `TEXT` is a *body* change; anything else (`SIGNATURE`,
+  `VISIBILITY`, `KEY`, `ADDED`, `REMOVED`) is a *contract* change;
+- a **removed** entity no longer exists in the analyzed generation, so the
+  delta's removed relations targeting it are its traversal evidence — the
+  dependents it used to have, reported with `removed: true` on the hop;
+- a **relation change explained by a changed endpoint** creates no extra seed:
+  seeding the caller of a deleted function would hide it inside the seed set
+  instead of reporting it as impact;
+- a relation change whose endpoints are both unchanged seeds its source, since
+  the ontology says a fact about that source changed and nothing else explains
+  it;
+- a seed whose identity is `DUPLICATE_ORDINAL` is recorded but never traversed.
+
+### Traversal and bounding
+
+Traversal is a deterministic breadth-first walk of *incoming* resolved
+relations, with a visited set (so cycles terminate and no entity is reported
+twice) and explicit bounds on depth, seeds, items, tests, fan-out and
+boundaries. Graph distance alone is never relevance. A hop past the first is
+taken only when the ontology proves the previous node re-exposes the change:
+
+- the node `IMPLEMENTS` the changed declaration; or
+- the seed change was a contract change **and** the node's own declared
+  visibility is provably exported.
+
+Everything else stops and records `UNDETERMINED_PROPAGATION`. Unknown
+visibility is never read as exported, so a body edit reaches its direct callers
+and no further, while a signature change can travel through an exported relay.
+Analysis is bound to one generation: a delta is analyzable only while the
+generation it describes is the one the graph tables materialize, and a stale
+request fails closed.
+
+### Planning and review integration
+
+`plan prepare` attaches a deliberately small `ImpactOutlook` for the primary
+entities it selected, read against the request's own scope, so a planner can
+see that a locally-correct edit has consequences elsewhere. It is advisory:
+it never widens read or write scope, it carries no source text, it adds no
+file to the request's provenance-bound support set, and it is the *first*
+record shed under the byte budget, so a packet with impact never displaces
+context a packet without it would have carried. Impact discovery is not
+authorization; out-of-envelope source still goes through the Stage-2 relay.
+
+`ontology impact --plan <id>` reads an observed delta against a plan's declared
+write scope, which answers what a reviewer should check because of what
+actually changed. It decides nothing, writes nothing, and leaves verifier
+independence untouched.
+
 ## Engineering memory
 
 Memory entries are immutable records with a trust class, kind, bounded content

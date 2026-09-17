@@ -20,9 +20,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
-/// Reused by the runtime to validate planner-approved context scope additions.
-pub(crate) use validation::safe_scope;
 use validation::*;
+/// Reused by the runtime to validate planner-approved context scope additions.
+pub(crate) use validation::{permits as covers, safe_scope};
 
 pub fn hash(value: &impl serde::Serialize) -> Result<String> {
     Ok(graph::content_hash(&serde_json::to_vec(value)?))

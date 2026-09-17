@@ -133,6 +133,13 @@ pub struct SourceExcerpt {
 #[serde(deny_unknown_fields)]
 pub struct PlanningContext {
     pub graph: graph::ContextPacket,
+    /// Bounded, evidence-backed consequences of editing the primary entities,
+    /// read against the request's own scope. Advisory only: it never widens
+    /// read or write authority, and it is the first thing shed under the byte
+    /// budget, so it can never displace context that existed without it.
+    /// Absent in packets prepared before impact analysis existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact: Option<graph::ImpactOutlook>,
     pub memory: MemoryContext,
     /// Frozen, validated policy input; not a competing mutable policy store.
     pub policy: ProjectConfig,
