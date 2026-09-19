@@ -1739,6 +1739,35 @@ fn full_diamond_runtime_captures_verifies_refreshes_and_completes() {
             .to_string()
             .contains("accepted fixture change")
     );
+    let footprint = &inputs[8].artifact["structural_footprint"];
+    assert_eq!(footprint["authority"], "ADVISORY_ONLY");
+    assert_eq!(
+        footprint["verification"]["plan_id"],
+        p.packet.plan_id.as_str()
+    );
+    assert!(
+        footprint["report"]["to"]["generation"]["sequence"]
+            .as_u64()
+            .unwrap()
+            > footprint["report"]["from"]["generation"]["sequence"]
+                .as_u64()
+                .unwrap()
+    );
+    assert!(
+        footprint["report"]["summary"]["production_files_touched"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        footprint["report"]["summary"]["production_entities_modified"], 0,
+        "comment-only edits must not manufacture structural entity changes"
+    );
+    assert_eq!(
+        footprint["verification"]["integration_verification"],
+        serde_json::Value::Null,
+        "the footprint is inspected before integration verification accepts it"
+    );
     assert_eq!(
         f.store()
             .execution_plan(&f.root, &p.packet.plan_id)
@@ -3113,6 +3142,77 @@ impl CheckLauncher for CrashCheck {
         assert_ne!(self.count, self.at, "controller loss at durable checkpoint");
         Checks { fail: false }.launch(spec)
     }
+}
+
+#[test]
+fn plan_footprint_refuses_to_relabel_a_foreign_candidate_after_runtime_work() {
+    use local::graph::{FootprintLimits, FootprintRequest, ReviewSignalKind};
+
+    let f = Fixture::new();
+    let p = f.plan();
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut store = f.store();
+        Runtime::new(
+            &mut store,
+            f.paths.clone(),
+            f.config.clone(),
+            BTreeMap::from([(
+                "test".into(),
+                Box::new(Fake {
+                    mode: Mode::Declare,
+                    seen: seen(),
+                }) as Box<dyn ProviderAdapter>,
+            )]),
+        )
+        .unwrap()
+        .with_check_launcher(Box::new(CrashCheck { count: 0, at: 2 }))
+        .run(&f.root, &p.packet.plan_id)
+        .unwrap();
+    }));
+    assert!(crash.is_err());
+    let runtime_candidate = f
+        .store()
+        .ontology_status(&f.root)
+        .unwrap()
+        .candidate
+        .unwrap();
+    assert_eq!(runtime_candidate.plan(), Some(&p.packet.plan_id));
+
+    fs::write(
+        f.root.join("src/foreign.rs"),
+        "pub struct ForeignObservation;\n",
+    )
+    .unwrap();
+    let mut store = f.store();
+    store.index_repository(&f.root).unwrap();
+    let candidate = store.ontology_status(&f.root).unwrap().candidate.unwrap();
+    assert_eq!(candidate.origin, local::graph::GenerationOrigin::External);
+    assert_ne!(candidate.generation, runtime_candidate.generation);
+    let error = store
+        .plan_footprint(
+            &f.root,
+            &p.packet.plan_id,
+            &FootprintRequest::Generation(candidate.generation_id.clone()),
+            FootprintLimits::default(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("plan-linked footprint requires the live candidate"),
+        "{error}"
+    );
+    let raw = store
+        .ontology_footprint(
+            &f.root,
+            &FootprintRequest::Generation(candidate.generation_id),
+            FootprintLimits::default(),
+        )
+        .unwrap();
+    assert!(raw.signals.iter().all(|signal| !matches!(
+        signal.kind,
+        ReviewSignalKind::UndeclaredStructuralGrowth
+            | ReviewSignalKind::VerificationEvidencePending
+    )));
 }
 
 #[test]
@@ -5123,9 +5223,19 @@ fn a_controller_crash_around_candidates_resumes_to_exactly_one_acceptance() {
             f.store().index_repository(&f.root).unwrap();
             assert_eq!(f.ontology().candidate.unwrap().ordinal, 6);
         }
+        let resumed_inputs = seen();
         assert_eq!(
-            f.run(&p, Mode::Declare, seen(), false).unwrap().state,
+            f.run(&p, Mode::Declare, resumed_inputs.clone(), false)
+                .unwrap()
+                .state,
             RunState::Complete
+        );
+        let resumed_inputs = resumed_inputs.lock().unwrap();
+        let footprint = &resumed_inputs.last().unwrap().artifact["structural_footprint"];
+        assert_eq!(
+            footprint["verification"]["plan_id"],
+            p.packet.plan_id.as_str(),
+            "at={at}, reindex={reindex}"
         );
         let accepted = f.ontology().accepted.unwrap();
         assert_eq!(accepted.ordinal, if reindex { 6 } else { 5 }, "at={at}");

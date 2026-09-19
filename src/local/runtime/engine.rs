@@ -2170,6 +2170,28 @@ impl<'a> Runtime<'a> {
             .flat_map(|t| t.invariants)
             .collect();
         let records = self.evidence_input(info, &evidence)?;
+        // Stage 5 is most useful at the acceptance boundary: give the
+        // independent integration verifier a small read-only projection of the
+        // exact accepted -> candidate ontology delta. No candidate means the
+        // plan introduced no newly indexed generation.
+        let structural_footprint = self
+            .store
+            .candidate_for_plan(&info.root, &run.plan_id)?
+            .map(|candidate| {
+                self.store.plan_footprint(
+                    &info.root,
+                    &run.plan_id,
+                    &graph::FootprintRequest::Generation(candidate.generation_id),
+                    graph::FootprintLimits {
+                        files: 8,
+                        entities: 16,
+                        relations: 16,
+                        signals: 5,
+                        evidence_per_signal: 3,
+                    },
+                )
+            })
+            .transpose()?;
         let keys: Vec<String> = invariants.keys().cloned().collect();
         let envelope: Vec<ScopePath> = plan
             .packet
@@ -2179,7 +2201,7 @@ impl<'a> Runtime<'a> {
             .collect();
         let (packet, contract) = (plan.packet.clone(), plan.metadata.integration.clone());
         let issued = evidence.clone();
-        let build = move |diff: Value, deltas: Value, relay: Value| json!({"plan":packet,"contract":contract,"invariants":invariants,"target":target,"evidence":issued,"evidence_records":records,"diff":diff,"deltas":deltas,"context_relay":relay,"verification_schema":schemars::schema_for!(VerificationPacket)});
+        let build = move |diff: Value, deltas: Value, relay: Value| json!({"plan":packet,"contract":contract,"invariants":invariants,"target":target,"evidence":issued,"evidence_records":records,"diff":diff,"structural_footprint":structural_footprint,"deltas":deltas,"context_relay":relay,"verification_schema":schemars::schema_for!(VerificationPacket)});
         let (_, proof) = self.verify(
             info,
             run,

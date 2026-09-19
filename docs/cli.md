@@ -110,6 +110,8 @@ agentctl ontology show <generation-id>          # one record: state, origin, pro
 agentctl ontology delta [<generation-id>]       # the recorded delta (default: the open candidate)
 agentctl ontology delta --from <id> --to <id>   # a delta between any two recorded generations
     [--change ADDED|REMOVED|MODIFIED] [--path PATH] [--limit N]   # filters (limit per section, default 200)
+agentctl ontology footprint [<generation-id>] [--plan <plan-id>] [--limit N]
+agentctl ontology footprint --from <id> --to <id> [--plan <plan-id>] [--limit N]
 agentctl ontology accept <generation-id> [--reason TEXT]
 agentctl ontology reject <generation-id> --reason TEXT
 ```
@@ -154,6 +156,25 @@ agentctl ontology reject <generation-id> --reason TEXT
   `FANOUT_LIMIT`, `ENTITY_ABSENT`). A delta is analyzable only while it
   describes the indexed generation. The command is read-only: it changes no
   lifecycle state and grants no read or write authority.
+
+- **Structural footprint** (`ontology footprint`) projects the exact semantic
+  delta into bounded production/test file, declaration, Rust public-surface,
+  and resolved-relation facts. A plain footprint may compare arbitrary recorded
+  generations when the `--to` generation is still indexed. A `--plan` footprint
+  is restricted to that plan's live runtime-owned candidate and its own
+  accepted-base delta, using the same provenance rule as runtime context and
+  promotion. Its closed review signals select observed public
+  or abstraction growth and multi-file production additions; `--plan` also
+  identifies growth outside declared write scope and links the plan-level
+  integration proof. Signals are prompts for review, never quality scores or
+  rejection rules. Test paths retain their convention-based classification,
+  duplicate identity remains unproven, and unsupported claims—configuration or
+  persistence machinery, semantic duplication, non-Rust export visibility,
+  unresolved imports, and per-entity test coverage—are explicitly not inferred.
+  Reports are derived, read-only, generation-bound, bounded, and grant no
+  authority. Integration verification receives the same compact advisory view
+  when a candidate exists; planning does not, because no implementation delta
+  exists yet.
 
 ## Engineering memory
 

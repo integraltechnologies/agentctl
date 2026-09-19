@@ -18,6 +18,7 @@ Usage:
   agentctl ontology <status|list> [--limit N] [--json]
   agentctl ontology show <generation-id> [--json]
   agentctl ontology delta [<generation-id> | --from <id> --to <id>] [--change ADDED|REMOVED|MODIFIED] [--path PATH] [--limit N] [--json]
+  agentctl ontology footprint [<generation-id> | --from <id> --to <id>] [--plan <plan-id>] [--limit N] [--json]
   agentctl ontology impact [<generation-id> | --from <id> --to <id> | --symbol NAME] [--plan <plan-id>] [--depth N] [--limit N] [--tests N] [--json]
   agentctl ontology accept <generation-id> [--reason TEXT] [--json]
   agentctl ontology reject <generation-id> --reason TEXT [--json]

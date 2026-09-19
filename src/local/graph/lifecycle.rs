@@ -589,7 +589,7 @@ pub(crate) fn close_for_plan(
 /// itself recorded that exact generation (sequence and fingerprint). Its own
 /// label may be external: a human re-observing the unchanged state does not
 /// change which facts it holds.
-fn plan_candidate(
+pub(crate) fn plan_candidate(
     c: &Connection,
     info: &RepositoryInfo,
     plan: &PlanId,
@@ -607,6 +607,24 @@ fn plan_candidate(
             live.fingerprint
         ])?;
     Ok(observed.then_some(open))
+}
+
+impl Store {
+    /// Returns the live open candidate only when this plan's runtime recorded
+    /// the exact generation. This is the same ownership rule used by context
+    /// issuance and final promotion, including identical external
+    /// re-observations after a crash.
+    pub(crate) fn candidate_for_plan(
+        &self,
+        start: &Path,
+        plan: &PlanId,
+    ) -> Result<Option<OntologyGeneration>> {
+        let info = checked_workspace(self, start)?;
+        let Some(live) = generation(&self.connection, &info)? else {
+            return Ok(None);
+        };
+        plan_candidate(&self.connection, &info, plan, &live)
+    }
 }
 
 /// Context may be issued only from accepted truth or from the plan's own

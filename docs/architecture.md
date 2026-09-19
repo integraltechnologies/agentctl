@@ -812,6 +812,38 @@ applies there. The snapshot also records a hash of the repository-local exclude
 rules (`info/exclude`, as Git resolves it), so changing them fails closed as
 `SOURCE_DRIFT`.
 
+## Structural economy
+
+`local::graph::footprint` is a pure, bounded projection of a `SemanticDelta`;
+the CLI can compare any two recorded generations when the second is still the
+indexed generation. Plan-linked and runtime footprints are narrower: they must
+be the live plan-owned candidate's own accepted-base delta. The projection adds
+no table, artifact, graph, score, or policy gate. File, entity, visibility,
+identity, and resolved-relation records are the machine-inspectable evidence.
+Production/test separation reuses the Stage-1
+test-kind and path conventions and exposes that basis. Public surface is only
+claimed where the extractor records visibility (currently Rust). Review signals
+form a closed set and embed the exact facts that triggered them.
+
+The report must name the exact two ontology generation points and the compared-
+to generation must still be the indexed generation. Stale data fails closed.
+Plan review adds declared write scope and plan-level verification references
+only after the Stage-3 runtime ownership rule attributes the exact candidate to
+that plan; neither changes the plan or proves that a particular entity was exercised. The
+integration verifier receives a compact report before the Stage-3 acceptance
+boundary. Planning receives none: before implementation there is no structural
+delta to report, and speculative structure would be weaker than the existing
+bounded context and impact view.
+
+The analyzer abstains from configuration/persistence classification, semantic
+duplication, unresolved import claims, non-Rust export claims, and per-entity
+test coverage. A later policy may interpret its signals; Stage 5 itself never
+accepts or rejects a generation and never grants context or filesystem access.
+Analysis currently materializes the complete recorded delta-derived fact and
+signal inputs before applying presentation limits. The 64 MiB `SemanticDelta`
+artifact ceiling remains the outer bound; Stage 5 does not add a separate
+streaming or analysis-budget mechanism.
+
 ## Routing and prompt compilation
 
 `runtime::routing` is a pure policy layer: it reads no repository, database, or

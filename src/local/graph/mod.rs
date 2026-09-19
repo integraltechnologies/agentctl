@@ -2,6 +2,7 @@
 pub(crate) mod cli;
 mod delta;
 pub mod files;
+mod footprint;
 mod impact;
 mod lifecycle;
 mod model;
@@ -12,6 +13,11 @@ mod wire;
 pub use delta::{
     Change, ContentChange, DeltaSummary, EntityChange, EntityFacts, EntityField, FactsRef,
     FileChange, GenerationPoint, IdentityBasis, RelationChange, SemanticDelta,
+};
+pub use footprint::{
+    FootprintLimits, FootprintOutlook, FootprintRequest, FootprintSummary, ReviewEvidence,
+    ReviewSignal, ReviewSignalKind, StructuralEntity, StructuralFile, StructuralFootprint,
+    StructuralRelation, StructuralRole, StructuralRoleBasis, Surface, VerificationLink,
 };
 pub(crate) use impact::proposed as proposed_impact;
 pub use impact::{

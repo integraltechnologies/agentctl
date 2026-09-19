@@ -247,6 +247,7 @@ fn ontology(
         "list" => &["limit"],
         "delta" => &["from", "to", "change", "path", "limit"],
         "impact" => &["from", "to", "symbol", "plan", "depth", "limit", "tests"],
+        "footprint" => &["from", "to", "plan", "limit"],
         "accept" | "reject" => &["reason"],
         _ => {
             return Err(Error::Invalid(
@@ -321,6 +322,7 @@ fn ontology(
             output(json, &selected, &delta_lines(&delta, &selected))
         }
         "impact" => impact(store, root, &positional, &flags, limit, json),
+        "footprint" => footprint(store, root, &positional, &flags, limit, json),
         "accept" => {
             let record = store.accept_generation(
                 root,
@@ -521,6 +523,177 @@ fn output(json: bool, value: &impl Serialize, human: &str) -> Result<()> {
         println!("{}", crate::local::terminal::human(human));
     }
     Ok(())
+}
+
+/// `agentctl ontology footprint` — bounded structural facts derived from a
+/// semantic delta. Like impact, it is read-only and advisory.
+fn footprint(
+    store: &mut Store,
+    root: &Path,
+    positional: &[&str],
+    flags: &BTreeMap<&str, &str>,
+    limit: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let request = match (flags.get("from"), flags.get("to"), positional) {
+        (Some(from), Some(to), []) => FootprintRequest::Diff {
+            from: (*from).into(),
+            to: (*to).into(),
+        },
+        (None, None, [id]) => FootprintRequest::Generation((*id).into()),
+        (None, None, []) => FootprintRequest::Generation(
+            store
+                .ontology_status(root)?
+                .candidate
+                .ok_or_else(|| {
+                    Error::Invalid("no open candidate; name a generation or use --from/--to".into())
+                })?
+                .generation_id,
+        ),
+        _ => {
+            return Err(Error::Invalid(
+                "ontology footprint takes one generation ID, or both --from and --to".into(),
+            ));
+        }
+    };
+    let mut limits = FootprintLimits::default();
+    if let Some(limit) = limit {
+        limits.files = limit.min(500);
+        limits.entities = limit.min(1000);
+        limits.relations = limit.min(1000);
+    }
+    match flags.get("plan") {
+        Some(plan) => {
+            let plan = crate::protocol::PlanId::new(*plan).map_err(Error::Invalid)?;
+            let outlook = store.plan_footprint(root, &plan, &request, limits)?;
+            let text = footprint_lines(&outlook.report, Some(&outlook));
+            output(json, &outlook, &text)
+        }
+        None => {
+            let report = store.ontology_footprint(root, &request, limits)?;
+            let text = footprint_lines(&report, None);
+            output(json, &report, &text)
+        }
+    }
+}
+
+fn footprint_lines(report: &StructuralFootprint, outlook: Option<&FootprintOutlook>) -> String {
+    let s = &report.summary;
+    let mut lines = vec![format!(
+        "{} (sequence {}) -> {} (sequence {})\nfiles +{} -{} ~{} (production +{} -{}, tests +{} -{}); production declarations +{} -{} ~{}; test declarations +{} -{} ~{}; public +{} -{} expanded {}; resolved relations +{} -{}",
+        report.from.generation_id,
+        report.from.generation.sequence,
+        report.to.generation_id,
+        report.to.generation.sequence,
+        s.files_added,
+        s.files_removed,
+        s.files_modified,
+        s.production_files_added,
+        s.production_files_removed,
+        s.test_files_added,
+        s.test_files_removed,
+        s.production_entities_added,
+        s.production_entities_removed,
+        s.production_entities_modified,
+        s.test_entities_added,
+        s.test_entities_removed,
+        s.test_entities_modified,
+        s.public_surface_added,
+        s.public_surface_removed,
+        s.public_surface_expanded,
+        s.relations_added,
+        s.relations_removed,
+    )];
+    for file in &report.files {
+        lines.push(format!(
+            "file {:?} {:?} {}  ({} entity, {} relation changes; {:?})",
+            file.change,
+            file.role,
+            file.path,
+            file.entity_changes,
+            file.relation_changes,
+            file.role_basis,
+        ));
+    }
+    for entity in report.entities.iter().filter(|e| {
+        e.kind != EntityKind::File
+            && !(e.kind == EntityKind::Module
+                && e.qualified_name
+                    == e.path
+                        .rsplit_once('.')
+                        .map_or(e.path.as_str(), |(stem, _)| stem)
+                        .replace('/', "::"))
+    }) {
+        lines.push(format!(
+            "entity {:?} {:?} {:?} {}  {}  surface {:?}->{:?}{}",
+            entity.change,
+            entity.role,
+            entity.kind,
+            entity.qualified_name,
+            entity.path,
+            entity.before_surface,
+            entity.after_surface,
+            if entity.identity == IdentityBasis::DuplicateOrdinal {
+                " [unproven identity]"
+            } else {
+                ""
+            }
+        ));
+    }
+    for relation in &report.relations {
+        lines.push(format!(
+            "relation {:?} {:?} {} -> {}  ({} -> {})",
+            relation.change,
+            relation.kind,
+            relation.source.as_str(),
+            relation.target.as_str(),
+            relation.source_path,
+            relation.target_path,
+        ));
+    }
+    for signal in &report.signals {
+        lines.push(format!(
+            "review {:?}: {} ({} evidence, {} omitted)",
+            signal.kind,
+            signal.meaning,
+            signal.evidence.len(),
+            signal.evidence_omitted,
+        ));
+    }
+    if let Some(outlook) = outlook {
+        lines.push(format!(
+            "plan {} {:?}: {}/{} tasks verified; integration proof {}; outside write scope: {} ({} omitted)\nAuthority: {:?}",
+            outlook.verification.plan_id.as_str(),
+            outlook.verification.state,
+            outlook.verification.verified_tasks,
+            outlook.verification.total_tasks,
+            outlook
+                .verification
+                .integration_verification
+                .as_ref()
+                .map_or("pending", |id| id.as_str()),
+            if outlook.outside_scope.is_empty() {
+                "none".into()
+            } else {
+                outlook.outside_scope.join(", ")
+            },
+            outlook.outside_scope_omitted,
+            outlook.authority,
+        ));
+    }
+    lines.push(format!(
+        "reported/omitted: files {}/{}, entities {}/{}, relations {}/{}, signals {}/{}\n{}",
+        s.files_reported,
+        s.files_omitted,
+        s.entities_reported,
+        s.entities_omitted,
+        s.relations_reported,
+        s.relations_omitted,
+        s.signals_reported,
+        s.signals_omitted,
+        report.meaning,
+    ));
+    lines.join("\n")
 }
 
 /// `agentctl ontology impact` — the evidence-backed consequences of an observed
