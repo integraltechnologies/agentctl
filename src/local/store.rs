@@ -466,13 +466,28 @@ impl Store {
             "UPDATE tasks SET state_json=?1 WHERE repo_id=?2 AND task_id=?3",
             params![serde_json::to_string(&next)?, repo.as_str(), id.as_str()],
         )?;
+        let plan_workspace = associated_workspace(
+            &tx,
+            "execution_plans",
+            "plan_id",
+            repo,
+            current.plan_id.as_str(),
+        )?;
+        let verifier_workspace = verification
+            .map(|v| associated_workspace(&tx, "jobs", "job_id", repo, v.verifier_job_id.as_str()))
+            .transpose()?
+            .flatten();
+        require(
+            plan_workspace.is_none()
+                || verifier_workspace.is_none()
+                || plan_workspace == verifier_workspace,
+            "task transition plan/verifier workspace mismatch",
+        )?;
         let links = Links {
-            workspace_id: verification
-                .map(|v| {
-                    associated_workspace(&tx, "jobs", "job_id", repo, v.verifier_job_id.as_str())
-                })
-                .transpose()?
-                .flatten(),
+            // Stage-4 tasks inherit their canonical workspace from the
+            // execution plan on every transition. A verifier job is an
+            // additional equality check, not the sole source of identity.
+            workspace_id: plan_workspace.or(verifier_workspace),
             plan_id: Some(current.plan_id),
             task_id: Some(id.clone()),
             job_id: verification.map(|v| v.verifier_job_id.clone()),

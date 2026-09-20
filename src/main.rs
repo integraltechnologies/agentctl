@@ -41,7 +41,7 @@ Usage:
   agentctl run <planner|plan|resume> <id> [--override role:provider[:model]] [--json]
   agentctl run planner <request-id> [--json]
   agentctl run plan <plan-id> [--dry-run] [--json]
-  agentctl run <resume|status|cancel> <plan-id> [--json]
+  agentctl run <resume|status|cancel|capabilities> <plan-id> [--json]
   agentctl run replace <old-plan-id> <validated-replacement-id>
   agentctl run packet-hashes < plan-packet.json
   agentctl experiment run --program PATH [--arg V]... [--cwd PATH] [--network] [--env NAME]... [--timeout-ms N]

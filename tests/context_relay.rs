@@ -1112,6 +1112,22 @@ fn an_out_of_envelope_request_escalates_and_a_denial_keeps_the_task_blocked() {
         "{:?}",
         journal_phases(&f)
     );
+    let artifacts = Artifacts::new(&f.paths.data_root.join("runtime/blobs")).unwrap();
+    let report = f
+        .store()
+        .control_plane_capabilities(&artifacts, &f.root, &plan.packet.plan_id)
+        .unwrap();
+    assert_eq!(
+        report
+            .capabilities
+            .iter()
+            .find(|finding| {
+                finding.capability == ControlPlaneCapability::MediateContextEscalation
+            })
+            .unwrap()
+            .status,
+        CapabilityStatus::Supported
+    );
 }
 
 /// Part E/F: an approval is validated and re-resolved under the wider
@@ -1182,6 +1198,68 @@ fn a_planner_approval_widens_the_envelope_and_re_issues_a_fresh_job() {
         .unwrap();
     assert!(manifest.context_deltas[0].planner_approved);
     assert!(journal_phases(&f).contains(&"CONTEXT_ESCALATION_APPROVED".to_string()));
+    let artifacts = Artifacts::new(&f.paths.data_root.join("runtime/blobs")).unwrap();
+    let report = f
+        .store()
+        .control_plane_capabilities(&artifacts, &f.root, &plan.packet.plan_id)
+        .unwrap();
+    assert_eq!(
+        report
+            .capabilities
+            .iter()
+            .find(|finding| {
+                finding.capability == ControlPlaneCapability::MediateContextEscalation
+            })
+            .unwrap()
+            .status,
+        CapabilityStatus::Supported
+    );
+
+    // An otherwise valid decision from another request/round cannot be
+    // borrowed by this round in the derived evidence join.
+    let mut borrowed = approval.clone();
+    borrowed.request_hash = "blake3:another-request".into();
+    let borrowed_ref = artifacts.json(&borrowed).unwrap();
+    let mut run = f
+        .store()
+        .runtime_status(&f.root, &plan.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    run.context.get_mut("executor:task:cache").unwrap().rounds[0].decision = Some(borrowed_ref);
+    let db = common::sql(&f.paths.database);
+    let runtime_runs_update: String = db
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='runtime_runs_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute_batch("DROP TRIGGER runtime_runs_update;")
+        .unwrap();
+    db.execute(
+        "UPDATE runtime_runs SET record_json=?1 WHERE plan_id=?2",
+        rusqlite::params![
+            serde_json::to_string(&run).unwrap(),
+            plan.packet.plan_id.as_str()
+        ],
+    )
+    .unwrap();
+    db.execute_batch(&runtime_runs_update).unwrap();
+    let attacked = f
+        .store()
+        .control_plane_capabilities(&artifacts, &f.root, &plan.packet.plan_id)
+        .unwrap();
+    assert_eq!(
+        attacked
+            .capabilities
+            .iter()
+            .find(|finding| {
+                finding.capability == ControlPlaneCapability::MediateContextEscalation
+            })
+            .unwrap()
+            .status,
+        CapabilityStatus::NotDemonstrated
+    );
 }
 
 /// Part 7/L5: machine-owned round budgets end the loop, whatever the worker asks.

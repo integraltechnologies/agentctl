@@ -160,6 +160,13 @@ pub(crate) fn run(
             let value=json!({"run":store.runtime_status(&root,&id)?,"jobs":store.runtime_jobs(&root,Some(&id))?});
             super::super::cli::output(json_mode,&value,&serde_json::to_string_pretty(&value)?)
         }
+        ["run","capabilities",id] => {
+            let store=Store::read_only(&paths.database,machine.busy_timeout_ms)?;
+            let id=PlanId::new(*id).map_err(Error::Invalid)?;
+            let artifacts=Artifacts::new(&paths.data_root.join("runtime/blobs"))?;
+            let value=store.control_plane_capabilities(&artifacts,&root,&id)?;
+            super::super::cli::output(json_mode,&value,&serde_json::to_string_pretty(&value)?)
+        }
         ["run","plan",id,"--dry-run"] => {
             let store=Store::read_only(&paths.database,machine.busy_timeout_ms)?;
             let id=PlanId::new(*id).map_err(Error::Invalid)?;
@@ -195,7 +202,7 @@ pub(crate) fn run(
             let value=if *command=="planner" {serde_json::to_value(runtime.plan(&root,&planning::PlanningRequestId::new(*id).map_err(Error::Invalid)?)?)?}else{serde_json::to_value(runtime.run(&root,&PlanId::new(*id).map_err(Error::Invalid)?)?)?};
             super::super::cli::output(json_mode,&value,&serde_json::to_string_pretty(&value)?)
         }
-        _=>Err(Error::Invalid("expected run planner <request-id>, run plan <plan-id> [--dry-run], run resume/status/cancel/context <plan-id>, run context decide <plan-id> <decision.json>, or provider list/doctor".into())),
+        _=>Err(Error::Invalid("expected run planner <request-id>, run plan <plan-id> [--dry-run], run resume/status/cancel/context/capabilities <plan-id>, run context decide <plan-id> <decision.json>, or provider list/doctor".into())),
     }
 }
 fn version(executable: &Path) -> Result<String> {

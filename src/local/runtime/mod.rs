@@ -17,6 +17,11 @@ pub use session::{AgentLifetime, AgentOwnership, EngineeringSession};
 mod state;
 use state::*;
 pub use state::{RunRecord, RunState, RuntimeJob, RuntimeJobState};
+mod capability;
+pub use capability::{
+    CapabilityEvidence, CapabilityEvidenceKind, CapabilityFinding, CapabilityStatus,
+    ControlPlaneCapability, ControlPlaneCapabilityReport,
+};
 mod engine;
 mod experiment;
 pub(crate) mod experiment_cli;

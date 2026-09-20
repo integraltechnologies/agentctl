@@ -1435,12 +1435,17 @@ enum Mode {
     DeclareThenIntegrationDrift,
     /// `Declare`, but the packet verifier rejects the named task.
     DeclareRejecting(&'static str),
+    /// `Declare`, but only the final integration verifier rejects.
+    DeclareThenIntegrationReject,
 }
 impl Mode {
     fn declares(&self) -> bool {
         matches!(
             self,
-            Mode::Declare | Mode::DeclareThenIntegrationDrift | Mode::DeclareRejecting(_)
+            Mode::Declare
+                | Mode::DeclareThenIntegrationDrift
+                | Mode::DeclareRejecting(_)
+                | Mode::DeclareThenIntegrationReject
         )
     }
 }
@@ -1556,7 +1561,9 @@ impl ProviderAdapter for Fake {
                 }
                 let reject = matches!(self.mode, Mode::Reject)
                     || matches!(self.mode, Mode::DeclareRejecting(t)
-                        if input.task_id.as_ref().map(TaskId::as_str) == Some(t));
+                        if input.task_id.as_ref().map(TaskId::as_str) == Some(t))
+                    || matches!(self.mode, Mode::DeclareThenIntegrationReject)
+                        && input.task_id.is_none();
                 let target: VerificationTarget =
                     serde_json::from_value(input.artifact["target"].clone()).unwrap();
                 let requirements = if input.task_id.is_some() {
@@ -1799,6 +1806,14 @@ fn verifier_rejection_stops_a_b_c_d_cascade() {
         .unwrap();
     assert_eq!(tasks[0].state, TaskState::Rejected);
     assert!(tasks[1..].iter().all(|t| t.state == TaskState::Planned));
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::RejectFailureWithoutAdvancingAcceptedTruth
+        ),
+        CapabilityStatus::Supported
+    );
 }
 #[test]
 fn executor_failures_and_spoofing_never_launch_dependents() {
@@ -1815,6 +1830,14 @@ fn executor_failures_and_spoofing_never_launch_dependents() {
                 .unwrap()
                 .state,
             RunState::Blocked
+        );
+        assert_eq!(
+            capability_status(
+                &f,
+                &p,
+                ControlPlaneCapability::RejectFailureWithoutAdvancingAcceptedTruth
+            ),
+            CapabilityStatus::Supported
         );
     }
 }
@@ -1852,6 +1875,27 @@ fn source_changes_after_activation_block_before_launch() {
         .unwrap();
     assert_eq!(run.state, RunState::Blocked);
     assert!(run.reason.unwrap().contains("SOURCE_DRIFT"));
+    assert_eq!(
+        capability_status(&f, &p, ControlPlaneCapability::RefuseStaleSource),
+        CapabilityStatus::Supported
+    );
+    // Historical containment is plan-specific: later, unrelated accepted truth
+    // neither proves nor disproves the stale attempt's refusal.
+    git(&f.root, &["stash", "--quiet"]);
+    fs::write(f.root.join("src/external.rs"), "pub struct External;\n").unwrap();
+    f.store().index_repository(&f.root).unwrap();
+    let external = f.ontology().candidate.unwrap();
+    f.store()
+        .accept_generation(
+            &f.root,
+            &external.generation_id,
+            Some("unrelated external work"),
+        )
+        .unwrap();
+    assert_eq!(
+        capability_status(&f, &p, ControlPlaneCapability::RefuseStaleSource),
+        CapabilityStatus::Supported
+    );
 }
 #[test]
 fn deterministic_check_failure_cannot_be_overridden_by_model() {
@@ -3265,7 +3309,153 @@ fn reopen_resumes_pending_verification_and_integration_without_reexecuting_verif
                 1
             );
         }
+        assert_eq!(
+            capability_status(
+                &f,
+                &p,
+                ControlPlaneCapability::ResumeDurableWorkToCompletion
+            ),
+            CapabilityStatus::Supported
+        );
     }
+}
+
+#[test]
+fn a_resume_marker_without_post_resume_completion_does_not_prove_recovery() {
+    let f = Fixture::new();
+    let p = f.plan();
+    assert_eq!(
+        f.run(&p, Mode::Pass, seen(), false).unwrap().state,
+        RunState::Complete
+    );
+    let info = RepositoryInfo::discover(&f.root).unwrap();
+    common::sql(&f.paths.database)
+        .execute(
+            "INSERT INTO events(repo_id,timestamp_ms,plan_id,entry_json,workspace_id) VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![
+                info.repository_id.as_str(),
+                1_u64,
+                p.packet.plan_id.as_str(),
+                r#"{"kind":"RUNTIME","job_id":null,"phase":"PLAN_RUNTIME_RESUMED","detail":"forged marker"}"#,
+                info.workspace_id.as_str()
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::ResumeDurableWorkToCompletion
+        ),
+        CapabilityStatus::NotDemonstrated
+    );
+}
+fn completed_resumed_plan() -> (Fixture, ExecutionPlan) {
+    let f = Fixture::new();
+    let p = f.plan();
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut store = f.store();
+        Runtime::new(
+            &mut store,
+            f.paths.clone(),
+            f.config.clone(),
+            BTreeMap::from([(
+                "test".into(),
+                Box::new(Fake {
+                    mode: Mode::Pass,
+                    seen: seen(),
+                }) as Box<dyn ProviderAdapter>,
+            )]),
+        )
+        .unwrap()
+        .with_check_launcher(Box::new(CrashCheck { count: 0, at: 2 }))
+        .run(&f.root, &p.packet.plan_id)
+        .unwrap();
+    }));
+    assert!(crash.is_err());
+    assert_eq!(
+        f.run(&p, Mode::Pass, seen(), false).unwrap().state,
+        RunState::Complete
+    );
+    (f, p)
+}
+
+#[test]
+fn recovery_requires_pre_resume_work_bound_to_the_finally_accepted_task() {
+    let (f, p) = completed_resumed_plan();
+    let artifacts = Artifacts::new(&f.paths.data_root.join("runtime/blobs")).unwrap();
+    let run = f
+        .store()
+        .runtime_status(&f.root, &p.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    let jobs = f
+        .store()
+        .runtime_jobs(&f.root, Some(&p.packet.plan_id))
+        .unwrap();
+    for accepted in run.accepted.values() {
+        let mut executor = jobs
+            .iter()
+            .find(|job| job.job_id == accepted.executor)
+            .unwrap()
+            .clone();
+        let mut input: JobInput = artifacts.decode(&executor.input).unwrap();
+        input.task_id = Some(TaskId::new("task:foreign").unwrap());
+        executor.input = artifacts.json(&input).unwrap();
+        overwrite_runtime_job(&f, &executor);
+    }
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::ResumeDurableWorkToCompletion
+        ),
+        CapabilityStatus::NotDemonstrated
+    );
+}
+
+#[test]
+fn extra_failed_interrupted_and_duplicate_attempts_do_not_expand_the_narrowed_recovery_claim() {
+    let (f, p) = completed_resumed_plan();
+    let artifacts = Artifacts::new(&f.paths.data_root.join("runtime/blobs")).unwrap();
+    let template = f
+        .store()
+        .runtime_jobs(&f.root, Some(&p.packet.plan_id))
+        .unwrap()
+        .into_iter()
+        .find(|job| job.role == AgentRole::Executor)
+        .unwrap();
+    for (suffix, state) in [
+        ("failed", RuntimeJobState::Failed),
+        ("interrupted", RuntimeJobState::Interrupted),
+        ("duplicate", RuntimeJobState::Succeeded),
+    ] {
+        let mut attempt = template.clone();
+        attempt.job_id = JobId::new(format!("job:adversarial-{suffix}")).unwrap();
+        attempt.state = state.clone();
+        let mut input: JobInput = artifacts.decode(&attempt.input).unwrap();
+        input.job_id = attempt.job_id.clone();
+        attempt.input = artifacts.json(&input).unwrap();
+        if state == RuntimeJobState::Succeeded {
+            let mut output: ResultPacket =
+                artifacts.decode(attempt.output.as_ref().unwrap()).unwrap();
+            output.executor_job_id = attempt.job_id.clone();
+            attempt.output = Some(artifacts.json(&output).unwrap());
+            attempt.failure = None;
+        } else {
+            attempt.output = None;
+            attempt.failure = Some(format!("adversarial {suffix} attempt"));
+        }
+        insert_runtime_job(&f, &attempt);
+    }
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::ResumeDurableWorkToCompletion
+        ),
+        CapabilityStatus::Supported
+    );
 }
 
 #[test]
@@ -4928,6 +5118,67 @@ fn added_functions(delta: &local::graph::SemanticDelta) -> std::collections::BTr
         .collect()
 }
 
+fn capability_status(
+    f: &Fixture,
+    plan: &ExecutionPlan,
+    capability: ControlPlaneCapability,
+) -> CapabilityStatus {
+    let artifacts = Artifacts::new(&f.paths.data_root.join("runtime/blobs")).unwrap();
+    f.store()
+        .control_plane_capabilities(&artifacts, &f.root, &plan.packet.plan_id)
+        .unwrap()
+        .capabilities
+        .into_iter()
+        .find(|finding| finding.capability == capability)
+        .unwrap()
+        .status
+}
+
+fn overwrite_runtime_job(f: &Fixture, job: &RuntimeJob) {
+    let db = common::sql(&f.paths.database);
+    let trigger: String = db
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='runtime_jobs_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute_batch("DROP TRIGGER runtime_jobs_update;")
+        .unwrap();
+    db.execute(
+        "UPDATE runtime_jobs SET record_json=?1 WHERE job_id=?2",
+        rusqlite::params![serde_json::to_string(job).unwrap(), job.job_id.as_str()],
+    )
+    .unwrap();
+    db.execute_batch(&trigger).unwrap();
+}
+
+fn insert_runtime_job(f: &Fixture, job: &RuntimeJob) {
+    let info = RepositoryInfo::discover(&f.root).unwrap();
+    let db = common::sql(&f.paths.database);
+    let trigger: String = db
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='runtime_jobs_insert'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute_batch("DROP TRIGGER runtime_jobs_insert;")
+        .unwrap();
+    db.execute(
+        "INSERT INTO runtime_jobs(job_id,repo_id,workspace_id,plan_id,request_id,record_json) VALUES (?1,?2,?3,?4,NULL,?5)",
+        rusqlite::params![
+            job.job_id.as_str(),
+            info.repository_id.as_str(),
+            info.workspace_id.as_str(),
+            job.plan_id.as_ref().unwrap().as_str(),
+            serde_json::to_string(job).unwrap()
+        ],
+    )
+    .unwrap();
+    db.execute_batch(&trigger).unwrap();
+}
+
 #[test]
 fn a_verified_plan_advances_accepted_ontology_exactly_once_at_integration() {
     use local::graph::{Change, DecisionReason, GenerationOrigin, GenerationState as G};
@@ -5032,6 +5283,238 @@ fn a_verified_plan_advances_accepted_ontology_exactly_once_at_integration() {
     assert_eq!(
         f.prepare().request.source.graph_generation.as_ref(),
         Some(&accepted.generation)
+    );
+    for capability in [
+        ControlPlaneCapability::ExecuteAndIndependentlyVerifyBoundedTask,
+        ControlPlaneCapability::PreserveDependencyLockUntilVerification,
+        ControlPlaneCapability::KeepCandidateSeparateFromAcceptedTruth,
+        ControlPlaneCapability::ExposeStructuralEvidenceToIntegration,
+        ControlPlaneCapability::AtomicallyIntegrateAndAcceptFinalTruth,
+    ] {
+        assert_eq!(
+            capability_status(&f, &p, capability),
+            CapabilityStatus::Supported,
+            "{capability:?}"
+        );
+    }
+    fs::write(f.root.join("src/external.rs"), "pub struct External;\n").unwrap();
+    f.store().index_repository(&f.root).unwrap();
+    let external = f.ontology().candidate.unwrap();
+    f.store()
+        .accept_generation(
+            &f.root,
+            &external.generation_id,
+            Some("later external work"),
+        )
+        .unwrap();
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::AtomicallyIntegrateAndAcceptFinalTruth
+        ),
+        CapabilityStatus::Supported,
+        "later accepted truth cannot erase the plan's historical atomic outcome"
+    );
+}
+
+#[test]
+fn structural_evidence_for_another_plan_candidate_cannot_prove_the_final_candidate() {
+    let f = Fixture::new();
+    let p = f.plan();
+    assert_eq!(
+        f.run(&p, Mode::Declare, seen(), false).unwrap().state,
+        RunState::Complete
+    );
+    let artifacts = Artifacts::new(&f.paths.data_root.join("runtime/blobs")).unwrap();
+    let mut job = f
+        .store()
+        .runtime_jobs(&f.root, Some(&p.packet.plan_id))
+        .unwrap()
+        .into_iter()
+        .find(|job| job.role == AgentRole::Verifier && job.task_id.is_none())
+        .unwrap();
+    let mut input: JobInput = artifacts.decode(&job.input).unwrap();
+    let accepted_id = f.ontology().accepted.unwrap().generation_id;
+    let other = f
+        .store()
+        .ontology_generations(&f.root, 100)
+        .unwrap()
+        .into_iter()
+        .find(|generation| {
+            generation.plan() == Some(&p.packet.plan_id) && generation.generation_id != accepted_id
+        })
+        .unwrap();
+    input.artifact["structural_footprint"]["report"]["to"] = json!({
+        "generation_id": other.generation_id,
+        "generation": other.generation,
+        "snapshot": other.snapshot,
+    });
+    job.input = artifacts.json(&input).unwrap();
+    let db = common::sql(&f.paths.database);
+    let runtime_jobs_update: String = db
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='runtime_jobs_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute_batch("DROP TRIGGER runtime_jobs_update;")
+        .unwrap();
+    db.execute(
+        "UPDATE runtime_jobs SET record_json=?1 WHERE job_id=?2",
+        rusqlite::params![serde_json::to_string(&job).unwrap(), job.job_id.as_str()],
+    )
+    .unwrap();
+    db.execute_batch(&runtime_jobs_update).unwrap();
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::ExposeStructuralEvidenceToIntegration
+        ),
+        CapabilityStatus::NotDemonstrated
+    );
+}
+
+#[test]
+fn atomic_acceptance_requires_the_integration_job_exact_final_source() {
+    let f = Fixture::new();
+    let p = f.plan();
+    assert_eq!(
+        f.run(&p, Mode::Declare, seen(), false).unwrap().state,
+        RunState::Complete
+    );
+    let artifacts = Artifacts::new(&f.paths.data_root.join("runtime/blobs")).unwrap();
+    let mut job = f
+        .store()
+        .runtime_jobs(&f.root, Some(&p.packet.plan_id))
+        .unwrap()
+        .into_iter()
+        .find(|job| job.role == AgentRole::Verifier && job.task_id.is_none())
+        .unwrap();
+    let mut input: JobInput = artifacts.decode(&job.input).unwrap();
+    input.source.revision = "git:foreign".into();
+    job.input = artifacts.json(&input).unwrap();
+    let db = common::sql(&f.paths.database);
+    let runtime_jobs_update: String = db
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='runtime_jobs_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute_batch("DROP TRIGGER runtime_jobs_update;")
+        .unwrap();
+    db.execute(
+        "UPDATE runtime_jobs SET record_json=?1 WHERE job_id=?2",
+        rusqlite::params![serde_json::to_string(&job).unwrap(), job.job_id.as_str()],
+    )
+    .unwrap();
+    db.execute_batch(&runtime_jobs_update).unwrap();
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::AtomicallyIntegrateAndAcceptFinalTruth
+        ),
+        CapabilityStatus::NotDemonstrated
+    );
+}
+#[test]
+fn atomic_acceptance_requires_the_exact_issued_integration_target() {
+    let f = Fixture::new();
+    let p = f.plan();
+    assert_eq!(
+        f.run(&p, Mode::Declare, seen(), false).unwrap().state,
+        RunState::Complete
+    );
+    let artifacts = Artifacts::new(&f.paths.data_root.join("runtime/blobs")).unwrap();
+    let mut job = f
+        .store()
+        .runtime_jobs(&f.root, Some(&p.packet.plan_id))
+        .unwrap()
+        .into_iter()
+        .find(|job| job.role == AgentRole::Verifier && job.task_id.is_none())
+        .unwrap();
+    let mut input: JobInput = artifacts.decode(&job.input).unwrap();
+    let mut forged = input.artifact["target"]["executor_job_ids"]
+        .as_array()
+        .unwrap()
+        .clone();
+    forged.reverse();
+    input.artifact["target"]["executor_job_ids"] = json!(forged);
+    job.input = artifacts.json(&input).unwrap();
+    overwrite_runtime_job(&f, &job);
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::AtomicallyIntegrateAndAcceptFinalTruth
+        ),
+        CapabilityStatus::NotDemonstrated
+    );
+}
+
+#[test]
+fn task_support_requires_the_exact_issued_verifier_target() {
+    let f = Fixture::new();
+    let p = f.plan();
+    assert_eq!(
+        f.run(&p, Mode::Pass, seen(), false).unwrap().state,
+        RunState::Complete
+    );
+    let artifacts = Artifacts::new(&f.paths.data_root.join("runtime/blobs")).unwrap();
+    let verifiers: Vec<_> = f
+        .store()
+        .runtime_jobs(&f.root, Some(&p.packet.plan_id))
+        .unwrap()
+        .into_iter()
+        .filter(|job| job.role == AgentRole::Verifier && job.task_id.is_some())
+        .collect();
+    for mut verifier in verifiers {
+        let mut input: JobInput = artifacts.decode(&verifier.input).unwrap();
+        input.artifact["target"]["executor_job_id"] = json!("job:forged-executor");
+        verifier.input = artifacts.json(&input).unwrap();
+        overwrite_runtime_job(&f, &verifier);
+    }
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::ExecuteAndIndependentlyVerifyBoundedTask
+        ),
+        CapabilityStatus::NotDemonstrated
+    );
+}
+
+#[test]
+fn task_rejection_requires_the_exact_issued_verifier_target() {
+    let f = Fixture::new();
+    let p = f.plan();
+    assert!(
+        f.run(&p, Mode::DeclareRejecting("task:0"), seen(), false)
+            .is_err()
+    );
+    let artifacts = Artifacts::new(&f.paths.data_root.join("runtime/blobs")).unwrap();
+    let mut verifier = f
+        .store()
+        .runtime_jobs(&f.root, Some(&p.packet.plan_id))
+        .unwrap()
+        .into_iter()
+        .find(|job| job.role == AgentRole::Verifier)
+        .unwrap();
+    let mut input: JobInput = artifacts.decode(&verifier.input).unwrap();
+    input.artifact["target"]["executor_job_id"] = json!("job:forged-executor");
+    verifier.input = artifacts.json(&input).unwrap();
+    overwrite_runtime_job(&f, &verifier);
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::RejectFailureWithoutAdvancingAcceptedTruth
+        ),
+        CapabilityStatus::NotDemonstrated
     );
 }
 
@@ -5179,6 +5662,79 @@ fn a_rejected_task_never_advances_accepted_ontology() {
     assert_eq!(
         f.generation_states(),
         vec![(1, G::Accepted), (2, G::Rejected)]
+    );
+}
+
+#[test]
+fn an_integration_rejection_keeps_verified_tasks_out_of_accepted_truth() {
+    use local::graph::{DecisionReason, GenerationState as G};
+    let f = Fixture::new();
+    let base = f.ontology().accepted.unwrap();
+    let p = f.plan();
+    assert!(
+        f.run(&p, Mode::DeclareThenIntegrationReject, seen(), false)
+            .is_err()
+    );
+    assert!(
+        f.store()
+            .execution_tasks(&f.root, &p.packet.plan_id)
+            .unwrap()
+            .iter()
+            .all(|task| task.state == TaskState::Verified)
+    );
+    assert_eq!(
+        f.store()
+            .execution_plan(&f.root, &p.packet.plan_id)
+            .unwrap()
+            .state,
+        PlanState::Active
+    );
+    let status = f.ontology();
+    assert_eq!(status.accepted.as_ref(), Some(&base));
+    assert!(status.candidate.is_none());
+    let rejected = status.observed.unwrap();
+    assert_eq!(rejected.state, G::Rejected);
+    assert_eq!(
+        rejected.closure.unwrap().reason,
+        DecisionReason::IntegrationRejected
+    );
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::RejectFailureWithoutAdvancingAcceptedTruth
+        ),
+        CapabilityStatus::Supported
+    );
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::AtomicallyIntegrateAndAcceptFinalTruth
+        ),
+        CapabilityStatus::NotDemonstrated
+    );
+
+    // A later external acceptance changes current truth, but not the historical
+    // fact that this plan's rejected candidate was never promoted.
+    git(&f.root, &["stash", "--quiet"]);
+    fs::write(f.root.join("src/external.rs"), "pub struct External;\n").unwrap();
+    f.store().index_repository(&f.root).unwrap();
+    let external = f.ontology().candidate.unwrap();
+    f.store()
+        .accept_generation(
+            &f.root,
+            &external.generation_id,
+            Some("unrelated external work"),
+        )
+        .unwrap();
+    assert_eq!(
+        capability_status(
+            &f,
+            &p,
+            ControlPlaneCapability::RejectFailureWithoutAdvancingAcceptedTruth
+        ),
+        CapabilityStatus::Supported
     );
 }
 

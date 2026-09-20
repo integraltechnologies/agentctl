@@ -280,6 +280,7 @@ agentctl run planner <request-id>         # planner provider produces a plan; im
 agentctl run plan <plan-id> --dry-run     # workspace, strategy, configured roles, ready tasks
 agentctl run plan <plan-id> [--override role:provider[:model]]
 agentctl run status <plan-id>
+agentctl run capabilities <plan-id> --json
 agentctl run resume <plan-id>
 agentctl run cancel <plan-id>             # request cancellation from another terminal
 agentctl run replace <old-plan-id> <validated-replacement-id>
@@ -287,6 +288,12 @@ agentctl run replace <old-plan-id> <validated-replacement-id>
 agentctl run context <plan-id>                          # context relay: budgets, rounds, pending decision
 agentctl run context decide <plan-id> <decision.json>   # approve or deny an escalated request
 ```
+
+`run capabilities` is a read-only, derived report. It does not score a plan or
+persist a second lifecycle: each `SUPPORTED`, `NOT_DEMONSTRATED`, or
+`UNAVAILABLE` result names the canonical task/job/generation/artifact evidence
+that establishes it for this particular plan. A successful historical plan is
+evidence about that run, not a claim that every future provider run will work.
 
 `run plan` is a foreground controller. For an **ACTIVE** plan, it does the
 following:

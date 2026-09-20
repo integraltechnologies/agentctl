@@ -415,6 +415,9 @@ default, and trust boundary.
 - `agentctl observe snapshot|sessions|agents|tasks|events|experiments|usage` returns
   the same data, as JSON with `--json`.
 - `agentctl run status <plan-id>` shows run and job state for one plan.
+- `agentctl run capabilities <plan-id> --json` derives demonstrated end-to-end
+  control-plane behaviors from canonical plan, task, job, artifact, journal, and
+  ontology evidence; it stores no separate capability score or ledger.
 - `agentctl analytics summary|usage|roles|routes|corrections` produces historical,
   descriptive metrics. Token provenance (`EXACT`/`ESTIMATED`/`UNKNOWN`) is kept, and
   missing data is never counted as zero.

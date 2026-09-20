@@ -2,6 +2,7 @@
 mod common;
 use agentctl::{
     local::{
+        self,
         config::{Declaration, ProjectConfig, VerificationDefinition},
         graph::SearchMode,
         memory::{MemoryDraft, MemoryKind, MemoryLink},
@@ -776,6 +777,26 @@ fn activation_and_verified_only_dag_readiness_localize_work() {
     verify(&f, &p, 1, true);
     assert!(f.tasks(&p)[2].structurally_ready);
     assert!(f.tasks(&p)[3].structurally_ready);
+    let transitions: Vec<_> = f
+        .store()
+        .events(Some(&f.info.repository_id), None, None, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event.plan_id.as_ref() == Some(&p.packet.plan_id)
+                && matches!(
+                    event.entry,
+                    local::store::JournalEntry::TaskStateChanged { .. }
+                )
+        })
+        .collect();
+    assert!(!transitions.is_empty());
+    assert!(
+        transitions
+            .iter()
+            .all(|event| event.workspace_id.as_ref() == Some(&f.info.workspace_id)),
+        "every task transition must preserve the execution plan's workspace identity"
+    );
 }
 #[test]
 fn independent_tasks_are_simultaneously_structurally_ready() {

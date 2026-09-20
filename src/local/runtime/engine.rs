@@ -968,7 +968,9 @@ impl<'a> Runtime<'a> {
             &session::for_plan(self.store, &info, id)?.id,
         )?;
         let view = self.store.execution_plan(root, id)?;
-        let mut run = if let Some(run) = load_run(self.store, &info, id)? {
+        let existing = load_run(self.store, &info, id)?;
+        let resumed = existing.is_some();
+        let mut run = if let Some(run) = existing {
             run
         } else {
             require(
@@ -1066,6 +1068,12 @@ impl<'a> Runtime<'a> {
             run.state == RunState::Running,
             "runtime is blocked/cancelled; explicit planner decision and replacement plan required",
         )?;
+        if resumed {
+            // A durable marker distinguishes a controller/process recovery from
+            // an uninterrupted invocation. It carries no competing state: the
+            // existing RunRecord remains the sole resumable checkpoint.
+            save_run(self.store, &info, &run, "PLAN_RUNTIME_RESUMED")?;
+        }
         let outcome = self.drive(&info, &view.plan, &mut run, &lease);
         if let Err(error) = outcome {
             run.reason = Some(error.to_string().chars().take(1024).collect());
