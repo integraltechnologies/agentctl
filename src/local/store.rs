@@ -876,6 +876,14 @@ impl Links {
             ..Self::default()
         }
     }
+    pub(super) fn planning_task(workspace: WorkspaceId, plan: PlanId, task: TaskId) -> Self {
+        Self {
+            workspace_id: Some(workspace),
+            plan_id: Some(plan),
+            task_id: Some(task),
+            ..Self::default()
+        }
+    }
     pub(super) fn workspace(id: WorkspaceId) -> Self {
         Self {
             workspace_id: Some(id),

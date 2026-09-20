@@ -260,6 +260,166 @@ impl Fixture {
             .unwrap();
         (root, plan)
     }
+    fn parallel_plan_repo(&self, name: &str) -> (PathBuf, ExecutionPlan) {
+        let root = self.temp.0.join(name);
+        fs::create_dir_all(root.join("src")).unwrap();
+        git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub mod a;\npub mod b;\npub mod c;\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+        fs::write(root.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
+        fs::write(root.join("src/c.rs"), "pub fn combined() {}\n").unwrap();
+        let mut policy = ProjectConfig::initialize(&root).unwrap();
+        policy.commands.insert(
+            "unit".into(),
+            CommandSpec {
+                program: "/usr/bin/true".into(),
+                args: vec![],
+                cwd: ".".into(),
+            },
+        );
+        for kind in ["unit", "integration"] {
+            policy.verification.insert(
+                kind.into(),
+                VerificationDefinition {
+                    description: format!("{kind} tests"),
+                    command_refs: vec!["unit".into()],
+                },
+            );
+        }
+        fs::write(
+            root.join(".agentctl/project.toml"),
+            toml::to_string(&policy).unwrap(),
+        )
+        .unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--quiet", "-m", "baseline"]);
+        let mut store = self.store();
+        let info = RepositoryInfo::discover(&root).unwrap();
+        store.register_repository(info.clone()).unwrap();
+        store.index_repository(&root).unwrap();
+        let prepared = store
+            .prepare_plan(
+                &root,
+                RequestDraft {
+                    objective: "Implement independent alpha and beta work, then combine".into(),
+                    query: Some("alpha beta combined".into()),
+                    scope: vec![ScopePath::Directory { path: "src".into() }],
+                    constraints: vec![],
+                    definition_of_done: vec!["all work integrated".into()],
+                    verification: Some(reqs("integration")),
+                    invariant_refs: vec![],
+                    provenance: PlanningProvenance {
+                        actor: "human".into(),
+                        source_refs: vec!["objective".into()],
+                        provider: None,
+                    },
+                },
+                PlanningLimits::default(),
+            )
+            .unwrap();
+        let entity = |path: &str, name: &str| {
+            store
+                .graph(&root)
+                .unwrap()
+                .locate(name, 10)
+                .unwrap()
+                .data
+                .into_iter()
+                .find(|located| {
+                    located.entity.provenance.path == path && located.entity.name == name
+                })
+                .unwrap()
+                .entity
+                .id
+        };
+        let alpha = entity("src/a.rs", "alpha");
+        let beta = entity("src/b.rs", "beta");
+        let combined = entity("src/c.rs", "combined");
+        for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            assert!(
+                prepared
+                    .request
+                    .source
+                    .support
+                    .iter()
+                    .any(|p| p.path == path)
+            );
+        }
+        let task =
+            |id: &str, path: &str, graph: GraphEntityId, dependencies: Vec<TaskId>| TaskPacket {
+                version: ProtocolVersion::V1,
+                task_id: TaskId::new(id).unwrap(),
+                objective: format!("edit {path}"),
+                read_scope: vec![ScopePath::File { path: path.into() }],
+                write_scope: vec![ScopePath::File { path: path.into() }],
+                graph_entities: vec![graph],
+                invariant_refs: vec![],
+                dependencies,
+                definition_of_done: vec![format!("{path} changed")],
+                verification: reqs("unit"),
+            };
+        let a = task("task:a", "src/a.rs", alpha.clone(), vec![]);
+        let b = task("task:b", "src/b.rs", beta, vec![]);
+        let c = task(
+            "task:c",
+            "src/c.rs",
+            combined,
+            vec![a.task_id.clone(), b.task_id.clone()],
+        );
+        let d = task("task:d", "src/a.rs", alpha, vec![]);
+        let packet = PlanPacket {
+            version: ProtocolVersion::V1,
+            plan_id: PlanId::new(format!("plan:{name}")).unwrap(),
+            objective: prepared.request.intent.objective.clone(),
+            tasks: vec![a, b, c, d],
+            integration_verification: reqs("integration"),
+        };
+        let plan = ExecutionPlan {
+            metadata: PlanMetadata {
+                version: ProtocolVersion::V1,
+                request_id: prepared.request.request_id.clone(),
+                source: prepared.request.source.clone(),
+                created_at_ms: local::now_ms().unwrap(),
+                provenance: PlanningProvenance {
+                    actor: "fixture-planner".into(),
+                    source_refs: vec![prepared.request.request_id.as_str().into()],
+                    provider: None,
+                },
+                contracts: packet
+                    .tasks
+                    .iter()
+                    .map(|task| VerificationContract {
+                        task_id: task.task_id.clone(),
+                        task_packet_hash: hash(task).unwrap(),
+                        independent_verifier: true,
+                        input: VerifierInput::PacketDiffAndEvidence,
+                        memory_refs: vec![],
+                        exclusions: vec![],
+                        non_goals: vec![],
+                    })
+                    .collect(),
+                integration: IntegrationVerificationContract {
+                    plan_id: packet.plan_id.clone(),
+                    plan_packet_hash: hash(&packet).unwrap(),
+                    independent_verifier: true,
+                    require_all_task_verifications: true,
+                    require_final_diff_and_evidence: true,
+                    expectations: prepared.request.intent.definition_of_done.clone(),
+                },
+                replan: None,
+            },
+            packet,
+        };
+        store.import_execution_plan(&root, &plan).unwrap();
+        store
+            .activate_execution_plan(&root, &plan.packet.plan_id)
+            .unwrap();
+        (root, plan)
+    }
 }
 fn reqs(name: &str) -> VerificationRequirements {
     VerificationRequirements {
@@ -516,6 +676,27 @@ impl ProviderAdapter for Controlled {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 }
+struct CountingControlled {
+    inner: Controlled,
+    launches: Arc<AtomicUsize>,
+}
+impl ProviderAdapter for CountingControlled {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+    fn launch(
+        &mut self,
+        input: &JobInput,
+        process: ProcessSpec,
+        config: &RoleConfig,
+    ) -> local::Result<Box<dyn RunningProcess>> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        self.inner.launch(input, process, config)
+    }
+    fn collect(&self, output: &ProcessOutput) -> local::Result<Value> {
+        self.inner.collect(output)
+    }
+}
 struct Checks;
 impl CheckLauncher for Checks {
     fn provenance(&self) -> &'static str {
@@ -524,6 +705,738 @@ impl CheckLauncher for Checks {
     fn launch(&mut self, _: &ProcessSpec) -> local::Result<Box<dyn RunningProcess>> {
         Ok(Box::new(Done(Some(success(b"ok".to_vec())))))
     }
+}
+
+struct OverlapProcess {
+    active: Arc<AtomicUsize>,
+    overlapped: Arc<AtomicBool>,
+    output: Option<ProcessOutput>,
+}
+impl RunningProcess for OverlapProcess {
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+    fn poll(&mut self) -> local::Result<Option<ProcessOutput>> {
+        if !self.overlapped.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        Ok(self.output.take().inspect(|_| {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }))
+    }
+    fn cancel(&mut self) -> local::Result<CancellationOutcome> {
+        self.overlapped.store(true, Ordering::SeqCst);
+        Ok(CancellationOutcome::Applied)
+    }
+}
+
+#[derive(Clone)]
+struct Stage7Adapter {
+    active: Arc<AtomicUsize>,
+    overlapped: Arc<AtomicBool>,
+    launches: Arc<AtomicUsize>,
+    fail_b: bool,
+}
+impl ProviderAdapter for Stage7Adapter {
+    fn fork(&self) -> Option<Box<dyn ProviderAdapter>> {
+        Some(Box::new(self.clone()))
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            model: true,
+            effort: true,
+            fresh_session: true,
+            structured_output: true,
+            token_usage: false,
+        }
+    }
+    fn launch(
+        &mut self,
+        input: &JobInput,
+        process: ProcessSpec,
+        _: &RoleConfig,
+    ) -> local::Result<Box<dyn RunningProcess>> {
+        let value = match input.role {
+            AgentRole::Executor => {
+                let task: TaskPacket =
+                    serde_json::from_value(input.artifact["task"].clone()).unwrap();
+                let path = task.write_scope[0].path().to_string();
+                let mut text = fs::read_to_string(process.workspace.join(&path)).unwrap();
+                text.push_str(&format!("// {}\n", task.task_id.as_str()));
+                fs::write(process.workspace.join(&path), text).unwrap();
+                serde_json::to_value(ResultPacket {
+                    version: ProtocolVersion::V1,
+                    task_id: task.task_id.clone(),
+                    executor_job_id: input.job_id.clone(),
+                    status: ResultStatus::Succeeded,
+                    changed_paths: vec![path],
+                    changed_entities: vec![],
+                    evidence: vec![],
+                    notes: None,
+                    failure: None,
+                    context_request: None,
+                })
+                .unwrap()
+            }
+            AgentRole::Verifier => serde_json::to_value(VerificationPacket {
+                version: ProtocolVersion::V1,
+                verification_id: VerificationId::new(format!(
+                    "verification:{}",
+                    input.job_id.as_str()
+                ))
+                .unwrap(),
+                target: serde_json::from_value(input.artifact["target"].clone()).unwrap(),
+                verifier_job_id: input.job_id.clone(),
+                decision: VerificationDecision::Pass,
+                findings: vec![],
+                evidence: serde_json::from_value(input.artifact["evidence"].clone()).unwrap(),
+                requirement_refs: if input.task_id.is_some() {
+                    vec!["unit".into()]
+                } else {
+                    vec!["integration".into()]
+                },
+                invariant_refs: vec![],
+                notes: None,
+                context_request: None,
+            })
+            .unwrap(),
+            AgentRole::Planner => unreachable!(),
+        };
+        let bytes = serde_json::to_vec(&value).unwrap();
+        if input.role == AgentRole::Executor
+            && matches!(
+                input.task_id.as_ref().map(TaskId::as_str),
+                Some("task:a" | "task:b")
+            )
+        {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            let previous = self.active.fetch_add(1, Ordering::SeqCst);
+            if previous >= 1 {
+                self.overlapped.store(true, Ordering::SeqCst);
+            }
+            Ok(Box::new(OverlapProcess {
+                active: self.active.clone(),
+                overlapped: self.overlapped.clone(),
+                output: Some(
+                    if self.fail_b
+                        && input
+                            .task_id
+                            .as_ref()
+                            .is_some_and(|id| id.as_str() == "task:b")
+                    {
+                        ProcessOutput {
+                            exit: Some(1),
+                            stdout: bytes,
+                            stderr: b"injected".to_vec(),
+                            failure: Some("injected sibling failure".into()),
+                        }
+                    } else {
+                        success(bytes)
+                    },
+                ),
+            }))
+        } else {
+            Ok(Box::new(Done(Some(success(bytes)))))
+        }
+    }
+    fn collect(&self, output: &ProcessOutput) -> local::Result<Value> {
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PrelaunchCancellation {
+    BeforeFirst,
+    BetweenBranches,
+}
+
+#[derive(Clone)]
+struct CancellingStage7Adapter {
+    inner: Stage7Adapter,
+    database: PathBuf,
+    root: PathBuf,
+    plan: PlanId,
+    timing: PrelaunchCancellation,
+    preflights: Arc<AtomicUsize>,
+    cancelled: Arc<AtomicBool>,
+}
+impl CancellingStage7Adapter {
+    fn request_cancel(&self) {
+        let mut store = Store::open(&self.database, 5_000).unwrap();
+        store.runtime_cancel(&self.root, &self.plan).unwrap();
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+    fn wait_for(&self, predicate: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !predicate() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out at prelaunch test boundary"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+impl ProviderAdapter for CancellingStage7Adapter {
+    fn fork(&self) -> Option<Box<dyn ProviderAdapter>> {
+        Some(Box::new(self.clone()))
+    }
+    fn preflight(&self) -> local::Result<()> {
+        let ordinal = self.preflights.fetch_add(1, Ordering::SeqCst);
+        match self.timing {
+            PrelaunchCancellation::BeforeFirst => {
+                if ordinal == 0 {
+                    self.request_cancel();
+                } else {
+                    self.wait_for(|| self.cancelled.load(Ordering::SeqCst));
+                }
+            }
+            PrelaunchCancellation::BetweenBranches if ordinal == 1 => {
+                self.wait_for(|| self.inner.launches.load(Ordering::SeqCst) == 1);
+                self.request_cancel();
+            }
+            PrelaunchCancellation::BetweenBranches => {}
+        }
+        Ok(())
+    }
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+    fn launch(
+        &mut self,
+        input: &JobInput,
+        process: ProcessSpec,
+        config: &RoleConfig,
+    ) -> local::Result<Box<dyn RunningProcess>> {
+        self.inner.launch(input, process, config)
+    }
+    fn collect(&self, output: &ProcessOutput) -> local::Result<Value> {
+        self.inner.collect(output)
+    }
+}
+
+#[test]
+fn stage7_compatible_tasks_overlap_in_isolated_worktrees_and_reconcile_before_dependents() {
+    let mut fixture = Fixture::new(4);
+    fixture.config.timeout_ms = 5_000;
+    let (root, plan) = fixture.parallel_plan_repo("stage7");
+    let store = fixture.store();
+    let info = RepositoryInfo::discover(&root).unwrap();
+    let a = &plan.packet.tasks[0];
+    let b = &plan.packet.tasks[1];
+    let c = &plan.packet.tasks[2];
+    let d = &plan.packet.tasks[3];
+    let compatible = concurrency::decide(&store, &info, &plan, a, b).unwrap();
+    assert_eq!(
+        compatible.decision,
+        concurrency::Compatibility::Compatible,
+        "{compatible:?}"
+    );
+    let dependency = concurrency::decide(&store, &info, &plan, a, c).unwrap();
+    assert_eq!(
+        dependency.decision,
+        concurrency::Compatibility::DependencyBlocked
+    );
+    let conflict = concurrency::decide(&store, &info, &plan, a, d).unwrap();
+    assert_eq!(conflict.decision, concurrency::Compatibility::Conflict);
+    let mut ambiguous = b.clone();
+    ambiguous.task_id = TaskId::new("task:ambiguous").unwrap();
+    ambiguous.graph_entities.clear();
+    let unknown = concurrency::decide(&store, &info, &plan, a, &ambiguous).unwrap();
+    assert_eq!(unknown.decision, concurrency::Compatibility::Unknown);
+    drop(store);
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let overlapped = Arc::new(AtomicBool::new(false));
+    let mut store = fixture.store();
+    let result = Runtime::new(
+        &mut store,
+        fixture.paths.clone(),
+        fixture.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Stage7Adapter {
+                active: active.clone(),
+                overlapped: overlapped.clone(),
+                launches: Arc::new(AtomicUsize::new(0)),
+                fail_b: false,
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .with_check_launcher(Box::new(Checks))
+    .run(&root, &plan.packet.plan_id);
+    let run = result.unwrap_or_else(|error| {
+        panic!(
+            "{error}; run={:?}; tasks={:?}; jobs={:?}; events={:?}",
+            store.runtime_status(&root, &plan.packet.plan_id).unwrap(),
+            store
+                .tasks(&info.repository_id, Some(&plan.packet.plan_id))
+                .unwrap(),
+            store
+                .runtime_jobs(&root, Some(&plan.packet.plan_id))
+                .unwrap(),
+            store
+                .events(Some(&info.repository_id), None, None, 50)
+                .unwrap()
+        )
+    });
+    assert_eq!(run.state, RunState::Complete);
+    assert!(
+        overlapped.load(Ordering::SeqCst),
+        "independent executor jobs never overlapped"
+    );
+    assert!(run.branches.is_empty());
+    assert!(plan.packet.tasks.iter().all(|task| {
+        store
+            .task(&info.repository_id, &task.task_id)
+            .unwrap()
+            .unwrap()
+            .state
+            == TaskState::Verified
+    }));
+    assert!(
+        fs::read_to_string(root.join("src/a.rs"))
+            .unwrap()
+            .contains("task:a")
+    );
+    assert!(
+        fs::read_to_string(root.join("src/b.rs"))
+            .unwrap()
+            .contains("task:b")
+    );
+    assert!(
+        fs::read_to_string(root.join("src/c.rs"))
+            .unwrap()
+            .contains("task:c")
+    );
+}
+
+#[test]
+fn stage7_executor_failure_is_branch_local_and_does_not_discard_verified_sibling() {
+    let mut fixture = Fixture::new(4);
+    fixture.config.timeout_ms = 5_000;
+    let (root, plan) = fixture.parallel_plan_repo("stage7-failure");
+    let info = RepositoryInfo::discover(&root).unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let overlapped = Arc::new(AtomicBool::new(false));
+    let mut store = fixture.store();
+    let result = Runtime::new(
+        &mut store,
+        fixture.paths.clone(),
+        fixture.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Stage7Adapter {
+                active,
+                overlapped: overlapped.clone(),
+                launches: Arc::new(AtomicUsize::new(0)),
+                fail_b: true,
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .with_check_launcher(Box::new(Checks))
+    .run(&root, &plan.packet.plan_id);
+    assert!(result.is_err());
+    assert!(overlapped.load(Ordering::SeqCst));
+    assert_eq!(
+        store
+            .task(&info.repository_id, &TaskId::new("task:a").unwrap())
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Verified
+    );
+    assert_eq!(
+        store
+            .task(&info.repository_id, &TaskId::new("task:b").unwrap())
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Blocked
+    );
+    assert!(
+        fs::read_to_string(root.join("src/a.rs"))
+            .unwrap()
+            .contains("task:a")
+    );
+    assert!(
+        !fs::read_to_string(root.join("src/b.rs"))
+            .unwrap()
+            .contains("task:b")
+    );
+}
+
+#[test]
+fn source_change_after_selection_before_claim_prevents_executor_launch() {
+    let mut fixture = Fixture::new(4);
+    fixture.config.timeout_ms = 5_000;
+    let (root, plan) = fixture.parallel_plan_repo("stage7-stale-source");
+    let launches = Arc::new(AtomicUsize::new(0));
+    let mutate_root = root.clone();
+    let mut store = fixture.store();
+    let result = Runtime::new(
+        &mut store,
+        fixture.paths.clone(),
+        fixture.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Stage7Adapter {
+                active: Arc::new(AtomicUsize::new(0)),
+                overlapped: Arc::new(AtomicBool::new(false)),
+                launches: launches.clone(),
+                fail_b: false,
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .with_check_launcher(Box::new(Checks))
+    .with_boundary_observer(move |boundary| {
+        if boundary == "batch_preclaim" {
+            fs::write(mutate_root.join("src/a.rs"), "external drift\n").unwrap();
+        }
+    })
+    .run(&root, &plan.packet.plan_id);
+    let error = result.unwrap_err();
+    assert!(
+        error.to_string().contains("stale")
+            || error.to_string().contains("STALE_CONCURRENCY_AUTHORITY"),
+        "{error}"
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    let durable = store
+        .runtime_status(&root, &plan.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    assert!(durable.batch_authority.is_none());
+    assert!(durable.branches.is_empty());
+}
+
+#[test]
+fn ontology_change_after_revalidation_before_claim_prevents_executor_launch() {
+    let mut fixture = Fixture::new(4);
+    fixture.config.timeout_ms = 5_000;
+    let (root, plan) = fixture.parallel_plan_repo("stage7-stale-ontology");
+    let launches = Arc::new(AtomicUsize::new(0));
+    let database = fixture.paths.database.clone();
+    let info = RepositoryInfo::discover(&root).unwrap();
+    let workspace = info.workspace_id.as_str().to_string();
+    let mut store = fixture.store();
+    let result = Runtime::new(
+        &mut store,
+        fixture.paths.clone(),
+        fixture.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Stage7Adapter {
+                active: Arc::new(AtomicUsize::new(0)),
+                overlapped: Arc::new(AtomicBool::new(false)),
+                launches: launches.clone(),
+                fail_b: false,
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .with_check_launcher(Box::new(Checks))
+    .with_boundary_observer(move |boundary| {
+        if boundary == "batch_revalidated" {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute(
+                    "UPDATE graph_indexes SET metadata_json=json_set(metadata_json,'$.generation.sequence',json_extract(metadata_json,'$.generation.sequence')+1,'$.generation.fingerprint','blake3:stale-window') WHERE workspace_id=?1",
+                    [&workspace],
+                )
+                .unwrap();
+        }
+    })
+    .run(&root, &plan.packet.plan_id);
+    assert!(result.is_err());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    let durable = store
+        .runtime_status(&root, &plan.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    assert!(durable.batch_authority.is_none());
+    assert!(durable.branches.is_empty());
+}
+
+#[test]
+fn lifecycle_change_after_revalidation_is_rejected_in_atomic_batch_claim() {
+    let mut fixture = Fixture::new(4);
+    fixture.config.timeout_ms = 5_000;
+    let (root, plan) = fixture.parallel_plan_repo("stage7-stale-task");
+    let launches = Arc::new(AtomicUsize::new(0));
+    let paths = fixture.paths.clone();
+    let mutate_root = root.clone();
+    let mutate_plan = plan.packet.plan_id.clone();
+    let mut store = fixture.store();
+    let result = Runtime::new(
+        &mut store,
+        fixture.paths.clone(),
+        fixture.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Stage7Adapter {
+                active: Arc::new(AtomicUsize::new(0)),
+                overlapped: Arc::new(AtomicBool::new(false)),
+                launches: launches.clone(),
+                fail_b: false,
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .with_check_launcher(Box::new(Checks))
+    .with_boundary_observer(move |boundary| {
+        if boundary == "batch_revalidated" {
+            let mut other = Store::open(&paths.database, 5000).unwrap();
+            other.runtime_cancel(&mutate_root, &mutate_plan).unwrap();
+        }
+    })
+    .run(&root, &plan.packet.plan_id);
+    assert!(result.is_err());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert!(
+        store
+            .runtime_status(&root, &plan.packet.plan_id)
+            .unwrap()
+            .unwrap()
+            .batch_authority
+            .is_none()
+    );
+}
+
+#[test]
+fn cancellation_after_batch_authorization_before_first_launch_prevents_all_launches() {
+    let mut fixture = Fixture::new(4);
+    fixture.config.timeout_ms = 5_000;
+    let (root, plan) = fixture.parallel_plan_repo("stage7-cancel-before-first-launch");
+    let launches = Arc::new(AtomicUsize::new(0));
+    let adapter = CancellingStage7Adapter {
+        inner: Stage7Adapter {
+            active: Arc::new(AtomicUsize::new(0)),
+            overlapped: Arc::new(AtomicBool::new(false)),
+            launches: launches.clone(),
+            fail_b: false,
+        },
+        database: fixture.paths.database.clone(),
+        root: root.clone(),
+        plan: plan.packet.plan_id.clone(),
+        timing: PrelaunchCancellation::BeforeFirst,
+        preflights: Arc::new(AtomicUsize::new(0)),
+        cancelled: Arc::new(AtomicBool::new(false)),
+    };
+    let mut store = fixture.store();
+    let result = Runtime::new(
+        &mut store,
+        fixture.paths.clone(),
+        fixture.config.clone(),
+        BTreeMap::from([("test".into(), Box::new(adapter) as Box<dyn ProviderAdapter>)]),
+    )
+    .unwrap()
+    .with_check_launcher(Box::new(Checks))
+    .run(&root, &plan.packet.plan_id);
+    assert!(result.is_err());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn cancellation_between_branch_prelaunch_boundaries_prevents_second_launch() {
+    let mut fixture = Fixture::new(4);
+    fixture.config.timeout_ms = 5_000;
+    let (root, plan) = fixture.parallel_plan_repo("stage7-cancel-between-launches");
+    let launches = Arc::new(AtomicUsize::new(0));
+    let adapter = CancellingStage7Adapter {
+        inner: Stage7Adapter {
+            active: Arc::new(AtomicUsize::new(0)),
+            overlapped: Arc::new(AtomicBool::new(false)),
+            launches: launches.clone(),
+            fail_b: false,
+        },
+        database: fixture.paths.database.clone(),
+        root: root.clone(),
+        plan: plan.packet.plan_id.clone(),
+        timing: PrelaunchCancellation::BetweenBranches,
+        preflights: Arc::new(AtomicUsize::new(0)),
+        cancelled: Arc::new(AtomicBool::new(false)),
+    };
+    let mut store = fixture.store();
+    let result = Runtime::new(
+        &mut store,
+        fixture.paths.clone(),
+        fixture.config.clone(),
+        BTreeMap::from([("test".into(), Box::new(adapter) as Box<dyn ProviderAdapter>)]),
+    )
+    .unwrap()
+    .with_check_launcher(Box::new(Checks))
+    .run(&root, &plan.packet.plan_id);
+    assert!(result.is_err());
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cancellation_at_task_verifier_prelaunch_boundary_prevents_verifier_issuance() {
+    let mut fixture = Fixture::new(1);
+    fixture.config.timeout_ms = 5_000;
+    let (root, plan) = fixture.plan_repo("stage7-cancel-before-verifier");
+    let launches = Arc::new(AtomicUsize::new(0));
+    let boundaries = Arc::new(AtomicUsize::new(0));
+    let observer_boundaries = boundaries.clone();
+    let database = fixture.paths.database.clone();
+    let cancel_root = root.clone();
+    let cancel_plan = plan.packet.plan_id.clone();
+    let mut store = fixture.store();
+    let result = Runtime::new(
+        &mut store,
+        fixture.paths.clone(),
+        fixture.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(CountingControlled {
+                inner: Controlled {
+                    hang_at: HangAt::IntegrationVerifier,
+                    release: Arc::new(AtomicBool::new(true)),
+                },
+                launches: launches.clone(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .with_check_launcher(Box::new(Checks))
+    .with_policy_observer(move |boundary| {
+        if boundary == "prelaunch" && observer_boundaries.fetch_add(1, Ordering::SeqCst) == 1 {
+            let mut other = Store::open(&database, 5_000).unwrap();
+            other.runtime_cancel(&cancel_root, &cancel_plan).unwrap();
+        }
+    })
+    .run(&root, &plan.packet.plan_id);
+    assert!(result.is_err());
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert_eq!(boundaries.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn restart_recovers_durable_intent_before_first_write_without_rerunning_executors() {
+    let mut fixture = Fixture::new(4);
+    fixture.config.timeout_ms = 5_000;
+    let (root, plan) = fixture.parallel_plan_repo("stage7-restart-intent");
+    let launches = Arc::new(AtomicUsize::new(0));
+    let adapter = Stage7Adapter {
+        active: Arc::new(AtomicUsize::new(0)),
+        overlapped: Arc::new(AtomicBool::new(false)),
+        launches: launches.clone(),
+        fail_b: false,
+    };
+    let mut store = fixture.store();
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Runtime::new(
+            &mut store,
+            fixture.paths.clone(),
+            fixture.config.clone(),
+            BTreeMap::from([(
+                "test".into(),
+                Box::new(adapter.clone()) as Box<dyn ProviderAdapter>,
+            )]),
+        )
+        .unwrap()
+        .with_check_launcher(Box::new(Checks))
+        .with_boundary_observer(|boundary| {
+            if boundary == "reconciliation_intent_durable" {
+                panic!("injected crash before first publication write");
+            }
+        })
+        .run(&root, &plan.packet.plan_id)
+    }));
+    assert!(interrupted.is_err());
+    let durable = store
+        .runtime_status(&root, &plan.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    assert!(durable.reconciliation.is_some());
+    assert_eq!(launches.load(Ordering::SeqCst), 2);
+    drop(store);
+
+    let mut reopened = fixture.store();
+    let recovered = Runtime::new(
+        &mut reopened,
+        fixture.paths.clone(),
+        fixture.config.clone(),
+        BTreeMap::from([("test".into(), Box::new(adapter) as Box<dyn ProviderAdapter>)]),
+    )
+    .unwrap()
+    .with_check_launcher(Box::new(Checks))
+    .run(&root, &plan.packet.plan_id)
+    .unwrap();
+    assert_eq!(recovered.state, RunState::Complete);
+    assert!(recovered.reconciliation.is_none());
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        2,
+        "captured concurrent executors were not rerun"
+    );
+}
+
+#[test]
+fn unresolved_publication_blocks_verifier_and_dependent_release() {
+    let mut fixture = Fixture::new(4);
+    fixture.config.timeout_ms = 5_000;
+    let (root, plan) = fixture.parallel_plan_repo("stage7-unresolved-intent");
+    let mutate_root = root.clone();
+    let mut store = fixture.store();
+    let result = Runtime::new(
+        &mut store,
+        fixture.paths.clone(),
+        fixture.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Stage7Adapter {
+                active: Arc::new(AtomicUsize::new(0)),
+                overlapped: Arc::new(AtomicBool::new(false)),
+                launches: Arc::new(AtomicUsize::new(0)),
+                fail_b: false,
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap()
+    .with_check_launcher(Box::new(Checks))
+    .with_boundary_observer(move |boundary| {
+        if boundary == "reconciliation_intent_durable" {
+            fs::write(mutate_root.join("src/a.rs"), "third-party state\n").unwrap();
+        }
+    })
+    .run(&root, &plan.packet.plan_id);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("RECONCILIATION_UNRESOLVED")
+    );
+    let durable = store
+        .runtime_status(&root, &plan.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.state, RunState::Running);
+    assert!(durable.reconciliation.is_some());
+    assert!(durable.pending.is_none());
+    assert_eq!(
+        fs::read_to_string(root.join("src/a.rs")).unwrap(),
+        "third-party state\n"
+    );
+    assert!(
+        store
+            .runtime_jobs(&root, Some(&plan.packet.plan_id))
+            .unwrap()
+            .iter()
+            .all(|job| job.role != AgentRole::Verifier)
+    );
+    let dependent = store
+        .task(
+            &RepositoryInfo::discover(&root).unwrap().repository_id,
+            &TaskId::new("task:c").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(dependent.state, TaskState::Planned);
 }
 
 // ============================== requirement 1 ==============================

@@ -373,6 +373,14 @@ provider and cannot bypass project `allowed_providers`. If the machine-wide
 `max_agents` limit is reached, the launch fails with `AGENT_CAPACITY_EXCEEDED`.
 That failure is not treated as a provider failure and does not trigger fallback.
 
+`agentctl run plan <plan-id> --dry-run` reports READY tasks together with typed
+pairwise compatibility decisions. `COMPATIBLE` requires disjoint write/write
+and write/read scopes plus complete accepted-ontology evidence. DAG
+dependencies, semantic interference, source mismatch, missing graph authority,
+and unresolved impact are explicit blocking reasons. Compatible executors use
+isolated linked worktrees; captured results reconcile and verify serially
+against the evolving canonical source.
+
 Source snapshots observe the checkout the way Git walks it:
 - **Source files** are captured by content: every tracked file, even one an
   ignore rule also matches, and every untracked file that is not ignored.

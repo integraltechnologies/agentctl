@@ -644,14 +644,25 @@ there are no persistent or cross-session workers.
    walked. The snapshot is taken twice and the two captures must match. It is
    an integrity observation for drift and scope checks, not agent context:
    agents receive only bounded, scope-filtered context.
-2. **Execution.** A workspace lock serializes every task and check within the
-   workspace, so there are no concurrent writers and no automatic worktrees. For
-   each ready task, the runtime checks readiness, routing, scope, drift, and
-   concurrency, then launches an executor. The executor receives its TaskPacket
+2. **Execution.** The controller holds one canonical-workspace lease. It derives
+   pairwise compatibility for READY tasks from the DAG, declared read/write
+   scopes, containment and accepted-ontology impact evidence. `UNKNOWN`,
+   overlap, dependency, source mismatch, or a semantic boundary fails closed.
+   A compatible set is transactionally claimed through the existing
+   `READY -> EXECUTING` transition, and each executor receives a linked detached
+   Git worktree materialized from the exact same captured baseline. Other work
+   remains serial. The executor receives its TaskPacket
    and contract, invariants, constraints, and the **planner-authored context**
    described in [Context relay](#context-relay) — nothing the runtime chose on
    its own. It does not receive other tasks or any conversation. An executor
    that lacks context requests it through the relay instead of exploring.
+   Immediately before that claim, compatibility is recomputed. Under the
+   workspace lease and one SQLite `BEGIN IMMEDIATE` transaction, the runtime
+   rechecks the exact canonical source, ontology generation/fingerprint, active
+   plan, cancellation flag, task/dependency states, DAG, scopes, and pairwise
+   evidence. The durable batch authority and every claim commit together.
+   Each isolated executor rechecks canonical source, ontology generation, and
+   its claim again immediately before invocation.
 3. **Capture.** After the executor exits, agentctl computes the actual diff
    (additions, deletions, content and mode changes) against the snapshot and
    checks it against the write scope. The executor's self-reported changed paths
@@ -674,6 +685,34 @@ there are no persistent or cross-session workers.
    completion gate used by imported plans, and promotes the plan's ontology
    candidate in the same transaction (see
    [The acceptance boundary](#the-acceptance-boundary)).
+
+Between capture and verification, isolated results are reconciled one at a time.
+Every path the branch read or intended to write must retain its issued value.
+After a sibling is verified and indexed, its observed ontology delta is checked
+against the stale branch's entities and scopes; truncated or unresolved impact
+is `UNKNOWN` and blocks reconciliation. A clean Git merge is never acceptance
+evidence. Only after reconciliation does the existing task verifier run, so
+dependency release remains `VERIFIED`-only.
+
+Canonical publication is explicitly crash consistent; SQLite is not treated as
+a filesystem transaction. The ordering is:
+
+1. persist a reconciliation intent in the existing `RunRecord`, binding the
+   plan/task/branch executor and diff, expected canonical snapshot, intended
+   snapshot, affected paths, and each path's before/after content identity;
+2. classify every affected canonical path as expected-before or intended-after,
+   refusing before any write if a path (or unaffected source) is neither;
+3. write only expected-before paths, then capture and verify the complete
+   intended source;
+4. clear the intent in the durable `BRANCH_RECONCILED` checkpoint that installs
+   the pending verification record.
+
+On restart, an intent is recovered before job reconciliation, verification,
+index refresh, dependency release, integration, or new execution. Therefore
+every publication prefix from 0/N through N/N is safely resumable, including
+N/N with a lost completion checkpoint. An I/O failure leaves the intent
+resumable. Unknown third-party content leaves it unresolved and is never
+overwritten; the run remains recoverable but can do no other lifecycle work.
 
 ### Context relay
 
@@ -774,6 +813,22 @@ in different workspaces cannot exceed it. Exhaustion fails the launch with
 `AGENT_CAPACITY_EXCEEDED`. It is not a provider failure and never triggers
 fallback. Finished jobs free capacity. Experiments are not agents.
 
+Task concurrency is narrower than capacity. Positive eligibility requires no
+DAG path, no write/write or write/read scope intersection, nonempty
+planner-selected graph authority for both tasks, and a complete
+accepted-ontology impact traversal that reaches neither the other task's
+entities nor its scopes. Decisions are typed as `COMPATIBLE`, `CONFLICT`,
+`DEPENDENCY_BLOCKED`, `SOURCE_INCOMPATIBLE`, or `UNKNOWN`, with structured
+reasons. `run plan <id> --dry-run` exposes them.
+
+Concurrent executors never mutate the canonical checkout. Their physical
+worktree is recorded on each job, and each captured branch result is merged
+transactionally into the existing `RunRecord`; there is no scheduler database.
+The task-state compare-and-swap is the claim, the workspace lease excludes a
+second controller, and transactional job admission enforces the bound. No lease
+table or generic lock manager is needed. Reconciliation, verification, ontology
+refresh, integration, and final acceptance remain serialized.
+
 ### Drift, correction, and recovery
 
 - Unexpected HEAD, index, content, or policy changes block with a `SOURCE_DRIFT`
@@ -784,11 +839,13 @@ fallback. Finished jobs free capacity. Experiments are not agents.
   replace` links an explicit replacement plan (default at most two rounds,
   configurable down to zero). There is no automatic retry and no source-discard
   operation.
-- `run resume` continues from durable artifacts. Pending checks and verification
-  resume, `VERIFIED` tasks are never re-executed, and recorded verifier outputs are
-  recovered without a new call. Queued or running jobs whose controller was lost
-  become interrupted and block. Stored PIDs are diagnostic only; they are never
-  reattached or killed. Crash gaps before a checkpoint can require manual review.
+- `run resume` continues from durable artifacts. Captured branch results,
+  pending checks, and verification resume; `VERIFIED` tasks are never
+  re-executed, and recorded verifier outputs are recovered without a new call.
+  Queued or running executor jobs whose controller was lost are interrupted and
+  contained to their task while already captured siblings remain valid. An
+  interrupted verifier blocks the serialized acceptance path. Stored PIDs are
+  diagnostic only; they are never reattached or killed.
 - agentctl never commits, pushes, resets, or cleans the checkout.
 
 ### Runtime limits

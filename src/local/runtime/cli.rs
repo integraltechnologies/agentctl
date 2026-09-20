@@ -171,7 +171,7 @@ pub(crate) fn run(
             let store=Store::read_only(&paths.database,machine.busy_timeout_ms)?;
             let id=PlanId::new(*id).map_err(Error::Invalid)?;
             let info=graph::checked_workspace(&store,&root)?;
-            let value=json!({"workspace":info.workspace_id,"root":info.root,"strategy":"serialized writers; no automatic worktrees/commits","roles":machine.runtime.roles,"ready":store.execution_tasks(&root,&id)?.into_iter().filter(|t|t.structurally_ready).collect::<Vec<_>>()});
+            let value=json!({"workspace":info.workspace_id,"root":info.root,"strategy":"compatible executors use isolated Git worktrees; reconciliation and acceptance remain serialized","roles":machine.runtime.roles,"ready":store.execution_tasks(&root,&id)?.into_iter().filter(|t|t.structurally_ready).collect::<Vec<_>>(),"compatibility":store.runtime_compatibility(&root,&id)?});
             super::super::cli::output(json_mode,&value,&serde_json::to_string_pretty(&value)?)
         }
         ["run","cancel",id] => Store::open(&paths.database,machine.busy_timeout_ms)?.runtime_cancel(&root,&PlanId::new(*id).map_err(Error::Invalid)?),

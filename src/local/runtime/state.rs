@@ -27,6 +27,44 @@ pub struct PendingTask {
     pub evidence: Vec<EvidenceRef>,
     pub verifier: Option<JobId>,
     pub proof: Option<VerificationPacket>,
+    /// Isolated mutation surface used by a concurrent executor. Serial results
+    /// omit this. The path is controller-owned and is retained across an
+    /// interruption until reconciliation or explicit replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_workspace: Option<String>,
+    /// Typed eligibility evidence frozen when this branch was dispatched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatibility: Vec<super::concurrency::CompatibilityDecision>,
+    /// Ontology generation against which executor context was issued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology_generation: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchLaunchAuthority {
+    /// Exact canonical source observed while the task claims were committed.
+    pub source: ArtifactRef,
+    /// Accepted ontology row whose sequence/fingerprint backed compatibility.
+    pub ontology_generation: String,
+    pub tasks: Vec<TaskId>,
+    pub compatibility: Vec<super::concurrency::CompatibilityDecision>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationPath {
+    pub path: String,
+    pub before: Option<source::FileState>,
+    pub after: Option<source::FileState>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationIntent {
+    pub task_id: TaskId,
+    pub executor: JobId,
+    pub diff: ArtifactRef,
+    pub expected_source: ArtifactRef,
+    pub intended_source: ArtifactRef,
+    pub paths: Vec<ReconciliationPath>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +79,20 @@ pub struct RunRecord {
     pub policy_hash: String,
     pub accepted: BTreeMap<TaskId, AcceptedTask>,
     pub pending: Option<PendingTask>,
+    /// Captured isolated results awaiting deterministic reconciliation. This is
+    /// part of the RunRecord rather than scheduler state: a restarted
+    /// controller can prove exactly what exists and must never duplicate it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub branches: BTreeMap<TaskId, PendingTask>,
+    /// Coherent authority checkpoint written in the same SQLite transaction as
+    /// all claims in a concurrent batch. It is cleared after all branch
+    /// results have been captured or contained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_authority: Option<BatchLaunchAuthority>,
+    /// Branch-specific filesystem publication intent, durable before the first
+    /// canonical write and cleared only with BRANCH_RECONCILED.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<ReconciliationIntent>,
     pub reason: Option<String>,
     pub correction_round: u32,
     /// Context-relay ledgers keyed by worker subject (`executor:<task>`,
@@ -62,6 +114,10 @@ pub enum RuntimeJobState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeJob {
+    /// Physical mutation/read surface. `workspace_id` remains the canonical
+    /// authority identity; this path makes isolation inspectable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_root: Option<String>,
     /// Planner jobs have no Stage 0 plan/job row. This is their sole usage
     /// observation; plan-associated jobs continue using canonical usage events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +235,96 @@ pub(super) fn save_run(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// Merge one isolated branch checkpoint without replacing sibling progress.
+/// The read, duplicate check, merge, journal append and write share one
+/// IMMEDIATE transaction, closing the lost-update race between executors.
+pub(super) fn merge_branch(
+    store: &mut Store,
+    info: &RepositoryInfo,
+    task: &TaskId,
+    pending: PendingTask,
+    executor_context: Option<context::ContextLedger>,
+) -> Result<()> {
+    let session = session::for_plan(store, info, &pending_task_plan(store, info, task)?)?;
+    require(
+        store.connection.query_row(
+            "SELECT agentctl_runtime_session_authorized(?1,?2,?3)",
+            params![
+                info.repository_id.as_str(),
+                pending_task_plan(store, info, task)?.as_str(),
+                session.id
+            ],
+            |row| row.get::<_, bool>(0),
+        )?,
+        "runtime session authorization required",
+    )?;
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let json: String = tx.query_row(
+        "SELECT record_json FROM runtime_runs WHERE repo_id=?1 AND plan_id=(SELECT plan_id FROM tasks WHERE repo_id=?1 AND task_id=?2)",
+        params![info.repository_id.as_str(), task.as_str()],
+        |row| row.get(0),
+    )?;
+    let mut run: RunRecord = serde_json::from_str(&json)?;
+    require(
+        !run.accepted.contains_key(task) && run.pending.as_ref().is_none_or(|p| &p.task_id != task),
+        "stale branch cannot replace accepted/pending task state",
+    )?;
+    match run.branches.get(task) {
+        Some(existing) => require(
+            existing.executor == pending.executor && existing.diff == pending.diff,
+            "a different branch result already owns this task",
+        )?,
+        None => {
+            run.branches.insert(task.clone(), pending);
+        }
+    }
+    if let Some(ledger) = executor_context {
+        let key = context::subject_key(AgentRole::Executor, Some(task));
+        match run.context.get(&key) {
+            Some(existing) => require(
+                existing.base == ledger.base && existing.rounds == ledger.rounds,
+                "concurrent context ledger conflict",
+            )?,
+            None => {
+                run.context.insert(key, ledger);
+            }
+        }
+    }
+    tx.execute(
+        "UPDATE runtime_runs SET record_json=?1 WHERE repo_id=?2 AND plan_id=?3",
+        params![
+            serde_json::to_string(&run)?,
+            info.repository_id.as_str(),
+            run.plan_id.as_str()
+        ],
+    )?;
+    store::append(
+        &tx,
+        &info.repository_id,
+        now_ms()?,
+        &Links::planning(info.workspace_id.clone(), Some(run.plan_id.clone())),
+        None,
+        &JournalEntry::Runtime {
+            job_id: Some(run.branches[task].executor.clone()),
+            phase: "BRANCH_RESULT_CAPTURED".into(),
+            detail: task.as_str().into(),
+        },
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn pending_task_plan(store: &Store, info: &RepositoryInfo, task: &TaskId) -> Result<PlanId> {
+    let value: String = store.connection.query_row(
+        "SELECT plan_id FROM tasks WHERE repo_id=?1 AND task_id=?2",
+        params![info.repository_id.as_str(), task.as_str()],
+        |row| row.get(0),
+    )?;
+    PlanId::new(value).map_err(Error::Invalid)
 }
 pub(super) fn save_job(
     store: &mut Store,

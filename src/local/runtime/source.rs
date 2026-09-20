@@ -288,6 +288,31 @@ pub(super) fn capture(root: &Path, artifacts: &Artifacts) -> Result<SourceSnapsh
     )?;
     Ok(b)
 }
+
+/// Capture an isolated mutation surface while preserving the canonical
+/// repository/workspace identity to which the issued authority belongs. The
+/// physical Git worktree identity is recorded separately by the runtime job;
+/// this normalization lets snapshots and diffs remain comparable to the
+/// canonical source baseline without pretending the worktree is canonical.
+pub(super) fn capture_bound(
+    root: &Path,
+    artifacts: &Artifacts,
+    repository: &RepositoryId,
+    workspace: &WorkspaceId,
+) -> Result<SourceSnapshot> {
+    let normalize = |mut snapshot: SourceSnapshot| {
+        snapshot.repository_id = repository.clone();
+        snapshot.workspace_id = workspace.clone();
+        snapshot
+    };
+    let a = normalize(collect(root, artifacts)?);
+    let b = normalize(collect(root, artifacts)?);
+    require(
+        a == b,
+        "SOURCE_DRIFT: isolated workspace changed during source capture",
+    )?;
+    Ok(b)
+}
 /// Ceiling on the repository-local `info/exclude` rules read during capture. They
 /// are Git control metadata, not source: only their hash is kept.
 const GIT_EXCLUDE_BYTES: u64 = 1024 * 1024;

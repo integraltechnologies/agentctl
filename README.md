@@ -107,7 +107,9 @@ Alpha limitations to know about:
 
 - Only Claude Code and Codex CLI adapters exist. Codex token usage is not
   reported.
-- Tasks within a workspace run one at a time. There are no parallel worktrees.
+- READY tasks with proven-disjoint scopes and accepted-ontology impact may run
+  concurrently in managed linked worktrees. Unknown or conflicting work stays
+  serial, and reconciliation, verification, and acceptance remain serialized.
 - The runtime supports modest repositories: up to 20,000 files and 64 MiB, with no
   symlinks, hardlinks, or submodules in the checkout. Verifier diffs carry exact
   hunks with bounded context, so they scale with the size of a change rather than
@@ -444,8 +446,8 @@ dates.
 - **Stronger cross-platform sandboxing.** Filesystem and network confinement on
   Windows, and kernel-level process-tree and aggregate resource containment on
   Linux and macOS.
-- **Parallel execution.** Isolated, managed worktrees so independent verified-ready
-  tasks can run concurrently.
+- **Richer concurrency evidence.** Broader language/ontology coverage can prove
+  more tasks independent without weakening the current fail-closed rules.
 - **Richer repository intelligence.** Cross-file resolution with correct
   invalidation, and more languages.
 - **Provider integrations.** Broader authentication and platform support, and more

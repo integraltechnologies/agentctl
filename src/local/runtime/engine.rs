@@ -15,6 +15,14 @@ pub struct Runtime<'a> {
     checks: Box<dyn process::CheckLauncher>,
     overrides: BTreeMap<String, routing::RolePatch>,
     policy_observer: Option<PolicyObserver>,
+    boundary_observer: Option<PolicyObserver>,
+    persist_run: bool,
+    branch_workspace: Option<String>,
+    branch_compatibility: Vec<concurrency::CompatibilityDecision>,
+    branch_generation: Option<String>,
+    branch_physical_index: Option<String>,
+    branch_canonical_index: Option<String>,
+    authority_info: Option<RepositoryInfo>,
 }
 type PolicyObserver = Box<dyn FnMut(&str)>;
 /// Outcome of relaying one worker context request.
@@ -54,7 +62,39 @@ impl<'a> Runtime<'a> {
             checks: Box::new(process::NativeChecks),
             overrides: BTreeMap::new(),
             policy_observer: None,
+            boundary_observer: None,
+            persist_run: true,
+            branch_workspace: None,
+            branch_compatibility: vec![],
+            branch_generation: None,
+            branch_physical_index: None,
+            branch_canonical_index: None,
+            authority_info: None,
         })
+    }
+    fn for_branch(
+        mut self,
+        workspace: String,
+        compatibility: Vec<concurrency::CompatibilityDecision>,
+        generation: String,
+        physical_index: String,
+        canonical_index: String,
+        authority_info: RepositoryInfo,
+    ) -> Self {
+        self.persist_run = false;
+        self.branch_workspace = Some(workspace);
+        self.branch_compatibility = compatibility;
+        self.branch_generation = Some(generation);
+        self.branch_physical_index = Some(physical_index);
+        self.branch_canonical_index = Some(canonical_index);
+        self.authority_info = Some(authority_info);
+        self
+    }
+    fn checkpoint(&mut self, info: &RepositoryInfo, run: &RunRecord, phase: &str) -> Result<()> {
+        if self.persist_run {
+            save_run(self.store, info, run, phase)?;
+        }
+        Ok(())
     }
     pub fn with_check_launcher(mut self, launcher: Box<dyn process::CheckLauncher>) -> Self {
         self.checks = launcher;
@@ -66,6 +106,18 @@ impl<'a> Runtime<'a> {
     pub fn with_policy_observer(mut self, observer: impl FnMut(&str) + 'static) -> Self {
         self.policy_observer = Some(Box::new(observer));
         self
+    }
+    /// Trusted embedding/test hook for deterministic authority and publication
+    /// crash-boundary exercises. It cannot alter production decisions.
+    #[doc(hidden)]
+    pub fn with_boundary_observer(mut self, observer: impl FnMut(&str) + 'static) -> Self {
+        self.boundary_observer = Some(Box::new(observer));
+        self
+    }
+    fn observe_boundary(&mut self, boundary: &str) {
+        if let Some(observer) = &mut self.boundary_observer {
+            observer(boundary);
+        }
     }
     /// Trusted caller/user policy only; never populated from provider output.
     pub fn with_role_overrides(
@@ -234,7 +286,7 @@ impl<'a> Runtime<'a> {
         {
             if attempt > 0 {
                 require(
-                    source::capture(&info.root, &self.artifacts)? == *source,
+                    self.capture(info)? == *source,
                     "source changed during failed startup; fallback blocked",
                 )?;
                 require(!self.cancelled(info, plan)?, "cancelled before fallback")?;
@@ -306,7 +358,9 @@ impl<'a> Runtime<'a> {
     ) -> Result<(RuntimeJob, Value)> {
         let config = route.selected.clone();
         let (job_id, session_id) = self.identity()?;
-        let ownership = session::issued(self.store, info, plan, request, task, role, &job_id)?;
+        let authority = self.authority_info.clone().unwrap_or_else(|| info.clone());
+        let ownership =
+            session::issued(self.store, &authority, plan, request, task, role, &job_id)?;
         let mut input = JobInput {
             compiled: None,
             ownership: ownership.clone(),
@@ -346,6 +400,7 @@ impl<'a> Runtime<'a> {
         let context_manifest = manifest::for_job(&input, request, &prompt_provenance, inventory)?;
         input.compiled = Some(compiled);
         let mut job = RuntimeJob {
+            execution_root: Some(info.root.display().to_string()),
             planner_usage: None,
             reported_verification: None,
             availability_failure: None,
@@ -373,7 +428,7 @@ impl<'a> Runtime<'a> {
             finished_at_ms: None,
             failure: None,
         };
-        create_job(self.store, info, &job, max_agents)?;
+        create_job(self.store, &authority, &job, max_agents)?;
         if let Some(plan) = plan {
             let canonical = AgentJob {
                 version: ProtocolVersion::V1,
@@ -413,11 +468,13 @@ impl<'a> Runtime<'a> {
             spec.network &= profile.network;
             spec.timeout_ms = profile.timeout_ms;
             let _scratch = process::ScratchCleanup(spec.scratch.clone());
-            let adapter = self.adapters.get_mut(&config.provider).ok_or_else(|| {
-                Error::ProviderAvailability(routing::FailureClass::ProviderUnavailable)
-            })?;
-            routing::validate_capabilities(&adapter.capabilities(), &config)?;
-            adapter.preflight()?;
+            {
+                let adapter = self.adapters.get_mut(&config.provider).ok_or_else(|| {
+                    Error::ProviderAvailability(routing::FailureClass::ProviderUnavailable)
+                })?;
+                routing::validate_capabilities(&adapter.capabilities(), &config)?;
+                adapter.preflight()?;
+            }
             if let Some(observer) = &mut self.policy_observer {
                 observer("prelaunch");
             }
@@ -443,6 +500,10 @@ impl<'a> Runtime<'a> {
                 )?;
                 return Err(Error::Invalid("SOURCE_DRIFT: project policy changed before launch; replan/revalidation required".into()));
             }
+            self.revalidate_launch_at_adapter(info, plan, task, role, source)?;
+            let adapter = self.adapters.get_mut(&config.provider).ok_or_else(|| {
+                Error::ProviderAvailability(routing::FailureClass::ProviderUnavailable)
+            })?;
             let mut process = adapter.launch(&input, spec, &config).map_err(|e| match e {
                 Error::Io(ref io)
                     if matches!(
@@ -466,7 +527,7 @@ impl<'a> Runtime<'a> {
             job.pid = process.pid();
             job.started_at_ms = Some(now_ms()?);
             job.state = RuntimeJobState::Running;
-            save_job(self.store, info, &job, "JOB_STARTED")?;
+            save_job(self.store, &authority, &job, "JOB_STARTED")?;
             let started = Instant::now();
             let mut interruption = None;
             let mut cancellation_checked = false;
@@ -639,7 +700,7 @@ impl<'a> Runtime<'a> {
         }
         save_job(
             self.store,
-            info,
+            &authority,
             &job,
             if cancelled {
                 "JOB_CANCELLED"
@@ -651,9 +712,28 @@ impl<'a> Runtime<'a> {
         )?;
         Ok((job, result?))
     }
-    fn expected(&self, root: &Path, reference: &ArtifactRef) -> Result<SourceSnapshot> {
+    fn capture(&self, info: &RepositoryInfo) -> Result<SourceSnapshot> {
+        let mut captured = source::capture_bound(
+            &info.root,
+            &self.artifacts,
+            &info.repository_id,
+            &info.workspace_id,
+        )?;
+        if let Some(physical) = &self.branch_physical_index {
+            require(
+                &captured.index_hash == physical,
+                "SOURCE_DRIFT: isolated executor changed its Git index",
+            )?;
+            captured.index_hash = self
+                .branch_canonical_index
+                .clone()
+                .expect("branch canonical index");
+        }
+        Ok(captured)
+    }
+    fn expected(&self, info: &RepositoryInfo, reference: &ArtifactRef) -> Result<SourceSnapshot> {
         let expected: SourceSnapshot = self.artifacts.decode(reference)?;
-        let current = source::capture(root, &self.artifacts)?;
+        let current = self.capture(info)?;
         require(
             expected == current,
             "SOURCE_DRIFT: current workspace differs from the captured result; explicit replan required",
@@ -913,7 +993,7 @@ impl<'a> Runtime<'a> {
                 format!("deterministic check {name} failed; model prose cannot override it"),
             )?;
             require(
-                source::capture(&info.root, &self.artifacts)? == *source,
+                self.capture(info)? == *source,
                 "SOURCE_DRIFT: verification command changed workspace",
             )?;
             refs.push(EvidenceRef(evidence_id));
@@ -1009,6 +1089,9 @@ impl<'a> Runtime<'a> {
                 policy_hash: view.plan.metadata.source.policy_hash.clone(),
                 accepted: BTreeMap::new(),
                 pending: None,
+                branches: BTreeMap::new(),
+                batch_authority: None,
+                reconciliation: None,
                 reason: None,
                 correction_round: round,
                 context: BTreeMap::new(),
@@ -1047,10 +1130,10 @@ impl<'a> Runtime<'a> {
             if let Err(error) = adoption {
                 run.state = RunState::Blocked;
                 run.reason = Some(error.to_string());
-                save_run(self.store, &info, &run, "SOURCE_DRIFT_DETECTED")?;
+                self.checkpoint(&info, &run, "SOURCE_DRIFT_DETECTED")?;
                 return Err(error);
             }
-            save_run(self.store, &info, &run, "PLAN_RUNTIME_STARTED")?;
+            self.checkpoint(&info, &run, "PLAN_RUNTIME_STARTED")?;
             run
         };
         require(
@@ -1060,7 +1143,7 @@ impl<'a> Runtime<'a> {
         if view.state == planning::PlanState::Complete {
             if run.state != RunState::Complete {
                 run.state = RunState::Complete;
-                save_run(self.store, &info, &run, "PLAN_RUNTIME_COMPLETED")?;
+                self.checkpoint(&info, &run, "PLAN_RUNTIME_COMPLETED")?;
             }
             return Ok(run);
         }
@@ -1072,11 +1155,20 @@ impl<'a> Runtime<'a> {
             // A durable marker distinguishes a controller/process recovery from
             // an uninterrupted invocation. It carries no competing state: the
             // existing RunRecord remains the sole resumable checkpoint.
-            save_run(self.store, &info, &run, "PLAN_RUNTIME_RESUMED")?;
+            self.checkpoint(&info, &run, "PLAN_RUNTIME_RESUMED")?;
         }
         let outcome = self.drive(&info, &view.plan, &mut run, &lease);
         if let Err(error) = outcome {
             run.reason = Some(error.to_string().chars().take(1024).collect());
+            if run.reconciliation.is_some() {
+                // This is a recoverable or explicitly unresolved publication,
+                // not a second lifecycle. Keep the sole RunRecord resumable;
+                // drive() will do nothing except recover/refuse this intent on
+                // the next invocation.
+                run.state = RunState::Running;
+                self.checkpoint(&info, &run, "RECONCILIATION_PENDING")?;
+                return Err(error);
+            }
             run.state = if self.cancelled(&info, Some(id))? {
                 RunState::Cancelled
             } else {
@@ -1100,8 +1192,7 @@ impl<'a> Runtime<'a> {
                     )?;
                 }
             }
-            save_run(
-                self.store,
+            self.checkpoint(
                 &info,
                 &run,
                 match run.reason.as_deref().unwrap_or_default() {
@@ -1171,7 +1262,7 @@ impl<'a> Runtime<'a> {
                 "CONTEXT_ESCALATION_DENIED: {}",
                 decision.reason.chars().take(512).collect::<String>()
             ));
-            save_run(self.store, &info, &run, "CONTEXT_ESCALATION_DENIED")?;
+            self.checkpoint(&info, &run, "CONTEXT_ESCALATION_DENIED")?;
             event(
                 self.store,
                 &info,
@@ -1194,7 +1285,7 @@ impl<'a> Runtime<'a> {
             planning::hash(&policy)? == run.policy_hash,
             "SOURCE_DRIFT: canonical policy changed; replan required",
         )?;
-        let current = self.expected(&info.root, &run.expected)?;
+        let current = self.expected(&info, &run.expected)?;
         let base = ledger
             .base
             .clone()
@@ -1310,7 +1401,7 @@ impl<'a> Runtime<'a> {
         }
         run.state = RunState::Running;
         run.reason = None;
-        save_run(self.store, &info, &run, "CONTEXT_ESCALATION_APPROVED")?;
+        self.checkpoint(&info, &run, "CONTEXT_ESCALATION_APPROVED")?;
         event(
             self.store,
             &info,
@@ -1344,6 +1435,369 @@ impl<'a> Runtime<'a> {
         )?;
         self.store.supersede_execution_plan(root, old, new)
     }
+    fn fork_adapters(&self) -> Option<BTreeMap<String, Box<dyn ProviderAdapter>>> {
+        self.adapters
+            .iter()
+            .map(|(name, adapter)| adapter.fork().map(|fork| (name.clone(), fork)))
+            .collect()
+    }
+
+    /// Re-prove and claim the entire batch at one authority boundary. The
+    /// workspace lease excludes another controller; BEGIN IMMEDIATE excludes
+    /// concurrent database/ontology writers. Canonical source is captured
+    /// inside that transaction, and the authority record plus every task claim
+    /// commit together.
+    fn authorize_batch(
+        &mut self,
+        info: &RepositoryInfo,
+        plan: &planning::ExecutionPlan,
+        run: &mut RunRecord,
+        tasks: &[planning::TaskInspection],
+    ) -> Result<(
+        SourceSnapshot,
+        String,
+        Vec<concurrency::CompatibilityDecision>,
+    )> {
+        let mut compatibility = vec![];
+        for (index, left) in tasks.iter().enumerate() {
+            for right in &tasks[index + 1..] {
+                let decision =
+                    concurrency::decide(self.store, info, plan, &left.packet, &right.packet)?;
+                require(
+                    decision.decision == concurrency::Compatibility::Compatible,
+                    "STALE_CONCURRENCY_AUTHORITY: pairwise compatibility is no longer proven",
+                )?;
+                compatibility.push(decision);
+            }
+        }
+        let expected: SourceSnapshot = self.artifacts.decode(&run.expected)?;
+        self.observe_boundary("batch_revalidated");
+        let tx = self
+            .store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = source::capture_bound(
+            &info.root,
+            &self.artifacts,
+            &info.repository_id,
+            &info.workspace_id,
+        )?;
+        require(
+            current == expected,
+            "STALE_CONCURRENCY_AUTHORITY: canonical source changed before batch claim",
+        )?;
+        let graph_generation = graph::generation(&tx, info)?.ok_or_else(|| {
+            Error::Invalid("STALE_CONCURRENCY_AUTHORITY: accepted ontology is unavailable".into())
+        })?;
+        require(
+            compatibility.iter().all(|decision| {
+                decision.reasons.iter().any(|reason| {
+                    matches!(reason, concurrency::CompatibilityReason::OntologyProvesNoInterference { generation } if generation == &graph_generation)
+                })
+            }),
+            "STALE_CONCURRENCY_AUTHORITY: compatibility does not bind the current ontology",
+        )?;
+        let generation: String = tx.query_row(
+            "SELECT generation_id FROM ontology_generations WHERE workspace_id=?1 AND sequence=?2 AND fingerprint=?3 ORDER BY ordinal DESC LIMIT 1",
+            params![info.workspace_id.as_str(), graph_generation.sequence as i64, graph_generation.fingerprint],
+            |row| row.get(0),
+        )?;
+        let plan_state: String = tx.query_row(
+            "SELECT state FROM execution_plans WHERE repo_id=?1 AND plan_id=?2 AND workspace_id=?3",
+            params![
+                info.repository_id.as_str(),
+                run.plan_id.as_str(),
+                info.workspace_id.as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        require(
+            plan_state == "ACTIVE",
+            "STALE_CONCURRENCY_AUTHORITY: execution plan is no longer active",
+        )?;
+        let cancelled: bool = tx.query_row(
+            "SELECT cancel_requested FROM runtime_runs WHERE repo_id=?1 AND plan_id=?2 AND workspace_id=?3",
+            params![info.repository_id.as_str(), run.plan_id.as_str(), info.workspace_id.as_str()],
+            |row| row.get(0),
+        )?;
+        require(
+            !cancelled,
+            "STALE_CONCURRENCY_AUTHORITY: runtime was cancelled before batch claim",
+        )?;
+        let mut states = store::task_states(&tx, &info.repository_id, &run.plan_id)?;
+        for task in tasks {
+            let id = &task.packet.task_id;
+            let mut state = *states
+                .get(id)
+                .ok_or_else(|| Error::Invalid("batch task state disappeared".into()))?;
+            if state == TaskState::Planned {
+                plan.packet
+                    .validate_task_transition(id, &states, TaskState::Ready, None)?;
+                tx.execute(
+                    "UPDATE tasks SET state_json='\"READY\"' WHERE repo_id=?1 AND task_id=?2 AND state_json='\"PLANNED\"'",
+                    params![info.repository_id.as_str(), id.as_str()],
+                )?;
+                store::append(
+                    &tx,
+                    &info.repository_id,
+                    now_ms()?,
+                    &Links::planning_task(
+                        info.workspace_id.clone(),
+                        run.plan_id.clone(),
+                        id.clone(),
+                    ),
+                    None,
+                    &JournalEntry::TaskStateChanged {
+                        from: TaskState::Planned,
+                        to: TaskState::Ready,
+                        verification: None,
+                    },
+                )?;
+                states.insert(id.clone(), TaskState::Ready);
+                state = TaskState::Ready;
+            }
+            require(
+                state == TaskState::Ready,
+                "STALE_CONCURRENCY_AUTHORITY: selected task is no longer READY",
+            )?;
+            plan.packet
+                .validate_task_transition(id, &states, TaskState::Executing, None)?;
+            tx.execute(
+                "UPDATE tasks SET state_json='\"EXECUTING\"' WHERE repo_id=?1 AND task_id=?2 AND state_json='\"READY\"'",
+                params![info.repository_id.as_str(), id.as_str()],
+            )?;
+            store::append(
+                &tx,
+                &info.repository_id,
+                now_ms()?,
+                &Links::planning_task(info.workspace_id.clone(), run.plan_id.clone(), id.clone()),
+                None,
+                &JournalEntry::TaskStateChanged {
+                    from: TaskState::Ready,
+                    to: TaskState::Executing,
+                    verification: None,
+                },
+            )?;
+            states.insert(id.clone(), TaskState::Executing);
+        }
+        let source_ref = self.artifacts.json(&current)?;
+        run.batch_authority = Some(BatchLaunchAuthority {
+            source: source_ref,
+            ontology_generation: generation.clone(),
+            tasks: tasks
+                .iter()
+                .map(|task| task.packet.task_id.clone())
+                .collect(),
+            compatibility: compatibility.clone(),
+        });
+        tx.execute(
+            "UPDATE runtime_runs SET record_json=?1 WHERE repo_id=?2 AND plan_id=?3",
+            params![
+                serde_json::to_string(run)?,
+                info.repository_id.as_str(),
+                run.plan_id.as_str()
+            ],
+        )?;
+        store::append(
+            &tx,
+            &info.repository_id,
+            now_ms()?,
+            &Links::planning(info.workspace_id.clone(), Some(run.plan_id.clone())),
+            None,
+            &JournalEntry::Runtime {
+                job_id: None,
+                phase: "CONCURRENT_BATCH_AUTHORIZED".into(),
+                detail: generation.clone(),
+            },
+        )?;
+        tx.commit()?;
+        Ok((current, generation, compatibility))
+    }
+
+    /// Execute a proven-compatible READY set in isolated Git worktrees. Only
+    /// executor jobs overlap; captured results are reconciled and verified one
+    /// at a time by `drive`, preserving the existing acceptance boundary.
+    fn execute_batch(
+        &mut self,
+        info: &RepositoryInfo,
+        plan: &planning::ExecutionPlan,
+        run: &mut RunRecord,
+        tasks: &[planning::TaskInspection],
+        lease: &WorkspaceLease,
+    ) -> Result<()> {
+        let baseline = self.expected(info, &run.expected)?;
+        self.observe_boundary("batch_selected");
+        let mut launches = vec![];
+        let prepare = (|| -> Result<()> {
+            for task in tasks {
+                let mut compatibility = vec![];
+                for other in tasks {
+                    if task.packet.task_id < other.packet.task_id {
+                        compatibility.push(concurrency::decide(
+                            self.store,
+                            info,
+                            plan,
+                            &task.packet,
+                            &other.packet,
+                        )?);
+                    } else if task.packet.task_id > other.packet.task_id {
+                        compatibility.push(concurrency::decide(
+                            self.store,
+                            info,
+                            plan,
+                            &other.packet,
+                            &task.packet,
+                        )?);
+                    }
+                }
+                require(
+                    !compatibility.is_empty()
+                        && compatibility.iter().all(|decision| {
+                            decision.decision == concurrency::Compatibility::Compatible
+                        }),
+                    "UNKNOWN: batch contains a task without positive pairwise compatibility evidence",
+                )?;
+                let adapters = self
+                    .fork_adapters()
+                    .ok_or_else(|| Error::Invalid("provider adapter cannot fork safely".into()))?;
+                let (workspace, branch_info) = concurrency::create_workspace(
+                    self.store,
+                    &self.paths,
+                    info,
+                    &run.plan_id,
+                    &task.packet.task_id,
+                    &baseline,
+                    &self.artifacts,
+                )?;
+                launches.push((
+                    task.clone(),
+                    workspace,
+                    branch_info,
+                    compatibility,
+                    adapters,
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = prepare {
+            for (_, workspace, _, _, _) in &launches {
+                let _ = concurrency::remove_workspace(info, &workspace.root);
+            }
+            return Err(error);
+        }
+        self.observe_boundary("batch_preclaim");
+        let authority = self.authorize_batch(info, plan, run, tasks);
+        let (_, generation, fresh_compatibility) = match authority {
+            Ok(authority) => authority,
+            Err(error) => {
+                for (_, workspace, _, _, _) in &launches {
+                    let _ = concurrency::remove_workspace(info, &workspace.root);
+                }
+                return Err(error);
+            }
+        };
+        for (_, _, _, compatibility, _) in &mut launches {
+            *compatibility = fresh_compatibility.clone();
+        }
+        self.observe_boundary("batch_authorized");
+        let database = self
+            .store
+            .connection
+            .path()
+            .ok_or_else(|| Error::Invalid("runtime database has no durable path".into()))?
+            .to_owned();
+        let paths = self.paths.clone();
+        let config = self.config.clone();
+        let overrides = self.overrides.clone();
+        let plan_id = run.plan_id.clone();
+        let base_run = run.clone();
+        let results = std::thread::scope(|scope| {
+            let mut handles = vec![];
+            for (task, workspace, branch_info, compatibility, adapters) in launches {
+                let database = database.clone();
+                let paths = paths.clone();
+                let config = config.clone();
+                let overrides = overrides.clone();
+                let plan_id = plan_id.clone();
+                let mut branch_run = base_run.clone();
+                let generation = generation.clone();
+                let canonical_index = baseline.index_hash.clone();
+                handles.push((
+                    task.packet.task_id.clone(),
+                    workspace.clone(),
+                    scope.spawn(move || -> Result<()> {
+                        let mut store = Store::open(Path::new(&database), 5000)?;
+                        let authority_info = info.clone();
+                        let session = session::for_plan(&store, &authority_info, &plan_id)?;
+                        let _permit = auth::authorize(
+                            &store.connection,
+                            &authority_info.repository_id,
+                            plan_id.as_str(),
+                            &session.id,
+                        )?;
+                        Runtime::new(&mut store, paths, config, adapters)?
+                            .with_role_overrides(overrides)?
+                            .for_branch(
+                                workspace.root.clone(),
+                                compatibility,
+                                generation,
+                                workspace.physical_index_hash.clone(),
+                                canonical_index,
+                                authority_info,
+                            )
+                            .execute_task(&branch_info, &mut branch_run, &task, lease)
+                    }),
+                ));
+            }
+            handles
+                .into_iter()
+                .map(|(task, workspace, handle)| {
+                    (
+                        task,
+                        workspace,
+                        handle.join().unwrap_or_else(|_| {
+                            Err(Error::Invalid("concurrent executor thread panicked".into()))
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        for (task, workspace, result) in results {
+            if let Err(error) = result {
+                if let Some(stored) = self.store.task(&info.repository_id, &task)?
+                    && matches!(
+                        stored.state,
+                        TaskState::Executing | TaskState::AwaitingVerification
+                    )
+                {
+                    self.store.transition_task(
+                        &info.repository_id,
+                        &task,
+                        stored.state,
+                        TaskState::Blocked,
+                        None,
+                        now_ms()?,
+                    )?;
+                }
+                event(
+                    self.store,
+                    info,
+                    Some(&run.plan_id),
+                    None,
+                    "BRANCH_FAILED",
+                    &format!("{}: {error}", task.as_str()),
+                )?;
+                // Preserve a failed branch worktree for explicit inspection.
+                let _ = workspace;
+            }
+        }
+        *run = load_run(self.store, info, &run.plan_id)?.ok_or_else(|| {
+            Error::Invalid("runtime run disappeared after branch execution".into())
+        })?;
+        run.batch_authority = None;
+        self.checkpoint(info, run, "CONCURRENT_BATCH_FINISHED")?;
+        Ok(())
+    }
     fn drive(
         &mut self,
         info: &RepositoryInfo,
@@ -1355,7 +1809,12 @@ impl<'a> Runtime<'a> {
             run.correction_round <= self.config.max_correction_rounds,
             "correction limit reached; needs planner escalation",
         )?;
-        let mut interrupted = false;
+        // Publication recovery precedes job interruption handling, graph
+        // refresh, verification, dependency release, and every new launch.
+        if run.reconciliation.is_some() {
+            self.recover_reconciliation(info, run)?;
+        }
+        let mut fatal_interruption = false;
         for mut job in self.store.runtime_jobs(&info.root, Some(&run.plan_id))? {
             session::validate_job(self.store, info, &job)?;
             if matches!(
@@ -1384,17 +1843,44 @@ impl<'a> Runtime<'a> {
                     )?;
                 }
                 save_job(self.store, info, &job, "JOB_INTERRUPTED")?;
-                interrupted = true;
+                if job.role == AgentRole::Executor {
+                    if let Some(task_id) = &job.task_id
+                        && let Some(task) = self.store.task(&info.repository_id, task_id)?
+                        && matches!(task.state, TaskState::Ready | TaskState::Executing)
+                    {
+                        self.store.transition_task(
+                            &info.repository_id,
+                            task_id,
+                            task.state,
+                            TaskState::Blocked,
+                            None,
+                            now_ms()?,
+                        )?;
+                    }
+                    event(
+                        self.store,
+                        info,
+                        Some(&run.plan_id),
+                        Some(&job.job_id),
+                        "BRANCH_INTERRUPTED",
+                        "executor branch contained; durable sibling results remain valid",
+                    )?;
+                } else {
+                    // A task/integration verifier interruption sits on the
+                    // serialized acceptance path. Its absence proves no
+                    // decision, so resumption requires explicit review.
+                    fatal_interruption = true;
+                }
             }
         }
         require(
-            !interrupted,
+            !fatal_interruption,
             "interrupted job requires explicit planner review",
         )?;
         // Repair only the derived graph if a crash occurred after the durable
         // VERIFIED checkpoint and before its refresh. Recheck source first.
         if run.pending.is_none() && !run.accepted.is_empty() {
-            self.expected(&info.root, &run.expected)?;
+            self.expected(info, &run.expected)?;
             let origin = graph::GenerationOrigin::Runtime {
                 plan_id: run.plan_id.clone(),
                 task_id: None,
@@ -1417,14 +1903,102 @@ impl<'a> Runtime<'a> {
                 self.verify_pending(info, plan, run, lease)?;
                 continue;
             }
-            let current = self.expected(&info.root, &run.expected)?;
+            if let Some((task_id, mut pending)) = run
+                .branches
+                .iter()
+                .next()
+                .map(|(task, pending)| (task.clone(), pending.clone()))
+            {
+                let task = plan
+                    .packet
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == task_id)
+                    .ok_or_else(|| Error::Invalid("branch task is absent from plan".into()))?;
+                let generation = pending.ontology_generation.as_deref().ok_or_else(|| {
+                    Error::Invalid("UNKNOWN: branch lacks issued ontology generation".into())
+                })?;
+                concurrency::revalidate_semantic(self.store, info, task, generation)?;
+                let current = self.expected(info, &run.expected)?;
+                let intent =
+                    concurrency::reconciliation_intent(task, &pending, &current, &self.artifacts)?;
+                run.reconciliation = Some(intent);
+                self.checkpoint(info, run, "RECONCILIATION_INTENT")?;
+                self.observe_boundary("reconciliation_intent_durable");
+                self.recover_reconciliation(info, run)?;
+                pending = run.pending.clone().expect("recovered pending task");
+                self.verify_pending(info, plan, run, lease)?;
+                if let Some(root) = &pending.execution_workspace {
+                    concurrency::remove_workspace(info, root)?;
+                }
+                continue;
+            }
+            let current = self.expected(info, &run.expected)?;
             let tasks = self.store.execution_tasks(&info.root, &run.plan_id)?;
             if tasks.iter().all(|t| t.state == TaskState::Verified) {
                 return self.integrate(info, plan, run, &current, lease);
             }
-            let task=tasks.into_iter().find(|t|t.structurally_ready).ok_or_else(||Error::Invalid("no runnable task; unverified/rejected/interrupted work requires planner decision".into()))?;
+            let ready: Vec<_> = tasks
+                .into_iter()
+                .filter(|task| task.structurally_ready)
+                .collect();
+            let task = ready.first().cloned().ok_or_else(|| {
+                Error::Invalid(
+                    "no runnable task; unverified/rejected/interrupted work requires planner decision"
+                        .into(),
+                )
+            })?;
+            let project = ProjectConfig::load(&info.root)?;
+            let limit = self.config.effective_max_agents(&project.routing);
+            if limit > 1 && self.fork_adapters().is_some() {
+                let mut batch = vec![task.clone()];
+                'candidate: for candidate in ready.into_iter().skip(1) {
+                    if batch.len() >= limit {
+                        break;
+                    }
+                    for selected in &batch {
+                        let decision = concurrency::decide(
+                            self.store,
+                            info,
+                            plan,
+                            &selected.packet,
+                            &candidate.packet,
+                        )?;
+                        if decision.decision != concurrency::Compatibility::Compatible {
+                            continue 'candidate;
+                        }
+                    }
+                    batch.push(candidate);
+                }
+                if batch.len() > 1 {
+                    self.execute_batch(info, plan, run, &batch, lease)?;
+                    continue;
+                }
+            }
             self.execute_task(info, run, &task, lease)?;
         }
+    }
+    fn recover_reconciliation(&mut self, info: &RepositoryInfo, run: &mut RunRecord) -> Result<()> {
+        let intent = run
+            .reconciliation
+            .clone()
+            .ok_or_else(|| Error::Invalid("reconciliation intent missing".into()))?;
+        let mut pending =
+            run.branches.get(&intent.task_id).cloned().ok_or_else(|| {
+                Error::Invalid("reconciliation intent has no captured branch".into())
+            })?;
+        require(
+            pending.executor == intent.executor && pending.diff == intent.diff,
+            "RECONCILIATION_UNRESOLVED: durable intent does not match captured branch",
+        )?;
+        let reconciled = concurrency::publish_reconciliation(&info.root, &intent, &self.artifacts)?;
+        self.observe_boundary("reconciliation_files_complete");
+        pending.after = self.artifacts.json(&reconciled)?;
+        run.branches.remove(&intent.task_id);
+        run.pending = Some(pending);
+        run.expected = intent.intended_source;
+        run.reconciliation = None;
+        self.checkpoint(info, run, "BRANCH_RECONCILED")
     }
     /// Runs one ready task to a captured result. While the executor reports
     /// CONTEXT_REQUIRED and the relay grants it, each round is a brand-new
@@ -1440,7 +2014,7 @@ impl<'a> Runtime<'a> {
         let key = context::subject_key(AgentRole::Executor, Some(&id));
         let limits = self.config.context;
         loop {
-            let current = self.expected(&info.root, &run.expected)?;
+            let current = self.expected(info, &run.expected)?;
             let ledger = run
                 .context
                 .entry(key.clone())
@@ -1470,9 +2044,10 @@ impl<'a> Runtime<'a> {
                 }
                 None => {
                     graph::require_issuable(&self.store.connection, info, &run.plan_id)?;
+                    let authority = self.authority_info.as_ref().unwrap_or(info);
                     let built = context::base_executor(
                         &*self.store,
-                        info,
+                        authority,
                         &self.artifacts,
                         &current,
                         task,
@@ -1484,7 +2059,7 @@ impl<'a> Runtime<'a> {
                         source_hash: built.source_hash.clone(),
                     };
                     run.context.get_mut(&key).expect("issued ledger").base = Some(base);
-                    save_run(self.store, info, run, "CONTEXT_BASE_ISSUED")?;
+                    self.checkpoint(info, run, "CONTEXT_BASE_ISSUED")?;
                     built
                 }
             };
@@ -1493,7 +2068,7 @@ impl<'a> Runtime<'a> {
             let round = ledger.rounds_used();
             let relay = self.relay_state(&ledger, limits.max_rounds);
             let (artifact, inventory) = self.task_input(task, &base, &deltas, relay, round)?;
-            self.expected(&info.root, &run.expected)?;
+            self.expected(info, &run.expected)?;
             let state = self
                 .store
                 .task(&info.repository_id, &id)?
@@ -1521,10 +2096,14 @@ impl<'a> Runtime<'a> {
             }
             let previous: BTreeSet<JobId> = self
                 .store
-                .runtime_jobs(&info.root, Some(&run.plan_id))?
+                .runtime_jobs(
+                    &self.authority_info.as_ref().unwrap_or(info).root,
+                    Some(&run.plan_id),
+                )?
                 .into_iter()
                 .map(|j| j.job_id)
                 .collect();
+            self.revalidate_branch_launch(run, &id)?;
             let invocation = self.invoke(
                 info,
                 Some(&run.plan_id),
@@ -1543,7 +2122,10 @@ impl<'a> Runtime<'a> {
                 Ok((job, _)) => job.job_id.clone(),
                 Err(error) => self
                     .store
-                    .runtime_jobs(&info.root, Some(&run.plan_id))?
+                    .runtime_jobs(
+                        &self.authority_info.as_ref().unwrap_or(info).root,
+                        Some(&run.plan_id),
+                    )?
                     .into_iter()
                     .filter(|j| j.role == AgentRole::Executor && !previous.contains(&j.job_id))
                     .find_map(|j| {
@@ -1556,7 +2138,7 @@ impl<'a> Runtime<'a> {
                         ))
                     })?,
             };
-            let after = source::capture(&info.root, &self.artifacts)?;
+            let after = self.capture(info)?;
             let diff = source::diff(
                 &current,
                 &after,
@@ -1635,6 +2217,30 @@ impl<'a> Runtime<'a> {
                     == diff.changes.iter().map(|c| &c.path).collect(),
                 "executor changed-path report differs from captured files",
             )?;
+            let pending = PendingTask {
+                task_id: id.clone(),
+                executor: job.job_id,
+                before: diff.before,
+                after: diff.after,
+                diff: reference,
+                evidence: vec![evidence],
+                verifier: None,
+                proof: None,
+                execution_workspace: self.branch_workspace.clone(),
+                compatibility: self.branch_compatibility.clone(),
+                ontology_generation: self.branch_generation.clone(),
+            };
+            run.pending = Some(pending.clone());
+            if self.persist_run {
+                self.checkpoint(info, run, "TASK_EXECUTION_COMPLETED")?;
+            } else {
+                let ledger = run.context.get(&key).cloned();
+                let authority = self.authority_info.as_ref().unwrap_or(info);
+                merge_branch(self.store, authority, &id, pending, ledger)?;
+            }
+            // The durable captured result precedes AWAITING_VERIFICATION. A
+            // restart can therefore recover every state at or beyond this
+            // transition without inferring from provider success.
             self.store.transition_task(
                 &info.repository_id,
                 &id,
@@ -1643,19 +2249,149 @@ impl<'a> Runtime<'a> {
                 None,
                 now_ms()?,
             )?;
-            run.pending = Some(PendingTask {
-                task_id: id,
-                executor: job.job_id,
-                before: diff.before,
-                after: diff.after,
-                diff: reference,
-                evidence: vec![evidence],
-                verifier: None,
-                proof: None,
-            });
-            save_run(self.store, info, run, "TASK_EXECUTION_COMPLETED")?;
             return Ok(());
         }
+    }
+    fn revalidate_branch_launch(&self, run: &RunRecord, task: &TaskId) -> Result<()> {
+        let Some(authority) = &self.authority_info else {
+            return Ok(());
+        };
+        let expected: SourceSnapshot = self.artifacts.decode(&run.expected)?;
+        let current = source::capture_bound(
+            &authority.root,
+            &self.artifacts,
+            &authority.repository_id,
+            &authority.workspace_id,
+        )?;
+        require(
+            current == expected,
+            "STALE_CONCURRENCY_AUTHORITY: canonical source changed after batch claim and before executor launch",
+        )?;
+        require(
+            concurrency::live_generation_id(self.store, authority)?
+                == self
+                    .branch_generation
+                    .clone()
+                    .ok_or_else(|| Error::Invalid("branch ontology authority missing".into()))?,
+            "STALE_CONCURRENCY_AUTHORITY: ontology changed after batch claim and before executor launch",
+        )?;
+        require(
+            self.store
+                .task(&authority.repository_id, task)?
+                .is_some_and(|stored| stored.state == TaskState::Executing),
+            "STALE_CONCURRENCY_AUTHORITY: task claim changed before executor launch",
+        )
+    }
+    /// Re-prove durable lifecycle authority after provider preflight, at the
+    /// closest practical boundary before external process creation. SQLite and
+    /// the filesystem cannot participate atomically in `adapter.launch`, so a
+    /// cancellation or source mutation after this returns is the residual
+    /// cooperative race that requires Stage-8 enforcement to eliminate.
+    fn revalidate_launch_at_adapter(
+        &mut self,
+        info: &RepositoryInfo,
+        plan: Option<&PlanId>,
+        task: Option<&TaskId>,
+        role: AgentRole,
+        source: &SourceSnapshot,
+    ) -> Result<()> {
+        let Some(plan) = plan else {
+            return Ok(());
+        };
+        require(
+            self.capture(info)? == *source,
+            "SOURCE_DRIFT: launch source changed before external process creation",
+        )?;
+        let authority = self.authority_info.clone().unwrap_or_else(|| info.clone());
+        let tx = self
+            .store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (record, cancelled, plan_state): (String, bool, String) = tx.query_row(
+            "SELECT r.record_json,r.cancel_requested,e.state FROM runtime_runs r JOIN execution_plans e ON e.repo_id=r.repo_id AND e.plan_id=r.plan_id WHERE r.repo_id=?1 AND r.plan_id=?2 AND r.workspace_id=?3 AND e.workspace_id=r.workspace_id",
+            params![
+                authority.repository_id.as_str(),
+                plan.as_str(),
+                authority.workspace_id.as_str()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let durable: RunRecord = serde_json::from_str(&record)?;
+        require(
+            durable.state == RunState::Running
+                && plan_state == "ACTIVE"
+                && !cancelled
+                && durable.reconciliation.is_none(),
+            "STALE_CONCURRENCY_AUTHORITY: lifecycle or reconciliation authority changed before launch",
+        )?;
+        let states = store::task_states(&tx, &authority.repository_id, plan)?;
+        match (role, task) {
+            (AgentRole::Executor, Some(task)) => require(
+                states.get(task) == Some(&TaskState::Executing),
+                "STALE_CONCURRENCY_AUTHORITY: task claim changed before executor launch",
+            )?,
+            (AgentRole::Verifier, Some(task)) => require(
+                states.get(task) == Some(&TaskState::Verifying) && durable.pending.is_some(),
+                "STALE_CONCURRENCY_AUTHORITY: task is not currently eligible for verification",
+            )?,
+            (AgentRole::Verifier, None) => require(
+                states.values().all(|state| *state == TaskState::Verified)
+                    && durable.accepted.len() == states.len()
+                    && durable.pending.is_none()
+                    && durable.branches.is_empty(),
+                "STALE_CONCURRENCY_AUTHORITY: plan is not currently eligible for integration verification",
+            )?,
+            _ => {}
+        }
+        if self.authority_info.is_some() {
+            let task =
+                task.ok_or_else(|| Error::Invalid("branch task authority missing".into()))?;
+            let batch = durable.batch_authority.as_ref().ok_or_else(|| {
+                Error::Invalid(
+                    "STALE_CONCURRENCY_AUTHORITY: durable batch authority missing".into(),
+                )
+            })?;
+            require(
+                batch.tasks.contains(task)
+                    && batch.compatibility == self.branch_compatibility
+                    && batch.ontology_generation
+                        == self.branch_generation.clone().ok_or_else(|| {
+                            Error::Invalid("branch ontology authority missing".into())
+                        })?,
+                "STALE_CONCURRENCY_AUTHORITY: launch no longer corresponds to the authorized batch branch",
+            )?;
+            let generation = graph::generation(&tx, &authority)?.ok_or_else(|| {
+                Error::Invalid(
+                    "STALE_CONCURRENCY_AUTHORITY: accepted ontology is unavailable".into(),
+                )
+            })?;
+            let generation_id: String = tx.query_row(
+                "SELECT generation_id FROM ontology_generations WHERE workspace_id=?1 AND sequence=?2 AND fingerprint=?3 ORDER BY ordinal DESC LIMIT 1",
+                params![
+                    authority.workspace_id.as_str(),
+                    generation.sequence as i64,
+                    generation.fingerprint
+                ],
+                |row| row.get(0),
+            )?;
+            require(
+                generation_id == batch.ontology_generation,
+                "STALE_CONCURRENCY_AUTHORITY: ontology changed before executor launch",
+            )?;
+            let expected: SourceSnapshot = self.artifacts.decode(&batch.source)?;
+            let current = source::capture_bound(
+                &authority.root,
+                &self.artifacts,
+                &authority.repository_id,
+                &authority.workspace_id,
+            )?;
+            require(
+                current == expected,
+                "STALE_CONCURRENCY_AUTHORITY: canonical source changed before executor launch",
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
     /// Between context rounds the ontology generation and the captured source
     /// a base context was derived from must still hold, or the relay would
@@ -1754,9 +2490,10 @@ impl<'a> Runtime<'a> {
             .base
             .as_ref()
             .and_then(|b| b.graph_generation.clone());
+        let authority = self.authority_info.as_ref().unwrap_or(info);
         let (resolution, items) = context::resolve(
             &*self.store,
-            info,
+            authority,
             &self.artifacts,
             source,
             key,
@@ -1851,7 +2588,7 @@ impl<'a> Runtime<'a> {
             _ => {}
         }
         entry.rounds.push(record);
-        save_run(self.store, info, run, phase)?;
+        self.checkpoint(info, run, phase)?;
         event(
             self.store,
             info,
@@ -1870,7 +2607,7 @@ impl<'a> Runtime<'a> {
         lease: &WorkspaceLease,
     ) -> Result<()> {
         let mut pending = run.pending.clone().expect("pending task");
-        let after = self.expected(&info.root, &pending.after)?;
+        let after = self.expected(info, &pending.after)?;
         let task = plan
             .packet
             .tasks
@@ -1881,6 +2618,21 @@ impl<'a> Runtime<'a> {
             .store
             .task(&info.repository_id, &pending.task_id)?
             .ok_or_else(|| Error::Invalid("pending task missing".into()))?;
+        let current = if current.state == TaskState::Executing {
+            self.store.transition_task(
+                &info.repository_id,
+                &pending.task_id,
+                TaskState::Executing,
+                TaskState::AwaitingVerification,
+                None,
+                now_ms()?,
+            )?;
+            self.store
+                .task(&info.repository_id, &pending.task_id)?
+                .ok_or_else(|| Error::Invalid("pending task disappeared".into()))?
+        } else {
+            current
+        };
         if current.state == TaskState::Verified {
             require(
                 pending.proof.is_some(),
@@ -1898,7 +2650,7 @@ impl<'a> Runtime<'a> {
                 pending.verifier = Some(job.job_id);
                 pending.proof = Some(proof);
                 run.pending = Some(pending.clone());
-                save_run(self.store, info, run, "VERIFIER_OUTPUT_RECOVERED")?;
+                self.checkpoint(info, run, "VERIFIER_OUTPUT_RECOVERED")?;
             }
             if pending.proof.is_none() {
                 if pending.evidence.len() == 1 {
@@ -1911,7 +2663,7 @@ impl<'a> Runtime<'a> {
                     )?);
                 }
                 run.pending = Some(pending.clone());
-                save_run(self.store, info, run, "PACKET_CHECKS_COMPLETED")?;
+                self.checkpoint(info, run, "PACKET_CHECKS_COMPLETED")?;
                 if current.state == TaskState::AwaitingVerification {
                     self.store.transition_task(
                         &info.repository_id,
@@ -1956,9 +2708,9 @@ impl<'a> Runtime<'a> {
                 pending.verifier = Some(verifier);
                 pending.proof = Some(proof);
                 run.pending = Some(pending.clone());
-                save_run(self.store, info, run, "VERIFIER_OUTPUT_CAPTURED")?;
+                self.checkpoint(info, run, "VERIFIER_OUTPUT_CAPTURED")?;
             }
-            self.expected(&info.root, &pending.after)?;
+            self.expected(info, &pending.after)?;
             let proof = pending.proof.as_ref().expect("recorded proof");
             let next = match proof.decision {
                 VerificationDecision::Pass => TaskState::Verified,
@@ -2006,7 +2758,7 @@ impl<'a> Runtime<'a> {
             },
         );
         run.pending = None;
-        save_run(self.store, info, run, "TASK_VERIFIED")?;
+        self.checkpoint(info, run, "TASK_VERIFIED")?;
         // Task-verified work refreshes the working ontology as this plan's
         // candidate; it becomes accepted truth only at plan completion.
         require(
@@ -2055,7 +2807,7 @@ impl<'a> Runtime<'a> {
                         source_hash: context::source_hash(source)?,
                     };
                     run.context.get_mut(&key).expect("issued ledger").base = Some(base);
-                    save_run(self.store, info, run, "VERIFIER_CONTEXT_BASE_ISSUED")?;
+                    self.checkpoint(info, run, "VERIFIER_CONTEXT_BASE_ISSUED")?;
                 }
             }
             let ledger = run.context.get(&key).cloned().expect("issued ledger");
@@ -2235,7 +2987,7 @@ impl<'a> Runtime<'a> {
         current: &SourceSnapshot,
         proof: &VerificationPacket,
     ) -> Result<()> {
-        self.expected(&info.root, &run.expected)?;
+        self.expected(info, &run.expected)?;
         if proof.decision == VerificationDecision::Reject {
             graph::close_for_plan(
                 &self.store.connection,
@@ -2252,7 +3004,7 @@ impl<'a> Runtime<'a> {
             &current.source_ref()?,
         )?;
         run.state = RunState::Complete;
-        save_run(self.store, info, run, "PLAN_RUNTIME_COMPLETED")?;
+        self.checkpoint(info, run, "PLAN_RUNTIME_COMPLETED")?;
         if let Some(generation) = accepted {
             event(
                 self.store,

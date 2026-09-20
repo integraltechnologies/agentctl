@@ -27,7 +27,13 @@ pub struct JobInput {
     pub source: SourceStateRef,
     pub artifact: Value,
 }
-pub trait ProviderAdapter {
+pub trait ProviderAdapter: Send {
+    /// A fresh adapter instance for an isolated concurrent invocation. Adapters
+    /// with process-local mutable state may decline; the scheduler then falls
+    /// back to serial execution rather than sharing that state unsafely.
+    fn fork(&self) -> Option<Box<dyn ProviderAdapter>> {
+        None
+    }
     /// Token-free mechanical availability check. Never parse model prose.
     fn preflight(&self) -> Result<()> {
         Ok(())
@@ -78,6 +84,12 @@ fn prompt(input: &JobInput) -> Result<Vec<u8>> {
         .ok_or_else(|| Error::Invalid("adapter requires compiled role instructions".into()))
 }
 impl ProviderAdapter for CodexAdapter {
+    fn fork(&self) -> Option<Box<dyn ProviderAdapter>> {
+        Some(Box::new(Self {
+            executable: self.executable.clone(),
+            authentication: self.authentication.clone(),
+        }))
+    }
     fn preflight(&self) -> Result<()> {
         executable_available(&self.executable)
     }
@@ -154,6 +166,12 @@ impl ProviderAdapter for CodexAdapter {
     }
 }
 impl ProviderAdapter for ClaudeAdapter {
+    fn fork(&self) -> Option<Box<dyn ProviderAdapter>> {
+        Some(Box::new(Self {
+            executable: self.executable.clone(),
+            authentication: self.authentication.clone(),
+        }))
+    }
     fn preflight(&self) -> Result<()> {
         executable_available(&self.executable)
     }
