@@ -53,6 +53,13 @@ pub enum Capability {
     FilesystemWrite,
     FilesystemMetadataWrite,
     NetworkDeny,
+    /// The worker cannot ask a system service broker (macOS LaunchServices /
+    /// launchd via Mach bootstrap) to start a process on its behalf. Such a
+    /// process is created by the broker, so it is outside the worker's sandbox,
+    /// process group, environment and inherited descriptors at once: it would
+    /// defeat filesystem, network and credential confinement AND make the
+    /// process-tree sweep report a clean job over a live escapee.
+    ServiceBrokerDeny,
     ProcessTree,
     EnvironmentIsolation,
     CredentialIsolation,
@@ -568,6 +575,9 @@ pub struct SecurityPolicy {
     pub resources: ResourceLimits,
     /// Values used only to redact captured output; never persisted.
     pub secrets: Vec<String>,
+    /// The worker authenticates through the macOS login Keychain, so the
+    /// securityd Mach services stay reachable. Everything else is denied.
+    pub keychain: bool,
     /// Resolved program path (not canonicalized: multicall proxies use argv[0]).
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -583,6 +593,9 @@ impl SecurityPolicy {
             (FilesystemRead, Enforced),
             (FilesystemWrite, Enforced),
             (EnvironmentIsolation, Enforced),
+            // Unconditional: a broker-launched process escapes every other
+            // capability at once, whatever this job was otherwise granted.
+            (ServiceBrokerDeny, Enforced),
             (ProcessTree, BestEffort),
             (WallClock, Enforced),
             (OutputCapture, Enforced),
@@ -828,21 +841,29 @@ fn resolve_program(program: &Path, cwd: &Path, path_var: &OsStr) -> Result<PathB
 }
 
 /// The executable's own install directory plus one level of `#!` interpreter.
+///
+/// `project` marks a program named by repository configuration
+/// (`.agentctl/project.toml` `[commands.KEY].program`) rather than by the
+/// machine operator. Such a program is granted as a single file and never
+/// widens the policy to its install directory, because repository
+/// configuration must not be able to add a read root (see `SecurityConfig`).
 fn executable_roots(
     program: &Path,
     path_var: &OsStr,
     home: Option<&Path>,
+    project: bool,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let (mut roots, mut files) = (vec![], vec![]);
     let mut grant = |file: PathBuf| {
         match file.parent() {
             Some(parent)
-                if parent.components().count() > 1
+                if !project
+                    && parent.components().count() > 1
                     && !home.is_some_and(|h| h.starts_with(parent)) =>
             {
                 push_unique(&mut roots, parent.to_path_buf())
             }
-            // Never widen to "/" or to an ancestor of HOME: grant the file only.
+            // Never widen to "/", to an ancestor of HOME, or on repository say-so.
             _ => push_unique(&mut files, file),
         }
     };
@@ -1045,7 +1066,12 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
             push_unique(&mut fs_policy.read_roots, canonical_or_self(git));
         }
     }
-    let (exe_roots, exe_files) = executable_roots(&program, &path_var, real_home.as_deref());
+    let (exe_roots, exe_files) = executable_roots(
+        &program,
+        &path_var,
+        real_home.as_deref(),
+        spec.project_executable,
+    );
     for root in exe_roots {
         push_unique(&mut fs_policy.read_roots, root);
     }
@@ -1230,6 +1256,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
         environment,
         resources: spec.security.resources,
         secrets,
+        keychain: keychain_client,
         program,
         args: spec.args.clone(),
         marker,
@@ -1505,6 +1532,7 @@ pub fn self_test(config: &SecurityConfig) -> std::result::Result<(), String> {
         native_auth: None,
         api_key: None,
         executable: "/bin/sh".into(),
+        project_executable: false,
         args: vec![
             "-c".into(),
             "cat \"$1\" >/dev/null || exit 10; if cat \"$2\" >/dev/null 2>&1; then exit 11; fi; if (printf x > \"$3\") 2>/dev/null; then exit 12; fi; if (printf x > \"$4\") 2>/dev/null; then exit 13; fi; exit 0".into(),
@@ -1567,6 +1595,7 @@ mod tests {
                 FilesystemRead,
                 FilesystemWrite,
                 EnvironmentIsolation,
+                ServiceBrokerDeny,
                 ProcessTree,
                 NetworkDeny,
                 CredentialIsolation,
@@ -1587,6 +1616,7 @@ mod tests {
             environment: BTreeMap::new(),
             resources,
             secrets: vec![],
+            keychain: false,
             program: "/bin/true".into(),
             args: vec![],
             marker: "m".into(),
@@ -1630,6 +1660,49 @@ mod tests {
         let mut root = report(CapabilityStatus::Enforced);
         root.running_as_root = true;
         assert!(check(&root, &deny).is_err());
+    }
+
+    /// Stage 8A SEC-8A-01/SEC-8A-02: a backend that cannot shut the system
+    /// service broker cannot confine a worker at all, because a broker-started
+    /// process is outside the sandbox, the process group, the environment and
+    /// the inherited descriptors at once. It is required unconditionally - of
+    /// every class and every network grant - and nothing less than ENFORCED
+    /// is accepted, so such a host is refused rather than silently degraded.
+    #[test]
+    fn a_backend_that_cannot_deny_the_service_broker_is_refused_not_degraded() {
+        for network in [NetworkPolicy::DenyAll, NetworkPolicy::AllowAll] {
+            for class in [WorkerClass::Tool, WorkerClass::ProviderFrontend] {
+                let mut policy = policy(network, ResourceLimits::default());
+                policy.class = class;
+                assert!(
+                    policy
+                        .required()
+                        .contains(&(Capability::ServiceBrokerDeny, CapabilityStatus::Enforced)),
+                    "{class:?}/{network:?} must require SERVICE_BROKER_DENY as ENFORCED"
+                );
+                check(&report(CapabilityStatus::Enforced), &policy).unwrap();
+                for degraded in [CapabilityStatus::BestEffort, CapabilityStatus::Unsupported] {
+                    let mut partial = report(CapabilityStatus::Enforced);
+                    for entry in &mut partial.capabilities {
+                        if entry.capability == Capability::ServiceBrokerDeny {
+                            entry.status = degraded;
+                        }
+                    }
+                    let error = check(&partial, &policy).unwrap_err().to_string();
+                    assert!(
+                        error.starts_with("SECURITY_CAPABILITY_UNSUPPORTED")
+                            && error.contains("ServiceBrokerDeny"),
+                        "{degraded:?}: {error}"
+                    );
+                }
+                // A backend that does not report it at all is also refused.
+                let mut missing = report(CapabilityStatus::Enforced);
+                missing
+                    .capabilities
+                    .retain(|c| c.capability != Capability::ServiceBrokerDeny);
+                assert!(check(&missing, &policy).is_err());
+            }
+        }
     }
 
     #[test]
@@ -1767,6 +1840,7 @@ mod tests {
             native_auth: None,
             api_key: None,
             executable: "/bin/sh".into(),
+            project_executable: false,
             args: vec![],
             input: vec![],
             cwd: workspace.clone(),
@@ -1833,6 +1907,90 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// Stage 8A SEC-8A-03: `[commands.KEY].program` in `.agentctl/project.toml`
+    /// is repository-controlled, and an absolute path there used to add the
+    /// program's whole install directory to the worker's read roots - a grant
+    /// the stated invariant says repository configuration can never make. The
+    /// machine operator's own programs must keep that grant, because ordinary
+    /// toolchains read files beside their executable.
+    #[test]
+    fn a_repository_declared_program_never_widens_worker_read_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "agentctl-project-exe-{}-{}",
+            std::process::id(),
+            crate::local::now_ms().unwrap()
+        ));
+        fs::create_dir_all(base.join("repo/.git")).unwrap();
+        fs::create_dir_all(base.join("state/data/scratch")).unwrap();
+        // A directory outside the workspace holding the declared program and a
+        // neighbouring file that must stay unreadable.
+        fs::create_dir_all(base.join("tools")).unwrap();
+        let base = fs::canonicalize(&base).unwrap();
+        let program = base.join("tools/check");
+        fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(base.join("tools/neighbour"), "not source").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut spec = ProcessSpec {
+            project_policy_hash: None,
+            native_auth: None,
+            api_key: None,
+            executable: program.clone(),
+            project_executable: true,
+            args: vec![],
+            input: vec![],
+            cwd: base.join("repo"),
+            workspace: base.join("repo"),
+            scratch: base.join("state/data/scratch"),
+            data_root: base.join("state/data"),
+            config_root: base.join("state/config"),
+            cache_root: base.join("state/cache"),
+            writable: false,
+            network: false,
+            timeout_ms: 1000,
+            git_directories: vec![base.join("repo/.git")],
+            protected: vec![],
+            credential_env: vec![],
+            experiment_event_file: None,
+            class: WorkerClass::Tool,
+            security: SecurityConfig::default(),
+            issued: None,
+            lock_fd: None,
+        };
+        let tools = base.join("tools");
+        // Repository authority: the program runs, but as a single file.
+        let project = compile(&spec).unwrap();
+        assert!(
+            !project.filesystem.read_roots.contains(&tools),
+            "repository configuration added a read root: {:?}",
+            project.filesystem.read_roots
+        );
+        assert!(
+            project.filesystem.read_files.contains(&program),
+            "the declared program must still be readable/executable"
+        );
+        assert!(
+            !project
+                .filesystem
+                .read_roots
+                .iter()
+                .any(|r| tools.starts_with(r) && r != &base.join("tools")),
+            "no ancestor of the program's directory may be granted either"
+        );
+        // Operator authority is unchanged: the install directory stays granted,
+        // because ordinary toolchains read files beside their executable.
+        spec.project_executable = false;
+        let operator = compile(&spec).unwrap();
+        assert!(
+            operator.filesystem.read_roots.contains(&tools),
+            "operator-chosen programs must keep their install directory"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn keychain_access_is_granted_only_to_native_provider_frontends() {
         let base = std::env::temp_dir().join(format!(
@@ -1848,6 +2006,7 @@ mod tests {
             native_auth: None,
             api_key: None,
             executable: "/bin/sh".into(),
+            project_executable: false,
             args: vec![],
             input: vec![],
             cwd: base.join("repo"),

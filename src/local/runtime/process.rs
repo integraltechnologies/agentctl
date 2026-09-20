@@ -16,6 +16,11 @@ pub struct ProcessSpec {
     pub native_auth: Option<super::credentials::NativeAuth>,
     pub api_key: Option<(String, String)>,
     pub executable: PathBuf,
+    /// The executable was named by repository configuration
+    /// (`.agentctl/project.toml` `[commands.KEY].program`) rather than by the
+    /// machine operator. Such a program never widens the worker's read policy
+    /// to its install directory.
+    pub project_executable: bool,
     pub args: Vec<String>,
     pub input: Vec<u8>,
     pub cwd: PathBuf,
@@ -405,6 +410,7 @@ mod tests {
                 native_auth: None,
                 api_key: None,
                 executable: "/usr/bin/true".into(),
+                project_executable: false,
                 args: vec![],
                 input: vec![],
                 cwd: self.0.join("repo"),

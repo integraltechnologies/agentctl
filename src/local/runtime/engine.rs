@@ -176,6 +176,7 @@ impl<'a> Runtime<'a> {
             native_auth: None,
             api_key: None,
             executable: PathBuf::new(),
+            project_executable: false,
             args: vec![],
             input: vec![],
             cwd: info.root.clone(),
@@ -910,7 +911,10 @@ impl<'a> Runtime<'a> {
             spec.class = crate::local::security::WorkerClass::Tool;
             spec.network = false;
             spec.args = command.args.clone();
+            // Repository-declared program: it may be run, but it must not widen
+            // the worker's read policy to its own install directory.
             spec.executable = PathBuf::from(&command.program);
+            spec.project_executable = true;
             let cwd = if command.cwd == "." {
                 info.root.clone()
             } else {

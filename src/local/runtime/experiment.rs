@@ -381,6 +381,9 @@ fn build_spec(
         native_auth: None,
         api_key: None,
         executable: PathBuf::from(&run.command.program),
+        // `--command KEY` runs a repository-declared program; `--program PATH`
+        // is the operator's own choice. Only the former is repository authority.
+        project_executable: run.project_command_key.is_some(),
         args: run.command.args.clone(),
         input: vec![],
         cwd,

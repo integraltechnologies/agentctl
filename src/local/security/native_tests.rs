@@ -69,6 +69,7 @@ impl Fixture {
             native_auth: None,
             api_key: None,
             executable: "/bin/sh".into(),
+            project_executable: false,
             args: argv,
             input: vec![],
             cwd: self.0.join("repo"),
@@ -393,6 +394,103 @@ fn native_marker_clearing_daemon_is_never_reported_as_clean() {
         gone_within(daemon, Duration::from_secs(5)),
         "marker-clearing daemon survived"
     );
+}
+
+/// Stage 8A SEC-8A-01/SEC-8A-02: a worker asked LaunchServices to start a
+/// process, and launchd created it outside the sandbox, outside the job's
+/// process group, without the job marker and without the sentinel descriptor.
+/// It could read a planted secret the sandbox had just refused, write outside
+/// every write root, and it outlived a job the tree sweep called clean. Unit
+/// evidence is not enough here: only a real launch proves the broker is shut.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "native: requires host sandbox enforcement (macOS Seatbelt / Linux Landlock+seccomp)"]
+fn native_service_broker_cannot_start_a_process_outside_the_sandbox() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    // A background-only app bundle inside the workspace. If LaunchServices can
+    // be reached, launchd runs this unsandboxed as the operator.
+    let app = f.0.join("repo/Escape.app/Contents/MacOS");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(
+        f.0.join("repo/Escape.app/Contents/Info.plist"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+         <key>CFBundleExecutable</key><string>escape</string>\
+         <key>CFBundleIdentifier</key><string>local.agentctl.native.escape</string>\
+         <key>CFBundlePackageType</key><string>APPL</string>\
+         <key>LSBackgroundOnly</key><string>1</string></dict></plist>\n",
+    )
+    .unwrap();
+    let executable = app.join("escape");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\ncat {secret} > {canary} 2>&1\nsleep 45 &\nprintf '%s' \"$!\" > {survivor}\n",
+            secret = f.path("outside/secret"),
+            canary = f.path("outside/broker-canary"),
+            survivor = f.path("outside/broker-survivor"),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut spec = f.spec("", &[], false, false);
+    spec.executable = "/usr/bin/open".into();
+    spec.args = vec![
+        "-g".into(),
+        "-j".into(),
+        f.path("repo/Escape.app"),
+        // `open` must not be allowed to wait on a broker it cannot reach.
+        "--wait-apps".into(),
+    ];
+    spec.timeout_ms = 8_000;
+    let output = run(&spec);
+
+    // Give a successful escape every chance to land before asserting absence.
+    std::thread::sleep(Duration::from_secs(3));
+    let canary = f.0.join("outside/broker-canary");
+    let survivor = f.0.join("outside/broker-survivor");
+    if let Ok(text) = fs::read_to_string(&survivor)
+        && let Ok(pid) = text.trim().parse::<i32>()
+    {
+        // SAFETY: only reached when the escape succeeded; clean up the proof.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(
+        !canary.exists(),
+        "LaunchServices escape: a broker-started process read {} and wrote outside every write root ({output:?})",
+        f.path("outside/secret"),
+    );
+    assert!(
+        !survivor.exists(),
+        "LaunchServices escape: a broker-started process outlived the job ({output:?})"
+    );
+}
+
+/// Stage 8B F-2: scratch lives inside the denied canonical state tree, and the
+/// denial hid even the metadata of the directories leading to it. `realpath`
+/// (cargo canonicalizes every dep-info path) stats each ancestor, so a build in
+/// scratch failed with `could not parse/generate dep info ... Operation not
+/// permitted` whatever the toolchain. The ancestors must answer `stat` while
+/// everything else in the state tree stays unreadable and unlistable.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "native: requires host sandbox enforcement (macOS Seatbelt / Linux Landlock+seccomp)"]
+fn native_scratch_paths_can_be_canonicalized_without_opening_state() {
+    let f = Fixture::new();
+    let script = "mkdir -p \"$1/target/debug\" && : > \"$1/target/debug/x\" || exit 30; \
+        /usr/bin/perl -MCwd=realpath -e 'defined realpath($ARGV[0]) or exit 20' \"$1/target/debug/x\" || exit 20; \
+        if ls \"$2\" >/dev/null 2>&1; then exit 21; fi; \
+        if cat \"$2/state.sqlite3\" >/dev/null 2>&1; then exit 22; fi; \
+        exit 0";
+    let spec = f.spec(
+        script,
+        &[f.path("state/data/scratch"), f.path("state/data")],
+        false,
+        false,
+    );
+    let output = run(&spec);
+    assert_eq!(output.exit, Some(0), "{output:?}");
 }
 
 #[cfg(target_os = "macos")]
