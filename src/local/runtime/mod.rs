@@ -1,9 +1,14 @@
 //! Provider-neutral local execution. Canonical packets and guarded transitions are reused.
 pub(super) mod auth;
 pub(crate) mod cli;
+pub mod concurrency;
 pub mod config;
+pub mod context;
+pub mod contract;
 pub mod credentials;
+pub mod diffview;
 pub(crate) mod liveness;
+pub mod manifest;
 pub mod process;
 pub mod prompt;
 pub mod provider;
@@ -13,7 +18,15 @@ pub mod source;
 pub use session::{AgentLifetime, AgentOwnership, EngineeringSession};
 mod state;
 use state::*;
-pub use state::{RunRecord, RunState, RuntimeJob, RuntimeJobState};
+pub use state::{
+    BatchLaunchAuthority, OutcomeClass, ReconciliationIntent, ReconciliationPath, RunRecord,
+    RunState, RuntimeJob, RuntimeJobState,
+};
+mod capability;
+pub use capability::{
+    CapabilityEvidence, CapabilityEvidenceKind, CapabilityFinding, CapabilityStatus,
+    ControlPlaneCapability, ControlPlaneCapabilityReport,
+};
 mod engine;
 mod experiment;
 pub(crate) mod experiment_cli;

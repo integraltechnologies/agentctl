@@ -37,6 +37,7 @@ documents! {
     "experiment" => ExperimentSpec,
     "experiment-event" => ExperimentEvent,
     "memory-provenance" => MemoryProvenance,
+    "context-request" => ContextRequest,
 }
 
 /// Replaces only the named generated schema files; unrelated files are untouched.

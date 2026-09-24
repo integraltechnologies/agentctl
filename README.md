@@ -33,7 +33,17 @@ database that you own.
 - **Repository intelligence.** An incremental, content-hashed code graph for Rust,
   Python, TypeScript, and JavaScript supports symbol lookup, ranked location,
   callers, tests, impact, and bounded context packets. It runs locally, without a
-  language server or a model.
+  language server or a model. Its facts are generational: an observed change
+  becomes accepted truth only through verification or an explicit
+  `agentctl ontology accept`, and `agentctl ontology delta` shows exactly which
+  declarations and relations changed.
+- **Semantic impact.** `agentctl ontology impact` answers what a proposed or
+  observed change could affect, with an inspectable evidence chain behind every
+  claim (resolved relations, containment of an added or removed declaration, or
+  a test association). Traversal is deterministic, cycle-safe and bounded, and
+  it stops where the ontology stops proving things: open questions are reported
+  as explicit boundaries rather than as impact. Planning gets a small advisory
+  outlook of consequences outside its own scope; it never widens authority.
 - **Structured engineering memory.** Durable decisions, derived facts, observed
   evidence, and agent notes carry explicit trust and provenance. Low-trust notes
   never silently become authority.
@@ -97,12 +107,30 @@ Alpha limitations to know about:
 
 - Only Claude Code and Codex CLI adapters exist. Codex token usage is not
   reported.
-- Tasks within a workspace run one at a time. There are no parallel worktrees.
+- READY tasks with proven-disjoint scopes and accepted-ontology impact run
+  concurrently in managed linked worktrees, each a sandboxed worker of its own.
+  Unknown or conflicting work stays serial, and reconciliation, verification,
+  and acceptance remain serialized.
 - The runtime supports modest repositories: up to 20,000 files and 64 MiB, with no
-  symlinks, hardlinks, or submodules in the checkout. Verifier diffs are limited to
-  128 KiB.
-- The code graph is syntactic and single-file. It resolves only a narrow set of
-  references.
+  symlinks, hardlinks, or submodules in the checkout. Verifier diffs carry exact
+  hunks with bounded context, so they scale with the size of a change rather than
+  the size of the files it touches, and are capped at 128 KiB.
+- Context expansion is deliberately narrow. A worker asks for specific symbols,
+  relations, tests, file ranges or memory entries; there is no semantic
+  repository search. A request for anything outside the task's read scope is
+  never granted automatically: it blocks the run for an explicit planner
+  decision (`agentctl run context`). Verifiers cannot escalate at all.
+- Hard issued-context confinement (`[runtime.context] visibility = "issued"`) is
+  opt-in; the default still lets a worker read the workspace. Under `issued` a
+  worker can resolve its own working directory and list the directories on the
+  path to an issued file, but no unissued file content is readable. See
+  [docs/security.md](docs/security.md#issued-context-visibility).
+- The code graph is syntactic by default. It resolves a relation only when
+  exactly one declaration is provable: in-file lexical scope and methods,
+  qualified paths, and import statements and the names they bind (Rust, Python,
+  TypeScript/JavaScript). Re-exports, globs, and calls on variables stay
+  UNKNOWN unless an installed semantic provider (`rust-analyzer`, or
+  `scip-python` for Python) proves them with `agentctl repo enrich`.
 - Process-tree cleanup on macOS and Linux is best effort, and resource limits are
   mostly per process. See [docs/security.md](docs/security.md#known-limitations).
 - agentctl never commits or pushes. You review and commit results yourself.
@@ -261,6 +289,19 @@ git status && git diff                # agentctl never commits; review and commi
 agentctl analytics summary
 ```
 
+If you edit files yourself between plans, `agentctl repo index` records the
+change as an ontology candidate. Inspect it with `agentctl ontology delta` and
+accept it with `agentctl ontology accept <generation-id>` before preparing the
+next plan.
+
+Before acting on a change, ask what it could reach:
+
+```bash
+agentctl ontology impact --symbol <qualified-name>   # a proposed edit
+agentctl ontology impact                             # the open candidate's observed change
+agentctl ontology impact <generation-id> --plan <plan-id>
+```
+
 If a task is rejected or blocked, the run stops. Prepare a replacement plan and
 link it with `agentctl run replace <old-plan-id> <new-plan-id>`, or resume an
 interrupted run with `agentctl run resume <plan-id>`. See [docs/cli.md](docs/cli.md).
@@ -276,15 +317,23 @@ planning ── planner worker ──▶ ExecutionPlan (task DAG + verification 
    ▼
 for each task whose prerequisites are VERIFIED:
    executor worker ──▶ actual diff captured and scope-checked
+      └─ needs more context? typed request ──▶ deterministic resolution inside the
+         planner's envelope ──▶ delta ──▶ fresh executor job (outside it: planner decides)
    project checks  ──▶ evidence (sandboxed, offline)
    verifier worker ──▶ PASS → VERIFIED (unlocks dependents) │ REJECT → blocked, replan
    ▼
 integration: combined diff + integration checks + fresh integration verifier
    ▼
-COMPLETE
+COMPLETE  (and, in the same transaction, the plan's ontology candidate becomes
+           the accepted generation)
 ```
 
-agentctl owns the canonical state at every step. Provider workers receive bounded,
+agentctl owns the canonical state at every step. The planner decides what a
+worker starts with: a task's `read_scope` authorizes what it may *request*,
+while its issued context is only what the plan actually references. A worker
+that lacks context says so in a typed request instead of exploring, and
+agentctl resolves it deterministically, hands the result to a fresh job, and
+records exactly what every job received. Provider workers receive bounded,
 explicit inputs, return strict JSON, and are discarded. Their claims are checked
 against what actually happened on disk and in the checks. Every transition is
 recorded in an append-only journal and guarded in the database. An interrupted run
@@ -373,6 +422,9 @@ default, and trust boundary.
 - `agentctl observe snapshot|sessions|agents|tasks|events|experiments|usage` returns
   the same data, as JSON with `--json`.
 - `agentctl run status <plan-id>` shows run and job state for one plan.
+- `agentctl run capabilities <plan-id> --json` derives demonstrated end-to-end
+  control-plane behaviors from canonical plan, task, job, artifact, journal, and
+  ontology evidence; it stores no separate capability score or ledger.
 - `agentctl analytics summary|usage|roles|routes|corrections` produces historical,
   descriptive metrics. Token provenance (`EXACT`/`ESTIMATED`/`UNKNOWN`) is kept, and
   missing data is never counted as zero.
@@ -399,8 +451,8 @@ dates.
 - **Stronger cross-platform sandboxing.** Filesystem and network confinement on
   Windows, and kernel-level process-tree and aggregate resource containment on
   Linux and macOS.
-- **Parallel execution.** Isolated, managed worktrees so independent verified-ready
-  tasks can run concurrently.
+- **Richer concurrency evidence.** Broader language/ontology coverage can prove
+  more tasks independent without weakening the current fail-closed rules.
 - **Richer repository intelligence.** Cross-file resolution with correct
   invalidation, and more languages.
 - **Provider integrations.** Broader authentication and platform support, and more

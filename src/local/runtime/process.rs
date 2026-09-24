@@ -16,6 +16,11 @@ pub struct ProcessSpec {
     pub native_auth: Option<super::credentials::NativeAuth>,
     pub api_key: Option<(String, String)>,
     pub executable: PathBuf,
+    /// The executable was named by repository configuration
+    /// (`.agentctl/project.toml` `[commands.KEY].program`) rather than by the
+    /// machine operator. Such a program never widens the worker's read policy
+    /// to its install directory.
+    pub project_executable: bool,
     pub args: Vec<String>,
     pub input: Vec<u8>,
     pub cwd: PathBuf,
@@ -30,7 +35,7 @@ pub struct ProcessSpec {
     pub protected: Vec<super::super::config::ProtectedRule>,
     pub credential_env: Vec<String>,
     /// Attempt-owned structured JSONL channel. This is not a credential and is
-    /// exposed only to experiment processes that explicitly opt into Stage 9B.
+    /// exposed only to experiment processes that explicitly opt into structured experiment events.
     pub experiment_event_file: Option<PathBuf>,
     /// Provider frontend (network + native auth) or untrusted tool (neither).
     pub class: security::WorkerClass,
@@ -38,6 +43,9 @@ pub struct ProcessSpec {
     pub cache_root: PathBuf,
     /// Effective machine-owned security policy (a project can only tighten it).
     pub security: security::SecurityConfig,
+    /// Issued-context visibility of a provider frontend (opt-in); `None` keeps
+    /// the whole workspace readable.
+    pub issued: Option<security::IssuedVisibility>,
     /// Inherited by the entire child family so a controller crash cannot release
     /// the workspace lease while an orphan can still edit files.
     pub(crate) lock_fd: Option<i32>,
@@ -118,6 +126,45 @@ impl ProcessSpec {
         Ok(())
     }
 }
+/// Creates the per-job provider homes the adapters name through `CODEX_HOME`
+/// and `CLAUDE_CONFIG_DIR`, and links in the operator credential files a
+/// scratch provider home needs. Without this a provider CLI refuses to start
+/// against a directory agentctl told it to use but never created.
+///
+/// The link is never followed by agentctl: no credential file is opened, read
+/// or copied here. It exists so the CLI can refresh its own token in place, and
+/// its target already carries the same read/write grant it has today.
+fn prepare_provider_home(spec: &ProcessSpec, scratch_home: &Path) -> Result<()> {
+    for provider in [".codex", ".claude"] {
+        paths::ensure_directory(&scratch_home.join(provider))?;
+    }
+    let Some(native) = spec
+        .native_auth
+        .as_ref()
+        .filter(|_| spec.class == security::WorkerClass::ProviderFrontend)
+    else {
+        return Ok(());
+    };
+    for (link, target) in native.linked_files(scratch_home) {
+        require(
+            link.starts_with(&spec.scratch),
+            "provider credential links belong in job scratch",
+        )?;
+        if std::fs::symlink_metadata(&link).is_ok() {
+            std::fs::remove_file(&link)?;
+        }
+        if std::fs::symlink_metadata(&target).is_err() {
+            // Not logged in with this mechanism; the CLI reports that itself.
+            continue;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link)?;
+        #[cfg(not(unix))]
+        std::fs::hard_link(&target, &link)?;
+    }
+    Ok(())
+}
+
 fn drain(mut stream: impl Read + Send + 'static) -> JoinHandle<std::io::Result<Vec<u8>>> {
     std::thread::spawn(move || {
         let mut bytes = vec![];
@@ -144,7 +191,9 @@ impl NativeProcess {
         // Canonical policy drift is the first pre-spawn gate, then confinement.
         spec.recheck_policy()?;
         paths::ensure_directory(&spec.scratch)?;
-        paths::ensure_directory(&spec.scratch.join("home"))?;
+        let scratch_home = spec.scratch.join("home");
+        paths::ensure_directory(&scratch_home)?;
+        prepare_provider_home(spec, &scratch_home)?;
         let policy = security::compile(spec)?;
         spec.recheck_policy()?;
         let security::Spawned { mut child, tree } = security::launch(
@@ -402,6 +451,7 @@ mod tests {
                 native_auth: None,
                 api_key: None,
                 executable: "/usr/bin/true".into(),
+                project_executable: false,
                 args: vec![],
                 input: vec![],
                 cwd: self.0.join("repo"),
@@ -419,6 +469,7 @@ mod tests {
                 class: security::WorkerClass::Tool,
                 cache_root: self.0.join("cache"),
                 security: Default::default(),
+                issued: None,
                 lock_fd: None,
             }
         }

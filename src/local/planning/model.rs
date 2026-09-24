@@ -55,6 +55,10 @@ pub struct PlanningSource {
     pub observation: RepositorySourceState,
     pub policy_hash: String,
     pub graph_version: String,
+    /// The ontology generation the context was compiled against. Absent only in
+    /// requests prepared before generations existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_generation: Option<graph::GraphGeneration>,
     pub support: Vec<graph::Provenance>,
     pub guarantee: SourceGuarantee,
 }
@@ -115,6 +119,9 @@ impl Default for PlanningLimits {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceExcerpt {
+    /// The graph entity whose range this excerpt shows (absent in older packets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<GraphEntityId>,
     pub provenance: graph::Provenance,
     pub start_byte: usize,
     pub end_byte: usize,
@@ -126,6 +133,13 @@ pub struct SourceExcerpt {
 #[serde(deny_unknown_fields)]
 pub struct PlanningContext {
     pub graph: graph::ContextPacket,
+    /// Bounded, evidence-backed consequences of editing the primary entities,
+    /// read against the request's own scope. Advisory only: it never widens
+    /// read or write authority, and it is the first thing shed under the byte
+    /// budget, so it can never displace context that existed without it.
+    /// Absent in packets prepared before impact analysis existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact: Option<graph::ImpactOutlook>,
     pub memory: MemoryContext,
     /// Frozen, validated policy input; not a competing mutable policy store.
     pub policy: ProjectConfig,
@@ -177,7 +191,7 @@ pub struct IntegrationVerificationContract {
     pub require_final_diff_and_evidence: bool,
     pub expectations: Vec<String>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReplanReference {
     pub previous_plan_id: PlanId,
@@ -198,7 +212,7 @@ pub struct PlanMetadata {
     pub integration: IntegrationVerificationContract,
     pub replan: Option<ReplanReference>,
 }
-/// Stage 4 envelope. The canonical Stage 0 PlanPacket remains the only task definition.
+/// Execution-plan envelope. The canonical protocol PlanPacket remains the only task definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionPlan {

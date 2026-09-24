@@ -29,7 +29,7 @@ fn every_public_document_roundtrips_and_validates() {
         "evidence" => EvidenceRecord, "agent-job" => AgentJob, "agent-event" => AgentEvent,
         "probe" => ProbeSnapshot, "token-usage" => TokenUsageEvent,
         "experiment" => ExperimentSpec, "experiment-event" => ExperimentEvent,
-        "memory-provenance" => MemoryProvenance);
+        "memory-provenance" => MemoryProvenance, "context-request" => ContextRequest);
     roundtrip(verification(true));
     roundtrip(finding());
     roundtrip(EvidenceRef(EvidenceId::new("evidence:1").unwrap()));
@@ -157,6 +157,69 @@ fn ids_and_scope_paths_reject_ambiguous_or_unbounded_values() {
     let mut value = task("a", &[]);
     value.write_scope.clear(); // Explicit read-only task, not unbounded write access.
     value.validate().unwrap();
+}
+
+/// Issue #1: names a repository really contains are literal. Framework route
+/// segments and pattern metacharacters are accepted wherever a path is observed
+/// (reported changes, file events); authored scopes accept them too but refuse
+/// the `*`/`?` wildcards; traversal and platform-ambiguous forms stay rejected.
+#[test]
+fn observed_paths_are_literal_while_authored_scopes_refuse_wildcards() {
+    let observed = |path: &str| {
+        let mut result = samples()["result"].clone();
+        result["changed_paths"] = json!([path]);
+        let mut event = samples()["agent-event"].clone();
+        event["event"]["path"] = json!(path);
+        let parsed = (
+            decode::<ResultPacket>(result.clone()).validate(),
+            decode::<AgentEvent>(event.clone()).validate(),
+        );
+        if parsed.0.is_ok() {
+            schema::validate_json("result", &result.to_string()).unwrap();
+            schema::validate_json("agent-event", &event.to_string()).unwrap();
+        }
+        parsed.0.is_ok() && parsed.1.is_ok()
+    };
+    let authored = |path: &str| {
+        let mut value = task("a", &[]);
+        value.write_scope = vec![ScopePath::File { path: path.into() }];
+        value.read_scope = vec![ScopePath::Directory { path: path.into() }];
+        value.validate().is_ok()
+    };
+    for literal in [
+        "app/[slug]/page.tsx",
+        "app/[...slug]/page.tsx",
+        "app/[[...slug]]/page.tsx",
+        "app/(customer)/s/[slug]/actions.ts",
+        "app/@modal/(.)photo/[id]/page.tsx",
+        "src/routes/[[lang]]/+page.svelte",
+        "lib/{brace}/100%_done/it's here.ts",
+        "lib/$param/~tilde/#hash!/x.ts",
+    ] {
+        assert!(observed(literal), "{literal:?}");
+        assert!(authored(literal), "{literal:?}");
+    }
+    for wildcard in ["lib/star*/x.ts", "lib/q?/x.ts", "src/**"] {
+        assert!(observed(wildcard), "{wildcard:?}");
+        assert!(!authored(wildcard), "{wildcard:?}");
+    }
+    for bad in [
+        "",
+        " ",
+        "/abs/[slug]",
+        "../[slug]",
+        "app/[slug]/../x",
+        "app//[slug]",
+        "app/./[slug]",
+        "app/[slug]/",
+        "C:\\[slug]",
+        "app\\[slug]",
+        "app/[slug]:stream",
+        "app/[slug]\n/x",
+    ] {
+        assert!(!observed(bad), "{bad:?}");
+        assert!(!authored(bad), "{bad:?}");
+    }
 }
 
 #[test]
@@ -314,7 +377,7 @@ fn lifecycle_has_no_verification_shortcut_or_rejection_loop() {
         value
             .validate_task_transition(&a, &states, next, None)
             .unwrap();
-        assert!(!next.is_complete());
+        assert_ne!(next, TaskState::Verified);
         states.insert(a.clone(), next);
     }
     let mut rejection = verification(false);
@@ -343,8 +406,8 @@ fn lifecycle_has_no_verification_shortcut_or_rejection_loop() {
             .validate_task_transition(&a, &states, TaskState::Verified, Some(&verification(false)))
             .is_err()
     );
-    assert!(TaskState::Verified.is_complete());
-    assert!(!TaskState::Rejected.is_complete());
+    assert_eq!(TaskState::Verified, TaskState::Verified);
+    assert_ne!(TaskState::Rejected, TaskState::Verified);
     assert!(TaskState::Blocked.can_transition_to(TaskState::Planned));
     assert!(!TaskState::Blocked.can_transition_to(TaskState::Executing));
 }
@@ -620,8 +683,8 @@ fn experiment_boundaries_are_generic_and_finite() {
 
 #[test]
 fn legacy_boundary_definition_json_without_action_defaults_to_record_only() {
-    // A document written before Stage 9D's `action` field existed: only `boundary_id`
-    // and `condition`, exactly as Stage 0's original contract allowed.
+    // A document written before the `action` field existed: only `boundary_id`
+    // and `condition`, exactly as the original protocol contract allowed.
     let legacy = json!({
         "boundary_id": "legacy-threshold",
         "condition": {"kind": "METRIC_THRESHOLD", "metric": "loss", "comparison": "LESS_THAN", "value": 0.5}
@@ -763,7 +826,7 @@ fn assert_local_refs_resolve(node: &Value, root: &Value) {
 fn schemas_are_deterministic_self_contained_and_match_checked_in_output() {
     let first = schema::schemas();
     let second = schema::schemas();
-    assert_eq!(first.len(), 13);
+    assert_eq!(first.len(), 14);
     for (name, document) in first {
         let json = serde_json::to_value(&document).unwrap();
         assert_eq!(

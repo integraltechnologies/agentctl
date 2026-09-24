@@ -214,15 +214,47 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
         }
         "show" | "links" => {
             let view = store.memory_show(&root, &id()?, get("--all-workspaces").is_some())?;
+            let links: Vec<String> = view
+                .entry
+                .links
+                .iter()
+                .map(crate::local::terminal::json_compact)
+                .collect::<serde_json::Result<_>>()?;
             if command == "links" {
-                output(
-                    json,
-                    &view.entry.links,
-                    &serde_json::to_string_pretty(&view.entry.links)?,
-                )
-            } else {
-                output(json, &view, &serde_json::to_string_pretty(&view)?)
+                let human = if links.is_empty() {
+                    "No links".to_string()
+                } else {
+                    links.join("\n")
+                };
+                return output(json, &view.entry.links, &human);
             }
+            use crate::local::terminal::{Report, name};
+            let e = &view.entry;
+            let mut report = Report::new(format!("Memory {}", e.id.as_str()));
+            report
+                .field("Trust", label(&e.provenance.trust_class)?)
+                .field("Kind", name(&e.kind))
+                .field("Status", name(&view.status))
+                .field(
+                    "Validity",
+                    format!("{} — {}", name(&view.validity), view.validity_detail),
+                )
+                .field_opt("Key", e.canonical_key.as_deref())
+                .field_opt(
+                    "Superseded",
+                    view.superseded_by.as_ref().map(MemoryId::as_str),
+                )
+                .field(
+                    "Scope",
+                    e.workspace_id.as_ref().map_or("repository", |w| w.as_str()),
+                )
+                .field("Actor", &e.actor)
+                .section("Content")
+                .text(e.content.clone());
+            if !links.is_empty() {
+                report.section("Links").text(links.join("\n"));
+            }
+            output(json, &view, &report.to_string())
         }
         _ => {
             require(
@@ -265,7 +297,15 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
             if command == "policy" {
                 let policy =
                     serde_json::json!({"policy": result.policy, "truncated": result.truncated});
-                return output(json, &policy, &serde_json::to_string_pretty(&policy)?);
+                let mut human: Vec<String> = result
+                    .policy
+                    .iter()
+                    .map(|p| format!("{}: {}", p.key, p.content))
+                    .collect();
+                if result.truncated {
+                    human.push("Bounded; narrow filters for more.".into());
+                }
+                return output(json, &policy, &human.join("\n"));
             }
             let mut human = result
                 .policy
@@ -273,13 +313,14 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
                 .map(|p| format!("[CANONICAL PROJECT_CONFIG] {}: {}", p.key, p.content))
                 .collect::<Vec<_>>();
             for v in &result.entries {
+                use crate::local::terminal::name;
                 human.push(format!(
-                    "[{} {:?} {:?}] {} {:?} scope={}\n  {}",
+                    "[{} {} {}] {} {} scope={}\n  {}",
                     label(&v.entry.provenance.trust_class)?,
-                    v.status,
-                    v.validity,
+                    name(&v.status),
+                    name(&v.validity),
                     v.entry.id.as_str(),
-                    v.entry.kind,
+                    name(&v.entry.kind),
                     v.entry
                         .workspace_id
                         .as_ref()

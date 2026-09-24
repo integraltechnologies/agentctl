@@ -137,10 +137,10 @@ variable that points at the real location.
 
 ### `[runtime.roles.<role>]`
 
-Maps a role to a provider. The built-in roles are `planner`, `executor`,
-`verifier`, `recon`, and `reviewer`. Only `planner`, `executor`, and `verifier`
-can be launched by the runtime today. `recon`, `reviewer`, and custom roles can
-be configured and inspected.
+Maps a role to a provider. The built-in roles are `planner`, `executor`, and
+`verifier` — the three the runtime can launch. Configuration and project policy
+may add further profiles for inspection, and `agentctl role show` rejects a name
+that is not a role at all.
 
 | Field | Rules |
 | --- | --- |
@@ -148,10 +148,8 @@ be configured and inspected.
 | `model` | optional opaque string passed to the CLI (≤128 bytes) |
 | `effort` | optional opaque string passed to the CLI (≤128 bytes) |
 
-`agentctl route check` validates every known role, including `recon` and
-`reviewer`, and exits nonzero if any of them is unrouted. To check only the roles
-you use, run `agentctl route planner`, `agentctl route executor`, and
-`agentctl route verifier`.
+`agentctl route check` validates every known role and exits nonzero if any of
+them is unrouted.
 
 ### `[runtime.profiles.<role>]`
 
@@ -217,6 +215,35 @@ environment.
 
 With `strict = true` and `max_memory_bytes` set, every launch on macOS is refused,
 because macOS cannot enforce memory limits.
+
+### `[runtime.context]`
+
+Machine-owned budgets of the planner-mediated context relay (see
+[architecture.md](architecture.md#context-relay)). Hard maxima are compiled in;
+configuration can only choose values inside them, and neither provider output,
+planner output nor project policy can raise them.
+
+| Field | Default | Rules |
+| --- | --- | --- |
+| `max_rounds` | `2` | 0–4. Context rounds granted per executor task. Each round is a new provider job; `0` disables executor expansion. |
+| `verifier_max_rounds` | `1` | 0–2. Context rounds granted per verification (packet or integration), on a budget independent of the executor's. |
+| `max_round_bytes` | `16384` | 1024–32768. Bytes one round's ContextDelta may carry. A worker's own `max_bytes` can only ask for less. |
+| `max_task_bytes` | `49152` | 1024–98304, and at least `max_round_bytes`. Cumulative delta bytes per task or verification. |
+| `max_escalations` | `1` | 0–2. Planner escalations per executor task. Verifiers never escalate. |
+| `visibility` | `"workspace"` | `"workspace"` or `"issued"`. See [security.md](security.md#issued-context-visibility); `issued` is opt-in. |
+
+```toml
+[runtime.context]
+max_rounds = 2
+verifier_max_rounds = 1
+max_round_bytes = 16384
+max_task_bytes = 49152
+max_escalations = 1
+visibility = "workspace"
+```
+
+Exhausting a budget does not degrade quietly: the request is denied, the task
+blocks with the persisted reason, and the decision returns to a planner.
 
 #### `[runtime.security.experiment_events]`
 

@@ -28,6 +28,12 @@ pub enum Error {
     CapacityExceeded { active: usize, limit: usize },
     #[error("{0}")]
     Invalid(String),
+    /// A provider exchange that yielded no accepted output, with its class.
+    #[error("{class}: {detail}")]
+    Provider {
+        class: runtime::OutcomeClass,
+        detail: String,
+    },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("SQLite: {0}")]

@@ -9,7 +9,7 @@ use super::{
     store::{RegisteredRepository, RegisteredWorkspace},
 };
 
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 14;
 pub const APPLICATION_ID: i64 = 0x41475443; // AGTC
 
 const INITIAL: &str = r#"
@@ -123,6 +123,9 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
         (9, "experiment_events"),
         (10, "experiment_decisions"),
         (11, "experiment_decision_cursors"),
+        (12, "graph_resolution"),
+        (13, "ontology_lifecycle"),
+        (14, "graph_semantic_provider"),
     ]
     .into_iter()
     .filter(|(v, _)| *v <= version)
@@ -334,6 +337,48 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
             require(n == 1, format!("database is missing trigger {name}"))?;
         }
     }
+    if version >= 12 {
+        connection.prepare(
+            "SELECT workspace_id,edge_id,source_id,target_id,kind,rule FROM graph_resolutions LIMIT 0",
+        )?;
+        connection.prepare("SELECT path_hint FROM graph_edges LIMIT 0")?;
+        for name in [
+            "graph_edges_hinted",
+            "graph_resolutions_outgoing",
+            "graph_resolutions_incoming",
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing index {name}"))?;
+        }
+    }
+    if version >= 13 {
+        connection.prepare("SELECT hash,bytes,body FROM ontology_blobs LIMIT 0")?;
+        connection.prepare(
+            "SELECT generation_id,repo_id,workspace_id,ordinal,sequence,fingerprint,snapshot,plan_id,state,record_json FROM ontology_generations LIMIT 0",
+        )?;
+        connection.prepare("SELECT text_hash FROM graph_entities LIMIT 0")?;
+        for (kind, name) in [
+            ("trigger", "ontology_blobs_no_update"),
+            ("trigger", "ontology_blobs_no_delete"),
+            ("trigger", "ontology_generations_insert"),
+            ("trigger", "ontology_generations_update"),
+            ("trigger", "ontology_generations_delete"),
+            ("index", "ontology_generations_accepted"),
+            ("index", "ontology_generations_candidate"),
+            ("index", "ontology_generations_by_plan"),
+        ] {
+            let n: i64 = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type=?1 AND name=?2",
+                [kind, name],
+                |r| r.get(0),
+            )?;
+            require(n == 1, format!("database is missing {kind} {name}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -400,6 +445,61 @@ fn migrate_transaction(connection: &mut Connection) -> Result<()> {
     if header(&transaction)? == 10 {
         check_version(&transaction, 10)?;
         transaction.execute_batch(include_str!("runtime/experiment_cursor_schema.sql"))?;
+    }
+    if header(&transaction)? == 11 {
+        check_version(&transaction, 11)?;
+        // Lossless and additive: graph payloads are untouched. Path hints already
+        // live in each edge record, so the new column is backfilled from them and
+        // every workspace's resolutions are derived now; the facts (and so the
+        // graph generation) do not change. Records from an older index version
+        // carry no hints and stay stale by version until `repo index`.
+        let hinted = transaction
+            .prepare("SELECT 1 FROM pragma_table_info('graph_edges') WHERE name='path_hint'")?
+            .exists([])?;
+        if !hinted {
+            transaction.execute_batch("ALTER TABLE graph_edges ADD COLUMN path_hint TEXT;")?;
+        }
+        transaction.execute_batch(include_str!("graph/resolution_schema.sql"))?;
+        transaction.execute(
+            "UPDATE graph_edges SET path_hint=json_extract(record_json,'$.path_hint') WHERE target_id IS NULL AND path_hint IS NULL",
+            [],
+        )?;
+        let workspaces: Vec<String> = transaction
+            .prepare("SELECT workspace_id FROM graph_indexes ORDER BY workspace_id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        for workspace in workspaces {
+            super::graph::rebuild_resolutions(&transaction, &workspace)?;
+        }
+    }
+    if header(&transaction)? == 12 {
+        check_version(&transaction, 12)?;
+        // Additive and lossless: no fact, generation, or history is rewritten,
+        // and no lifecycle record is synthesized (that would need source the
+        // migration must not read). Existing entities keep a NULL text hash,
+        // so the next `repo index` re-derives them and records the workspace's
+        // first generation, which is accepted as BOOTSTRAP only if complete.
+        let hashed = transaction
+            .prepare("SELECT 1 FROM pragma_table_info('graph_entities') WHERE name='text_hash'")?
+            .exists([])?;
+        if !hashed {
+            transaction.execute_batch("ALTER TABLE graph_entities ADD COLUMN text_hash TEXT;")?;
+        }
+        transaction.execute_batch(include_str!("graph/lifecycle_schema.sql"))?;
+    }
+    if header(&transaction)? == 13 {
+        check_version(&transaction, 13)?;
+        // Additive: records which semantic provider proved a resolution, so a
+        // semantic claim is attributable. Existing rows are fast-path
+        // resolutions and keep a NULL provider. Nothing is rewritten: semantic
+        // rows only appear once an enrichment pass runs.
+        let attributed = transaction
+            .prepare("SELECT 1 FROM pragma_table_info('graph_resolutions') WHERE name='provider'")?
+            .exists([])?;
+        if !attributed {
+            transaction.execute_batch("ALTER TABLE graph_resolutions ADD COLUMN provider TEXT;")?;
+        }
+        transaction.execute_batch("INSERT INTO schema_migrations VALUES (14, 'graph_semantic_provider'); PRAGMA user_version=14;")?;
     }
     check(&transaction)?;
     require(

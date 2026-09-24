@@ -99,11 +99,13 @@ pub(super) fn issued(
     let instance = AgentId::new(format!("agent:{}", job.as_str())).map_err(Error::Invalid)?;
     let jobs = store.runtime_jobs(&info.root, None)?;
     // The accepted plan is the supervisor's request for the default topology.
-    // Verifiers are children of completed executors, not resumed conversations.
+    // Verifiers are children of the completed executor whose result is being
+    // verified (the latest one that returned a result, never a job that only
+    // requested context), not resumed conversations.
     let parent = jobs
         .iter()
-        .filter(|j| j.state == RuntimeJobState::Succeeded)
-        .find(|j| {
+        .filter(|j| j.state == RuntimeJobState::Succeeded && j.context_request.is_none())
+        .filter(|j| {
             j.ownership
                 .as_ref()
                 .is_some_and(|o| o.engineering_session_id == session.id)
@@ -114,6 +116,11 @@ pub(super) fn issued(
                 } else {
                     j.role == AgentRole::Planner
                 }
+        })
+        .max_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| b.job_id.cmp(&a.job_id))
         });
     Ok(parent
         .and_then(|j| j.ownership.as_ref())

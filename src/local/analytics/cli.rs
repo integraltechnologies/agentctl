@@ -1,6 +1,9 @@
 use super::*;
 use crate::local::{
-    self, Error, Result, paths::MachinePaths, repository::RepositoryInfo, store::Store,
+    self, Error, Result,
+    paths::MachinePaths,
+    repository::{RepositoryId, RepositoryInfo},
+    store::Store,
 };
 pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Result<()> {
     let now = local::now_ms()?;
@@ -23,6 +26,7 @@ pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Resul
             i += 1;
         }
     }
+    let store = Store::read_only(&paths.database, 5000)?;
     let (repository, workspace) = if let Some(repo) = flags.get("--repository") {
         (
             (*repo).to_owned(),
@@ -40,6 +44,20 @@ pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Resul
             ),
         )
     };
+    // An unregistered repository has no cohort at all. Reporting an empty one
+    // would be indistinguishable from a registered repository that has simply
+    // not run anything, so both the discovered and the named repository are
+    // checked — `--repository` is the route the message above recommends.
+    local::require(
+        RepositoryId::try_from(repository.clone())
+            .ok()
+            .and_then(|id| store.repository(&id).transpose())
+            .transpose()?
+            .is_some(),
+        format!(
+            "repository {repository} is not registered with agentctl; run agentctl repo init in that checkout, or name a registered repository with --repository"
+        ),
+    )?;
     let mut q = Query::workspace(repository, workspace.clone().unwrap_or_default(), now);
     q.workspace = workspace;
     for (k, v) in flags {
@@ -90,96 +108,150 @@ pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Resul
                 .into(),
         )),
     };
-    let snapshot = Store::read_only(&paths.database, 100)?.analytics(q, now)?;
+    let snapshot = store.analytics(q, now)?;
     if json_mode {
         println!("{}", crate::local::terminal::json(&snapshot)?);
         return Ok(());
     }
-    // Provider/model/role names and warnings are untrusted text.
-    macro_rules! say {
-        ($($arg:tt)*) => {
-            println!("{}", crate::local::terminal::human(&format!($($arg)*)))
-        };
+    use crate::local::terminal::{Report, name};
+    // Absent values are UNKNOWN or not applicable, never zero.
+    fn known<T: std::fmt::Display>(value: &Option<T>) -> String {
+        value
+            .as_ref()
+            .map_or_else(|| "UNKNOWN".into(), ToString::to_string)
     }
     let s = &snapshot.summary;
-    say!(
-        "ANALYTICS v{} — {command}\nJobs {} | contract-completed {} | usage {}\nTokens exact {:?} | estimated {:?} | unknown jobs {} | partial jobs {}\nVerifier REJECT {}/{} | fallback executions {}/{} | policy skips {}\nVERIFIED packet usage coverage {} complete / {} partial\nContext bytes median {:?} | completed execution ms median {:?}",
-        snapshot.analytics_version,
-        s.jobs,
-        s.contract_completed,
-        s.token_quality,
-        s.tokens.total.exact,
-        s.tokens.total.estimated,
-        s.unknown_jobs,
-        s.partial_jobs,
-        s.reject_rate.numerator,
-        s.reject_rate.denominator,
-        s.fallback_rate.numerator,
-        s.fallback_rate.denominator,
-        s.policy_skipped,
-        snapshot.verified_tasks_with_complete_usage,
-        snapshot.verified_tasks_with_partial_usage,
-        s.prompt_bytes.median,
-        s.completed_execution_ms.median
-    );
-    for session in snapshot.sessions.iter().take(20) {
-        say!(
-            "Session {}: {} | {}/{} VERIFIED | correction round {:?}",
-            session.id,
-            session.lifecycle,
-            session.verified,
-            session.current_tasks,
-            session.correction_round
+    let mut report = Report::new(format!("Analytics — {command}"));
+    report
+        .field(
+            "Jobs",
+            format!("{} ({} contract-completed)", s.jobs, s.contract_completed),
+        )
+        .field("Usage", &s.token_quality)
+        .field(
+            "Tokens",
+            format!(
+                "{} exact, {} estimated",
+                known(&s.tokens.total.exact),
+                known(&s.tokens.total.estimated)
+            ),
+        )
+        .field(
+            "Incomplete",
+            format!(
+                "{} unknown, {} partial job(s)",
+                s.unknown_jobs, s.partial_jobs
+            ),
+        )
+        .field(
+            "Rejections",
+            format!(
+                "{}/{} verifier REJECT",
+                s.reject_rate.numerator, s.reject_rate.denominator
+            ),
+        )
+        .field(
+            "Fallbacks",
+            format!(
+                "{}/{} executions; {} policy skip(s)",
+                s.fallback_rate.numerator, s.fallback_rate.denominator, s.policy_skipped
+            ),
+        )
+        .field(
+            "Coverage",
+            format!(
+                "{} complete, {} partial (VERIFIED task usage)",
+                snapshot.verified_tasks_with_complete_usage,
+                snapshot.verified_tasks_with_partial_usage
+            ),
+        )
+        .field(
+            "Context",
+            format!("median {} bytes", known(&s.prompt_bytes.median)),
+        )
+        .field(
+            "Duration",
+            format!(
+                "median {} ms (completed executions)",
+                known(&s.completed_execution_ms.median)
+            ),
         );
+    if !snapshot.sessions.is_empty() {
+        report.section("Sessions");
+        for session in snapshot.sessions.iter().take(20) {
+            report.field(
+                &session.id,
+                format!(
+                    "{}  {}/{} VERIFIED  correction round {}",
+                    session.lifecycle,
+                    session.verified,
+                    session.current_tasks,
+                    known(&session.correction_round)
+                ),
+            );
+        }
     }
-    if command == "task" || command == "corrections" {
+    if (command == "task" || command == "corrections") && !snapshot.tasks.is_empty() {
+        report.section("Tasks");
         for task in snapshot.tasks.iter().take(20) {
-            say!(
-                "Task {}: {} | executor/verifier attempts {}/{} | correction count {:?}, round {:?} | usage {}",
-                task.id,
-                task.lifecycle,
-                task.executor_jobs.len(),
-                task.verifier_jobs.len(),
-                task.correction_count,
-                task.correction_round,
-                task.summary.token_quality
+            report.field(
+                &task.id,
+                format!(
+                    "{}  attempts {}/{} (executor/verifier)  corrections {}  round {}  usage {}",
+                    task.lifecycle,
+                    task.executor_jobs.len(),
+                    task.verifier_jobs.len(),
+                    known(&task.correction_count),
+                    known(&task.correction_round),
+                    task.summary.token_quality
+                ),
             );
         }
     }
-    if command == "job" {
+    if command == "job" && !snapshot.jobs.is_empty() {
+        report.section("Jobs");
         for job in &snapshot.jobs {
-            say!(
-                "Job {}: {} / {} / {} | {} | fallback depth {:?} | usage {} | wall ms {:?}",
-                job.id,
-                job.role,
-                job.provider.as_deref().unwrap_or("UNKNOWN"),
-                job.model.as_deref().unwrap_or("UNKNOWN"),
-                job.lifecycle,
-                job.route_attempt,
-                job.usage_quality,
-                job.wall_elapsed_ms
+            report.field(
+                &job.id,
+                format!(
+                    "{}  {}/{}  {}  fallback depth {}  usage {}  wall {} ms",
+                    job.role,
+                    job.provider.as_deref().unwrap_or("UNKNOWN"),
+                    job.model.as_deref().unwrap_or("UNKNOWN"),
+                    job.lifecycle,
+                    known(&job.route_attempt),
+                    job.usage_quality,
+                    known(&job.wall_elapsed_ms)
+                ),
             );
         }
     }
-    say!(
-        "Human lists show at most 20 entries; --json exposes the full bounded snapshot. None means UNKNOWN/not applicable, never zero."
-    );
     if command == "routes" || command == "job" {
-        for job in snapshot.jobs.iter().take(20) {
-            if let Some(route) = &job.route_provenance {
-                say!(
-                    "Route {}: provider={} model={} fallback-source={} depth={:?} preceding={:?} policy-skips={}",
-                    job.id,
-                    route.provider_source.as_deref().unwrap_or("UNKNOWN"),
-                    route.model_source.as_deref().unwrap_or("UNKNOWN"),
-                    route.fallback_source.as_deref().unwrap_or("UNKNOWN"),
-                    route.fallback_depth,
-                    route
-                        .preceding_failures
-                        .iter()
-                        .map(|f| f.reason)
-                        .collect::<Vec<_>>(),
-                    route.policy_skipped.len()
+        let routed: Vec<_> = snapshot
+            .jobs
+            .iter()
+            .take(20)
+            .filter_map(|job| job.route_provenance.as_ref().map(|r| (job, r)))
+            .collect();
+        if !routed.is_empty() {
+            report.section("Route provenance");
+            for (job, route) in routed {
+                let preceding: Vec<String> = route
+                    .preceding_failures
+                    .iter()
+                    .map(|f| name(&f.reason))
+                    .collect();
+                report.field(
+                    &job.id,
+                    format!(
+                        "provider {}  model {}  fallback {}  depth {}  preceding [{}]  policy skips {}",
+                        route.provider_source.as_deref().unwrap_or("UNKNOWN"),
+                        route.model_source.as_deref().unwrap_or("UNKNOWN"),
+                        route.fallback_source.as_deref().unwrap_or("UNKNOWN"),
+                        known(&route.fallback_depth),
+                        preceding.join(", "),
+                        route.policy_skipped.len()
+                    ),
                 );
             }
         }
@@ -189,20 +261,38 @@ pub(crate) fn run(paths: &MachinePaths, args: &[&str], json_mode: bool) -> Resul
     } else {
         &snapshot.roles
     };
-    for g in groups.iter().take(20) {
-        say!(
-            "{} / {} / {}: {} jobs, {} usage, exact {:?}, estimated {:?}",
-            g.role.as_deref().unwrap_or("UNKNOWN"),
-            g.provider.as_deref().unwrap_or("UNKNOWN"),
-            g.model.as_deref().unwrap_or("UNKNOWN"),
-            g.summary.jobs,
-            g.summary.token_quality,
-            g.summary.tokens.total.exact,
-            g.summary.tokens.total.estimated
-        );
+    if !groups.is_empty() {
+        report.section(if command == "routes" {
+            "By route"
+        } else {
+            "By role"
+        });
+        for g in groups.iter().take(20) {
+            report.field(
+                &format!(
+                    "{}/{}/{}",
+                    g.role.as_deref().unwrap_or("UNKNOWN"),
+                    g.provider.as_deref().unwrap_or("UNKNOWN"),
+                    g.model.as_deref().unwrap_or("UNKNOWN")
+                ),
+                format!(
+                    "{} job(s)  usage {}  {} exact, {} estimated tokens",
+                    g.summary.jobs,
+                    g.summary.token_quality,
+                    known(&g.summary.tokens.total.exact),
+                    known(&g.summary.tokens.total.estimated)
+                ),
+            );
+        }
     }
+    report.section("Notes");
     for warning in &snapshot.warnings {
-        say!("Note: {warning}");
+        report.text(format!("- {warning}"));
     }
+    report.text(format!(
+        "- Lists show at most 20 entries; agentctl analytics {command} --json has the full bounded snapshot."
+    ));
+    // Provider/model/role names and warnings are untrusted text.
+    println!("{}", crate::local::terminal::human(&report.to_string()));
     Ok(())
 }

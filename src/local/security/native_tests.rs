@@ -69,6 +69,7 @@ impl Fixture {
             native_auth: None,
             api_key: None,
             executable: "/bin/sh".into(),
+            project_executable: false,
             args: argv,
             input: vec![],
             cwd: self.0.join("repo"),
@@ -91,6 +92,7 @@ impl Fixture {
             experiment_event_file: None,
             class: WorkerClass::Tool,
             security: SecurityConfig::default(),
+            issued: None,
             lock_fd: None,
         }
     }
@@ -394,6 +396,103 @@ fn native_marker_clearing_daemon_is_never_reported_as_clean() {
     );
 }
 
+/// A worker that asks LaunchServices to start a process would get one created
+/// by launchd outside the sandbox, outside the job's process group, without
+/// the job marker and without the sentinel descriptor: it could read a planted
+/// secret the sandbox refuses, write outside every write root, and outlive a
+/// job the tree sweep calls clean. The broker must therefore be shut. Unit
+/// evidence is not enough here: only a real launch proves the broker is shut.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "native: requires host sandbox enforcement (macOS Seatbelt / Linux Landlock+seccomp)"]
+fn native_service_broker_cannot_start_a_process_outside_the_sandbox() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    // A background-only app bundle inside the workspace. If LaunchServices can
+    // be reached, launchd runs this unsandboxed as the operator.
+    let app = f.0.join("repo/Escape.app/Contents/MacOS");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(
+        f.0.join("repo/Escape.app/Contents/Info.plist"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+         <key>CFBundleExecutable</key><string>escape</string>\
+         <key>CFBundleIdentifier</key><string>local.agentctl.native.escape</string>\
+         <key>CFBundlePackageType</key><string>APPL</string>\
+         <key>LSBackgroundOnly</key><string>1</string></dict></plist>\n",
+    )
+    .unwrap();
+    let executable = app.join("escape");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\ncat {secret} > {canary} 2>&1\nsleep 45 &\nprintf '%s' \"$!\" > {survivor}\n",
+            secret = f.path("outside/secret"),
+            canary = f.path("outside/broker-canary"),
+            survivor = f.path("outside/broker-survivor"),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut spec = f.spec("", &[], false, false);
+    spec.executable = "/usr/bin/open".into();
+    spec.args = vec![
+        "-g".into(),
+        "-j".into(),
+        f.path("repo/Escape.app"),
+        // `open` must not be allowed to wait on a broker it cannot reach.
+        "--wait-apps".into(),
+    ];
+    spec.timeout_ms = 8_000;
+    let output = run(&spec);
+
+    // Give a successful escape every chance to land before asserting absence.
+    std::thread::sleep(Duration::from_secs(3));
+    let canary = f.0.join("outside/broker-canary");
+    let survivor = f.0.join("outside/broker-survivor");
+    if let Ok(text) = fs::read_to_string(&survivor)
+        && let Ok(pid) = text.trim().parse::<i32>()
+    {
+        // SAFETY: only reached when the escape succeeded; clean up the proof.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(
+        !canary.exists(),
+        "LaunchServices escape: a broker-started process read {} and wrote outside every write root ({output:?})",
+        f.path("outside/secret"),
+    );
+    assert!(
+        !survivor.exists(),
+        "LaunchServices escape: a broker-started process outlived the job ({output:?})"
+    );
+}
+
+/// Scratch lives inside the denied canonical state tree. `realpath` (cargo
+/// canonicalizes every dep-info path) stats each ancestor, so if the denial
+/// also hid the ancestors' metadata a build in scratch would fail with
+/// `could not parse/generate dep info ... Operation not permitted` whatever
+/// the toolchain. The ancestors must answer `stat` while
+/// everything else in the state tree stays unreadable and unlistable.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "native: requires host sandbox enforcement (macOS Seatbelt / Linux Landlock+seccomp)"]
+fn native_scratch_paths_can_be_canonicalized_without_opening_state() {
+    let f = Fixture::new();
+    let script = "mkdir -p \"$1/target/debug\" && : > \"$1/target/debug/x\" || exit 30; \
+        /usr/bin/perl -MCwd=realpath -e 'defined realpath($ARGV[0]) or exit 20' \"$1/target/debug/x\" || exit 20; \
+        if ls \"$2\" >/dev/null 2>&1; then exit 21; fi; \
+        if cat \"$2/state.sqlite3\" >/dev/null 2>&1; then exit 22; fi; \
+        exit 0";
+    let spec = f.spec(
+        script,
+        &[f.path("state/data/scratch"), f.path("state/data")],
+        false,
+        false,
+    );
+    let output = run(&spec);
+    assert_eq!(output.exit, Some(0), "{output:?}");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn strict_unsupported_resource_limit_refuses_before_launch() {
@@ -412,4 +511,129 @@ fn strict_unsupported_resource_limit_refuses_before_launch() {
     );
     assert!(error.to_string().contains("MemoryLimit"));
     assert!(!f.0.join("state/data/scratch/launched").exists());
+}
+
+/// Issued visibility is a *denial*, not merely a missing grant. A broader read
+/// root that happens to contain the checkout — an operator `read_roots` entry,
+/// or the platform temp directory when the repository lives under it — would
+/// otherwise silently restore workspace-wide access and the mode would confine
+/// nothing. This is compile-time policy, so it needs no host enforcement.
+#[test]
+fn issued_visibility_denies_unissued_workspace_under_a_broader_read_root() {
+    let fixture = Fixture::new();
+    let workspace = fixture.0.join("repo");
+    let issued = workspace.join("src/issued.rs");
+    let unissued = workspace.join("src/unissued.rs");
+    fs::write(&issued, "pub fn issued() {}\n").unwrap();
+    fs::write(&unissued, "pub fn unissued() {}\n").unwrap();
+
+    let mut spec = fixture.spec("true", &[], true, false);
+    spec.class = WorkerClass::ProviderFrontend;
+    // The overlap under test: a broader root that contains the checkout.
+    spec.security.read_roots = vec![fixture.0.clone()];
+    spec.issued = Some(IssuedVisibility {
+        read_files: vec![issued.clone()],
+        write_paths: vec![issued.clone()],
+    });
+    let policy = compile(&spec).unwrap();
+
+    let canonical = fs::canonicalize(&workspace).unwrap();
+    let issued = fs::canonicalize(&issued).unwrap();
+    let unissued = fs::canonicalize(&unissued).unwrap();
+
+    // The workspace is never granted wholesale under issued visibility.
+    assert!(
+        !policy
+            .filesystem
+            .read_roots
+            .iter()
+            .any(|r| canonical.starts_with(r) && *r != canonical)
+            || policy
+                .filesystem
+                .denied
+                .iter()
+                .any(|d| d.read && d.path == canonical),
+        "a broader read root contains the workspace, so an explicit denial is required"
+    );
+
+    let read_denial = policy
+        .filesystem
+        .denied
+        .iter()
+        .find(|d| d.read && d.path == canonical)
+        .expect("issued visibility must deny unissued workspace reads");
+    assert!(
+        read_denial.except.iter().any(|e| issued.starts_with(e)),
+        "the issued file must stay readable"
+    );
+    assert!(
+        !read_denial.except.iter().any(|e| unissued.starts_with(e)),
+        "an unissued sibling must not be re-allowed: {:?}",
+        read_denial.except
+    );
+    assert!(
+        !read_denial.except_files.contains(&unissued),
+        "except_files re-allows exact directories for traversal, never file contents"
+    );
+
+    let write_denial = policy
+        .filesystem
+        .denied
+        .iter()
+        .find(|d| d.write && d.path == canonical)
+        .expect("issued visibility must deny writes outside the issued write targets");
+    assert!(!write_denial.except.iter().any(|e| unissued.starts_with(e)));
+}
+
+/// An editor's normal atomic replacement — write `<file>.tmp.*` beside the
+/// target, then rename it into place — works for an authorized file under
+/// issued visibility, while every other sibling stays unwritable: it cannot be
+/// created, overwritten, removed, or clobbered by renaming a temporary onto it.
+#[test]
+#[ignore = "native: requires host sandbox enforcement (macOS Seatbelt / Linux Landlock+seccomp)"]
+fn native_issued_visibility_permits_atomic_replacement_of_authorized_files_only() {
+    let fixture = Fixture::new();
+    let workspace = fixture.0.join("repo");
+    let target = workspace.join("src/edit.rs");
+    let keep = workspace.join("src/keep.rs");
+    fs::write(&target, "old\n").unwrap();
+    fs::write(&keep, "keep\n").unwrap();
+    let script = "cd src \
+        && (printf 'new\\n' > edit.rs.tmp.1 && mv edit.rs.tmp.1 edit.rs && echo ATOMIC_OK || echo ATOMIC_DENIED); \
+        (printf 'x' > other.rs 2>/dev/null && echo CREATE_WRITTEN || echo CREATE_DENIED); \
+        (printf 'x' > keep.rs 2>/dev/null && echo KEEP_WRITTEN || echo KEEP_DENIED); \
+        (rm -f keep.rs 2>/dev/null && [ ! -e keep.rs ] && echo KEEP_REMOVED || echo REMOVE_DENIED); \
+        (printf 'y' > edit.rs.tmp.2 && mv edit.rs.tmp.2 keep.rs 2>/dev/null && echo KEEP_CLOBBERED || echo CLOBBER_DENIED); \
+        rm -f edit.rs.tmp.2; true";
+    let mut spec = fixture.spec(script, &[], true, false);
+    // Issued visibility confines provider frontends: executors are one.
+    spec.class = WorkerClass::ProviderFrontend;
+    spec.issued = Some(IssuedVisibility {
+        read_files: vec![target.clone()],
+        write_paths: vec![target.clone()],
+    });
+    let output = run(&spec);
+    let stdout = format!(
+        "{}\nstderr: {}\nexit: {:?} failure: {:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        output.exit,
+        output.failure
+    );
+    for denied in [
+        "CREATE_DENIED",
+        "KEEP_DENIED",
+        "REMOVE_DENIED",
+        "CLOBBER_DENIED",
+    ] {
+        assert!(stdout.contains(denied), "{denied} expected: {stdout}");
+    }
+    assert_eq!(fs::read_to_string(&keep).unwrap(), "keep\n");
+    assert!(!workspace.join("src/other.rs").exists());
+    // Seatbelt can match sibling names; Landlock cannot, so there the grant
+    // is exact-file only and an atomic replacement is refused (documented).
+    if cfg!(target_os = "macos") {
+        assert!(stdout.contains("ATOMIC_OK"), "{stdout}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+    }
 }

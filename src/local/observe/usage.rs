@@ -65,7 +65,7 @@ fn sum(samples: &[&Usage]) -> (Option<u64>, String) {
     };
     (total, quality.into())
 }
-/// Stage 0 usage records are deltas, never cumulative counters. Receipt-time bursts
+/// Protocol usage records are deltas, never cumulative counters. Receipt-time bursts
 /// are not interpolated into unobserved provider activity. Re-reading is idempotent.
 pub fn series(snapshot: &Snapshot, scope: Scope, session: Option<&str>) -> Series {
     let now = snapshot.at_ms;

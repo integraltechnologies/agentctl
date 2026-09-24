@@ -38,7 +38,7 @@ WHEN OLD.repo_id IS NOT NEW.repo_id OR OLD.plan_id IS NOT NEW.plan_id OR OLD.req
  OR NEW.updated_at_ms < OLD.updated_at_ms
  OR (NEW.state='COMPLETE' AND OLD.state!='ACTIVE')
 BEGIN SELECT RAISE(ABORT,'execution plan payload/history is immutable'); END;
--- Only Stage 4-owned task rows gain the activation gate. Legacy Stage 1 plans are unchanged.
+-- Only execution-plan task rows gain the activation gate. Legacy protocol-only plans are unchanged.
 CREATE TRIGGER execution_task_gate BEFORE UPDATE ON tasks
 WHEN EXISTS(SELECT 1 FROM execution_plans e WHERE e.repo_id=OLD.repo_id AND e.plan_id=OLD.plan_id AND e.state!='ACTIVE')
 BEGIN SELECT RAISE(ABORT,'task belongs to an inactive execution plan'); END;

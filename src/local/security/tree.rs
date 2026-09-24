@@ -527,7 +527,11 @@ mod unix {
             false
         }
 
+        // Native: it scans other processes' descriptors, which a worker sandbox
+        // correctly forbids (`process-info` of others), so it cannot pass when
+        // the suite itself runs as a sandboxed project command.
         #[test]
+        #[ignore = "native: requires host process inspection (not available inside a worker sandbox)"]
         fn sentinel_holders_outside_the_job_group_are_identified() {
             let sentinel = Sentinel::new().unwrap();
             let fd = sentinel.child_fd();

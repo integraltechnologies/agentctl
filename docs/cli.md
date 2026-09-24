@@ -1,13 +1,19 @@
 # Command guide
 
 This guide covers every command group in `agentctl` and `agenttop`. `agentctl
---help` prints the full syntax.
+--help` lists the command groups; `agentctl <command> --help` (or `agentctl help
+<command>`) prints that group's full syntax.
 
 ## Conventions
 
 - Put `--json` **last** to get machine-readable output. Without it, output is
   human-readable, with untrusted text escaped.
-- Errors go to stderr with a nonzero exit code. Diagnostic commands (`doctor`,
+- Human output is organized as titled sections of aligned `Label  value` fields.
+  Statuses use the canonical protocol names (`BLOCKED`, `VERIFIED`, `ACCEPTED`),
+  and a `Next` section names the command to run when there is an obvious one.
+- Errors go to stderr with a nonzero exit code, as `agentctl: <message>`; a
+  canonical code such as `SOURCE_DRIFT` leads the message, and a recommended
+  recovery command is repeated under `Next`. Diagnostic commands (`doctor`,
   `security doctor`, `repo status`, `route`, `route check`, `role show`) print
   their report and still exit nonzero when something is wrong.
 - Repository-scoped commands act on the Git checkout that contains the current
@@ -51,14 +57,17 @@ inspectable and is never silently rekeyed.
 ```bash
 agentctl repo index           # incremental: only new, changed or version-stale files are reparsed
 agentctl repo index --status  # last index, backend versions, counts, stale paths, failures
+agentctl repo enrich          # optional: attach what installed semantic providers prove
+                              # (bound to the indexed generation; any re-index that re-derives a file drops it)
 
 agentctl code symbol <name-or-id>      # exact name, qualified name, or graph ID
-agentctl code search <text>            # name substring
+                                       # (callers/refs/impact also accept source paths: crate::m::f, Type::method)
+agentctl code search <text>            # name substring; several words must all appear
 agentctl code file <path>              # entities in a file
 agentctl code locate <text>            # deterministic ranked lookup over names, paths, containers, signatures
 agentctl code refs <symbol>            # resolved references
 agentctl code callers <symbol>         # resolved callers
-agentctl code tests <symbol>           # lexical test candidates
+agentctl code tests <symbol>           # tests with resolved or lexical-container links
 agentctl code neighbors <symbol> [--depth N] [--neighbors N]
 agentctl code impact <symbol>          # known structural dependents
 agentctl code context <text> [--limit N] [--depth N] [--neighbors N] [--tests N] \
@@ -71,16 +80,116 @@ agentctl code context <text> [--limit N] [--depth N] [--neighbors N] [--tests N]
   changed, deleted, or stale, the query is refused with an instruction to run
   `repo index`. Partial indexes answer from successfully indexed files and are
   marked partial.
-- **Precision:** results are syntactic, not compiler truth. Most imports and
-  calls stay unresolved. Only unique same-module Rust `self::` paths are resolved.
-  Test links are lexical candidates, not proven coverage. `impact` reports known
-  dependents, not everything a change could break.
+- **Precision:** results are syntactic, not compiler truth. A relation is
+  resolved only when exactly one compatible declaration is visible. That covers
+  in-file lexical scope (shadowing-aware), `self.`/`Self::`/`this.` methods, and
+  qualified paths and import statements across files. Every resolved relation
+  names its rule. Re-exports, globs, and calls on variables stay unresolved
+  unless `repo enrich` proves them. Calls inside macro invocations
+  (`assert_eq!(f(), 1)`, `format!("{}", x.f())`) are recorded as unresolved
+  sites — never guessed, never absent — and only a semantic provider can prove
+  them. `repo index` and `repo index --status` say whether the indexed
+  generation is semantically enriched or structural only, and planner packets
+  carry the same flag. Context lists
+  unresolved call sites only as bounded per-entity name summaries. Test links
+  state their basis (resolved call, via a helper, shared container, or
+  lexical), not proven coverage. `impact` reports known dependents, not
+  everything a change could break.
+- **Ranking:** `locate` and `context` weight query terms by IDF after dropping
+  stopwords. Implementation and tests rank separately, and primary context
+  spans files. See [architecture.md](architecture.md#code-graph).
+- **Generations:** each `repo index` reports the graph generation, a
+  content-derived fingerprint plus a per-workspace sequence that only advances
+  when indexed facts change. Planning binds it, and only an *accepted*
+  generation can be planned against (see [Ontology lifecycle](#ontology-lifecycle)).
+- **Literal paths:** repository paths are always literal. `app/[slug]/page.tsx`,
+  `app/[...slug]`, `(group)` and `@slot` index and query like any other name.
 - **Discovery:** follows workspace `.gitignore`/`.ignore` rules. It skips
   symlinks, nested repositories, common build and dependency directories
   (`target`, `node_modules`, `.venv`, `vendor`, `dist`, `build`, `__pycache__`),
   and project `deny_read` paths.
 - **Limits:** result limits are 1–100. `context` defaults to 5 primaries, depth 1,
   20 neighbors, 80 relations, and 8 tests; the maximums are 10, 3, 100, 400, and 20.
+
+## Ontology lifecycle
+
+Indexing is an observation. It never makes a changed repository canonical by
+itself: `repo index` prints whether the indexed generation is the accepted one,
+and planning (`plan prepare`) and `run plan` refuse to start from a generation
+that is not accepted.
+
+```bash
+agentctl ontology status                        # accepted generation, open candidate, indexed generation
+agentctl ontology list [--limit N]              # recorded generations, newest first (default 20)
+agentctl ontology show <generation-id>          # one record: state, origin, provenance, delta summary
+agentctl ontology delta [<generation-id>]       # the recorded delta (default: the open candidate)
+agentctl ontology delta --from <id> --to <id>   # a delta between any two recorded generations
+    [--change ADDED|REMOVED|MODIFIED] [--path PATH] [--limit N]   # filters (limit per section, default 200)
+agentctl ontology footprint [<generation-id>] [--plan <plan-id>] [--limit N]
+agentctl ontology footprint --from <id> --to <id> [--plan <plan-id>] [--limit N]
+agentctl ontology accept <generation-id> [--reason TEXT]
+agentctl ontology reject <generation-id> --reason TEXT
+```
+
+- **Bootstrap:** the first complete `repo index` of a workspace (no file
+  failures) is accepted automatically, because there is no earlier truth to
+  protect. A database upgraded from schema 12 has no generations yet; run
+  `repo index` once.
+- **Manual changes:** after you edit files yourself, `repo index` records a
+  `CANDIDATE` with a semantic delta against the accepted generation. Inspect it
+  with `ontology delta`, then `ontology accept <id>` (or restore the source,
+  or `ontology reject <id> --reason ...`). Acceptance requires the candidate to
+  still be the indexed generation and the worktree to still match it; a stale
+  or superseded candidate is refused. Accepting or rejecting twice is a no-op.
+- **Reverts:** re-indexing source whose facts equal the accepted generation is
+  accepted automatically (`IDENTICAL_TO_ACCEPTED`) as a new generation with a
+  later sequence; old context bound to the earlier position stays unusable.
+- **Runtime work:** candidates produced by `run plan` are accepted only when
+  the plan completes after integration verification passes, never manually.
+  If such a run stops for good, `repo index` hands its state to you as an
+  ordinary external candidate.
+- **Deltas** list entity changes (`ADDED`, `REMOVED`, `MODIFIED` with the
+  changed facts: `SIGNATURE`, `VISIBILITY`, `TEXT`, `KEY`), distinct resolved
+  relation changes (`ADDED`, `REMOVED`), and per-file content and change
+  counts. Renames and moves are reported as removal plus addition. Entries whose
+  identity cannot be proven (same-named duplicates) carry
+  `identity: DUPLICATE_ORDINAL`. A delta describes what changed, not what the
+  change could affect. With `--json`, the output is the typed `SemanticDelta`
+  (filters narrow the entries; `summary` always describes the whole delta).
+
+- **Impact** (`ontology impact`) answers what an observed or proposed change
+  could affect, with the evidence for each claim. Name a generation (or omit it
+  for the open candidate), or use `--from`/`--to`, or `--symbol NAME` to analyze
+  a prospective edit. `--depth N` bounds the evidence hops (1–4, default 2),
+  `--limit N` the items, `--tests N` the associated tests. `--plan <plan-id>`
+  additionally reads the result against that plan's declared write scope and
+  lists the impacted files it never declared. Items are classed
+  `DIRECT_DEPENDENCY`, `CONTRACT_EXPOSURE`, `VERIFICATION_RELEVANCE` or
+  `CONTAINMENT_OWNERSHIP` and each carries its evidence chain; open questions
+  are listed separately as boundaries (`UNPROVEN_IDENTITY`,
+  `UNRESOLVED_REFERENCES`, `UNDETERMINED_PROPAGATION`, `DEPTH_LIMIT`,
+  `FANOUT_LIMIT`, `ENTITY_ABSENT`). A delta is analyzable only while it
+  describes the indexed generation. The command is read-only: it changes no
+  lifecycle state and grants no read or write authority.
+
+- **Structural footprint** (`ontology footprint`) projects the exact semantic
+  delta into bounded production/test file, declaration, Rust public-surface,
+  and resolved-relation facts. A plain footprint may compare arbitrary recorded
+  generations when the `--to` generation is still indexed. A `--plan` footprint
+  is restricted to that plan's live runtime-owned candidate and its own
+  accepted-base delta, using the same provenance rule as runtime context and
+  promotion. Its closed review signals select observed public
+  or abstraction growth and multi-file production additions; `--plan` also
+  identifies growth outside declared write scope and links the plan-level
+  integration proof. Signals are prompts for review, never quality scores or
+  rejection rules. Test paths retain their convention-based classification,
+  duplicate identity remains unproven, and unsupported claims—configuration or
+  persistence machinery, semantic duplication, non-Rust export visibility,
+  unresolved imports, and per-entity test coverage—are explicitly not inferred.
+  Reports are derived, read-only, generation-bound, bounded, and grant no
+  authority. Integration verification receives the same compact advisory view
+  when a candidate exists; planning does not, because no implementation delta
+  exists yet.
 
 ## Engineering memory
 
@@ -125,10 +234,11 @@ instructions.
 ## Planning
 
 ```bash
-agentctl plan prepare --objective TEXT [--query TEXT] [--bytes N] [--notes N]
-agentctl plan prepare --objective-file PATH
-agentctl plan prepare --request-file PATH       # a strict RequestDraft JSON document
+agentctl plan prepare --objective TEXT [--verify KEY[,KEY]] [--query TEXT] [--bytes N] [--notes N]
+agentctl plan prepare --objective-file PATH [--verify KEY[,KEY]]
+agentctl plan prepare --request-file PATH [--verify KEY[,KEY]]   # a strict RequestDraft JSON document
 agentctl plan context <request-id>              # the frozen planner input
+agentctl plan context <request-id> --manifest   # its context manifest: categories, bytes, paths, IDs
 agentctl plan import <execution-plan.json>      # externally produced plan → VALIDATED
 agentctl plan validate <plan-id>
 agentctl plan activate <plan-id>                # revalidate and make ACTIVE (one per workspace)
@@ -141,6 +251,13 @@ agentctl plan list [--all] [--limit N]
 agentctl plan supersede <old-id> --with <new-id>
 agentctl plan cancel <plan-id> --reason TEXT
 ```
+
+Every prepared request names the project verification profiles the plan is
+judged by: `--verify`, the request file's own `verification`, or — when the
+project declares exactly one profile — that profile. With several and no
+choice, `plan prepare` refuses and lists them. Symbols the request names
+explicitly (`Money::add`, `ClaudeAdapter::launch`) are pinned as primary
+context when they resolve to exactly one entity.
 
 `plan prepare` requires a complete, fresh code index. It freezes a bounded
 **PlannerPacket**: the objective, project invariants and policy, graph context,
@@ -157,12 +274,20 @@ or policy do not fit the budget, `plan prepare` fails.
 Plans usually come from `agentctl run planner`. An external producer can instead
 write an **ExecutionPlan** (a PlanPacket plus metadata with one independent
 verification contract per task and a final integration contract) and import it.
-Contract hashes are BLAKE3 over compact JSON in declared field order. Compute them
-with:
+Contract hashes are BLAKE3 over compact JSON in declared field order.
 
-```bash
-agentctl run packet-hashes < plan-packet.json
-```
+A provider never writes that envelope. `agentctl run planner` asks for a
+**PlanDecision** — the packet, one contract decision per task (memory
+references, scope exclusions, non-goals), the integration expectations and an
+optional replan reference — and agentctl derives the rest: every hash, the
+frozen source, the request identity and all timestamps. A contract therefore
+cannot fail to bind its task.
+
+An exclusion carves a hole in a task's own declared scope: it is denied for
+both reading and writing, so it may never overlap a path the same task declares
+in `read_scope` or `write_scope`. A memory reference must name an existing
+entry (`memory:…`); the `config:…` entries shown in the planner packet are live
+project policy that agentctl enforces itself and are never referenceable.
 
 `tests/planning.rs` contains a complete construction example.
 
@@ -179,16 +304,26 @@ agentctl provider doctor                  # CLI --version and token-free login s
 agentctl roles
 agentctl role show <role>
 agentctl route <role> [--override role:provider[:model]]
-agentctl route check                      # every known role, including recon and reviewer
+agentctl route check                      # every known role
 
 agentctl run planner <request-id>         # planner provider produces a plan; imported as VALIDATED
 agentctl run plan <plan-id> --dry-run     # workspace, strategy, configured roles, ready tasks
 agentctl run plan <plan-id> [--override role:provider[:model]]
 agentctl run status <plan-id>
+agentctl run capabilities <plan-id> --json
 agentctl run resume <plan-id>
 agentctl run cancel <plan-id>             # request cancellation from another terminal
 agentctl run replace <old-plan-id> <validated-replacement-id>
+
+agentctl run context <plan-id>                          # context relay: budgets, rounds, pending decision
+agentctl run context decide <plan-id> <decision.json>   # approve or deny an escalated request
 ```
+
+`run capabilities` is a read-only, derived report. It does not score a plan or
+persist a second lifecycle: each `SUPPORTED`, `NOT_DEMONSTRATED`, or
+`UNAVAILABLE` result names the canonical task/job/generation/artifact evidence
+that establishes it for this particular plan. A successful historical plan is
+evidence about that run, not a claim that every future provider run will work.
 
 `run plan` is a foreground controller. For an **ACTIVE** plan, it does the
 following:
@@ -202,11 +337,23 @@ following:
    integration verifier over the combined diff before the plan can become
    `COMPLETE`.
 4. Stops and blocks on rejection, failure, or unexpected source or policy drift
-   (`SOURCE_DRIFT`).
+   (`SOURCE_DRIFT`). A provider failure that left nothing uncertain pauses
+   instead (see [providers.md](providers.md#failures-and-retries)); resume it.
+5. Runs compatible ready tasks concurrently in isolated worktrees. If a
+   captured branch can no longer be proven unaffected by a sibling verified
+   first, it is withdrawn (never published) and the task runs again serially
+   on the current source.
 
 agentctl never commits, pushes, resets, or cleans your checkout. Review and commit
 the resulting changes yourself. Commit before preparing the next plan, because
 each plan needs a clean baseline.
+
+A completed plan also advances the accepted ontology: each verified task
+refreshes the index as the plan's candidate, and the candidate becomes the
+accepted generation in the same transaction that completes the plan. A plan
+that stops short of completion leaves the accepted generation unchanged. To keep
+what it left in the worktree, run `repo index`, inspect the candidate's delta
+(it includes any unverified edits), and accept it deliberately.
 
 To correct rejected or blocked work, prepare a replacement plan and link it with
 `run replace`. The replacement stays `VALIDATED` until you activate it. The
@@ -215,16 +362,79 @@ continues from durable checkpoints without replaying conversations: `VERIFIED`
 tasks never run again, and jobs whose controller was lost are marked interrupted
 and require review.
 
+### The context relay
+
+Workers are given what the plan references, not a directory dump: a task's
+`read_scope` authorizes what it may *request*, while the issued context is what
+it actually received. A worker that cannot finish returns a typed context
+request, and agentctl resolves it deterministically inside that envelope,
+issuing a fresh job with the original context plus the approved delta. See
+[architecture.md](architecture.md#context-relay) for the full lifecycle and
+[configuration.md](configuration.md#runtimecontext) for the budgets.
+
+`agentctl run context <plan-id>` is read-only. It prints, per subject
+(`executor:<task>`, `verifier:<task>`, `integration`): the relay state, rounds
+used against the limit, granted and remaining bytes, escalations, any
+planner-approved scope additions, and every round's request, resolution and
+delta.
+
+A request that needs a path outside the task's read scope is never granted
+automatically. The run blocks with `NEEDS_PLANNER_CONTEXT_APPROVAL`, and the
+report includes the paths involved and a decision template to fill in:
+
+```json
+{
+  "version": "agentctl-context-decision-1",
+  "plan_id": "plan:1",
+  "task_id": "task:2",
+  "request_hash": "blake3:…",
+  "decision": "APPROVE",
+  "read_scope_additions": [{ "kind": "FILE", "path": "src/security/mod.rs" }],
+  "reason": "The caller the task must update lives here",
+  "actor": "planner"
+}
+```
+
+`agentctl run context decide <plan-id> <decision.json>` consumes it. An
+approval adds 1–8 read-scope paths, which are revalidated against project
+policy, protected paths, symlinks, the planning request's own scope and the
+task's exclusions, and the request is then re-resolved under the wider
+envelope; the task returns to `PLANNED`, so `agentctl run resume` re-issues it
+as a fresh job. `"decision": "DENY"` leaves the task blocked for a replan.
+Executor output can never approve its own expansion.
+
 `--override` applies to the current command only. It must name a configured
 provider and cannot bypass project `allowed_providers`. If the machine-wide
 `max_agents` limit is reached, the launch fails with `AGENT_CAPACITY_EXCEEDED`.
 That failure is not treated as a provider failure and does not trigger fallback.
 
-The runtime supports repositories of up to 20,000 files and 64 MiB, with at most
-2 MiB per file. Verifier diffs are limited to 128 KiB and provider input to
-256 KiB. Symlinks, hardlinks, nested repositories or submodules, and read-denied
-files in the checkout cause the run to refuse. Ignored files are included in
-source snapshots.
+`agentctl run plan <plan-id> --dry-run` reports READY tasks together with typed
+pairwise compatibility decisions. `COMPATIBLE` requires disjoint write/write
+and write/read scopes plus complete accepted-ontology evidence. DAG
+dependencies, semantic interference, source mismatch, missing graph authority,
+and unresolved impact are explicit blocking reasons. Compatible executors use
+isolated linked worktrees; captured results reconcile and verify serially
+against the evolving canonical source.
+
+Source snapshots observe the checkout the way Git walks it:
+- **Source files** are captured by content: every tracked file, even one an
+  ignore rule also matches, and every untracked file that is not ignored.
+- **Individually ignored files** that Git reaches, such as `.env` or a stray
+  `*.log`, are observed by metadata only (size, mode, identity, and change
+  times). Their content is never read, stored, counted, or given to agents, but
+  creating, changing, or deleting one is still drift and a diff change.
+- **Directories that an ignore rule matches as a whole**, such as `target/` or
+  `node_modules/`, are never entered, by Git or by agentctl. Changes inside them
+  count neither as drift nor as diff changes.
+
+Ignore rules come from the repository's `.gitignore` files and
+`.git/info/exclude`. `core.excludesFile` is not applied. `.git/info/exclude` lives
+outside the worktree, so the snapshot records a hash of it: the file Git itself
+resolves, which linked worktrees share. Any change to it is `SOURCE_DRIFT`. Captured source may total
+up to 20,000 files and 64 MiB, and up to 20,000 individually ignored files may be
+observed. Verifier diffs are limited to 128 KiB and provider input to 256 KiB.
+Symlinks, hardlinks, nested repositories or submodules, and read-denied files
+among the captured source files cause the run to refuse.
 
 ## Experiments
 
@@ -365,4 +575,4 @@ agentctl schemas generate [--output DIR]   # write JSON Schemas (default: schema
 agentctl protocol validate <type> <file>   # structural and semantic validation of one document
 ```
 
-`agentctl --help` lists the protocol document types.
+`agentctl protocol --help` lists the protocol document types.

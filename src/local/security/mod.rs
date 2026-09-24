@@ -7,7 +7,7 @@
 //!                                  refused before launch (never unsandboxed)
 //! ```
 //!
-//! Planning, routing, lifecycle, verification, analytics, experiments and Stage 9
+//! Planning, routing, lifecycle, verification, analytics, experiments and experiment-event
 //! decisions only build `ProcessSpec`s; none of them sees a platform API. The
 //! policy vocabulary here (read/write roots, denied control-plane paths, network,
 //! environment allowlist, resource ceilings) is independent of Seatbelt, Landlock
@@ -53,6 +53,13 @@ pub enum Capability {
     FilesystemWrite,
     FilesystemMetadataWrite,
     NetworkDeny,
+    /// The worker cannot ask a system service broker (macOS LaunchServices /
+    /// launchd via Mach bootstrap) to start a process on its behalf. Such a
+    /// process is created by the broker, so it is outside the worker's sandbox,
+    /// process group, environment and inherited descriptors at once: it would
+    /// defeat filesystem, network and credential confinement AND make the
+    /// process-tree sweep report a clean job over a live escapee.
+    ServiceBrokerDeny,
     ProcessTree,
     EnvironmentIsolation,
     CredentialIsolation,
@@ -229,7 +236,7 @@ impl ResourceLimits {
     }
 }
 
-/// Stage 9 event-volume ceiling per experiment attempt. Machine-owned; a project
+/// Experiment-event volume ceiling per attempt. Machine-owned; a project
 /// may only lower it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -528,7 +535,23 @@ pub struct DeniedPath {
     pub write: bool,
     /// Controller-issued subpaths (scratch, provider auth files) re-allowed inside.
     pub except: Vec<PathBuf>,
+    /// Exact paths re-allowed inside, without re-allowing anything beneath
+    /// them. A directory listed here stays listable while its contents stay
+    /// denied, which is what issued visibility needs for path resolution.
+    pub except_files: Vec<PathBuf>,
     pub reason: &'static str,
+}
+
+/// Issued-context visibility of a provider frontend: instead of the
+/// whole workspace (and its Git directories), only the repository files issued
+/// to the job are readable, and a writable job may write only its write scope
+/// (which the backends also make readable). Checks and experiments never use it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IssuedVisibility {
+    /// Absolute paths of files issued in full.
+    pub read_files: Vec<PathBuf>,
+    /// Absolute paths of the executor's write scope (files or subtrees).
+    pub write_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -543,6 +566,13 @@ pub struct FilesystemPolicy {
     pub write_roots: Vec<PathBuf>,
     /// Individual files writable (device nodes, provider auth files).
     pub write_files: Vec<PathBuf>,
+    /// Authorized files that may also be replaced atomically: a sibling named
+    /// `<file>.<suffix>` may be created, written, renamed onto the file or
+    /// removed, and no other sibling. Editors write such a temporary next to
+    /// the target and rename it into place; without it an authorized edit is
+    /// mechanically impossible. Enforced where the backend can match names
+    /// (macOS Seatbelt); elsewhere the grant is not made (exact file only).
+    pub write_siblings: Vec<PathBuf>,
     /// Always win over every grant.
     pub denied: Vec<DeniedPath>,
 }
@@ -556,6 +586,9 @@ pub struct SecurityPolicy {
     pub resources: ResourceLimits,
     /// Values used only to redact captured output; never persisted.
     pub secrets: Vec<String>,
+    /// The worker authenticates through the macOS login Keychain, so the
+    /// securityd Mach services stay reachable. Everything else is denied.
+    pub keychain: bool,
     /// Resolved program path (not canonicalized: multicall proxies use argv[0]).
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -571,6 +604,9 @@ impl SecurityPolicy {
             (FilesystemRead, Enforced),
             (FilesystemWrite, Enforced),
             (EnvironmentIsolation, Enforced),
+            // Unconditional: a broker-launched process escapes every other
+            // capability at once, whatever this job was otherwise granted.
+            (ServiceBrokerDeny, Enforced),
             (ProcessTree, BestEffort),
             (WallClock, Enforced),
             (OutputCapture, Enforced),
@@ -679,7 +715,24 @@ pub fn platform_read_roots() -> Vec<PathBuf> {
             push_unique(&mut roots, real);
         }
     }
+    if let Some(temp) = platform_temp_root() {
+        push_unique(&mut roots, temp);
+    }
     roots
+}
+
+/// The OS-shared temporary directory, canonicalized (`/tmp` resolves to
+/// `/private/tmp` on macOS). Workers get their own `TMPDIR` in scratch, but
+/// third-party provider CLIs also use the platform location directly — the
+/// Claude Code CLI keeps a per-uid directory there — so it is a platform root
+/// like `/usr`, not a host-specific exception. Nothing in agentctl state, the
+/// workspace, Git metadata or a credential store is reachable through it:
+/// those denials are compiled after every grant and win.
+pub(crate) fn platform_temp_root() -> Option<PathBuf> {
+    if !cfg!(unix) {
+        return None;
+    }
+    fs::canonicalize("/tmp").ok().filter(|p| p.is_dir())
 }
 
 /// Individual system files whose symlink targets live outside the default roots
@@ -816,21 +869,29 @@ fn resolve_program(program: &Path, cwd: &Path, path_var: &OsStr) -> Result<PathB
 }
 
 /// The executable's own install directory plus one level of `#!` interpreter.
+///
+/// `project` marks a program named by repository configuration
+/// (`.agentctl/project.toml` `[commands.KEY].program`) rather than by the
+/// machine operator. Such a program is granted as a single file and never
+/// widens the policy to its install directory, because repository
+/// configuration must not be able to add a read root (see `SecurityConfig`).
 fn executable_roots(
     program: &Path,
     path_var: &OsStr,
     home: Option<&Path>,
+    project: bool,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let (mut roots, mut files) = (vec![], vec![]);
     let mut grant = |file: PathBuf| {
         match file.parent() {
             Some(parent)
-                if parent.components().count() > 1
+                if !project
+                    && parent.components().count() > 1
                     && !home.is_some_and(|h| h.starts_with(parent)) =>
             {
                 push_unique(&mut roots, parent.to_path_buf())
             }
-            // Never widen to "/" or to an ancestor of HOME: grant the file only.
+            // Never widen to "/", to an ancestor of HOME, or on repository say-so.
             _ => push_unique(&mut files, file),
         }
     };
@@ -940,7 +1001,7 @@ fn environment(
         // relied upon for any agentctl guarantee.
         env.insert("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB".into(), "1".into());
         if let Some(native) = &spec.native_auth {
-            for (name, value) in native.variables() {
+            for (name, value) in native.variables(&scratch_home) {
                 match value {
                     Some(value) => env.insert(name.into(), value),
                     None => env.remove(name),
@@ -998,6 +1059,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
     let program = resolve_program(&spec.executable, &spec.cwd, &path_var)?;
 
     let mut fs_policy = FilesystemPolicy {
+        write_siblings: vec![],
         workspace: workspace.clone(),
         scratch: scratch.clone(),
         ..Default::default()
@@ -1009,11 +1071,85 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
             push_unique(&mut fs_policy.read_roots, real);
         }
     }
-    push_unique(&mut fs_policy.read_roots, workspace.clone());
-    for git in &spec.git_directories {
-        push_unique(&mut fs_policy.read_roots, canonical_or_self(git));
+    let issued = spec
+        .issued
+        .as_ref()
+        .filter(|_| spec.class == WorkerClass::ProviderFrontend);
+    let inside_workspace = |path: &Path| -> Result<PathBuf> {
+        let real = canonical_or_self(path);
+        require(
+            real.starts_with(&workspace) && real != workspace,
+            "issued visibility paths must lie strictly inside the workspace",
+        )?;
+        Ok(real)
+    };
+    if let Some(visibility) = issued {
+        // Only what was issued; the workspace tree and Git object store stay
+        // unreadable, so neither can recover unissued source.
+        let mut readable = vec![];
+        for file in &visibility.read_files {
+            readable.push(inside_workspace(file)?);
+        }
+        let mut writable = vec![];
+        for path in &visibility.write_paths {
+            writable.push(inside_workspace(path)?);
+        }
+        // A process must be able to resolve its own working directory: getcwd()
+        // and relative path resolution read the directory entries themselves,
+        // and without this every provider CLI fails before it starts. Only the
+        // exact directories on the path to an issued item are listed — never a
+        // subtree — so this discloses the names in those directories and no
+        // file contents anywhere.
+        let mut directories = vec![workspace.clone()];
+        for path in readable.iter().chain(&writable) {
+            for ancestor in path.ancestors().skip(1) {
+                if !ancestor.starts_with(&workspace) {
+                    break;
+                }
+                push_unique(&mut directories, ancestor.to_path_buf());
+            }
+        }
+        directories.retain(|directory| directory.is_dir());
+        for path in readable.iter().chain(&writable).chain(&directories) {
+            push_unique(&mut fs_policy.read_files, path.clone());
+        }
+        // Issued visibility is a denial, not merely a missing grant. Without
+        // this, any broader read root that happens to contain the checkout —
+        // an operator `read_roots` entry, or the platform temp directory when
+        // the repository lives under it — would silently restore workspace-wide
+        // access and the mode would confine nothing.
+        let mut except = readable.clone();
+        except.extend(writable.iter().cloned());
+        fs_policy.denied.push(DeniedPath {
+            path: workspace.clone(),
+            read: true,
+            metadata: false,
+            write: false,
+            except,
+            except_files: directories.clone(),
+            reason: "issued-context visibility: unissued repository content",
+        });
+        fs_policy.denied.push(DeniedPath {
+            path: workspace.clone(),
+            read: false,
+            metadata: false,
+            write: true,
+            except: writable,
+            except_files: vec![],
+            reason: "issued-context visibility: write targets only",
+        });
+    } else {
+        push_unique(&mut fs_policy.read_roots, workspace.clone());
+        for git in &spec.git_directories {
+            push_unique(&mut fs_policy.read_roots, canonical_or_self(git));
+        }
     }
-    let (exe_roots, exe_files) = executable_roots(&program, &path_var, real_home.as_deref());
+    let (exe_roots, exe_files) = executable_roots(
+        &program,
+        &path_var,
+        real_home.as_deref(),
+        spec.project_executable,
+    );
     for root in exe_roots {
         push_unique(&mut fs_policy.read_roots, root);
     }
@@ -1025,7 +1161,18 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
     fs_policy.write_roots = device_roots;
     push_unique(&mut fs_policy.write_roots, scratch.clone());
     if spec.writable {
-        push_unique(&mut fs_policy.write_roots, workspace.clone());
+        match issued {
+            Some(visibility) => {
+                for path in &visibility.write_paths {
+                    let path = inside_workspace(path)?;
+                    if !path.is_dir() {
+                        push_unique(&mut fs_policy.write_siblings, path.clone());
+                    }
+                    push_unique(&mut fs_policy.write_roots, path);
+                }
+            }
+            None => push_unique(&mut fs_policy.write_roots, workspace.clone()),
+        }
     }
 
     let auth_files: Vec<PathBuf> = spec
@@ -1079,6 +1226,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
         metadata: true,
         write: true,
         except: vec![scratch.clone()],
+        except_files: vec![],
         reason: "agentctl canonical state",
     });
     for (path, reason) in [
@@ -1091,6 +1239,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
             metadata: true,
             write: true,
             except: vec![],
+            except_files: vec![],
             reason,
         });
     }
@@ -1106,10 +1255,13 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
         if !denied.iter().any(|d| d.path == path) {
             denied.push(DeniedPath {
                 path,
-                read: false,
+                // Under issued visibility Git metadata is also unreadable: its
+                // object store would otherwise recover unissued source.
+                read: issued.is_some(),
                 metadata: false,
                 write: true,
                 except: vec![],
+                except_files: vec![],
                 reason: "Git/agentctl/provider control plane",
             });
         }
@@ -1134,6 +1286,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
                 metadata: false,
                 write: true,
                 except,
+                except_files: vec![],
                 reason: "provider-private home",
             });
         }
@@ -1149,6 +1302,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
                 metadata: false,
                 write: true,
                 except: vec![],
+                except_files: vec![],
                 reason: "credential store",
             });
         }
@@ -1161,11 +1315,15 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
             metadata: false,
             write: true,
             except: vec![],
+            except_files: vec![],
             reason: "project protected path",
         });
     }
-    // A grant that sits inside a (non-excepted) denial is not a grant.
-    for grant in [&workspace, &scratch] {
+    // A grant that sits inside a (non-excepted) denial is not a grant. The
+    // check is over the write surface actually granted, which under issued
+    // visibility is the write targets rather than the workspace root.
+    let granted: Vec<PathBuf> = fs_policy.write_roots.clone();
+    for grant in granted.iter().chain([&scratch]) {
         require(
             !fs_policy.denied.iter().any(|d| {
                 d.write
@@ -1189,6 +1347,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
         environment,
         resources: spec.security.resources,
         secrets,
+        keychain: keychain_client,
         program,
         args: spec.args.clone(),
         marker,
@@ -1464,6 +1623,7 @@ pub fn self_test(config: &SecurityConfig) -> std::result::Result<(), String> {
         native_auth: None,
         api_key: None,
         executable: "/bin/sh".into(),
+        project_executable: false,
         args: vec![
             "-c".into(),
             "cat \"$1\" >/dev/null || exit 10; if cat \"$2\" >/dev/null 2>&1; then exit 11; fi; if (printf x > \"$3\") 2>/dev/null; then exit 12; fi; if (printf x > \"$4\") 2>/dev/null; then exit 13; fi; exit 0".into(),
@@ -1489,6 +1649,7 @@ pub fn self_test(config: &SecurityConfig) -> std::result::Result<(), String> {
         experiment_event_file: None,
         class: WorkerClass::Tool,
         security: config.clone(),
+        issued: None,
         lock_fd: None,
     };
     let mut process = NativeProcess::launch(&spec).map_err(|e| e.to_string())?;
@@ -1525,6 +1686,7 @@ mod tests {
                 FilesystemRead,
                 FilesystemWrite,
                 EnvironmentIsolation,
+                ServiceBrokerDeny,
                 ProcessTree,
                 NetworkDeny,
                 CredentialIsolation,
@@ -1545,6 +1707,7 @@ mod tests {
             environment: BTreeMap::new(),
             resources,
             secrets: vec![],
+            keychain: false,
             program: "/bin/true".into(),
             args: vec![],
             marker: "m".into(),
@@ -1588,6 +1751,49 @@ mod tests {
         let mut root = report(CapabilityStatus::Enforced);
         root.running_as_root = true;
         assert!(check(&root, &deny).is_err());
+    }
+
+    /// A backend that cannot shut the system
+    /// service broker cannot confine a worker at all, because a broker-started
+    /// process is outside the sandbox, the process group, the environment and
+    /// the inherited descriptors at once. It is required unconditionally - of
+    /// every class and every network grant - and nothing less than ENFORCED
+    /// is accepted, so such a host is refused rather than silently degraded.
+    #[test]
+    fn a_backend_that_cannot_deny_the_service_broker_is_refused_not_degraded() {
+        for network in [NetworkPolicy::DenyAll, NetworkPolicy::AllowAll] {
+            for class in [WorkerClass::Tool, WorkerClass::ProviderFrontend] {
+                let mut policy = policy(network, ResourceLimits::default());
+                policy.class = class;
+                assert!(
+                    policy
+                        .required()
+                        .contains(&(Capability::ServiceBrokerDeny, CapabilityStatus::Enforced)),
+                    "{class:?}/{network:?} must require SERVICE_BROKER_DENY as ENFORCED"
+                );
+                check(&report(CapabilityStatus::Enforced), &policy).unwrap();
+                for degraded in [CapabilityStatus::BestEffort, CapabilityStatus::Unsupported] {
+                    let mut partial = report(CapabilityStatus::Enforced);
+                    for entry in &mut partial.capabilities {
+                        if entry.capability == Capability::ServiceBrokerDeny {
+                            entry.status = degraded;
+                        }
+                    }
+                    let error = check(&partial, &policy).unwrap_err().to_string();
+                    assert!(
+                        error.starts_with("SECURITY_CAPABILITY_UNSUPPORTED")
+                            && error.contains("ServiceBrokerDeny"),
+                        "{degraded:?}: {error}"
+                    );
+                }
+                // A backend that does not report it at all is also refused.
+                let mut missing = report(CapabilityStatus::Enforced);
+                missing
+                    .capabilities
+                    .retain(|c| c.capability != Capability::ServiceBrokerDeny);
+                assert!(check(&missing, &policy).is_err());
+            }
+        }
     }
 
     #[test]
@@ -1695,21 +1901,136 @@ mod tests {
         );
     }
 
+    /// Opt-in issued visibility: a provider frontend then reads only the files
+    /// it was actually issued and writes only its planner-authored write scope.
+    /// The workspace tree and the Git object store both stop being readable, so
+    /// neither can recover unissued source. Tool workers (checks, experiments)
+    /// are never confined this way, and a path outside the workspace is refused
+    /// rather than granted.
     #[test]
-    fn keychain_access_is_granted_only_to_native_provider_frontends() {
+    fn issued_visibility_grants_only_issued_files_and_closes_the_git_escape_hatch() {
         let base = std::env::temp_dir().join(format!(
-            "agentctl-keychain-policy-{}-{}",
+            "agentctl-issued-policy-{}-{}",
             std::process::id(),
             crate::local::now_ms().unwrap()
         ));
+        fs::create_dir_all(base.join("repo/src")).unwrap();
         fs::create_dir_all(base.join("repo/.git")).unwrap();
         fs::create_dir_all(base.join("state/data/scratch")).unwrap();
         let base = fs::canonicalize(&base).unwrap();
+        for name in ["issued.rs", "unissued.rs"] {
+            fs::write(base.join("repo/src").join(name), "pub fn f() {}\n").unwrap();
+        }
+        let (workspace, git) = (base.join("repo"), base.join("repo/.git"));
+        let (issued, unissued) = (
+            base.join("repo/src/issued.rs"),
+            base.join("repo/src/unissued.rs"),
+        );
         let mut spec = ProcessSpec {
             project_policy_hash: None,
             native_auth: None,
             api_key: None,
             executable: "/bin/sh".into(),
+            project_executable: false,
+            args: vec![],
+            input: vec![],
+            cwd: workspace.clone(),
+            workspace: workspace.clone(),
+            scratch: base.join("state/data/scratch"),
+            data_root: base.join("state/data"),
+            config_root: base.join("state/config"),
+            cache_root: base.join("state/cache"),
+            writable: true,
+            network: false,
+            timeout_ms: 1000,
+            git_directories: vec![git.clone()],
+            protected: vec![],
+            credential_env: vec![],
+            experiment_event_file: None,
+            class: WorkerClass::ProviderFrontend,
+            security: SecurityConfig::default(),
+            issued: None,
+            lock_fd: None,
+        };
+        // The default: the whole workspace is readable and writable.
+        let open = compile(&spec).unwrap();
+        assert!(open.filesystem.read_roots.contains(&workspace));
+        assert!(open.filesystem.write_roots.contains(&workspace));
+        assert!(open.filesystem.read_roots.contains(&git));
+        // Issued: only what was issued, and only the write scope is writable.
+        spec.issued = Some(IssuedVisibility {
+            read_files: vec![issued.clone()],
+            write_paths: vec![issued.clone()],
+        });
+        let confined = compile(&spec).unwrap();
+        assert!(!confined.filesystem.read_roots.contains(&workspace));
+        assert!(!confined.filesystem.read_roots.contains(&git));
+        assert!(confined.filesystem.read_files.contains(&issued));
+        assert!(!confined.filesystem.read_files.contains(&unissued));
+        assert_eq!(
+            confined
+                .filesystem
+                .write_roots
+                .iter()
+                .filter(|w| w.starts_with(&workspace))
+                .collect::<Vec<_>>(),
+            vec![&issued]
+        );
+        assert!(
+            confined
+                .filesystem
+                .denied
+                .iter()
+                .any(|d| d.path == git && d.read && d.write),
+            "the Git object store must not be an escape hatch"
+        );
+        // Checks and experiments keep the workspace access they require.
+        spec.class = WorkerClass::Tool;
+        let tool = compile(&spec).unwrap();
+        assert!(tool.filesystem.read_roots.contains(&workspace));
+        // Issuing a path outside the workspace fails closed.
+        spec.class = WorkerClass::ProviderFrontend;
+        spec.issued = Some(IssuedVisibility {
+            read_files: vec![base.join("state/data/secret")],
+            write_paths: vec![],
+        });
+        assert!(compile(&spec).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// `[commands.KEY].program` in `.agentctl/project.toml` is
+    /// repository-controlled, so an absolute path there must never add the
+    /// program's whole install directory to the worker's read roots - a grant
+    /// repository configuration can never make. The
+    /// machine operator's own programs must keep that grant, because ordinary
+    /// toolchains read files beside their executable.
+    #[test]
+    fn a_repository_declared_program_never_widens_worker_read_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "agentctl-project-exe-{}-{}",
+            std::process::id(),
+            crate::local::now_ms().unwrap()
+        ));
+        fs::create_dir_all(base.join("repo/.git")).unwrap();
+        fs::create_dir_all(base.join("state/data/scratch")).unwrap();
+        // A directory outside the workspace holding the declared program and a
+        // neighbouring file that must stay unreadable.
+        fs::create_dir_all(base.join("tools")).unwrap();
+        let base = fs::canonicalize(&base).unwrap();
+        let program = base.join("tools/check");
+        fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(base.join("tools/neighbour"), "not source").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut spec = ProcessSpec {
+            project_policy_hash: None,
+            native_auth: None,
+            api_key: None,
+            executable: program.clone(),
+            project_executable: true,
             args: vec![],
             input: vec![],
             cwd: base.join("repo"),
@@ -1727,6 +2048,79 @@ mod tests {
             experiment_event_file: None,
             class: WorkerClass::Tool,
             security: SecurityConfig::default(),
+            issued: None,
+            lock_fd: None,
+        };
+        let tools = base.join("tools");
+        // Repository authority: the program runs, but as a single file.
+        let project = compile(&spec).unwrap();
+        assert!(
+            !project.filesystem.read_roots.contains(&tools),
+            "repository configuration added a read root: {:?}",
+            project.filesystem.read_roots
+        );
+        assert!(
+            project.filesystem.read_files.contains(&program),
+            "the declared program must still be readable/executable"
+        );
+        assert!(
+            !project
+                .filesystem
+                .read_roots
+                .iter()
+                // Platform roots (the OS temp directory among them) are granted
+                // to every worker regardless of repository configuration, so a
+                // fixture that happens to live under one proves nothing here.
+                .any(|r| tools.starts_with(r)
+                    && r != &base.join("tools")
+                    && !platform_read_roots().contains(r)),
+            "no ancestor of the program's directory may be granted either"
+        );
+        // Operator authority is unchanged: the install directory stays granted,
+        // because ordinary toolchains read files beside their executable.
+        spec.project_executable = false;
+        let operator = compile(&spec).unwrap();
+        assert!(
+            operator.filesystem.read_roots.contains(&tools),
+            "operator-chosen programs must keep their install directory"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn keychain_access_is_granted_only_to_native_provider_frontends() {
+        let base = std::env::temp_dir().join(format!(
+            "agentctl-keychain-policy-{}-{}",
+            std::process::id(),
+            crate::local::now_ms().unwrap()
+        ));
+        fs::create_dir_all(base.join("repo/.git")).unwrap();
+        fs::create_dir_all(base.join("state/data/scratch")).unwrap();
+        let base = fs::canonicalize(&base).unwrap();
+        let mut spec = ProcessSpec {
+            project_policy_hash: None,
+            native_auth: None,
+            api_key: None,
+            executable: "/bin/sh".into(),
+            project_executable: false,
+            args: vec![],
+            input: vec![],
+            cwd: base.join("repo"),
+            workspace: base.join("repo"),
+            scratch: base.join("state/data/scratch"),
+            data_root: base.join("state/data"),
+            config_root: base.join("state/config"),
+            cache_root: base.join("state/cache"),
+            writable: false,
+            network: false,
+            timeout_ms: 1000,
+            git_directories: vec![base.join("repo/.git")],
+            protected: vec![],
+            credential_env: vec![],
+            experiment_event_file: None,
+            class: WorkerClass::Tool,
+            security: SecurityConfig::default(),
+            issued: None,
             lock_fd: None,
         };
         let home = std::env::var_os("HOME").map(|h| canonical_or_self(Path::new(&h)));

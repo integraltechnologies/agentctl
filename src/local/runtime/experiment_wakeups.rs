@@ -1,12 +1,12 @@
-//! Stage 9D: DECISION -> CONTROLLED WAKEUP -> PLANNER REQUEST.
+//! Experiment wakeups: DECISION -> CONTROLLED WAKEUP -> PLANNER REQUEST.
 //!
-//! A wakeup may only originate from a persisted Stage 9C decision whose frozen boundary
+//! A wakeup may only originate from a persisted boundary decision whose frozen boundary
 //! action is REQUIRE_PLANNER_REVIEW; nothing here reads raw experiment events, WARNING/ERROR
 //! health facts, or process output directly. Creating a wakeup means minting exactly the
-//! smallest existing planning input the normal planner already consumes (a Stage 4
+//! smallest existing planning input the normal planner already consumes (an execution-plan
 //! `PlanningRequest`, via `Store::prepare_plan`) and recording the 1:1 binding durably; it
 //! never itself launches a provider or spends a model token. Canonical planning authority
-//! (routing, provider invocation, PlannerPacket/ExecutionPlan validation, Stage 4+
+//! (routing, provider invocation, PlannerPacket/ExecutionPlan validation, execution
 //! activation/verification) remains entirely in the existing `planning`/`runtime::engine`
 //! subsystems - this module only ever calls `prepare_plan`, never `Runtime::plan`.
 use super::experiment_decisions::ExperimentDecision;
@@ -35,7 +35,7 @@ pub enum PlannerInvocationStatus {
     /// A planner job for this request is queued or running.
     InProgress,
     /// A planner job for this request produced a validated, imported ExecutionPlan.
-    /// Normal Stage 4+ activation/execution/verification authority is unaffected and
+    /// Normal plan activation/execution/verification authority is unaffected and
     /// still applies in full to that plan.
     Succeeded,
     /// Every planner job attempted for this request has failed or was cancelled, and
@@ -46,7 +46,7 @@ pub enum PlannerInvocationStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExperimentWakeupObservation {
     pub wakeup: ExperimentWakeup,
-    /// Derived, not duplicated, from the existing Stage 7 `runtime_jobs` table: every
+    /// Derived, not duplicated, from the existing `runtime_jobs` table: every
     /// planner-role job ever issued against this wakeup's planning request.
     pub planner_jobs: Vec<PlannerJobSummary>,
     pub status: PlannerInvocationStatus,
@@ -71,7 +71,7 @@ pub struct ExperimentControlSummary {
     pub attention_required: bool,
 }
 
-/// Bounded, structured, and built only from already-persisted Stage 9B/9C facts - never
+/// Bounded, structured, and built only from already-persisted experiment facts and decisions - never
 /// raw stdout/stderr or an unbounded event dump. `prepare_plan`'s own 16 KiB intent cap
 /// and this experiment's own event-summary limits keep it small regardless of how long
 /// the experiment has been running.
@@ -103,7 +103,7 @@ fn wakeup_context(
         MetricComparison::Equal => "==",
     };
     let objective = format!(
-        "Experiment {} attempt {} tripped decision boundary {} (Stage 9C, deterministic): \
+        "Experiment {} attempt {} tripped decision boundary {} (deterministic decision): \
          metric {metric} observed {} {comparison} {threshold}. Review the experiment's current \
          state and decide the next controlled action (continue, adjust, restart, or halt); this \
          request does not itself execute anything.",
@@ -180,7 +180,7 @@ fn wakeups_used(store: &Store, info: &RepositoryInfo, id: &ExperimentId) -> Resu
 }
 
 /// Decisions requiring a planner that have no wakeup yet, oldest first: the only
-/// order Stage 9D ever spends wakeup budget in.
+/// order wakeups ever spend budget in.
 fn pending_planner_decisions(
     store: &Store,
     info: &RepositoryInfo,
@@ -289,10 +289,10 @@ fn create_wakeup(
     Ok(changed)
 }
 
-/// Stage 9D entry point: turn any not-yet-woken REQUIRE_PLANNER_REVIEW decision into a
+/// Wakeup entry point: turn any not-yet-woken REQUIRE_PLANNER_REVIEW decision into a
 /// wakeup, strictly within the experiment's immutable budget. No model/planner output
 /// and no experiment event can reach this function or influence the budget; it only ever
-/// consumes durable `ExperimentDecision` rows already committed by Stage 9C. Idempotent
+/// consumes durable `ExperimentDecision` rows already committed by boundary evaluation. Idempotent
 /// and safe to call repeatedly (live polling, reopen, explicit reconciliation), and safe
 /// to call concurrently from an independent controller/connection: the cap itself is
 /// enforced inside `create_wakeup`'s own atomic transaction, not here.
@@ -402,7 +402,7 @@ fn wakeups_for(
         .collect()
 }
 
-/// Stage 9C decision counts plus Stage 9D wakeup/budget state, including the durable
+/// Decision counts plus wakeup/budget state, including the durable
 /// ATTENTION_REQUIRED fact: whether continued autonomous escalation is currently
 /// permitted. Called both by `Store::experiment_control_summary` and, with an
 /// already-loaded `run`, by `experiment::observation` for `experiment status`/`list`.
@@ -442,7 +442,7 @@ pub(super) fn summary(
 
 impl Store {
     /// Read-only: every wakeup for this experiment, oldest first, with its planner
-    /// invocation status derived live from the existing Stage 7 `runtime_jobs` state -
+    /// invocation status derived live from the existing `runtime_jobs` state -
     /// never a separately maintained (and potentially stale) copy of it.
     pub fn experiment_wakeups(
         &self,
@@ -452,7 +452,7 @@ impl Store {
         let info = graph::checked_workspace(self, root)?;
         wakeups_for(self, &info, id)
     }
-    /// Read-only summary combining Stage 9C decision counts with Stage 9D wakeup/budget
+    /// Read-only summary combining decision counts with wakeup/budget
     /// state. See `summary` for the ATTENTION_REQUIRED derivation.
     pub fn experiment_control_summary(
         &self,

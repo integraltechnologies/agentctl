@@ -1,9 +1,9 @@
-//! Stage 9C + 9D: FACTS -> DETERMINISTIC POLICY -> DECISION -> CONTROLLED WAKEUP.
+//! Experiment boundaries and wakeups: FACTS -> DETERMINISTIC POLICY -> DECISION -> CONTROLLED WAKEUP.
 //!
 //! No test here requires Claude, Codex, network access, or paid model tokens: boundary
 //! evaluation is pure Rust/SQL over already-persisted facts, and the one test that
 //! exercises the "wakeup maps into existing planning infrastructure" path uses a
-//! deterministic fake `ProviderAdapter`, exactly like Stage 4/7's own test suite.
+//! deterministic fake `ProviderAdapter`, exactly like the runtime's own test suites.
 #[allow(dead_code)]
 mod common;
 use agentctl::{
@@ -40,7 +40,7 @@ impl Fixture {
         Self::build(true)
     }
     /// A repository registered but never indexed: any `prepare_plan` (and therefore
-    /// any Stage 9D wakeup creation) against it fails deterministically with
+    /// any wakeup creation) against it fails deterministically with
     /// "requires a complete fresh code index" every time it is attempted.
     fn unindexed() -> Self {
         Self::build(false)
@@ -298,7 +298,7 @@ fn input(
     }
 }
 
-// ============================== STAGE 9C ==============================
+// ========================= BOUNDARY DECISIONS =========================
 
 #[test]
 fn boundary_not_satisfied_creates_no_decision() {
@@ -393,8 +393,8 @@ fn nonfinite_metrics_never_satisfy_a_boundary() {
             ),
         )
         .unwrap();
-    // The NaN frame is rejected at Stage 9B ingestion into a HEALTH fact; it never
-    // becomes a METRIC row for Stage 9C to see.
+    // The NaN frame is rejected at experiment-event ingestion into a HEALTH fact; it never
+    // becomes a METRIC row for boundary evaluation to see.
     assert!(
         f.store()
             .experiment_decisions(&f.root, &run.experiment_id)
@@ -715,7 +715,7 @@ fn raw_sql_cannot_forge_or_mutate_decisions_or_wakeups() {
     );
 }
 
-// ============================== STAGE 9D ==============================
+// ============================== WAKEUPS ===============================
 
 #[test]
 fn record_only_decision_creates_no_planner_wakeup() {
@@ -831,7 +831,7 @@ fn planner_action_decision_creates_exactly_one_bounded_wakeup() {
     assert_eq!(wakeup.status, PlannerInvocationStatus::NotAttempted);
     assert!(wakeup.planner_jobs.is_empty());
     // Bounded, structured context: no raw stdout/stderr/log dump, just the compact
-    // facts Stage 9D assembled from already-persisted Stage 9B/9C state.
+    // facts the wakeup assembled from already-persisted experiment facts and decisions.
     let bytes = serde_json::to_vec(&wakeup.wakeup.context).unwrap();
     assert!(
         bytes.len() < 4096,
@@ -927,7 +927,7 @@ fn budget_exhaustion_blocks_further_wakeups_and_reports_attention_required() {
             .unwrap()
             .len(),
         2,
-        "Stage 9C decides independently of the Stage 9D budget"
+        "boundary evaluation decides independently of the wakeup budget"
     );
     let wakeups = f
         .store()
@@ -981,7 +981,7 @@ fn a_persistently_failing_wakeup_creation_surfaces_as_attention_required_not_a_s
             .unwrap()
             .len(),
         1,
-        "Stage 9C still decides even though Stage 9D cannot act on it yet"
+        "boundary evaluation still decides even though no wakeup can act on it yet"
     );
     assert!(
         f.store()
@@ -1142,7 +1142,10 @@ fn v9_to_v11_migration_preserves_experiment_and_event_history_and_adds_empty_dec
     raw.pragma_update(None, "user_version", 9).unwrap();
     drop(raw);
     let reopened = f.store();
-    assert_eq!(reopened.status().unwrap().schema_version, 11);
+    assert_eq!(
+        reopened.status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION
+    );
     let preserved = reopened
         .experiment_status(&f.root, &run.experiment_id)
         .unwrap()
@@ -1198,13 +1201,16 @@ fn v10_to_v11_migration_preserves_decisions_and_wakeups_and_adds_empty_cursor_st
     drop(store);
     let raw = common::sql(&f.paths.database);
     // Roll back ONLY the v11 cursor table; v10 decisions/wakeups stay exactly as they
-    // were persisted, exactly as an on-disk database created before Stage 9C's cursor
+    // were persisted, exactly as an on-disk database created before the decision cursor
     // existed would look.
     common::strip_experiment_decision_cursors(&raw);
     raw.pragma_update(None, "user_version", 10).unwrap();
     drop(raw);
     let mut reopened = f.store();
-    assert_eq!(reopened.status().unwrap().schema_version, 11);
+    assert_eq!(
+        reopened.status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION
+    );
     let decisions_after = reopened
         .experiment_decisions(&f.root, &run.experiment_id)
         .unwrap();
@@ -1323,9 +1329,10 @@ impl ProviderAdapter for FakePlanner {
         let prepared: PlannerPacket =
             serde_json::from_value(input.artifact["planner_packet"].clone()).unwrap();
         let plan = fake_execution_plan(&prepared);
+        let decision = common::plan_decision(&serde_json::to_value(&plan).unwrap());
         Ok(Box::new(Immediate(Some(output(
             Some(0),
-            &serde_json::to_vec(&plan).unwrap(),
+            &serde_json::to_vec(&decision).unwrap(),
         )))))
     }
     fn collect(&self, o: &ProcessOutput) -> local::Result<Value> {
@@ -1421,9 +1428,9 @@ fn wakeup_maps_into_existing_planning_infrastructure_and_planner_success_is_deri
     assert_eq!(wakeups.len(), 1);
     let request_id = wakeups[0].wakeup.planning_request_id.clone();
 
-    // Stage 9D never calls a provider itself: this is the SAME `Runtime::plan` any
+    // Wakeups never call a provider themselves: this is the SAME `Runtime::plan` any
     // operator already uses for a hand-authored planning request. The fixture's fake
-    // adapter is a stand-in for a model, not for any Stage 9-specific code path.
+    // adapter is a stand-in for a model, not for any experiment-specific code path.
     let view = Runtime::new(
         &mut store,
         f.paths.clone(),
@@ -1451,12 +1458,12 @@ fn wakeup_maps_into_existing_planning_infrastructure_and_planner_success_is_deri
         .experiment_control_summary(&f.root, &run.experiment_id)
         .unwrap();
     assert!(!control.attention_required);
-    // A successful planner invocation is entirely outside Stage 9D: it neither
+    // A successful planner invocation is entirely outside the wakeup path: it neither
     // consumes an extra slot nor alters the configured (immutable) budget.
     assert_eq!(control.wakeups_created, 1);
     assert_eq!(control.wakeups_budget, DEFAULT_MAX_PLANNER_WAKEUPS);
 
-    // Normal Stage 4+ authority is untouched: importing does not activate, and the
+    // Normal plan authority is untouched: importing does not activate, and the
     // plan still requires the ordinary explicit activation step.
     assert_ne!(view.state, PlanState::Active);
 }
@@ -1524,7 +1531,11 @@ fn planner_failure_remains_visible_and_does_not_corrupt_experiment_or_process_ou
         "the failed invocation does not spawn a second wakeup"
     );
     assert_eq!(wakeups[0].status, PlannerInvocationStatus::FailedUnresolved);
-    assert_eq!(wakeups[0].planner_jobs.len(), 1);
+    assert_eq!(
+        wakeups[0].planner_jobs.len(),
+        1 + agentctl::local::runtime::MAX_PROVIDER_RETRIES as usize,
+        "one invocation: its planner job and the bounded mechanical retries it made"
+    );
     let control = reopened
         .experiment_control_summary(&f.root, &run.experiment_id)
         .unwrap();
@@ -2038,7 +2049,7 @@ fn twenty_thousand_events_are_evaluated_via_a_durable_cursor_not_a_full_history_
         .unwrap();
     assert_eq!(cursor, max_sequence);
 
-    // The exact incremental query Stage 9C issues for its next batch is a bounded
+    // The exact incremental query boundary evaluation issues for its next batch is a bounded
     // index seek on `experiment_events_by_experiment`, not a scan of every row.
     let plan = raw
         .prepare(
@@ -2226,7 +2237,7 @@ fn cap_one_two_eligible_decisions_racing_for_the_same_open_slot_yield_exactly_on
             .unwrap()
             .len(),
         2,
-        "Stage 9C decides independently of whether Stage 9D can currently act"
+        "boundary evaluation decides independently of whether a wakeup can currently act"
     );
     assert!(
         f.store()

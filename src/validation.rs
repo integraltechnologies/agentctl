@@ -68,17 +68,39 @@ fn unique<T: Ord>(values: &[T], field: &'static str) -> Result<(), ValidationErr
     )
 }
 
-pub(crate) fn repo_path(path: &str) -> Result<(), ValidationError> {
+/// A literal repository-relative path, as a repository contains it: normalized
+/// (not absolute; no empty, `.` or `..` segments) and free of control
+/// characters, backslashes and `:` (Windows separators, drive-relative paths and
+/// alternate data streams). Every other character, including `[ ] { } ( ) @ * ?
+/// % _`, is an ordinary filename character. No agentctl interface gives a
+/// repository path pattern semantics, so `app/[slug]/page.tsx` can only ever
+/// name that one file.
+pub(crate) fn literal_repo_path(path: &str) -> Result<(), ValidationError> {
     ensure(
         !path.trim().is_empty()
             && !path
                 .chars()
-                .any(|c| c.is_control() || "\\:*?[]{}".contains(c))
+                .any(|c| c.is_control() || c == '\\' || c == ':')
             && path
                 .split('/')
                 .all(|p| !p.is_empty() && p != "." && p != ".."),
         "path",
-        "must be a normalized repository-relative path without globs or traversal",
+        "must be a normalized repository-relative path without traversal, backslashes, ':' or control characters",
+    )
+}
+
+/// An authored reference to a repository path (task, request and contract
+/// scopes, protected paths, command directories). Matched literally like every
+/// repository path, but `*` and `?` are refused: no portable (Windows-valid)
+/// filename contains them, and in an authored scope they almost always mean an
+/// intended glob, which literal matching would silently turn into a scope that
+/// matches nothing.
+pub(crate) fn repo_path(path: &str) -> Result<(), ValidationError> {
+    literal_repo_path(path)?;
+    ensure(
+        !path.contains(['*', '?']),
+        "path",
+        "is matched literally; '*' and '?' wildcards are not supported (name a file or directory subtree)",
     )
 }
 
@@ -183,6 +205,74 @@ impl Validate for PlanPacket {
     }
 }
 
+impl Validate for ContextRequestItem {
+    fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::SymbolByName { name } => {
+                nonempty(name, "context_request.items.name")?;
+                ensure(
+                    name.len() <= MAX_SYMBOL_NAME_BYTES && !name.chars().any(char::is_control),
+                    "context_request.items.name",
+                    "at most 256 bytes, no control characters",
+                )
+            }
+            Self::Neighborhood { depth, .. } => ensure(
+                (1..=MAX_NEIGHBORHOOD_DEPTH).contains(depth),
+                "context_request.items.depth",
+                "neighborhood depth must be 1–2",
+            ),
+            Self::FileRange {
+                path,
+                start_line,
+                end_line,
+            } => {
+                literal_repo_path(path)?;
+                ensure(
+                    *start_line >= 1
+                        && end_line >= start_line
+                        && end_line - start_line < MAX_FILE_RANGE_LINES,
+                    "context_request.items.range",
+                    "one-based inclusive range of at most 400 lines",
+                )
+            }
+            Self::Memory { memory_id } => ensure(
+                memory_id.starts_with("memory:") && GraphEntityId::new(memory_id.clone()).is_ok(),
+                "context_request.items.memory_id",
+                "must be a memory: identifier",
+            ),
+            Self::SymbolDefinition { .. }
+            | Self::SymbolRelations { .. }
+            | Self::RelatedTests { .. } => Ok(()),
+        }
+    }
+}
+
+impl Validate for ContextRequest {
+    fn validate(&self) -> Result<(), ValidationError> {
+        nonempty(&self.reason, "context_request.reason")?;
+        ensure(
+            self.reason.len() <= MAX_CONTEXT_REASON_BYTES && !self.reason.contains('\0'),
+            "context_request.reason",
+            "at most 1024 bytes and no NUL",
+        )?;
+        ensure(
+            (1..=MAX_CONTEXT_REQUEST_ITEMS).contains(&self.items.len()),
+            "context_request.items",
+            "a request names 1–16 items",
+        )?;
+        unique(&self.items, "context_request.items")?;
+        ensure(
+            (1..=MAX_CONTEXT_REQUEST_BYTES).contains(&self.max_bytes),
+            "context_request.max_bytes",
+            "must be 1–32768",
+        )?;
+        for item in &self.items {
+            item.validate()?;
+        }
+        Ok(())
+    }
+}
+
 impl Validate for ResultPacket {
     fn validate(&self) -> Result<(), ValidationError> {
         ensure(
@@ -194,8 +284,37 @@ impl Validate for ResultPacket {
             nonempty(&failure.code, "result.failure.code")?;
             nonempty(&failure.summary, "result.failure.summary")?;
         }
+        // Only the typed request means "context required"; failure text never does.
+        ensure(
+            self.failure
+                .as_ref()
+                .is_some_and(|f| f.code == CONTEXT_REQUIRED)
+                == self.context_request.is_some(),
+            "result.context_request",
+            "a CONTEXT_REQUIRED failure and a typed context_request must appear together",
+        )?;
+        if let Some(request) = &self.context_request {
+            ensure(
+                self.status == ResultStatus::Blocked,
+                "result.status",
+                "a context request is a BLOCKED result",
+            )?;
+            ensure(
+                self.changed_paths.is_empty() && self.changed_entities.is_empty(),
+                "result.changed_paths",
+                "a context request cannot report edits",
+            )?;
+            request.validate()?;
+            ensure(
+                request.task_id.as_ref() == Some(&self.task_id)
+                    && request.job_id == self.executor_job_id,
+                "result.context_request",
+                "must name this result's task and executor job",
+            )?;
+        }
         for path in &self.changed_paths {
-            repo_path(path)?;
+            // Reported names are compared with literally captured paths.
+            literal_repo_path(path)?;
         }
         unique(&self.changed_paths, "result.changed_paths")?;
         unique(&self.changed_entities, "result.changed_entities")?;
@@ -211,7 +330,7 @@ impl Validate for LocationRef {
             "requires a path or graph entity",
         )?;
         if let Some(path) = &self.path {
-            repo_path(path)?;
+            literal_repo_path(path)?;
         }
         if let Some(line) = self.line {
             ensure(
@@ -280,6 +399,23 @@ impl Validate for VerificationPacket {
         texts(&self.requirement_refs, "verification.requirement_refs")?;
         texts(&self.invariant_refs, "verification.invariant_refs")?;
         optional_text(&self.notes, "verification.notes")?;
+        if let Some(request) = &self.context_request {
+            ensure(
+                self.decision == VerificationDecision::Blocked && self.findings.is_empty(),
+                "verification.context_request",
+                "a verifier context request is BLOCKED without findings; it is neither PASS nor REJECT",
+            )?;
+            request.validate()?;
+            let task = match &self.target {
+                VerificationTarget::Packet { task_id, .. } => Some(task_id),
+                VerificationTarget::Integration { .. } => None,
+            };
+            ensure(
+                request.task_id.as_ref() == task && request.job_id == self.verifier_job_id,
+                "verification.context_request",
+                "must name this packet's verified task and verifier job",
+            )?;
+        }
         match self.decision {
             VerificationDecision::Pass => {
                 ensure(
@@ -304,9 +440,9 @@ impl Validate for VerificationPacket {
                 "REJECT requires a structured finding",
             )?,
             VerificationDecision::Blocked => ensure(
-                self.notes.is_some() || !self.findings.is_empty(),
+                self.notes.is_some() || !self.findings.is_empty() || self.context_request.is_some(),
                 "verification",
-                "BLOCKED requires a finding or explanatory note",
+                "BLOCKED requires a finding, explanatory note, or context request",
             )?,
         }
         Ok(())
@@ -524,7 +660,7 @@ impl Validate for AgentEvent {
             }
             AgentEventKind::PlanStepStarted { step } => nonempty(step, "event.step")?,
             AgentEventKind::FileRead { path } | AgentEventKind::FileEdited { path } => {
-                repo_path(path)?
+                literal_repo_path(path)?
             }
             AgentEventKind::ToolStarted {
                 invocation_id,

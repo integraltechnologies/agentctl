@@ -965,7 +965,7 @@ fn experiment_schema_migration_is_additive_and_preserves_prior_runtime_and_journ
         .unwrap();
 
     // Roll the on-disk schema back to the accepted v7 shape, exactly as a legacy
-    // database (created before Stage 9A existed) would look.
+    // database (created before experiments existed) would look.
     let raw = common::sql(&f.paths.database);
     common::strip_experiments(&raw);
     raw.pragma_update(None, "user_version", 7).unwrap();
@@ -1378,7 +1378,11 @@ fn v8_to_v9_migration_preserves_experiment_history_and_fabricates_no_events() {
     raw.pragma_update(None, "user_version", 8).unwrap();
     drop(raw);
     let reopened = f.store();
-    assert_eq!(reopened.status().unwrap().schema_version, 11);
+    assert_eq!(
+        reopened.status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION,
+        "migration must carry an old database to the current schema"
+    );
     let preserved = reopened
         .experiment_status(&f.root, &run.experiment_id)
         .unwrap()
@@ -1615,7 +1619,7 @@ fn metric_payload(count: u32) -> Vec<u8> {
 }
 
 #[test]
-fn stage9_event_volume_cap_is_machine_owned_explicit_and_never_silent() {
+fn experiment_event_volume_cap_is_machine_owned_explicit_and_never_silent() {
     let f = Fixture::new();
     // The project asks for MORE than the machine allows: the machine cap wins.
     let mut policy = ProjectConfig::load(&f.root).unwrap();

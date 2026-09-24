@@ -1,7 +1,7 @@
-//! Stage 9C: FACTS -> DETERMINISTIC POLICY -> DECISION.
+//! Experiment boundaries: FACTS -> DETERMINISTIC POLICY -> DECISION.
 //!
 //! Boundaries are declared once, at experiment creation (`ExperimentRun::decision_boundaries`,
-//! frozen and hash-bound), and are evaluated here purely against Stage 9B facts already
+//! frozen and hash-bound), and are evaluated here purely against experiment facts already
 //! committed to `experiment_events`. No model/provider call is ever made or required to
 //! evaluate a boundary; this module contains no process-control path (it never kills,
 //! restarts, or launches anything) and no planner invocation (that begins in
@@ -18,13 +18,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Bounded batch size for one evaluation transaction: caps memory and lock hold time
 /// regardless of how much history an experiment has accumulated. Consistent in spirit
-/// with Stage 9B's own `READ_BYTES_PER_POLL`/512-draft ingestion batching.
+/// with experiment-event ingestion's own `READ_BYTES_PER_POLL`/512-draft ingestion batching.
 pub(super) const EVALUATION_BATCH_SIZE: i64 = 512;
 
 /// Only METRIC_THRESHOLD is auto-evaluated: a deliberately small, fixed vocabulary of
-/// scalar comparisons over persisted Stage 9B metric facts. The other `ExperimentBoundary`
-/// variants remain valid Stage 0 protocol values but are not (yet) decided automatically
-/// here; declaring one for Stage 9C evaluation is rejected up front rather than silently
+/// scalar comparisons over persisted experiment metric facts. The other `ExperimentBoundary`
+/// variants remain valid protocol values but are not (yet) decided automatically
+/// here; declaring one for automatic evaluation is rejected up front rather than silently
 /// never firing.
 fn scalar_condition(
     boundary: &BoundaryDefinition,
@@ -37,7 +37,7 @@ fn scalar_condition(
             value,
         } => Ok((metric.as_str(), tags, *comparison, *value)),
         other => Err(Error::Invalid(format!(
-            "boundary {}: Stage 9C only auto-evaluates METRIC_THRESHOLD conditions against persisted Stage 9B metric facts; {other:?} is not decided automatically",
+            "boundary {}: only METRIC_THRESHOLD conditions are evaluated automatically, against persisted experiment metric facts; {other:?} is not decided automatically",
             boundary.boundary_id
         ))),
     }
@@ -290,7 +290,7 @@ struct Fired {
 }
 
 /// Persists every decision newly fired within one batch AND advances the cursor past
-/// that batch, in one transaction. This is the crash-safety core of Stage 9C: a crash
+/// that batch, in one transaction. This is the crash-safety core of boundary evaluation: a crash
 /// before commit leaves the cursor exactly where it was (the batch is simply
 /// re-evaluated, which is idempotent because of the decision uniqueness constraint), and
 /// a crash after commit can never have "advanced the cursor but lost a decision" - the
@@ -431,7 +431,7 @@ fn evaluate_attempt(
     Ok(())
 }
 
-/// Stage 9C entry point: evaluate every declared boundary against every attempt's
+/// Boundary-evaluation entry point: evaluate every declared boundary against every attempt's
 /// already-persisted event facts, in a fixed, documented order:
 ///
 /// 1. attempts ascending;
@@ -489,7 +489,7 @@ impl Store {
         })
     }
     /// Read-only: fired decisions, oldest first. Never mutates state; a decision row
-    /// exists only because Stage 9C's write path (`evaluate`, gated by the same
+    /// exists only because boundary evaluation's write path (`evaluate`, gated by the same
     /// controller authorization as every other experiment table) already inserted it.
     pub fn experiment_decisions(
         &self,

@@ -1,11 +1,40 @@
 //! Content-bound, workspace-specific repository intelligence. No source execution.
+mod bindings;
 pub(crate) mod cli;
+mod delta;
 pub mod files;
+mod footprint;
+mod impact;
+mod lifecycle;
 mod model;
 mod parser;
 mod query;
+mod resolve;
+mod semantic;
+mod wire;
+pub use delta::{
+    Change, ContentChange, DeltaSummary, EntityChange, EntityFacts, EntityField, FactsRef,
+    FileChange, GenerationPoint, IdentityBasis, RelationChange, SemanticDelta,
+};
+pub use footprint::{
+    FootprintLimits, FootprintOutlook, FootprintRequest, FootprintSummary, ReviewEvidence,
+    ReviewSignal, ReviewSignalKind, StructuralEntity, StructuralFile, StructuralFootprint,
+    StructuralRelation, StructuralRole, StructuralRoleBasis, Surface, VerificationLink,
+};
+pub(crate) use impact::proposed as proposed_impact;
+pub use impact::{
+    BoundaryReason, ImpactAuthority, ImpactBasis, ImpactBoundary, ImpactClass, ImpactEdge,
+    ImpactItem, ImpactLimits, ImpactOrigin, ImpactOutlook, ImpactReport, ImpactRequest, ImpactSeed,
+    ImpactStep, ImpactSummary,
+};
+pub use lifecycle::{
+    DecisionReason, DeltaStatus, GenerationDecision, GenerationOrigin, GenerationState,
+    OntologyGeneration, OntologyStatus,
+};
+pub(crate) use lifecycle::{accept_for_plan, close_for_plan, require_accepted, require_issuable};
 pub use model::*;
-pub use query::{GraphQuery, QueryResult, SearchMode};
+pub use query::{GraphQuery, QueryResult, SearchMode, objective_query, symbol_mentions};
+pub use semantic::{SemanticOutcome, SemanticTiming};
 
 use super::{
     Error, Result, now_ms,
@@ -21,8 +50,20 @@ use std::{
 };
 
 impl Store {
-    /// File derivations, index metadata, and the aggregate journal event commit together.
+    /// An explicit observation of the workspace (`agentctl repo index`). The
+    /// result becomes accepted ontology truth only through the lifecycle rules
+    /// in `lifecycle.rs`; otherwise it is recorded as a candidate.
     pub fn index_repository(&mut self, start: &Path) -> Result<IndexStats> {
+        self.index_observed(start, &GenerationOrigin::External)
+    }
+
+    /// File derivations, index metadata, the generation's lifecycle record and
+    /// the aggregate journal event commit together.
+    pub(crate) fn index_observed(
+        &mut self,
+        start: &Path,
+        origin: &GenerationOrigin,
+    ) -> Result<IndexStats> {
         let started = Instant::now();
         let info = checked_workspace(self, start)?;
         let candidates = files::discover(&info.root)?;
@@ -31,6 +72,12 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = stored_files(&tx, &info)?;
         let old_metadata = metadata(&tx, &info)?;
+        // Facts indexed before ontology snapshots carry no text hashes; their
+        // files are re-derived so every generation can be snapshotted.
+        let unhashed: BTreeSet<String> = tx
+            .prepare("SELECT DISTINCT path FROM graph_entities WHERE workspace_id=?1 AND text_hash IS NULL")?
+            .query_map([info.workspace_id.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
         let mut stats = IndexStats {
             discovered: candidates.len(),
             indexed: 0,
@@ -41,12 +88,17 @@ impl Store {
             entities: 0,
             edges: 0,
             duration_ms: 0,
+            resolved: 0,
+            generation: None,
         };
+        let previous = old_metadata.as_ref().and_then(|m| m.generation.clone());
         let initial = IndexMetadata {
             version: INDEX_VERSION.into(),
             indexed_at_ms: now_ms()?,
             source: info.source.clone(),
             stats: stats.clone(),
+            generation: previous.clone(),
+            semantic: None,
         };
         tx.execute("INSERT INTO graph_indexes(workspace_id,repo_id,metadata_json) VALUES (?1,?2,?3) ON CONFLICT(workspace_id) DO UPDATE SET metadata_json=excluded.metadata_json",
             params![info.workspace_id.as_str(), info.repository_id.as_str(), serde_json::to_string(&initial)?])?;
@@ -73,6 +125,7 @@ impl Store {
                 && previous.is_some_and(|f| {
                     f.content_hash == hash && f.backend == backend && f.diagnostic.is_none()
                 })
+                && !unhashed.contains(path)
             {
                 stats.reused += 1;
                 continue;
@@ -80,7 +133,7 @@ impl Store {
             stats.indexed += 1;
             stats.changed += usize::from(previous.is_some());
             let derivation = observed.and_then(|(hash, source)| {
-                parser::extract(
+                let derivation = parser::extract(
                     &source,
                     Provenance {
                         repository_id: info.repository_id.clone(),
@@ -90,7 +143,9 @@ impl Store {
                         language,
                         backend: backend.clone(),
                     },
-                )
+                )?;
+                let texts = delta::text_hashes(&source, &derivation.entities)?;
+                Ok((derivation, texts))
             });
             let diagnostic = derivation
                 .as_ref()
@@ -106,10 +161,10 @@ impl Store {
                 "INSERT INTO indexed_files VALUES (?1,?2,?3,?4,?5)",
                 params![info.workspace_id.as_str(), path, hash, backend, diagnostic],
             )?;
-            if let Ok(derivation) = derivation {
-                for entity in derivation.entities {
+            if let Ok((derivation, texts)) = derivation {
+                for (entity, text) in derivation.entities.into_iter().zip(texts) {
                     tx.execute(
-                        "INSERT INTO graph_entities VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        "INSERT INTO graph_entities(workspace_id,entity_id,path,name,qualified_name,kind,record_json,text_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                         params![
                             info.workspace_id.as_str(),
                             entity.id.as_str(),
@@ -117,13 +172,14 @@ impl Store {
                             entity.name,
                             entity.qualified_name,
                             serde_json::to_string(&entity.kind)?,
-                            serde_json::to_string(&entity)?
+                            serde_json::to_string(&entity)?,
+                            text
                         ],
                     )?;
                 }
                 for edge in derivation.edges {
                     tx.execute(
-                        "INSERT INTO graph_edges VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        "INSERT INTO graph_edges(workspace_id,edge_id,path,source_id,target_id,kind,record_json,path_hint) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                         params![
                             info.workspace_id.as_str(),
                             edge.id,
@@ -133,7 +189,8 @@ impl Store {
                                 .as_ref()
                                 .map(crate::protocol::GraphEntityId::as_str),
                             serde_json::to_string(&edge.kind)?,
-                            serde_json::to_string(&edge)?
+                            serde_json::to_string(&edge)?,
+                            edge.path_hint
                         ],
                     )?;
                 }
@@ -157,13 +214,43 @@ impl Store {
                 && after.source.head_commit == info.source.head_commit,
             "Git source identity changed during indexing; transaction rolled back, retry",
         )?;
+        // The generation advances only when the indexed facts actually change.
+        // Workspace resolution is rebuilt whenever any file was re-derived, even
+        // with identical content: re-deriving a file cascades away its rows.
+        let fingerprint = fingerprint(&tx, &info)?;
+        let changed = previous
+            .as_ref()
+            .is_none_or(|g| g.fingerprint != fingerprint);
+        let rebuilt = changed || stats.indexed > 0 || stats.deleted > 0;
+        if rebuilt {
+            resolve::rebuild(&tx, info.workspace_id.as_str())?;
+        }
+        let generation = match previous {
+            Some(g) if !changed => g,
+            prior => GraphGeneration {
+                sequence: prior.map_or(1, |g| g.sequence + 1),
+                fingerprint,
+            },
+        };
         (stats.entities, stats.edges) = counts(&tx, &info)?;
+        stats.resolved = tx.query_row(
+            "SELECT count(*) FROM graph_resolutions WHERE workspace_id=?1",
+            [info.workspace_id.as_str()],
+            |r| r.get(0),
+        )?;
+        stats.generation = Some(generation.clone());
         stats.duration_ms = started.elapsed().as_millis() as u64;
         let metadata = IndexMetadata {
             version: INDEX_VERSION.into(),
             indexed_at_ms: now_ms()?,
             source: after.source,
             stats: stats.clone(),
+            generation: Some(generation.clone()),
+            // Semantic rows survive only when nothing was re-derived.
+            semantic: old_metadata
+                .as_ref()
+                .and_then(|m| m.semantic.clone())
+                .filter(|s| !rebuilt && s.generation == generation),
         };
         tx.execute(
             "UPDATE graph_indexes SET metadata_json=?2 WHERE workspace_id=?1",
@@ -182,6 +269,7 @@ impl Store {
                 stats: stats.clone(),
             },
         )?;
+        lifecycle::observe(&tx, &info, origin, &generation, &stats, &metadata.source)?;
         tx.commit()?;
         Ok(stats)
     }
@@ -194,6 +282,22 @@ impl Store {
 
     /// A single-use, hash-checked SQLite read snapshot. Build a new query for each request.
     pub fn graph(&self, start: &Path) -> Result<GraphQuery<'_>> {
+        self.graph_snapshot(start, true)
+    }
+
+    /// A read snapshot for dereferencing planner references and context
+    /// requests, which tolerates an index that is stale relative to the
+    /// worktree: a verifier is issued context while the executor's captured
+    /// edits are deliberately not yet indexed (only accepted work refreshes the
+    /// ontology). Staleness cannot produce a wrong answer, because every issued
+    /// fact stays bound to the content hash it was derived from and is
+    /// rechecked against the captured source before it is issued; a row that no
+    /// longer matches fails closed instead.
+    pub(crate) fn graph_for_issue(&self, start: &Path) -> Result<GraphQuery<'_>> {
+        self.graph_snapshot(start, false)
+    }
+
+    fn graph_snapshot(&self, start: &Path, fresh: bool) -> Result<GraphQuery<'_>> {
         let info = checked_workspace(self, start)?;
         let tx = self.connection.unchecked_transaction()?;
         let mut freshness = status(&tx, &info)?;
@@ -202,7 +306,7 @@ impl Store {
             "workspace has no code index; run agentctl repo index",
         )?;
         require(
-            freshness.stale_files.is_empty(),
+            !fresh || freshness.stale_files.is_empty(),
             format!(
                 "code index is stale ({} paths/version changes); run agentctl repo index or repo index --status",
                 freshness.stale_files.len()
@@ -248,6 +352,68 @@ fn stored_files(
         .map(|r| r.map(|f| (f.path.clone(), f)).map_err(Error::from)).collect()
 }
 
+/// Re-derives one workspace's cross-file resolutions from its stored facts
+/// (used by the index pass and by the schema migration that introduced them).
+pub(crate) fn rebuild_resolutions(connection: &Connection, workspace: &str) -> Result<()> {
+    resolve::rebuild(connection, workspace)
+}
+
+impl Store {
+    /// Enriches the current generation with what a language semantic provider
+    /// can prove, if one is installed.
+    ///
+    /// Deliberately explicit rather than part of indexing: the deterministic
+    /// pass is milliseconds and must never wait on a provider that takes
+    /// seconds. The graph is fully usable before this runs and after it fails.
+    /// Enrichment is idempotent, and re-indexing discards what it added,
+    /// because resolutions are rebuilt whenever the generation changes.
+    pub fn enrich_semantic(&mut self, start: &Path) -> Result<Vec<semantic::SemanticOutcome>> {
+        let info = checked_workspace(self, start)?;
+        require(
+            status(&self.connection, &info)?.fresh,
+            "semantic enrichment requires a complete fresh index; run agentctl repo index",
+        )?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcomes = semantic::run(&tx, &info, info.workspace_id.as_str())?;
+        let providers: Vec<String> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                semantic::SemanticOutcome::Current { provider, .. } => Some(provider.clone()),
+                semantic::SemanticOutcome::Unavailable { .. } => None,
+            })
+            .collect();
+        if let Some(mut metadata) = metadata(&tx, &info)? {
+            metadata.semantic = match (&metadata.generation, providers.is_empty()) {
+                (Some(generation), false) => Some(SemanticStamp {
+                    generation: generation.clone(),
+                    providers,
+                    enriched_at_ms: now_ms()?,
+                }),
+                _ => None,
+            };
+            tx.execute(
+                "UPDATE graph_indexes SET metadata_json=?2 WHERE workspace_id=?1",
+                params![
+                    info.workspace_id.as_str(),
+                    serde_json::to_string(&metadata)?
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(outcomes)
+    }
+}
+
+/// The persisted generation of the workspace's index, without rehashing sources.
+pub(crate) fn generation(
+    connection: &Connection,
+    info: &RepositoryInfo,
+) -> Result<Option<GraphGeneration>> {
+    Ok(metadata(connection, info)?.and_then(|m| m.generation))
+}
+
 fn metadata(connection: &Connection, info: &RepositoryInfo) -> Result<Option<IndexMetadata>> {
     let json: Option<String> = connection
         .query_row(
@@ -258,6 +424,25 @@ fn metadata(connection: &Connection, info: &RepositoryInfo) -> Result<Option<Ind
         .optional()?;
     json.map(|s| serde_json::from_str(&s).map_err(Error::from))
         .transpose()
+}
+
+/// Content-derived identity of the indexed facts: the index version plus every
+/// indexed file's path, hash, backend and diagnostic, in path order.
+fn fingerprint(connection: &Connection, info: &RepositoryInfo) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut part = |s: &str| {
+        hasher.update(&(s.len() as u64).to_le_bytes());
+        hasher.update(s.as_bytes());
+    };
+    part("graph-generation-v1");
+    part(INDEX_VERSION);
+    for file in stored_files(connection, info)?.values() {
+        part(&file.path);
+        part(file.content_hash.as_deref().unwrap_or("\0unreadable"));
+        part(&file.backend);
+        part(file.diagnostic.as_deref().unwrap_or(""));
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 fn counts(connection: &Connection, info: &RepositoryInfo) -> Result<(usize, usize)> {

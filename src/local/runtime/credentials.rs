@@ -65,7 +65,18 @@ impl NativeAuth {
     /// Provider-frontend variables for native login (`None` removes one). These
     /// are locations and login identity, never values read from a credential
     /// store; tool workers never receive them.
-    pub(crate) fn variables(&self) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+    ///
+    /// `scratch_home` is the job's private HOME. Codex treats `CODEX_HOME` as a
+    /// mutable working directory — it bootstraps config, caches, plugins,
+    /// skills and a temp area there — so the job gets its own, and only the
+    /// operator's credential file is linked in (see [`Self::linked_files`]).
+    /// The operator's real Codex home, with its history, attachments and
+    /// executable plugins, is never exposed. Claude Code needs no writable
+    /// provider home, so `CLAUDE_CONFIG_DIR` keeps its normal meaning.
+    pub(crate) fn variables(
+        &self,
+        scratch_home: &Path,
+    ) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
         let mut variables = vec![("HOME", Some(self.home.clone().into_os_string()))];
         // macOS Keychain lookup in Claude requires the ordinary login identity
         // environment as well as HOME; these are names, never credentials.
@@ -75,7 +86,7 @@ impl NativeAuth {
             }
         }
         if self.provider == "codex" {
-            variables.push(("CODEX_HOME", Some(self.provider_home.clone().into())));
+            variables.push(("CODEX_HOME", Some(self.job_home(scratch_home).into())));
         } else if self.config_override {
             variables.push(("CLAUDE_CONFIG_DIR", Some(self.provider_home.clone().into())));
         } else {
@@ -83,12 +94,39 @@ impl NativeAuth {
         }
         variables
     }
+    /// The provider home this job actually runs against.
+    pub(crate) fn job_home(&self, scratch_home: &Path) -> PathBuf {
+        if self.provider == "codex" {
+            scratch_home.join(".codex")
+        } else {
+            self.provider_home.clone()
+        }
+    }
+    /// Operator-owned files that must appear inside a scratch provider home, as
+    /// `(link, target)`. agentctl links rather than copies: it never opens a
+    /// credential file, and an in-place refresh by the CLI still reaches the
+    /// operator's real file.
+    pub(crate) fn linked_files(&self, scratch_home: &Path) -> Vec<(PathBuf, PathBuf)> {
+        if self.provider == "codex" {
+            vec![(
+                self.job_home(scratch_home).join("auth.json"),
+                self.provider_home.join("auth.json"),
+            )]
+        } else {
+            vec![]
+        }
+    }
+    /// Controller-side probe environment. The probe runs unsandboxed as the
+    /// operator, so it uses the operator's own provider home.
     pub(super) fn environment(&self, command: &mut Command) {
-        for (name, value) in self.variables() {
+        for (name, value) in self.variables(&self.home) {
             match value {
                 Some(value) => command.env(name, value),
                 None => command.env_remove(name),
             };
+        }
+        if self.provider == "codex" {
+            command.env("CODEX_HOME", &self.provider_home);
         }
     }
     pub(crate) fn readable_files(&self) -> Vec<PathBuf> {

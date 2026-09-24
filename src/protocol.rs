@@ -168,7 +168,9 @@ pub struct MemoryProvenance {
     pub author_job_id: Option<JobId>,
 }
 
-/// A normalized repository-relative file or directory subtree. No glob syntax.
+/// A normalized repository-relative file or directory subtree, matched
+/// literally: `app/[slug]` is the directory named `[slug]`, never a pattern.
+/// `*` and `?` are refused rather than silently matched literally.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ScopePath {
@@ -247,6 +249,95 @@ pub struct ResultPacket {
     pub evidence: Vec<EvidenceRef>,
     pub notes: Option<String>,
     pub failure: Option<FailureInfo>,
+    /// Present exactly when `status` is `BLOCKED` with failure code
+    /// [`CONTEXT_REQUIRED`]: the executor made no edits and asks agentctl for
+    /// more issued context. Absent in results written before the relay existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_request: Option<ContextRequest>,
+}
+
+/// Failure code of a result (or the implied meaning of a verifier packet) that
+/// carries a typed [`ContextRequest`]. Failure text alone never means this.
+pub const CONTEXT_REQUIRED: &str = "CONTEXT_REQUIRED";
+/// Wire bounds of a [`ContextRequest`]. The machine configuration may only
+/// lower the byte budgets further; nothing a worker sends can raise them.
+pub const MAX_CONTEXT_REQUEST_ITEMS: usize = 16;
+pub const MAX_CONTEXT_REASON_BYTES: usize = 1024;
+pub const MAX_CONTEXT_REQUEST_BYTES: u32 = 32 * 1024;
+pub const MAX_NEIGHBORHOOD_DEPTH: u8 = 2;
+pub const MAX_FILE_RANGE_LINES: u32 = 400;
+pub const MAX_SYMBOL_NAME_BYTES: usize = 256;
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RelationDirection {
+    /// Entities with a resolved relation to the subject.
+    Callers,
+    /// Entities the subject has a resolved relation to.
+    Callees,
+}
+
+/// One deliberately narrow, deterministic question about the repository. There
+/// is no free-form search: every item names an ontology entity, a literal
+/// repository path, or a memory entry, and resolves without a model.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ContextRequestItem {
+    SymbolDefinition {
+        entity_id: GraphEntityId,
+    },
+    /// Exact name, qualified name, or ID lookup. More than one match fails
+    /// closed as ambiguous; prefer `SYMBOL_DEFINITION` with an issued ID.
+    SymbolByName {
+        #[schemars(length(min = 1, max = 256))]
+        name: String,
+    },
+    SymbolRelations {
+        entity_id: GraphEntityId,
+        relation: RelationDirection,
+    },
+    RelatedTests {
+        entity_id: GraphEntityId,
+    },
+    Neighborhood {
+        entity_id: GraphEntityId,
+        #[schemars(range(min = 1, max = 2))]
+        depth: u8,
+    },
+    /// One-based, inclusive line range of a captured source file.
+    FileRange {
+        path: String,
+        #[schemars(range(min = 1))]
+        start_line: u32,
+        #[schemars(range(min = 1))]
+        end_line: u32,
+    },
+    Memory {
+        memory_id: String,
+    },
+}
+
+/// A worker's typed statement that it cannot safely finish from its issued
+/// context. It never grants authority: agentctl resolves it deterministically
+/// inside the planner-authored envelope or escalates it to the planner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContextRequest {
+    pub version: ProtocolVersion,
+    /// The issued task; absent only for an integration verifier.
+    pub task_id: Option<TaskId>,
+    /// The issued job making the request.
+    pub job_id: JobId,
+    /// Why the issued context is insufficient. Recorded for the planner only.
+    #[schemars(length(min = 1, max = 1024))]
+    pub reason: String,
+    #[schemars(length(min = 1, max = 16))]
+    pub items: Vec<ContextRequestItem>,
+    /// The most context bytes the worker wants for this round.
+    #[schemars(range(min = 1, max = 32768))]
+    pub max_bytes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -279,9 +370,19 @@ pub struct VerificationPacket {
     pub decision: VerificationDecision,
     pub findings: Vec<VerificationFinding>,
     pub evidence: Vec<EvidenceRef>,
+    /// Stable check IDs this decision covers, copied verbatim from the issued
+    /// requirements (for example `test`); never prose. A PASS must include
+    /// every required ID.
     pub requirement_refs: Vec<String>,
+    /// Stable invariant IDs this decision covers, copied verbatim; a PASS must
+    /// include every required critical invariant.
     pub invariant_refs: Vec<String>,
     pub notes: Option<String>,
+    /// A verifier's own, independent context request: decision `BLOCKED`, no
+    /// findings. It is neither PASS nor REJECT and never becomes a task
+    /// transition. Absent in packets written before the relay existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_request: Option<ContextRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -527,7 +628,7 @@ pub enum ExperimentBoundary {
     EpochComplete,
     MetricThreshold {
         metric: String,
-        /// Exact-match selector against a Stage 9B metric event's own `tags`. Absent
+        /// Exact-match selector against a structured metric event's own `tags`. Absent
         /// in an old document deserializes as empty, which is NOT a wildcard: an
         /// empty selector matches only an untagged event of that metric name (see
         /// `local::runtime::experiment_decisions` for the full fail-closed matching
@@ -540,9 +641,9 @@ pub enum ExperimentBoundary {
     },
 }
 
-/// Stage 9C deterministic outcome of a satisfied boundary. Deliberately small: a
+/// Deterministic outcome of a satisfied boundary. Deliberately small: a
 /// boundary either just records a fact, or names the single existing verification
-/// profile Stage 9D must attach when it wakes the normal planner. Neither variant
+/// profile a planner wakeup must attach when it wakes the normal planner. Neither variant
 /// grants any process-control or model-invocation authority by itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]

@@ -25,43 +25,6 @@ impl Store {
         retrieve(&tx, &info, query)
     }
 
-    pub fn memory_for_task(
-        &self,
-        start: &Path,
-        task: &TaskPacket,
-        limits: MemoryLimits,
-    ) -> Result<MemoryContext> {
-        task.validate()?;
-        let mut links = vec![MemoryLink::Task {
-            id: task.task_id.clone(),
-        }];
-        links.extend(
-            task.graph_entities
-                .iter()
-                .cloned()
-                .map(|id| MemoryLink::Graph { id }),
-        );
-        links.extend(
-            task.invariant_refs
-                .iter()
-                .cloned()
-                .map(|key| MemoryLink::Invariant { key }),
-        );
-        self.memory_context(start, links, Some(&task.objective), limits)
-    }
-
-    pub fn code_context_with_memory(
-        &self,
-        start: &Path,
-        query: &str,
-        graph_limits: graph::ContextLimits,
-        memory_limits: MemoryLimits,
-    ) -> Result<CodeContextWithMemory> {
-        let graph = self.graph(start)?.context(query, graph_limits)?;
-        let memory = self.memory_for_code(start, &graph, memory_limits)?;
-        Ok(CodeContextWithMemory { graph, memory })
-    }
-
     pub fn memory_for_code(
         &self,
         start: &Path,

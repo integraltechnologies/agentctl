@@ -6,10 +6,6 @@ use crate::protocol::*;
 use crate::validation::{Validate, ValidationError, ensure};
 
 impl TaskState {
-    pub fn is_complete(self) -> bool {
-        self == Self::Verified
-    }
-
     /// Structural edge only. Use PlanPacket::validate_task_transition for DAG/proof guards.
     pub fn can_transition_to(self, next: Self) -> bool {
         use TaskState::*;
@@ -136,6 +132,11 @@ impl PlanPacket {
             })?;
             packet.validate()?;
             ensure(
+                packet.context_request.is_none(),
+                "task.verification",
+                "a verifier context request is not a verification decision",
+            )?;
+            ensure(
                 matches!(&packet.target, VerificationTarget::Packet { task_id: target, .. } if target == task_id),
                 "task.verification.target",
                 "requires packet verification for this task",
@@ -174,6 +175,11 @@ impl PlanPacket {
             "every task must be VERIFIED",
         )?;
         integration.validate()?;
+        ensure(
+            integration.context_request.is_none(),
+            "plan.completion",
+            "a verifier context request is not a verification decision",
+        )?;
         ensure(
             matches!(&integration.target, VerificationTarget::Integration { plan_id, .. } if plan_id == &self.plan_id),
             "plan.completion.target",

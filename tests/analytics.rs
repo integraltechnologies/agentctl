@@ -96,11 +96,8 @@ fn route_sources_filters_failure_history_and_cli_are_historical_allowlisted() {
             let text = String::from_utf8(result.stdout).unwrap();
             assert!(text.contains(source));
             assert!(!text.contains("CANARY"));
-            assert!(text.contains(if json_mode {
-                "PROVIDER_UNAVAILABLE"
-            } else {
-                "ProviderUnavailable"
-            }));
+            // Human output uses the canonical protocol name, as JSON does.
+            assert!(text.contains("PROVIDER_UNAVAILABLE"));
         }
     }
 }
@@ -111,7 +108,7 @@ fn primary_mixed_model_source_policy_promotion_and_ordered_multi_fallback() {
     let c = f.sql();
     f.job(&c, "job:r", "session:r", "executor", "a", "m2", "SUCCEEDED");
     let mut route = persisted_route("project profiles", 0);
-    // Model-only override changes the configured primary too in Stage 7.
+    // Model-only override changes the configured primary too.
     route["primary"] = route["selected"].clone();
     let set = |r: &Value| {
         c.execute("UPDATE runtime_jobs SET record_json=json_set(record_json,'$.route',json(?1)) WHERE job_id='job:r'",[r.to_string()]).unwrap();

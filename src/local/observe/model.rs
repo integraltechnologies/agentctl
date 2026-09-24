@@ -13,7 +13,7 @@ pub struct Snapshot {
     pub truncated: bool,
     pub warnings: Vec<String>,
 }
-/// Stage 9A long-running job/experiment process, projected read-only.
+/// Long-running job/experiment process, projected read-only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Experiment {
     pub id: String,

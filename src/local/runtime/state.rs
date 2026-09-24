@@ -27,6 +27,53 @@ pub struct PendingTask {
     pub evidence: Vec<EvidenceRef>,
     pub verifier: Option<JobId>,
     pub proof: Option<VerificationPacket>,
+    /// Isolated mutation surface used by a concurrent executor. Serial results
+    /// omit this. The path is controller-owned and is retained across an
+    /// interruption until reconciliation or explicit replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_workspace: Option<String>,
+    /// Typed eligibility evidence frozen when this branch was dispatched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatibility: Vec<super::concurrency::CompatibilityDecision>,
+    /// Ontology generation against which executor context was issued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology_generation: Option<String>,
+    /// Canonical source immediately *before* this branch was published into it.
+    /// Serial results omit it: they never leave canonical source, so their diff
+    /// and their checks already share one identity. For a concurrent branch the
+    /// diff is captured in an isolated worktree while the checks run on
+    /// canonical source, and this is the only identity in that chain the run
+    /// record would otherwise discard — `after` already holds what publication
+    /// produced, so nothing else needs storing to state the whole relationship.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciled_from: Option<ArtifactRef>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchLaunchAuthority {
+    /// Exact canonical source observed while the task claims were committed.
+    pub source: ArtifactRef,
+    /// Accepted ontology row whose sequence/fingerprint backed compatibility.
+    pub ontology_generation: String,
+    pub tasks: Vec<TaskId>,
+    pub compatibility: Vec<super::concurrency::CompatibilityDecision>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationPath {
+    pub path: String,
+    pub before: Option<source::FileState>,
+    pub after: Option<source::FileState>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationIntent {
+    pub task_id: TaskId,
+    pub executor: JobId,
+    pub diff: ArtifactRef,
+    pub expected_source: ArtifactRef,
+    pub intended_source: ArtifactRef,
+    pub paths: Vec<ReconciliationPath>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,8 +88,47 @@ pub struct RunRecord {
     pub policy_hash: String,
     pub accepted: BTreeMap<TaskId, AcceptedTask>,
     pub pending: Option<PendingTask>,
+    /// Captured isolated results awaiting deterministic reconciliation. This is
+    /// part of the RunRecord rather than scheduler state: a restarted
+    /// controller can prove exactly what exists and must never duplicate it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub branches: BTreeMap<TaskId, PendingTask>,
+    /// Coherent authority checkpoint written in the same SQLite transaction as
+    /// all claims in a concurrent batch. It is cleared after all branch
+    /// results have been captured or contained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_authority: Option<BatchLaunchAuthority>,
+    /// Branch-specific filesystem publication intent, durable before the first
+    /// canonical write and cleared only with BRANCH_RECONCILED.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<ReconciliationIntent>,
     pub reason: Option<String>,
     pub correction_round: u32,
+    /// Context-relay ledgers keyed by worker subject (`executor:<task>`,
+    /// `verifier:<task>`, `integration`). Absent in runs recorded before the
+    /// relay, and omitted while empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub context: BTreeMap<String, context::ContextLedger>,
+    /// Bounded relaunch budget already spent per task. A relaunch is only ever
+    /// granted when the workspace still equals this run's `expected` source, so
+    /// the counter records recoveries from launches that provably mutated
+    /// nothing — never a retry of unverified work.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub executor_relaunches: BTreeMap<TaskId, u32>,
+    /// The last executor result agentctl captured but has not accepted. It is
+    /// the exact authority `agentctl run restore` uses to discard a refused
+    /// result: only files this diff recorded may be rewritten, so an operator's
+    /// own edits can never be destroyed. Cleared the moment a task is VERIFIED.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<ArtifactRef>,
+    /// The last source this run actually *verified*, which is what discarding a
+    /// refused result must rewind to. It is deliberately not `expected`:
+    /// reconciliation publishes a concurrent branch into canonical source and
+    /// advances `expected` before that branch is verified, so `expected` can
+    /// carry work no verifier has accepted. Advanced only alongside a
+    /// TASK_VERIFIED transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<ArtifactRef>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -57,7 +143,11 @@ pub enum RuntimeJobState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeJob {
-    /// Planner jobs have no Stage 0 plan/job row. This is their sole usage
+    /// Physical mutation/read surface. `workspace_id` remains the canonical
+    /// authority identity; this path makes isolation inspectable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_root: Option<String>,
+    /// Planner jobs have no protocol plan/job row. This is their sole usage
     /// observation; plan-associated jobs continue using canonical usage events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner_usage: Option<TokenUsageEvent>,
@@ -69,6 +159,15 @@ pub struct RuntimeJob {
     pub route: Option<routing::RouteSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<prompt::PromptProvenance>,
+    /// What agentctl intentionally supplied to this job, byte-accounted. Absent
+    /// on jobs recorded before manifests existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_manifest: Option<manifest::ContextManifest>,
+    /// The typed ContextRequest artifact this job returned instead of a result
+    /// or decision. Such a job finished its protocol exchange but is never an
+    /// accepted executor or a verification decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_request: Option<ArtifactRef>,
     #[serde(default)]
     pub ownership: Option<AgentOwnership>,
     #[serde(default)]
@@ -90,6 +189,40 @@ pub struct RuntimeJob {
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
     pub failure: Option<String>,
+    /// How a failed or refused exchange is classified. Absent on successes and
+    /// on jobs recorded before the taxonomy existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<OutcomeClass>,
+}
+
+/// What a provider exchange that did not yield accepted output means for the
+/// control plane. The class decides whether agentctl may try again; the
+/// failure text says why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OutcomeClass {
+    /// Timeout, transient process failure, or a reply that is not the
+    /// canonical document: retrying cannot change accepted state.
+    RetryableProviderFailure,
+    /// Authentication, quota/rate limit or unavailable provider: retrying now
+    /// is pointless, but the work is not wrong and may resume later.
+    NonretryableProviderFailure,
+    /// A valid canonical document that deliberately declines the work (an
+    /// executor BLOCKED/FAILED result). Never retried automatically.
+    SemanticRejection,
+    /// A parseable canonical document that violates an agentctl contract rule.
+    ValidationFailure,
+}
+
+impl std::fmt::Display for OutcomeClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RetryableProviderFailure => "RETRYABLE_PROVIDER_FAILURE",
+            Self::NonretryableProviderFailure => "NONRETRYABLE_PROVIDER_FAILURE",
+            Self::SemanticRejection => "SEMANTIC_REJECTION",
+            Self::ValidationFailure => "VALIDATION_FAILURE",
+        })
+    }
 }
 
 pub(super) fn event(
@@ -165,6 +298,96 @@ pub(super) fn save_run(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// Merge one isolated branch checkpoint without replacing sibling progress.
+/// The read, duplicate check, merge, journal append and write share one
+/// IMMEDIATE transaction, closing the lost-update race between executors.
+pub(super) fn merge_branch(
+    store: &mut Store,
+    info: &RepositoryInfo,
+    task: &TaskId,
+    pending: PendingTask,
+    executor_context: Option<context::ContextLedger>,
+) -> Result<()> {
+    let session = session::for_plan(store, info, &pending_task_plan(store, info, task)?)?;
+    require(
+        store.connection.query_row(
+            "SELECT agentctl_runtime_session_authorized(?1,?2,?3)",
+            params![
+                info.repository_id.as_str(),
+                pending_task_plan(store, info, task)?.as_str(),
+                session.id
+            ],
+            |row| row.get::<_, bool>(0),
+        )?,
+        "runtime session authorization required",
+    )?;
+    let tx = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let json: String = tx.query_row(
+        "SELECT record_json FROM runtime_runs WHERE repo_id=?1 AND plan_id=(SELECT plan_id FROM tasks WHERE repo_id=?1 AND task_id=?2)",
+        params![info.repository_id.as_str(), task.as_str()],
+        |row| row.get(0),
+    )?;
+    let mut run: RunRecord = serde_json::from_str(&json)?;
+    require(
+        !run.accepted.contains_key(task) && run.pending.as_ref().is_none_or(|p| &p.task_id != task),
+        "stale branch cannot replace accepted/pending task state",
+    )?;
+    match run.branches.get(task) {
+        Some(existing) => require(
+            existing.executor == pending.executor && existing.diff == pending.diff,
+            "a different branch result already owns this task",
+        )?,
+        None => {
+            run.branches.insert(task.clone(), pending);
+        }
+    }
+    if let Some(ledger) = executor_context {
+        let key = context::subject_key(AgentRole::Executor, Some(task));
+        match run.context.get(&key) {
+            Some(existing) => require(
+                existing.base == ledger.base && existing.rounds == ledger.rounds,
+                "concurrent context ledger conflict",
+            )?,
+            None => {
+                run.context.insert(key, ledger);
+            }
+        }
+    }
+    tx.execute(
+        "UPDATE runtime_runs SET record_json=?1 WHERE repo_id=?2 AND plan_id=?3",
+        params![
+            serde_json::to_string(&run)?,
+            info.repository_id.as_str(),
+            run.plan_id.as_str()
+        ],
+    )?;
+    store::append(
+        &tx,
+        &info.repository_id,
+        now_ms()?,
+        &Links::planning(info.workspace_id.clone(), Some(run.plan_id.clone())),
+        None,
+        &JournalEntry::Runtime {
+            job_id: Some(run.branches[task].executor.clone()),
+            phase: "BRANCH_RESULT_CAPTURED".into(),
+            detail: task.as_str().into(),
+        },
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn pending_task_plan(store: &Store, info: &RepositoryInfo, task: &TaskId) -> Result<PlanId> {
+    let value: String = store.connection.query_row(
+        "SELECT plan_id FROM tasks WHERE repo_id=?1 AND task_id=?2",
+        params![info.repository_id.as_str(), task.as_str()],
+        |row| row.get(0),
+    )?;
+    PlanId::new(value).map_err(Error::Invalid)
 }
 pub(super) fn save_job(
     store: &mut Store,

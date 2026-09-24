@@ -48,6 +48,12 @@ fn report() -> CapabilityReport {
         CapabilityReport::entry(FilesystemMetadataWrite, Unsupported, "none", none),
         CapabilityReport::entry(NetworkDeny, Unsupported, "none", none),
         CapabilityReport::entry(
+            ServiceBrokerDeny,
+            Unsupported,
+            "none",
+            "COM/ShellExecute can have a service start a process outside the Job Object; not mediated without AppContainer",
+        ),
+        CapabilityReport::entry(
             ProcessTree,
             Enforced,
             "Job Object (KILL_ON_JOB_CLOSE, suspended start, no breakaway)",

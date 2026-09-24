@@ -16,13 +16,7 @@ fn config() -> RuntimeConfig {
             },
         );
     }
-    for (role, provider) in [
-        ("planner", "p"),
-        ("executor", "e"),
-        ("verifier", "v"),
-        ("recon", "p"),
-        ("reviewer", "v"),
-    ] {
+    for (role, provider) in [("planner", "p"), ("executor", "e"), ("verifier", "v")] {
         c.roles.insert(role.into(), route(provider));
     }
     c
@@ -276,40 +270,6 @@ fn legacy_config_and_project_serialization_keep_prior_policy_hash_inputs() {
     let p: ProjectConfig = toml::from_str("version=1").unwrap();
     assert!(serde_json::to_value(&p).unwrap().get("routing").is_none());
     assert!(!toml::to_string(&p).unwrap().contains("routing"));
-}
-#[test]
-fn recon_and_custom_compilation_deterministic_bounded_no_repository_dump() {
-    for role in ["recon", "security-review"] {
-        let profile = builtin(role, &config());
-        let one = prompt::compile_helper(
-            &profile,
-            "Locate cache symbol",
-            &["graph: cache_api in src/api.rs".into()],
-        )
-        .unwrap();
-        let two = prompt::compile_helper(
-            &profile,
-            "Locate cache symbol",
-            &["graph: cache_api in src/api.rs".into()],
-        )
-        .unwrap();
-        assert_eq!(one.bytes, two.bytes);
-        assert_eq!(one.provenance, two.provenance);
-        assert!(one.bytes.len() < 4096);
-        let text = String::from_utf8(one.bytes).unwrap();
-        assert!(text.contains("graph"));
-        assert!(!text.contains("unrelated.rs"));
-        let tiny = RoleProfile {
-            context_bytes: 20,
-            ..profile
-        };
-        assert!(
-            prompt::compile_helper(&tiny, "critical invariant", &[])
-                .unwrap_err()
-                .to_string()
-                .contains("no critical material was truncated")
-        );
-    }
 }
 #[test]
 fn partial_fallback_override_replaces_not_appends() {

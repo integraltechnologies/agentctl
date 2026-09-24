@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
@@ -99,7 +100,7 @@ pub struct RepositorySourceState {
     pub workspace_id: WorkspaceId,
     pub head_commit: Option<String>,
     pub dirty: bool,
-    /// Always None in Stage 1. Even clean Git status is not a whole-filesystem fingerprint.
+    /// Always None: even clean Git status is not a whole-filesystem fingerprint.
     pub worktree_fingerprint: Option<String>,
     pub observed_at_ms: u64,
 }
@@ -228,7 +229,7 @@ impl RepositoryInfo {
             self.source.repository_id == self.repository_id
                 && self.source.workspace_id == self.workspace_id
                 && self.source.worktree_fingerprint.is_none(),
-            "invalid Stage 1 source-state envelope",
+            "invalid source-state envelope",
         )
     }
 }
@@ -259,7 +260,7 @@ fn canonical_git_path(git: &Git, args: &[&str]) -> Result<PathBuf> {
         fs::canonicalize(value).map_err(|e| Error::Invalid(format!("Git path {value:?}: {e}")))?;
     require(
         path.to_str().is_some(),
-        "Stage 1 repository metadata requires UTF-8 filesystem paths",
+        "repository metadata requires UTF-8 filesystem paths",
     )?;
     Ok(path)
 }
@@ -347,6 +348,15 @@ impl Git {
     }
 
     fn run(&self, args: &[&str]) -> Result<Output> {
+        self.command(args).output().map_err(|e| {
+            Error::Invalid(format!(
+                "could not run Git for {}: {e}",
+                self.root.display()
+            ))
+        })
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new("git");
         command
             .args(["--no-optional-locks", "--no-pager", "-C"])
@@ -380,20 +390,119 @@ impl Git {
         }
         command
             .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_ATTR_NOSYSTEM", "1")
-            .output()
-            .map_err(|e| {
-                Error::Invalid(format!(
-                    "could not run Git for {}: {e}",
-                    self.root.display()
-                ))
-            })
+            .env("GIT_ATTR_NOSYSTEM", "1");
+        command
     }
 
     fn checked(&self, args: &[&str]) -> Result<Output> {
         let output = self.run(args)?;
         require(output.status.success(), git_failure(&self.root, &output))?;
         Ok(output)
+    }
+}
+
+/// Largest single `git ls-files -z` record accepted (one repository-relative path).
+const LISTING_RECORD_BYTES: u64 = 64 * 1024;
+
+/// `git ls-files -z` for runtime source capture, under the same hardened
+/// invocation as discovery. The `core.excludesFile` setting (from any scope) is
+/// additionally neutralized, so `--exclude-standard` applies only the
+/// repository's own ignore rules: `.gitignore` files at every level and
+/// `$GIT_COMMON_DIR/info/exclude`.
+pub(crate) struct SourceListing(Git);
+
+impl SourceListing {
+    pub(crate) fn new(root: &Path) -> Result<Self> {
+        let mut git = Git::hardened(root)?;
+        git.overrides
+            .push(("core.excludesFile".into(), NULL_DEVICE.into()));
+        Ok(Self(git))
+    }
+
+    /// The repository-local exclude file that `--exclude-standard` applies, as
+    /// Git itself resolves it: `info/exclude` in the common Git directory, which
+    /// linked worktrees share. It is never assumed to be
+    /// `<worktree>/.git/info/exclude` (in a linked worktree, `.git` is a file).
+    pub(crate) fn exclude_file(&self) -> Result<PathBuf> {
+        let output = self.0.checked(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        ])?;
+        let path = PathBuf::from(text(&output.stdout)?.trim_end_matches('\n'));
+        super::paths::absolute_path(&path)?;
+        Ok(path)
+    }
+
+    /// Streams each record of `git ls-files -z <args>` to `visit` without
+    /// buffering the whole listing. Records are raw path bytes: `-z` output is
+    /// never quoted or localized. `visit` returns `Ok(false)` to stop early, in
+    /// which case (as on error) Git is killed rather than left to finish its walk.
+    pub(crate) fn stream(
+        &self,
+        args: &[&str],
+        mut visit: impl FnMut(&[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        let git = &self.0;
+        let args: Vec<&str> = ["ls-files", "-z"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        let mut child = git
+            .command(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                Error::Invalid(format!("could not run Git for {}: {e}", git.root.display()))
+            })?;
+        let mut stderr = child.stderr.take().expect("piped Git stderr");
+        // Drained concurrently so Git can never block on a full stderr pipe.
+        let errors = std::thread::spawn(move || {
+            let mut kept = vec![];
+            let _ = (&mut stderr).take(64 * 1024).read_to_end(&mut kept);
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            kept
+        });
+        let mut stdout = BufReader::new(child.stdout.take().expect("piped Git stdout"));
+        let finished = (|| -> Result<bool> {
+            let mut record = vec![];
+            loop {
+                record.clear();
+                if (&mut stdout)
+                    .take(LISTING_RECORD_BYTES + 1)
+                    .read_until(0, &mut record)?
+                    == 0
+                {
+                    return Ok(true);
+                }
+                require(
+                    record.pop() == Some(0),
+                    "Git source listing record is unterminated or oversized",
+                )?;
+                if !visit(&record)? {
+                    return Ok(false);
+                }
+            }
+        })();
+        drop(stdout);
+        if !matches!(finished, Ok(true)) {
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        let stderr = errors.join().unwrap_or_default();
+        if finished? {
+            require(
+                status.success(),
+                format!(
+                    "Git source listing in {} failed: {}",
+                    git.root.display(),
+                    String::from_utf8_lossy(&stderr).trim()
+                ),
+            )?;
+        }
+        Ok(())
     }
 }
 

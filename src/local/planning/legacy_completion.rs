@@ -74,7 +74,7 @@ fn validate_plan(
     )?;
     require(audits.next()?.is_none(), "multiple completion audits exist")?;
 
-    // Replay the recorded task transitions using the unchanged Stage 0 guards.
+    // Replay the recorded task transitions using the unchanged protocol guards.
     // This proves packet PASS/check/invariant/evidence requirements and dependency
     // ordering, rather than trusting a raw VERIFIED row or an isolated event label.
     let mut replay: BTreeMap<_, _> = packet

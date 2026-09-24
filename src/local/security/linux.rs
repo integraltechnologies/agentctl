@@ -53,10 +53,11 @@ fn decompose(
     chains: &mut Vec<PathBuf>,
     budget: &mut usize,
 ) -> Result<()> {
-    if holes
-        .iter()
-        .any(|h| grant.starts_with(&h.path) && !h.except.iter().any(|e| grant.starts_with(e)))
-    {
+    if holes.iter().any(|h| {
+        grant.starts_with(&h.path)
+            && !h.except.iter().any(|e| grant.starts_with(e))
+            && !h.except_files.iter().any(|e| grant == e)
+    }) {
         return Ok(());
     }
     if !holes
@@ -272,6 +273,24 @@ fn report(abi: u32, seccomp: bool, arch: Option<Arch>) -> CapabilityReport {
             } else {
                 "seccomp filter mode or this CPU architecture is unsupported"
             },
+        ),
+        // Not ENFORCED: Landlock does not mediate connect(2) to an existing
+        // pathname or abstract Unix socket, and this backend uses no socket
+        // scoping, so a worker that may call socket(2) can still reach a
+        // session broker (D-Bus, systemd --user) and have it start a process
+        // outside the sandbox. Only a network-denied worker is protected, by
+        // seccomp's socket(2) denial. A backend-wide report cannot express that
+        // per-policy split, so the strongest truthful claim is BEST_EFFORT and
+        // the unconditional ENFORCED requirement refuses Linux workers.
+        CapabilityReport::entry(
+            ServiceBrokerDeny,
+            if filter == Enforced {
+                BestEffort
+            } else {
+                Unsupported
+            },
+            "seccomp socket(2) denial (network-denied workers only)",
+            "Landlock cannot stop connect(2) to a session-broker socket and no socket scoping is used, so a worker allowed to create sockets can have D-Bus/systemd --user start an unconfined process; only network-denied workers are protected",
         ),
         CapabilityReport::entry(
             ProcessTree,
@@ -573,6 +592,25 @@ mod tests {
         }
     }
 
+    /// Landlock does not stop `connect(2)` to a session-broker socket and no
+    /// socket scoping is used, so this backend can never truthfully report the
+    /// broker as ENFORCED, whatever the kernel supports. The unconditional
+    /// ENFORCED requirement therefore refuses Linux workers instead of
+    /// launching them behind an overclaimed capability.
+    #[test]
+    fn linux_never_claims_enforced_service_broker_denial() {
+        for abi in [0, 1, 3, 6, 9] {
+            for seccomp in [false, true] {
+                let status =
+                    report(abi, seccomp, Some(Arch::X86_64)).status(Capability::ServiceBrokerDeny);
+                assert!(
+                    status < CapabilityStatus::Enforced,
+                    "abi {abi} seccomp {seccomp}: {status:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn seccomp_program_denies_network_io_uring_keyrings_and_foreign_abis() {
         for arch in [Arch::X86_64, Arch::Aarch64] {
@@ -621,9 +659,11 @@ mod tests {
             metadata: false,
             write: true,
             except: vec![],
+            except_files: vec![],
             reason: "fixture",
         };
         let policy = FilesystemPolicy {
+            write_siblings: vec![],
             workspace: ws.clone(),
             scratch: base.join("state/data/scratch"),
             read_roots: vec![ws.clone(), base.join("state")],

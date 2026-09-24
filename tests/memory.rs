@@ -41,7 +41,7 @@ impl Fixture {
         let mut s = Store::open(&db, 5000).unwrap();
         s.register_repository(info.clone()).unwrap();
         s.index_repository(&root).unwrap();
-        seed(&mut s, &info);
+        seed(&mut s, &db, &info);
         Self {
             temp,
             root,
@@ -124,9 +124,8 @@ impl Fixture {
         path
     }
 }
-fn seed(s: &mut Store, info: &RepositoryInfo) {
-    s.create_plan(&info.repository_id, &common::plan(), 1)
-        .unwrap();
+fn seed(s: &mut Store, database: &std::path::Path, info: &RepositoryInfo) {
+    common::seed_plan(database, info.repository_id.as_str(), &common::plan());
     let mut job = common::samples()["agent-job"].clone();
     job["state"] = json!("QUEUED");
     job["provider"] = json!({"provider":"opaque-test-provider", "model":"opaque-model"});
@@ -139,6 +138,39 @@ fn seed(s: &mut Store, info: &RepositoryInfo) {
         &decode(common::samples()["evidence"].clone()),
     )
     .unwrap();
+}
+
+/// The two production calls `agentctl code context` composes. Kept in the test
+/// so the crate does not ship a third public entry point for it.
+fn code_context_with_memory(
+    store: &Store,
+    root: &std::path::Path,
+    query: &str,
+    limits: MemoryLimits,
+) -> agentctl::local::memory::CodeContextWithMemory {
+    let graph = store
+        .graph(root)
+        .unwrap()
+        .context(query, ContextLimits::default())
+        .unwrap();
+    let memory = store.memory_for_code(root, &graph, limits).unwrap();
+    agentctl::local::memory::CodeContextWithMemory { graph, memory }
+}
+
+/// A long free-text objective must still produce bounded retrieval through the
+/// production code-context path.
+fn memory_for_task(
+    store: &Store,
+    root: &std::path::Path,
+    objective: &str,
+    limits: MemoryLimits,
+) -> agentctl::local::memory::MemoryContext {
+    let graph = store
+        .graph(root)
+        .unwrap()
+        .context(objective, ContextLimits::default())
+        .unwrap();
+    store.memory_for_code(root, &graph, limits).unwrap()
 }
 fn draft(content: &str) -> MemoryDraft {
     MemoryDraft {
@@ -849,14 +881,8 @@ fn code_and_task_context_include_bounded_trust_labeled_relevant_memory() {
     let note = f.note("Possible resolve_candidate bypass", false);
     let derived = f.derive();
     let s = f.store();
-    let context = s
-        .code_context_with_memory(
-            &f.root,
-            "resolve_candidate",
-            ContextLimits::default(),
-            MemoryLimits::default(),
-        )
-        .unwrap();
+    let context =
+        code_context_with_memory(&s, &f.root, "resolve_candidate", MemoryLimits::default());
     assert!(!context.graph.primary.is_empty());
     assert!(
         context
@@ -875,27 +901,20 @@ fn code_and_task_context_include_bounded_trust_labeled_relevant_memory() {
     assert_eq!(context.memory.items[0].trust, MemoryTrustClass::Canonical);
     let bytes = serde_json::to_vec(&context.memory).unwrap().len();
     assert!(bytes <= context.memory.limits.bytes);
-    let tiny = s
-        .code_context_with_memory(
-            &f.root,
-            "resolve_candidate",
-            ContextLimits::default(),
-            MemoryLimits {
-                canonical: 1,
-                facts: 0,
-                notes: 0,
-                bytes: 600,
-            },
-        )
-        .unwrap();
+    let tiny = code_context_with_memory(
+        &s,
+        &f.root,
+        "resolve_candidate",
+        MemoryLimits {
+            canonical: 1,
+            facts: 0,
+            notes: 0,
+            bytes: 600,
+        },
+    );
     assert!(serde_json::to_vec(&tiny.memory).unwrap().len() <= 600);
     assert!(tiny.memory.items.len() <= 1);
     assert!(tiny.memory.truncated);
-    let task = common::task("a", &[]);
-    let m = s
-        .memory_for_task(&f.root, &task, MemoryLimits::default())
-        .unwrap();
-    assert!(m.items.iter().any(|m| m.id == canonical.id.as_str()));
     drop(s);
     f.store()
         .reject_memory(&f.root, &canonical.id, "reviewer")
@@ -906,16 +925,13 @@ fn code_and_task_context_include_bounded_trust_labeled_relevant_memory() {
         &SOURCE.replace("!name.is_empty()", "false"),
     );
     f.store().index_repository(&f.root).unwrap();
-    let m = f
-        .store()
-        .code_context_with_memory(
-            &f.root,
-            "resolve_candidate",
-            ContextLimits::default(),
-            MemoryLimits::default(),
-        )
-        .unwrap()
-        .memory;
+    let m = code_context_with_memory(
+        &f.store(),
+        &f.root,
+        "resolve_candidate",
+        MemoryLimits::default(),
+    )
+    .memory;
     assert!(
         !m.items
             .iter()
@@ -926,13 +942,9 @@ fn code_and_task_context_include_bounded_trust_labeled_relevant_memory() {
 #[test]
 fn long_task_objectives_do_not_break_bounded_retrieval() {
     let f = Fixture::new();
-    let mut t = common::task("a", &[]);
-    t.objective = "Resolve vehicle confirmation constraints carefully ".repeat(100);
-    assert!(
-        f.store()
-            .memory_for_task(&f.root, &t, MemoryLimits::default())
-            .is_ok()
-    );
+    let objective = "Resolve vehicle confirmation constraints carefully ".repeat(100);
+    let bounded = memory_for_task(&f.store(), &f.root, &objective, MemoryLimits::default());
+    assert!(serde_json::to_vec(&bounded).unwrap().len() <= bounded.limits.bytes);
 }
 
 #[test]
@@ -1092,7 +1104,7 @@ fn cli_real_processes_cover_trust_history_links_context_and_staleness() {
     cli_json(&f, &["repo", "init", "--json"]);
     cli_json(&f, &["repo", "index", "--json"]);
     let cli_db = f.temp.0.join("data/agentctl/state.sqlite3");
-    seed(&mut Store::open(&cli_db, 5000).unwrap(), &f.info);
+    seed(&mut Store::open(&cli_db, 5000).unwrap(), &cli_db, &f.info);
     assert!(
         !cli(&f, &["memory", "add", "--content", "implicit trust"])
             .status

@@ -30,6 +30,10 @@ The goals are:
   outside the paths its role is granted;
 - a worker cannot read agentctl state, well-known credential stores, or files
   outside its granted read roots;
+- a worker cannot silently widen the context it was issued: additional context
+  comes only from a typed, bounded, auditable request that agentctl resolves
+  inside the planner's envelope (see
+  [issued-context visibility](#issued-context-visibility));
 - a worker does not inherit the controller's ambient environment;
 - checks and experiments cannot reach provider credentials, and are offline unless
   explicitly allowed;
@@ -124,9 +128,14 @@ and reported, but they do not block launches.
 
 - File contents and directory listings are deny-by-default. Only the OS and
   toolchain roots (`/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/opt`, `/nix`,
-  Xcode, and a few system files), the workspace, scratch, the repository's Git
-  directories, the program's own install directory, and operator-granted
-  `read_roots` are readable.
+  Xcode, the platform temp directory, and a few system files), the workspace,
+  scratch, the repository's Git directories, the program's own install
+  directory, and operator-granted `read_roots` are readable. The platform temp
+  directory is read-only and a platform root like `/usr`: provider CLIs use it
+  directly regardless of `TMPDIR`, and the Claude Code CLI will not start
+  without it. Nothing in agentctl state, the workspace under issued visibility,
+  Git metadata or a credential store becomes reachable through it — those
+  denials are compiled after every grant and win.
 - `stat` metadata stays readable so path resolution works. This can reveal whether
   a file exists and how large it is, but not what it contains.
 - Writes are deny-by-default. Network denial includes localhost and Unix-domain
@@ -197,6 +206,61 @@ the workspace or scratch directory falls inside a denied path.
 `PATH` for workers is the controller's `PATH` with relative and empty entries
 removed, and with any entry under the workspace or agentctl state removed, so a
 repository cannot shadow `cargo` or `git`.
+
+## Issued-context visibility
+
+A task's `read_scope` is an **authorization envelope**: the paths the task may
+request context from. The **issued context** is what a job was actually given,
+recorded in its context manifest. The two are deliberately distinct, and a
+worker cannot widen its own issued context: it asks, and agentctl resolves the
+request deterministically inside the envelope or blocks for a planner decision
+(see [architecture.md](architecture.md#context-relay)).
+
+`[runtime.context] visibility` chooses how strongly the *filesystem* enforces
+that distinction:
+
+| Mode | Repository reads of an executor/verifier job |
+| --- | --- |
+| `workspace` (default) | the whole workspace, as before |
+| `issued` | only the repository files issued to that job in full, plus (for a writable executor) its write scope |
+
+Under `issued`, the workspace tree and the repository's Git directories are not
+read roots, so `.git` cannot be used to recover unissued source, and the
+executor's write roots are its planner-authored write scope rather than the
+whole workspace. The workspace is additionally *denied*, excepting only the
+issued files, the write scope and the exact directories on the path to them, so
+a broader read root — an operator `read_roots` entry, or the platform temp
+directory when the checkout lives under it — cannot silently restore
+workspace-wide access. Those directories stay listable because a process must
+be able to resolve its own working directory; their contents do not become
+readable. Checks and experiments are unaffected: they keep the read-only
+workspace access they need. agentctl state, credentials and the control plane
+stay denied exactly as before.
+
+**The default is `workspace`, and `issued` is opt-in.** Before the default can
+flip, the following must be settled:
+
+- **Real-provider validation.** Both Claude Code and Codex must be shown to work
+  through the relay under confinement — including whatever they read at startup
+  in the working directory and in `.git`. This has not been measured with real
+  provider processes yet, and a provider that needs an unissued path would fail
+  closed rather than degrade.
+- **Planner jobs.** `issued` applies to executor and verifier jobs. Planner
+  jobs still run with workspace visibility, because the planner is the authority
+  that decides what to issue and its packet carries excerpts rather than whole
+  files.
+- **Write scopes are readable.** The backends grant read access to write roots,
+  so a Directory write scope is readable under `issued`. Strict read
+  confinement needs File write scopes.
+- **Linux write targets.** Landlock rules need an existing path, so a write
+  target that does not exist yet cannot be granted on Linux; such a task must
+  create files under a granted directory instead.
+- **Atomic replacement.** Editors replace a file by writing `<file>.tmp.*`
+  beside it and renaming it into place. On macOS, an authorized File write
+  target also admits exactly its `<file>.<suffix>` siblings (create, write,
+  rename onto the target, remove); every other sibling stays unwritable.
+  Landlock cannot match names, so on Linux the grant stays exact-file and such
+  an edit is refused.
 
 ## Environment isolation
 
@@ -356,6 +420,18 @@ cases every worker launch would be refused.
   tool subprocesses.
 - Source snapshots are careful sequential observations, not atomic filesystem
   snapshots. External edits between observations cannot be proven absent.
+- Source snapshots do not look inside directories that the repository ignores
+  as a whole, such as `target/` or `node_modules/` (see
+  [cli.md](cli.md#running-plans)). An executor's writes inside such a directory
+  are therefore neither scope violations nor part of the verified diff.
+  Individually ignored files and every ignore-rule file are observed, so an
+  executor cannot create a new ignored location unnoticed. `.git/info/exclude`,
+  which lives outside the worktree, is recorded by content hash, so changing it
+  fails closed as `SOURCE_DRIFT`. Ignored files are
+  observed by metadata only: a change is detected by size, mode, identity, and
+  change times rather than by content hash, and their content is never captured
+  or placed in agent context. If checks consume an ignored directory, such as
+  `node_modules/`, deny writes to it with `[[protected]]`.
 - Local authorization is machine-local orchestration authority. It is not user
   authentication and does not protect against the machine owner.
 
