@@ -17,6 +17,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-rust",
  "which",
+ "windows-sys",
 ]
 
 [[package]]

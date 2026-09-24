@@ -15,22 +15,23 @@
 //! its object is durably published.
 //!
 //! Every path is resolved from the project root through real directories:
-//! a symlink is never followed, and a symlink or directory at a path is not
-//! file content. Checks and uses are separate system calls, so a concurrent
-//! process swapping an ancestor directory for a symlink between them is not
-//! excluded; closing that requires descriptor-relative (`openat`) resolution.
+//! a symlink (or other reparse point) is never followed, and one at a path,
+//! like a directory, is not file content. Checks and uses are separate system
+//! calls, so a concurrent process swapping an ancestor directory for a
+//! symlink between them is not excluded; closing that requires
+//! handle-relative resolution, hence `ConfinedResolution` is only best effort.
 
 mod objects;
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
+use crate::platform;
 use crate::project::{Project, STATE_DIR};
 use crate::state::{GenerationId, Store, check_path};
 use objects::Objects;
@@ -235,10 +236,9 @@ fn write_accepted(root: &Path, objects: &Objects, path: &str, hash: &str) -> Res
     if let Some(permissions) = permissions {
         staged.as_file().set_permissions(permissions)?;
     }
-    staged.as_file().sync_all()?;
+    platform::write_back(staged.as_file())?;
     let dir = parent(root, path, true)?.context("parent directory vanished")?;
-    // Renaming replaces a file or symlink entry, never a directory.
-    staged.persist(dir.join(name(path))).map_err(|e| e.error)?;
+    platform::replace(staged, &dir.join(name(path)))?;
     objects::sync_dir(&dir)
 }
 
@@ -260,8 +260,9 @@ fn remove(root: &Path, path: &str) -> Result<()> {
 }
 
 /// Refuses paths that cannot be source: non-canonical, outside every source
-/// root, or inside agentctl's or Git's own state. ASCII case is ignored for
-/// the latter, as case-insensitive filesystems do.
+/// root, inside agentctl's or Git's own state, or not addressable as literal
+/// names on this platform. ASCII case is ignored for state, as
+/// case-insensitive filesystems do.
 fn check_source(project: &Project, path: &str) -> Result<()> {
     check_path(path)?;
     ensure!(
@@ -274,6 +275,10 @@ fn check_source(project: &Project, path: &str) -> Result<()> {
         "`{path}` is outside the configured source roots"
     );
     ensure!(!reserved(path), "`{path}` is agentctl or Git state");
+    ensure!(
+        path.split('/').all(platform::literal_name),
+        "`{path}` cannot be addressed literally on this platform"
+    );
     Ok(())
 }
 
@@ -403,17 +408,10 @@ fn entry(root: &Path, path: &str) -> Result<Entry> {
 }
 
 fn open(path: &Path) -> Result<Entry> {
-    // Non-blocking, so an entry swapped for a FIFO cannot stall the open.
-    let opened = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path);
-    match opened {
-        Ok(file) if file.metadata()?.is_file() => Ok(Entry::File(file)),
-        Ok(_) => Ok(Entry::Other),
+    match platform::open_regular(path) {
+        Ok(Some(file)) => Ok(Entry::File(file)),
+        Ok(None) => Ok(Entry::Other),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Entry::Absent),
-        // `O_NOFOLLOW` refuses a symlink.
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Ok(Entry::Other),
         Err(e) => Err(e).with_context(|| format!("opening {}", path.display())),
     }
 }
@@ -461,7 +459,6 @@ mod tests {
     use crate::project::STATE_DB;
     use crate::state::tests::downgrade_to_v1;
     use sha2::{Digest, Sha256};
-    use std::os::unix::fs::{PermissionsExt, symlink};
     use tempfile::TempDir;
 
     struct Fixture {
@@ -663,6 +660,8 @@ mod tests {
         assert_eq!(store.accepted_source("src/a.rs").unwrap(), None);
     }
 
+    /// Windows reads `*`, `:` and `\` in names, so it refuses them instead.
+    #[cfg(unix)]
     #[test]
     fn literal_paths_round_trip() {
         let mut fx = Fixture::new("src, app/(customer)/s/[slug]");
@@ -724,6 +723,24 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn names_windows_would_reinterpret_are_refused() {
+        let mut fx = Fixture::new("src");
+        for path in [
+            "src/*.rs",
+            "src/:colon.rs",
+            "src/back\\slash.rs",
+            "src/C:x",
+            "src/GIT~1/config",
+        ] {
+            fails(fx.accept_absent(&[path]), "cannot be addressed");
+            fails(fx.restore(&[path]), "cannot be addressed");
+        }
+        fx.accept_absent(&["src/[new].ts", "src/(g)/[id]/new page.tsx"])
+            .unwrap();
+    }
+
     #[test]
     fn detects_drift_and_restores_exact_bytes() {
         let mut fx = Fixture::new("src");
@@ -732,11 +749,12 @@ mod tests {
         fx.write("src/nested/b.rs", b"b");
         fx.write("src/c.rs", b"c");
         fx.write("src/unrelated.rs", b"unrelated");
-        fs::set_permissions(
-            fx.root().join("src/a.rs"),
-            fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let executable = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(fx.root().join("src/a.rs"), executable).unwrap();
+        }
         fx.baseline();
         fx.accept_absent(&["src/new.rs"]).unwrap();
         for path in ["src/a.rs", "src/nested/b.rs", "src/c.rs", "src/new.rs"] {
@@ -757,11 +775,15 @@ mod tests {
         fx.restore(&["src/a.rs", "src/nested/b.rs", "src/new.rs"])
             .unwrap();
         assert_eq!(fx.read("src/a.rs"), a);
-        let mode = fs::metadata(fx.root().join("src/a.rs"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o755, "a replaced file keeps its mode");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(fx.root().join("src/a.rs"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "a replaced file keeps its mode");
+        }
         assert_eq!(fx.read("src/nested/b.rs"), b"b");
         assert!(!fx.exists("src/new.rs"));
         assert_eq!(fx.read("src/unrelated.rs"), b"concurrent work");
@@ -925,8 +947,12 @@ mod tests {
         assert_eq!(fs::read(&escape).unwrap(), b"victim");
     }
 
+    /// Exercises the Unix backend end to end; the Windows backend's reparse
+    /// handling is tested in `platform::windows`.
+    #[cfg(unix)]
     #[test]
     fn symlinks_never_lead_outside_the_project() {
+        use std::os::unix::fs::symlink;
         let outer = tempfile::tempdir().unwrap();
         let secret = outer.path().join("secret");
         fs::write(&secret, b"accepted a").unwrap();
@@ -995,17 +1021,21 @@ mod tests {
 
         // A source that cannot be read fails the whole baseline, even after
         // other objects were published.
-        let mut fx = Fixture::new("src");
-        fx.write("src/a.rs", b"a");
-        fx.write("src/b.rs", b"b");
-        let unreadable = fx.root().join("src/b.rs");
-        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(baseline(&fx.project, &mut fx.store).is_err());
-        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
-        for path in ["src/a.rs", "src/b.rs"] {
-            assert_eq!(fx.store.accepted_source(path).unwrap(), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut fx = Fixture::new("src");
+            fx.write("src/a.rs", b"a");
+            fx.write("src/b.rs", b"b");
+            let unreadable = fx.root().join("src/b.rs");
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(baseline(&fx.project, &mut fx.store).is_err());
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+            for path in ["src/a.rs", "src/b.rs"] {
+                assert_eq!(fx.store.accepted_source(path).unwrap(), None);
+            }
+            assert_eq!(fx.baseline(), ["src/a.rs", "src/b.rs"]);
         }
-        assert_eq!(fx.baseline(), ["src/a.rs", "src/b.rs"]);
     }
 
     #[test]

@@ -5,16 +5,15 @@
 //! store holds bytes only: which content is accepted where is canonical state
 //! in the `Store`.
 
-use std::fs::{self, File, Permissions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
+use crate::platform;
 use crate::state::check_hash;
 
 pub(super) struct Objects {
@@ -39,9 +38,7 @@ impl Objects {
     /// is renamed into place once complete. Abandoned files never become
     /// objects or source.
     pub(super) fn stage(&self) -> Result<NamedTempFile> {
-        tempfile::Builder::new()
-            .permissions(Permissions::from_mode(0o666))
-            .tempfile_in(&self.staging)
+        platform::stage(&self.staging)
             .with_context(|| format!("staging in {}", self.staging.display()))
     }
 
@@ -53,11 +50,11 @@ impl Objects {
         let hash = copy(source, staged.as_file_mut())?;
         let path = self.path(&hash)?;
         if !path.try_exists()? {
-            fsync(staged.as_file())?;
-            match staged.persist_noclobber(&path) {
-                Ok(_) => return Ok(hash),
-                Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e.error.into()),
+            platform::write_back(staged.as_file())?;
+            match platform::publish_new(staged, &path) {
+                Ok(()) => return Ok(hash),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
             }
         }
         self.copy_to(&hash, &mut io::sink())?;
@@ -67,8 +64,6 @@ impl Objects {
     /// Makes every object published so far durable. Canonical state may
     /// reference an object only after this.
     pub(super) fn sync(&self) -> Result<()> {
-        // On Apple platforms this is `F_FULLFSYNC`, which also flushes the
-        // drive's cache of every object `fsync` already wrote to it.
         sync_dir(&self.dir)
     }
 
@@ -145,20 +140,8 @@ impl Write for Counting {
     }
 }
 
-/// Writes `file` to its device: durable, except that Apple platforms may hold
-/// it in the drive's cache until a full flush such as [`sync_dir`]. One flush
-/// per batch instead of per object keeps publishing many objects fast.
-fn fsync(file: &File) -> io::Result<()> {
-    // SAFETY: the descriptor is owned by `file` and open for this call.
-    match unsafe { libc::fsync(file.as_raw_fd()) } {
-        0 => Ok(()),
-        _ => Err(io::Error::last_os_error()),
-    }
-}
-
-/// Makes entries created or removed in `dir` durable.
+/// Makes entries published, replaced or removed in `dir` durable, as far as
+/// the platform allows (see [`platform::sync_dir`]).
 pub(super) fn sync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .with_context(|| format!("syncing {}", dir.display()))
+    platform::sync_dir(dir).with_context(|| format!("syncing {}", dir.display()))
 }
