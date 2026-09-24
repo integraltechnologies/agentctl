@@ -5053,11 +5053,20 @@ fn observe_multiple_sessions_same_provider_and_malformed_legacy_metadata() {
 #[test]
 fn native_auth_preflight_prefers_provider_login_without_importing_api_environment() {
     use local::runtime::credentials::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
     let temp = common::TempDir::new();
     let executable = temp.0.join("provider");
-    fs::write(&executable,"#!/bin/sh\n[ -z \"${ANTHROPIC_API_KEY-}\" ] || exit 8\n[ -z \"${CODEX_API_KEY-}\" ] || exit 9\nprintf '%s' '{\"loggedIn\":true}'\n").unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    // Written by a child process, never by this multi-threaded test binary: on
+    // Linux, a sibling test that forks while this process holds a writable
+    // descriptor to the script makes the later exec fail with ETXTBSY.
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "sh"])
+        .arg(&executable)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    writer.stdin.take().unwrap().write_all(b"#!/bin/sh\n[ -z \"${ANTHROPIC_API_KEY-}\" ] || exit 8\n[ -z \"${CODEX_API_KEY-}\" ] || exit 9\nprintf '%s' '{\"loggedIn\":true}'\n").unwrap();
+    assert!(writer.wait().unwrap().success());
     for provider in ["codex", "claude"] {
         let native = NativeAuth {
             provider: provider.into(),
