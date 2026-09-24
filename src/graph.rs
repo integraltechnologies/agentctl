@@ -23,6 +23,8 @@
 //! Only direct relations are stored. Impact is derived by traversal, each
 //! hop keeping the relation it followed.
 
+pub mod rust;
+
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
@@ -43,7 +45,11 @@ pub struct EntityId {
     pub symbol: String,
 }
 
-/// A symbol outside the project. Its source is never indexed.
+/// A symbol a relation names without resolving it to a project entity: one
+/// outside the project, or one its frontend knows only by how it is written.
+/// Its source is never indexed. Equal values are one node, so a frontend
+/// qualifies a name it did not resolve by where it was written, keeping
+/// unrelated uses of the same text apart.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct External {
     /// Such as a package registry or language, if known.
@@ -367,7 +373,7 @@ impl fmt::Display for Evidence {
 pub struct GraphWritesAreValidated;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::tests::sample;
     use crate::source::accept_generation;
@@ -378,15 +384,15 @@ mod tests {
 
     const LANGUAGE: &str = "synthetic";
 
-    struct Fixture {
+    pub(crate) struct Fixture {
         _dir: TempDir,
-        project: Project,
-        store: Store,
+        pub(crate) project: Project,
+        pub(crate) store: Store,
     }
 
     impl Fixture {
         /// A Git repository holding a project with the given source roots.
-        fn new(roots: &str) -> Self {
+        pub(crate) fn new(roots: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let status = Command::new("git")
                 .arg("-C")
@@ -408,7 +414,7 @@ mod tests {
 
         /// Writes `path` (or removes it, for `None`) and accepts the result
         /// through a generation, returning the accepted hash.
-        fn accept(&mut self, path: &str, content: Option<&str>) -> Option<String> {
+        pub(crate) fn accept(&mut self, path: &str, content: Option<&str>) -> Option<String> {
             let file = self.project.root.join(path);
             match content {
                 Some(content) => {
@@ -428,7 +434,7 @@ mod tests {
             replace(&self.project, &mut self.store, c)
         }
 
-        fn reopen(self) -> Self {
+        pub(crate) fn reopen(self) -> Self {
             let Self {
                 _dir,
                 project,
@@ -444,11 +450,11 @@ mod tests {
             }
         }
 
-        fn status(&self, path: &str) -> Freshness<()> {
+        pub(crate) fn status(&self, path: &str) -> Freshness<()> {
             self.store.graph_status(path).unwrap()
         }
 
-        fn relations(&self, node: &Node, direction: Direction) -> Freshness<Relations> {
+        pub(crate) fn relations(&self, node: &Node, direction: Direction) -> Freshness<Relations> {
             self.store.relations(node, direction).unwrap()
         }
 
@@ -461,7 +467,7 @@ mod tests {
             self.store.traverse(start, direction, &bounds).unwrap()
         }
 
-        fn rows(&self, table: &str) -> i64 {
+        pub(crate) fn rows(&self, table: &str) -> i64 {
             self.store
                 .raw()
                 .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
@@ -535,7 +541,7 @@ mod tests {
         }
     }
 
-    fn current<T: fmt::Debug>(facts: Freshness<T>) -> T {
+    pub(crate) fn current<T: fmt::Debug>(facts: Freshness<T>) -> T {
         match facts {
             Current(facts) => facts,
             other => panic!("not current: {other:?}"),
@@ -568,7 +574,7 @@ mod tests {
         summary(t.hops.iter().map(|h| (h.depth, &h.relation)))
     }
 
-    fn fails(result: Result<impl fmt::Debug>, expected: &str) {
+    pub(crate) fn fails(result: Result<impl fmt::Debug>, expected: &str) {
         let message = format!("{:#}", result.unwrap_err());
         assert!(message.contains(expected), "{message}");
     }

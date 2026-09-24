@@ -174,6 +174,36 @@ pub fn restore(project: &Project, store: &Store, paths: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// A source path's accepted content, as read from its recovery object and
+/// verified against its accepted hash. Only this module constructs it, so
+/// holding one means the bytes are the accepted content named by the hash.
+#[derive(Debug)]
+pub struct AcceptedContent {
+    hash: String,
+    bytes: Vec<u8>,
+}
+
+impl AcceptedContent {
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Reads the accepted content of a tracked source path from its recovery
+/// object, never from the working tree. Fails for accepted absence, and for
+/// a missing or corrupt object.
+pub fn read_accepted(project: &Project, store: &Store, path: &str) -> Result<AcceptedContent> {
+    let hash = accepted(project, store, path)?
+        .with_context(|| format!("`{path}` is accepted as absent"))?;
+    let mut bytes = Vec::new();
+    Objects::open(&project.root.join(STATE_DIR))?.copy_to(&hash, &mut bytes)?;
+    Ok(AcceptedContent { hash, bytes })
+}
+
 /// The length of the accepted content named `hash`.
 pub(crate) fn content_len(project: &Project, hash: &str) -> Result<u64> {
     Objects::open(&project.root.join(STATE_DIR))?.len(hash)
@@ -1057,5 +1087,30 @@ mod tests {
         restore(&project, &store, &["src/a.rs", "src/new.rs"]).unwrap();
         assert_eq!(fs::read(project.root.join("src/a.rs")).unwrap(), b"a");
         assert!(!project.root.join("src/new.rs").exists());
+    }
+
+    #[test]
+    fn accepted_content_is_read_from_verified_objects_only() {
+        let mut fx = Fixture::new("src");
+        fx.write("src/a.rs", b"accepted");
+        fx.baseline();
+        fx.accept_absent(&["src/gone.rs"]).unwrap();
+        let read = |fx: &Fixture, path| read_accepted(&fx.project, &fx.store, path);
+
+        // The working tree is never consulted.
+        fx.write("src/a.rs", b"candidate");
+        let content = read(&fx, "src/a.rs").unwrap();
+        assert_eq!(content.bytes(), b"accepted");
+        assert_eq!(content.hash(), sha256(b"accepted"));
+
+        fails(read(&fx, "src/gone.rs"), "accepted as absent");
+        fails(read(&fx, "src/untracked.rs"), "no accepted state");
+        fails(read(&fx, "src/../src/a.rs"), "not a canonical");
+
+        let object = fx.object_path(b"accepted");
+        fs::write(&object, b"acceptee").unwrap();
+        fails(read(&fx, "src/a.rs"), "corrupt");
+        fs::remove_file(&object).unwrap();
+        fails(read(&fx, "src/a.rs"), "unavailable");
     }
 }
