@@ -6,6 +6,9 @@
 //! history never diverge. The schema enforces structure; `Store` enforces
 //! lifecycle transitions. Scheduling, verification and other orchestration
 //! policy belong to the layers that will use this store.
+//!
+//! Accepted source is written only through `crate::source`, which publishes
+//! the recovery object of any content before recording it here.
 
 use std::fmt;
 use std::path::Path;
@@ -21,8 +24,15 @@ use rusqlite::{
 /// Stamped into the SQLite header (`application_id`) so an agentctl store is
 /// recognized by what it is, not merely by its schema version number.
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"agct");
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SCHEMA: &str = include_str!("state/schema.sql");
+const MIGRATE_V1: &str = include_str!("state/migrate_v1.sql");
+/// The version 1 `accepted_sources` definition, exactly as SQLite keeps it.
+const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
+    path          TEXT    PRIMARY KEY,
+    hash          TEXT    NOT NULL CHECK (hash <> ''),
+    generation_id INTEGER REFERENCES generations (id)
+) STRICT, WITHOUT ROWID";
 /// How long a transaction waits for another process's writer to finish.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -171,12 +181,10 @@ pub enum AgentScope {
     Generation(GenerationId),
 }
 
-/// How a generation ends.
+/// How a generation ends without being accepted. Acceptance establishes
+/// accepted source, so it goes through `source::accept_generation`.
 #[derive(Debug, Clone, Copy)]
-pub enum GenerationEnd<'a> {
-    /// Accepted, establishing `(path, Some(hash))` as accepted content, or
-    /// `(path, None)` for an accepted deletion.
-    Accepted(&'a [(&'a str, Option<&'a str>)]),
+pub enum GenerationEnd {
     Rejected,
     Failed,
 }
@@ -243,7 +251,9 @@ pub struct Event {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedSource {
-    pub hash: String,
+    /// Content hash of the accepted bytes; `None` when the path is accepted
+    /// as not existing.
+    pub hash: Option<String>,
     /// The generation whose acceptance produced this content; `None` for
     /// the baseline accepted state.
     pub generation: Option<GenerationId>,
@@ -484,19 +494,42 @@ impl Store {
         })
     }
 
-    /// Ends an active generation. Accepting it atomically records the source
-    /// identities it establishes. However it ends, the generation keeps the
-    /// paths it owns until they are explicitly released.
+    /// Ends an active generation without accepting it. The generation keeps
+    /// the paths it owns until they are explicitly released.
     pub fn finish_generation(
         &mut self,
         generation: GenerationId,
         end: GenerationEnd,
     ) -> Result<()> {
-        let (to, sources) = match end {
-            GenerationEnd::Accepted(sources) => (GenerationState::Accepted, sources),
-            GenerationEnd::Rejected => (GenerationState::Rejected, &[][..]),
-            GenerationEnd::Failed => (GenerationState::Failed, &[][..]),
+        let to = match end {
+            GenerationEnd::Rejected => GenerationState::Rejected,
+            GenerationEnd::Failed => GenerationState::Failed,
         };
+        self.end_generation(generation, to, &[])
+    }
+
+    /// Accepts an active generation, atomically recording the source it
+    /// establishes: `(path, Some(hash))` as accepted content, `(path, None)`
+    /// as accepted absence. The generation keeps the paths it owns until they
+    /// are explicitly released.
+    ///
+    /// Canonical state may name only content the recovery object store
+    /// durably holds, which this store cannot check: the caller must have
+    /// published and synced every object `sources` names.
+    pub(crate) fn accept_generation(
+        &mut self,
+        generation: GenerationId,
+        sources: &[(&str, Option<&str>)],
+    ) -> Result<()> {
+        self.end_generation(generation, GenerationState::Accepted, sources)
+    }
+
+    fn end_generation(
+        &mut self,
+        generation: GenerationId,
+        to: GenerationState,
+        sources: &[(&str, Option<&str>)],
+    ) -> Result<()> {
         self.write(|tx| {
             let (plan, task, number) = active_generation(tx, generation)?;
             tx.execute(
@@ -504,16 +537,13 @@ impl Store {
                 params![generation, to, now()],
             )?;
             for &(path, hash) in sources {
-                check_path(path)?;
-                match hash {
-                    Some(hash) => tx.execute(
-                        "INSERT INTO accepted_sources (path, hash, generation_id) VALUES (?1, ?2, ?3)
-                         ON CONFLICT (path) DO UPDATE
-                         SET hash = excluded.hash, generation_id = excluded.generation_id",
-                        params![path, hash, generation],
-                    )?,
-                    None => tx.execute("DELETE FROM accepted_sources WHERE path = ?1", [path])?,
-                };
+                check_identity(path, hash)?;
+                tx.execute(
+                    "INSERT INTO accepted_sources (path, hash, generation_id) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (path) DO UPDATE
+                     SET hash = excluded.hash, generation_id = excluded.generation_id",
+                    params![path, hash, generation],
+                )?;
             }
             event(
                 tx,
@@ -597,11 +627,13 @@ impl Store {
     }
 
     /// Records the baseline accepted identity of paths that have none yet:
-    /// repository content accepted without any producing generation.
-    pub fn record_baseline(&mut self, sources: &[(&str, &str)]) -> Result<()> {
+    /// repository content (`Some(hash)`) or absence (`None`) accepted without
+    /// any producing generation. As for [`Store::accept_generation`], the
+    /// caller must have published and synced every object `sources` names.
+    pub(crate) fn record_baseline(&mut self, sources: &[(&str, Option<&str>)]) -> Result<()> {
         self.write(|tx| {
             for &(path, hash) in sources {
-                check_path(path)?;
+                check_identity(path, hash)?;
                 tx.execute(
                     "INSERT INTO accepted_sources (path, hash) VALUES (?1, ?2)",
                     params![path, hash],
@@ -894,14 +926,32 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     ensure!(id == APPLICATION_ID, "not an agentctl state database");
+    if version == 1 {
+        let sources: Option<String> = tx
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = 'accepted_sources'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            sources.as_deref() == Some(V1_ACCEPTED_SOURCES),
+            "state database does not match agentctl schema version 1"
+        );
+        tx.execute_batch(MIGRATE_V1)
+            .context("migrating state schema version 1")?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
     match version {
-        SCHEMA_VERSION => {
+        1 | SCHEMA_VERSION => {
             let expected = Connection::open_in_memory()?;
             expected.execute_batch(SCHEMA)?;
+            // A failed check rolls back any migration, leaving the file as found.
             ensure!(
                 schema_objects(&tx)? == schema_objects(&expected)?,
-                "state database does not match agentctl schema version {SCHEMA_VERSION}"
+                "state database does not match agentctl schema version {version}"
             );
+            tx.commit()?;
             Ok(())
         }
         v if v > SCHEMA_VERSION => bail!(
@@ -1048,11 +1098,12 @@ fn owner(conn: &Connection, path: &str) -> Result<Option<GenerationId>> {
     .map_err(Into::into)
 }
 
-/// Accepts only canonical, portable project-relative paths (`src/lib.rs`), so
-/// each file has exactly one key.
-fn check_path(path: &str) -> Result<()> {
+/// Accepts only canonical `/`-separated project-relative paths (`src/lib.rs`),
+/// so each file has exactly one key. Paths are literal: any other character a
+/// filename may hold, however special elsewhere (`[slug]`, `:`, `*`), is kept.
+pub(crate) fn check_path(path: &str) -> Result<()> {
     let canonical =
-        !path.contains(['\\', ':']) && path.split('/').all(|part| !matches!(part, "" | "." | ".."));
+        !path.contains('\0') && path.split('/').all(|part| !matches!(part, "" | "." | ".."));
     ensure!(
         canonical,
         "`{path}` is not a canonical project-relative path"
@@ -1060,9 +1111,25 @@ fn check_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Accepts only lowercase hex SHA-256 content hashes, the names of recovery
+/// objects.
+pub(crate) fn check_hash(hash: &str) -> Result<()> {
+    let valid = hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    ensure!(valid, "`{hash}` is not a SHA-256 content hash");
+    Ok(())
+}
+
+/// Checks an accepted source identity: a canonical path, and a content hash
+/// unless the path is accepted as absent.
+fn check_identity(path: &str, hash: Option<&str>) -> Result<()> {
+    check_path(path)?;
+    hash.map_or(Ok(()), check_hash)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use rusqlite::types::Value;
     use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
 
@@ -1070,6 +1137,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
         (dir, store)
+    }
+
+    /// A structurally valid content hash.
+    fn hash(n: u8) -> String {
+        format!("{n:064x}")
     }
 
     fn err(result: Result<impl fmt::Debug>) -> String {
@@ -1115,11 +1187,12 @@ mod tests {
         Store::open(&newer).unwrap();
         Connection::open(&newer)
             .unwrap()
-            .pragma_update(None, "user_version", 2)
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         let message = err(Store::open(&newer));
-        assert!(message.contains("version 2 is newer"), "{message}");
-        assert_eq!(version(&newer), 2);
+        let expected = format!("version {} is newer", SCHEMA_VERSION + 1);
+        assert!(message.contains(&expected), "{message}");
+        assert_eq!(version(&newer), SCHEMA_VERSION + 1);
 
         // Neither an unrelated schema nor one spoofing the current version
         // number is mistaken for an agentctl store, or modified.
@@ -1176,6 +1249,145 @@ mod tests {
         }
     }
 
+    /// Rewrites the store at `path` as schema version 1, whose only
+    /// difference is the `accepted_sources` table, holding `accepted`.
+    pub(crate) fn downgrade_to_v1(path: &Path, accepted: &[(&str, &str, Option<GenerationId>)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "DROP TABLE accepted_sources; {V1_ACCEPTED_SOURCES};"
+        ))
+        .unwrap();
+        for (path, hash, generation) in accepted {
+            conn.execute(
+                "INSERT INTO accepted_sources (path, hash, generation_id) VALUES (?1, ?2, ?3)",
+                params![path, hash, generation],
+            )
+            .unwrap();
+        }
+        conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+
+    /// Every row of every table except `accepted_sources`, by table.
+    fn rows_besides_accepted_sources(path: &Path) -> Vec<(String, Vec<Vec<Value>>)> {
+        let conn = Connection::open(path).unwrap();
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name <> 'accepted_sources' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+                let columns = stmt.column_count();
+                let rows = stmt
+                    .query_map([], |r| (0..columns).map(|i| r.get(i)).collect())
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                (table, rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn migrating_version_1_keeps_state_but_not_unrecoverable_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        let mut store = Store::open(&path).unwrap();
+        let (plan, first, accepted) = running_generation(&mut store);
+        let agent = store
+            .create_agent(Role::Planner, AgentScope::Plan(plan))
+            .unwrap();
+        let invocation = store.start_invocation(agent, "codex", "gpt").unwrap();
+        store.end_invocation(invocation).unwrap();
+        let intent = store.record_intent(agent, "write a.rs").unwrap();
+        store
+            .update_journal(intent, JournalState::Attempted, None)
+            .unwrap();
+        store.record_decision(plan, "concern", "decision").unwrap();
+        store.claim_paths(accepted, &["src/a.rs"]).unwrap();
+        store
+            .accept_generation(accepted, &[("src/a.rs", Some(&hash(1)))])
+            .unwrap();
+        let second = store.add_task(plan, "next", &[first]).unwrap();
+        let active = store.start_generation(second).unwrap();
+        store.claim_paths(active, &["src/b.rs"]).unwrap();
+        drop(store);
+        let before = rows_besides_accepted_sources(&path);
+        for (table, rows) in &before {
+            assert!(!rows.is_empty(), "{table} is exercised");
+        }
+
+        // Well-formed or not, no version 1 hash names a known recovery object.
+        downgrade_to_v1(
+            &path,
+            &[
+                ("src/a.rs", &hash(0), Some(accepted)),
+                ("src/b.rs", &hash(2), None),
+                ("src/c.rs", "h0", None),
+            ],
+        );
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        for source in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            assert_eq!(store.accepted_source(source).unwrap(), None, "{source}");
+        }
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM accepted_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(rows_besides_accepted_sources(&path), before);
+
+        // The migrated store accepts source state established afresh.
+        store
+            .record_baseline(&[("src/a.rs", Some(&hash(3))), ("src/c.rs", None)])
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.accepted_source("src/a.rs").unwrap(),
+            Some(AcceptedSource {
+                hash: Some(hash(3)),
+                generation: None
+            })
+        );
+    }
+
+    #[test]
+    fn refuses_version_1_files_without_agentctl_schema_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("altered.db");
+        Store::open(&path).unwrap();
+        downgrade_to_v1(&path, &[("src/a.rs", &hash(0), None)]);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER events_no_update")
+            .unwrap();
+        let message = err(Store::open(&path));
+        assert!(message.contains("schema version 1"), "{message}");
+        assert_eq!(version(&path), 1);
+        let conn = Connection::open(&path).unwrap();
+        let stored: String = conn
+            .query_row("SELECT hash FROM accepted_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, hash(0));
+        assert!(
+            conn.execute(
+                "INSERT INTO accepted_sources (path, hash) VALUES ('x', NULL)",
+                []
+            )
+            .is_err(),
+            "the version 1 table is left in place"
+        );
+    }
+
     #[test]
     fn refuses_preexisting_empty_databases_untouched() {
         let dir = tempfile::tempdir().unwrap();
@@ -1229,9 +1441,7 @@ mod tests {
         let message = err(store.set_plan_state(plan, Completed));
         assert!(message.contains("1 uncompleted tasks"), "{message}");
         let generation = store.start_generation(task).unwrap();
-        store
-            .finish_generation(generation, GenerationEnd::Accepted(&[]))
-            .unwrap();
+        store.accept_generation(generation, &[]).unwrap();
         store.set_plan_state(plan, Completed).unwrap();
         assert_eq!(store.plan(plan).unwrap().state, Completed);
 
@@ -1296,9 +1506,7 @@ mod tests {
 
         let second = store.start_generation(a).unwrap();
         assert_ne!(first, second);
-        store
-            .finish_generation(second, GenerationEnd::Accepted(&[]))
-            .unwrap();
+        store.accept_generation(second, &[]).unwrap();
         assert!(err(store.start_generation(a)).contains("already has an accepted generation"));
         drop(store);
 
@@ -1538,17 +1746,15 @@ mod tests {
             None,
             "claims are all-or-nothing"
         );
-        for bad in ["", "/abs", "a//b", "./a", "a/../b", "a\\b", "C:x"] {
+        for bad in ["", "/abs", "a//b", "./a", "a/../b", "a/", "a\0b"] {
             assert!(store.claim_paths(second, &[bad]).is_err(), "{bad:?}");
         }
 
         let message = err(store.release_ownership(first));
         assert!(message.contains("still active"), "{message}");
+        let (h1, h2, h3) = (hash(1), hash(2), hash(3));
         store
-            .finish_generation(
-                first,
-                GenerationEnd::Accepted(&[("src/a.rs", Some("h1")), ("src/b.rs", Some("h2"))]),
-            )
+            .accept_generation(first, &[("src/a.rs", Some(&h1)), ("src/b.rs", Some(&h2))])
             .unwrap();
         assert_eq!(
             store.owner("src/a.rs").unwrap(),
@@ -1559,19 +1765,23 @@ mod tests {
         assert_eq!(store.owner("src/a.rs").unwrap(), None);
         store.claim_paths(second, &["src/b.rs"]).unwrap();
         store
-            .finish_generation(
-                second,
-                GenerationEnd::Accepted(&[("src/a.rs", Some("h3")), ("src/b.rs", None)]),
-            )
+            .accept_generation(second, &[("src/a.rs", Some(&h3)), ("src/b.rs", None)])
             .unwrap();
         assert_eq!(
             store.accepted_source("src/a.rs").unwrap(),
             Some(AcceptedSource {
-                hash: "h3".into(),
+                hash: Some(h3),
                 generation: Some(second)
             })
         );
-        assert_eq!(store.accepted_source("src/b.rs").unwrap(), None);
+        assert_eq!(
+            store.accepted_source("src/b.rs").unwrap(),
+            Some(AcceptedSource {
+                hash: None,
+                generation: Some(second)
+            }),
+            "an accepted deletion is recorded as accepted absence"
+        );
         assert_eq!(store.owner("src/b.rs").unwrap(), Some(second));
     }
 
@@ -1606,19 +1816,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let mut store = Store::open(&path).unwrap();
+        let (h0, h1, h2) = (hash(0), hash(1), hash(2));
         store
-            .record_baseline(&[("src/a.rs", "h0"), ("src/b.rs", "h1")])
+            .record_baseline(&[
+                ("src/a.rs", Some(&h0)),
+                ("src/b.rs", Some(&h1)),
+                ("src/new.rs", None),
+            ])
             .unwrap();
-        assert!(store.record_baseline(&[("src/a.rs", "again")]).is_err());
-        assert!(store.record_baseline(&[("../x", "h")]).is_err());
-        assert!(store.record_baseline(&[("src/c.rs", "")]).is_err());
+        assert!(store.record_baseline(&[("src/a.rs", Some(&h2))]).is_err());
+        assert!(store.record_baseline(&[("src/new.rs", None)]).is_err());
+        assert!(store.record_baseline(&[("../x", Some(&h2))]).is_err());
 
         let (_, _, generation) = running_generation(&mut store);
         store
-            .finish_generation(
-                generation,
-                GenerationEnd::Accepted(&[("src/a.rs", Some("h2"))]),
-            )
+            .accept_generation(generation, &[("src/a.rs", Some(&h2))])
             .unwrap();
         drop(store);
 
@@ -1627,18 +1839,54 @@ mod tests {
         assert_eq!(
             source("src/a.rs"),
             AcceptedSource {
-                hash: "h2".into(),
+                hash: Some(h2),
                 generation: Some(generation)
             }
         );
         assert_eq!(
             source("src/b.rs"),
             AcceptedSource {
-                hash: "h1".into(),
+                hash: Some(h1),
+                generation: None
+            }
+        );
+        assert_eq!(
+            source("src/new.rs"),
+            AcceptedSource {
+                hash: None,
                 generation: None
             }
         );
         assert_eq!(store.accepted_source("src/c.rs").unwrap(), None);
+    }
+
+    #[test]
+    fn accepted_content_must_be_a_sha256_hash() {
+        let (_dir, mut store) = store();
+        let (_, task, generation) = running_generation(&mut store);
+        let valid = hash(0xab);
+        let bad = [
+            "",
+            "not-a-sha256-object",
+            &valid[1..],
+            &format!("{valid}0"),
+            &valid.to_uppercase(),
+            &format!("{}g", &valid[1..]),
+            &format!("{}é", &valid[1..]),
+        ];
+        for bad in bad {
+            let message = err(store.record_baseline(&[("src/a.rs", Some(bad))]));
+            assert!(message.contains("not a SHA-256 content hash"), "{message}");
+            let message = err(store.accept_generation(generation, &[("src/a.rs", Some(bad))]));
+            assert!(message.contains("not a SHA-256 content hash"), "{message}");
+            let insert = "INSERT INTO accepted_sources (path, hash) VALUES ('src/a.rs', ?1)";
+            assert!(
+                store.conn.execute(insert, [bad]).is_err(),
+                "the schema refuses {bad:?} too"
+            );
+        }
+        assert_eq!(store.accepted_source("src/a.rs").unwrap(), None);
+        assert_eq!(store.task(task).unwrap().state, TaskState::Running);
     }
 
     #[test]
@@ -1650,12 +1898,9 @@ mod tests {
 
         // The invalid second path fails after the state update and first
         // source write have already executed.
-        let sources = [("src/a.rs", Some("h1")), ("../escape", Some("h2"))];
-        assert!(
-            store
-                .finish_generation(generation, GenerationEnd::Accepted(&sources))
-                .is_err()
-        );
+        let h1 = hash(1);
+        let sources = [("src/a.rs", Some(h1.as_str())), ("../escape", Some(&h1))];
+        assert!(store.accept_generation(generation, &sources).is_err());
 
         assert_eq!(store.task(task).unwrap().state, TaskState::Running);
         assert_eq!(store.owner("src/a.rs").unwrap(), Some(generation));
@@ -1728,3 +1973,38 @@ mod tests {
         assert_eq!(store.generations(task).unwrap().len(), 2);
     }
 }
+
+/// Only `crate::source`, which publishes recovery objects first, can record
+/// accepted source. Other crates can neither record it directly:
+///
+/// ```compile_fail
+/// # fn f(store: &mut agentctl::state::Store) {
+/// store.record_baseline(&[("src/a.rs", Some("not-a-sha256-object"))]);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn f(store: &mut agentctl::state::Store, g: agentctl::state::GenerationId) {
+/// store.accept_generation(g, &[("src/a.rs", Some("not-a-sha256-object"))]);
+/// # }
+/// ```
+///
+/// nor accept a generation through its state-only lifecycle:
+///
+/// ```compile_fail
+/// # use agentctl::state::{GenerationEnd, GenerationId, Store};
+/// # fn f(store: &mut Store, g: GenerationId) {
+/// store.finish_generation(g, GenerationEnd::Accepted(&[("src/a.rs", None)]));
+/// # }
+/// ```
+///
+/// which remains usable for other ends:
+///
+/// ```no_run
+/// # use agentctl::state::{GenerationEnd, GenerationId, Store};
+/// # fn f(store: &mut Store, g: GenerationId) {
+/// store.finish_generation(g, GenerationEnd::Rejected).unwrap();
+/// # }
+/// ```
+#[cfg(doctest)]
+pub struct AcceptedSourceIsRestricted;

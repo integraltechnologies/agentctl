@@ -158,8 +158,13 @@ impl SourceRoot {
         &self.0
     }
 
+    /// Whether the canonical project-relative `path` lies within this root.
+    pub fn contains_path(&self, path: &str) -> bool {
+        self.0 == "." || self.0 == path || path.starts_with(&format!("{}/", self.0))
+    }
+
     fn contains(&self, other: &Self) -> bool {
-        self.0 == "." || self.0 == other.0 || other.0.starts_with(&format!("{}/", self.0))
+        self.contains_path(&other.0)
     }
 }
 

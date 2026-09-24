@@ -1,4 +1,4 @@
--- agentctl canonical project state, schema version 1.
+-- agentctl canonical project state, schema version 2.
 --
 -- The schema enforces structure: references, value domains and uniqueness.
 -- Lifecycle transitions are enforced by `Store`, the only writer.
@@ -134,11 +134,14 @@ CREATE TABLE ownership (
     generation_id INTEGER NOT NULL REFERENCES generations (id)
 ) STRICT, WITHOUT ROWID;
 
--- The accepted content identity of each project path, and the generation
--- whose acceptance established it, or NULL for the baseline accepted state
--- that predates every generation.
+-- The accepted state of each tracked project path: the content hash of its
+-- accepted bytes, or NULL (which the CHECK passes) when the path is accepted
+-- as not existing. A hash is lowercase hex SHA-256, the name of the recovery
+-- object `Store`'s callers publish before recording it. The
+-- generation whose acceptance established it, or NULL for the baseline
+-- accepted state that predates every generation. Untracked paths have no row.
 CREATE TABLE accepted_sources (
     path          TEXT    PRIMARY KEY,
-    hash          TEXT    NOT NULL CHECK (hash <> ''),
+    hash          TEXT    CHECK (length(hash) = 64 AND hash NOT GLOB '*[^0-9a-f]*'),
     generation_id INTEGER REFERENCES generations (id)
 ) STRICT, WITHOUT ROWID;
