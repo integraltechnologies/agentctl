@@ -5,6 +5,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::process::Child;
 
 use tempfile::NamedTempFile;
 
@@ -84,6 +85,25 @@ fn full_sync(file: &File) -> io::Result<()> {
     return check(|| unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) });
     #[cfg(not(target_vendor = "apple"))]
     return check(|| unsafe { libc::fsync(fd) });
+}
+
+/// Whether the executable at `path` runs as itself when spawned, rather
+/// than through a command interpreter agentctl did not choose: always here,
+/// where the kernel runs even an interpreter script's `#!` line directly.
+pub(crate) fn runs_directly(_path: &Path) -> bool {
+    true
+}
+
+/// Asks `child`, which must not have been reaped, to terminate: `SIGTERM`,
+/// which lets it stop what it started. Returns whether a request was sent.
+pub(crate) fn request_termination(child: &Child) -> io::Result<bool> {
+    // An unreaped child keeps its pid, so the signal cannot reach another
+    // process that reused it.
+    let pid = libc::pid_t::try_from(child.id())
+        .map_err(|_| io::Error::other("process id out of range"))?;
+    // SAFETY: `kill` takes no pointers.
+    check(|| unsafe { libc::kill(pid, libc::SIGTERM) })?;
+    Ok(true)
 }
 
 /// Runs a call that returns 0 on success and sets `errno` otherwise,

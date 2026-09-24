@@ -27,10 +27,11 @@ use rusqlite::{
 /// Stamped into the SQLite header (`application_id`) so an agentctl store is
 /// recognized by what it is, not merely by its schema version number.
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"agct");
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SCHEMA: &str = include_str!("state/schema.sql");
 const MIGRATE_V1: &str = include_str!("state/migrate_v1.sql");
 const MIGRATE_V2: &str = include_str!("state/migrate_v2.sql");
+const MIGRATE_V3: &str = include_str!("state/migrate_v3.sql");
 /// The version 1 `accepted_sources` definition, exactly as SQLite keeps it.
 const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
     path          TEXT    PRIMARY KEY,
@@ -178,6 +179,123 @@ impl JournalState {
     }
 }
 
+text_enum!(
+    /// Where a provider invocation is in its lifecycle, as agentctl knows it.
+    InvocationState {
+        /// Recorded before launch; a process may or may not exist.
+        Starting = "starting",
+        /// Launched, with no end recorded. After agentctl disappears this
+        /// says nothing about whether the process is still alive.
+        Running = "running",
+        Succeeded = "succeeded",
+        Failed = "failed",
+        /// agentctl terminated the process and observed it end.
+        Cancelled = "cancelled",
+        /// agentctl lost authoritative knowledge of how it ended.
+        Interrupted = "interrupted",
+    }
+);
+
+impl InvocationState {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Starting | Self::Running)
+    }
+}
+
+impl FailureKind {
+    /// Whether the failure happened before any provider process existed.
+    pub fn before_launch(self) -> bool {
+        matches!(self, Self::ExecutableMissing | Self::SpawnFailed)
+    }
+}
+
+impl InvocationEnd {
+    /// Why an invocation in state `from` cannot end like this, if it cannot.
+    ///
+    /// A `starting` invocation has launched no process that agentctl knows
+    /// of, so it can only fail to launch, or be interrupted when agentctl
+    /// loses track of whether it launched. Only a `running` one can succeed,
+    /// fail once launched, or be cancelled; success needs a zero exit code.
+    fn refusal(&self, from: InvocationState) -> Option<String> {
+        use InvocationState::*;
+        let launched = match from {
+            Starting => false,
+            Running => true,
+            ended => return Some(format!("it already ended as {ended}")),
+        };
+        match (self.state, self.failure) {
+            (Starting | Running, _) => Some(format!("an invocation cannot end as {}", self.state)),
+            (Succeeded | Cancelled, _) if !launched => {
+                Some(format!("a {from} invocation cannot end as {}", self.state))
+            }
+            (Succeeded, _) if self.exit_code != Some(0) => {
+                Some("a succeeded invocation must have exited with code 0".into())
+            }
+            (Failed, Some(kind)) if kind.before_launch() == launched => {
+                Some(format!("a {from} invocation cannot fail with {kind}"))
+            }
+            (Failed, _) if !launched && self.exit_code.is_some() => {
+                Some("an invocation that never launched has no exit code".into())
+            }
+            _ => None,
+        }
+    }
+}
+
+text_enum!(
+    /// Why an invocation failed.
+    FailureKind {
+        ExecutableMissing = "executable_missing",
+        SpawnFailed = "spawn_failed",
+        /// The task input could not be delivered to the provider.
+        InputFailed = "input_failed",
+        /// The provider reported an error in its structured output.
+        ProviderError = "provider_error",
+        /// The provider's structured output was unparseable or inconsistent.
+        MalformedOutput = "malformed_output",
+        /// The provider exited successfully without a result.
+        NoResult = "no_result",
+        /// The provider exited unsuccessfully without reporting why.
+        ExitStatus = "exit_status",
+    }
+);
+
+/// Token counts. `input` counts every input token processed, cached or not;
+/// the optional counts are subsets a provider reports separately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cached_input: Option<u64>,
+    pub cache_write: Option<u64>,
+    /// Output spent on reasoning, included in `output`.
+    pub reasoning: Option<u64>,
+}
+
+/// Token usage together with its provenance. Counts are never fabricated:
+/// what no provider reported and agentctl did not estimate is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Usage {
+    ProviderReported(TokenUsage),
+    LocalEstimate(TokenUsage),
+    Unavailable,
+}
+
+/// How an invocation ended, as recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvocationEnd {
+    /// A terminal state.
+    pub state: InvocationState,
+    /// Present exactly when the invocation failed.
+    pub failure: Option<FailureKind>,
+    /// Concise evidence; required for failed and interrupted invocations.
+    pub diagnostic: Option<String>,
+    pub exit_code: Option<i32>,
+    /// The provider's own session identifier, as noncanonical metadata.
+    pub provider_session: Option<String>,
+    pub usage: Usage,
+}
+
 /// What a logical agent serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentScope {
@@ -221,10 +339,15 @@ pub struct Generation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     pub id: InvocationId,
+    pub agent: AgentId,
     pub provider: String,
     pub model: String,
+    pub effort: Option<String>,
+    pub state: InvocationState,
     pub started_at: i64,
     pub ended_at: Option<i64>,
+    /// How it ended, once recorded.
+    pub end: Option<InvocationEnd>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -700,41 +823,148 @@ impl Store {
         })
     }
 
-    /// Records a physical provider invocation embodying `agent`; an agent has
-    /// at most one live invocation.
+    /// Records a physical provider invocation embodying `agent`, before its
+    /// process is launched; an agent has at most one live invocation.
     pub fn start_invocation(
         &mut self,
         agent: AgentId,
         provider: &str,
         model: &str,
+        effort: Option<&str>,
     ) -> Result<InvocationId> {
         self.write(|tx| {
             let (plan, task) = agent_subject(tx, agent)?;
             tx.execute(
-                "INSERT INTO invocations (agent_id, provider, model, started_at) VALUES (?1, ?2, ?3, ?4)",
-                params![agent, provider, model, now()],
+                "INSERT INTO invocations (agent_id, provider, model, effort, state, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    agent,
+                    provider,
+                    model,
+                    effort,
+                    InvocationState::Starting,
+                    now()
+                ],
             )
             .with_context(|| format!("starting an invocation of agent {agent}"))?;
             let invocation = InvocationId(tx.last_insert_rowid());
             let detail = format!("invocation {invocation}: {provider} {model}");
-            event(tx, "invocation.started", Some(plan), task, Some(agent), &detail)?;
+            event(
+                tx,
+                "invocation.started",
+                Some(plan),
+                task,
+                Some(agent),
+                &detail,
+            )?;
             Ok(invocation)
         })
     }
 
-    pub fn end_invocation(&mut self, invocation: InvocationId) -> Result<()> {
+    /// Records that a starting invocation's process has launched.
+    pub fn invocation_running(&mut self, invocation: InvocationId) -> Result<()> {
         self.write(|tx| {
             let agent: AgentId = tx
                 .query_row(
-                    "UPDATE invocations SET ended_at = ?2 WHERE id = ?1 AND ended_at IS NULL
+                    "UPDATE invocations SET state = ?2 WHERE id = ?1 AND state = ?3
                      RETURNING agent_id",
-                    params![invocation, now()],
+                    params![
+                        invocation,
+                        InvocationState::Running,
+                        InvocationState::Starting
+                    ],
                     |r| r.get(0),
                 )
                 .optional()?
-                .with_context(|| format!("invocation {invocation} is not live"))?;
+                .with_context(|| format!("invocation {invocation} is not starting"))?;
             let (plan, task) = agent_subject(tx, agent)?;
             let detail = format!("invocation {invocation}");
+            event(
+                tx,
+                "invocation.running",
+                Some(plan),
+                task,
+                Some(agent),
+                &detail,
+            )
+        })
+    }
+
+    /// Records how a live invocation ended. Ends are final, and must follow
+    /// from where the invocation is: see [`InvocationEnd`]'s rules.
+    pub fn finish_invocation(
+        &mut self,
+        invocation: InvocationId,
+        end: &InvocationEnd,
+    ) -> Result<()> {
+        ensure!(
+            end.state.is_terminal(),
+            "an invocation cannot end as {}",
+            end.state
+        );
+        let (source, tokens) = match end.usage {
+            Usage::ProviderReported(t) => ("provider_reported", Some(t)),
+            Usage::LocalEstimate(t) => ("local_estimate", Some(t)),
+            Usage::Unavailable => ("unavailable", None),
+        };
+        let count = |n: u64| i64::try_from(n).context("token count out of range");
+        let optional = |n: Option<u64>| n.map(count).transpose();
+        let (input, output, cached, written, reasoning) = match tokens {
+            Some(t) => (
+                Some(count(t.input)?),
+                Some(count(t.output)?),
+                optional(t.cached_input)?,
+                optional(t.cache_write)?,
+                optional(t.reasoning)?,
+            ),
+            None => (None, None, None, None, None),
+        };
+        self.write(|tx| {
+            let from: InvocationState = tx
+                .query_row(
+                    "SELECT state FROM invocations WHERE id = ?1",
+                    [invocation],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .with_context(|| format!("invocation {invocation} does not exist"))?;
+            if let Some(why) = end.refusal(from) {
+                bail!("invocation {invocation} cannot end as {}: {why}", end.state);
+            }
+            let agent: AgentId = tx
+                .query_row(
+                    "UPDATE invocations SET state = ?2, failure = ?3, diagnostic = ?4,
+                       exit_code = ?5, provider_session = ?6, usage = ?7, input_tokens = ?8,
+                       output_tokens = ?9, cached_input_tokens = ?10, cache_write_tokens = ?11,
+                       reasoning_tokens = ?12, ended_at = ?13
+                     WHERE id = ?1 AND state = ?14
+                     RETURNING agent_id",
+                    params![
+                        invocation,
+                        end.state,
+                        end.failure,
+                        end.diagnostic,
+                        end.exit_code,
+                        end.provider_session,
+                        source,
+                        input,
+                        output,
+                        cached,
+                        written,
+                        reasoning,
+                        now(),
+                        from
+                    ],
+                    |r| r.get(0),
+                )
+                .optional()
+                .with_context(|| format!("recording invocation {invocation} as {}", end.state))?
+                .with_context(|| format!("invocation {invocation} is not live"))?;
+            let (plan, task) = agent_subject(tx, agent)?;
+            let detail = match end.failure {
+                Some(kind) => format!("invocation {invocation}: {} ({kind})", end.state),
+                None => format!("invocation {invocation}: {}", end.state),
+            };
             event(
                 tx,
                 "invocation.ended",
@@ -746,21 +976,23 @@ impl Store {
         })
     }
 
+    pub fn invocation(&self, id: InvocationId) -> Result<Invocation> {
+        self.conn
+            .query_row(
+                &format!("{INVOCATION_COLUMNS} WHERE id = ?1"),
+                [id],
+                invocation_row,
+            )
+            .optional()?
+            .with_context(|| format!("invocation {id} does not exist"))
+    }
+
     pub fn invocations(&self, agent: AgentId) -> Result<Vec<Invocation>> {
         self.conn
-            .prepare(
-                "SELECT id, provider, model, started_at, ended_at FROM invocations
-                 WHERE agent_id = ?1 ORDER BY id",
-            )?
-            .query_map([agent], |r| {
-                Ok(Invocation {
-                    id: r.get(0)?,
-                    provider: r.get(1)?,
-                    model: r.get(2)?,
-                    started_at: r.get(3)?,
-                    ended_at: r.get(4)?,
-                })
-            })?
+            .prepare(&format!(
+                "{INVOCATION_COLUMNS} WHERE agent_id = ?1 ORDER BY id"
+            ))?
+            .query_map([agent], invocation_row)?
             .collect::<rusqlite::Result<_>>()
             .map_err(Into::into)
     }
@@ -896,6 +1128,54 @@ impl Store {
     }
 }
 
+const INVOCATION_COLUMNS: &str = "SELECT id, agent_id, provider, model, effort, state,
+    started_at, ended_at, failure, diagnostic, exit_code, provider_session, usage,
+    input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, reasoning_tokens
+    FROM invocations";
+
+fn invocation_row(r: &rusqlite::Row) -> rusqlite::Result<Invocation> {
+    let count = |i: usize| -> rusqlite::Result<Option<u64>> {
+        Ok(r.get::<_, Option<i64>>(i)?.map(|n| n as u64))
+    };
+    let tokens = || -> rusqlite::Result<TokenUsage> {
+        Ok(TokenUsage {
+            input: count(13)?.unwrap_or_default(),
+            output: count(14)?.unwrap_or_default(),
+            cached_input: count(15)?,
+            cache_write: count(16)?,
+            reasoning: count(17)?,
+        })
+    };
+    let usage = match r.get::<_, Option<String>>(12)?.as_deref() {
+        None => None,
+        Some("provider_reported") => Some(Usage::ProviderReported(tokens()?)),
+        Some("local_estimate") => Some(Usage::LocalEstimate(tokens()?)),
+        Some(_) => Some(Usage::Unavailable),
+    };
+    let state: InvocationState = r.get(5)?;
+    Ok(Invocation {
+        id: r.get(0)?,
+        agent: r.get(1)?,
+        provider: r.get(2)?,
+        model: r.get(3)?,
+        effort: r.get(4)?,
+        state,
+        started_at: r.get(6)?,
+        ended_at: r.get(7)?,
+        end: match usage {
+            Some(usage) => Some(InvocationEnd {
+                state,
+                failure: r.get(8)?,
+                diagnostic: r.get(9)?,
+                exit_code: r.get(10)?,
+                provider_session: r.get(11)?,
+                usage,
+            }),
+            None => None,
+        },
+    })
+}
+
 /// Builds a complete store in a private file beside `path`, then links it
 /// into place only if `path` is still absent. A file agentctl did not create
 /// is never claimed, however empty, and racing creators cannot observe a
@@ -954,6 +1234,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     }
     if version <= 2 {
         tx.execute_batch(MIGRATE_V2).with_context(mismatch)?;
+    }
+    if version <= 3 {
+        tx.execute_batch(MIGRATE_V3).with_context(mismatch)?;
     }
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SCHEMA)?;
@@ -1162,6 +1445,28 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    pub(crate) fn agent_id(id: i64) -> AgentId {
+        AgentId(id)
+    }
+
+    fn ended(state: InvocationState) -> InvocationEnd {
+        InvocationEnd {
+            state,
+            failure: None,
+            diagnostic: None,
+            exit_code: None,
+            provider_session: None,
+            usage: Usage::Unavailable,
+        }
+    }
+
+    fn succeeded() -> InvocationEnd {
+        InvocationEnd {
+            exit_code: Some(0),
+            ..ended(InvocationState::Succeeded)
+        }
+    }
+
     /// A plan with one task running its first generation.
     fn running_generation(store: &mut Store) -> (PlanId, TaskId, GenerationId) {
         let plan = store.create_plan("intent").unwrap();
@@ -1258,7 +1563,33 @@ pub(crate) mod tests {
 
     /// Rewrites the store at `path` as schema version 2, which lacks only
     /// the CodeGraph tables.
+    /// Rewrites the store at `path` as schema version 3, whose invocations
+    /// record only when they started and ended.
+    pub(crate) fn downgrade_to_v3(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX invocations_live;
+             ALTER TABLE invocations RENAME TO invocations_v4;
+             CREATE TABLE invocations (
+                 id         INTEGER PRIMARY KEY,
+                 agent_id   INTEGER NOT NULL REFERENCES agents (id),
+                 provider   TEXT    NOT NULL CHECK (provider <> ''),
+                 model      TEXT    NOT NULL CHECK (model <> ''),
+                 started_at INTEGER NOT NULL,
+                 ended_at   INTEGER
+             ) STRICT;
+             INSERT INTO invocations
+                 SELECT id, agent_id, provider, model, started_at, ended_at FROM invocations_v4;
+             DROP TABLE invocations_v4;
+             CREATE UNIQUE INDEX invocations_live ON invocations (agent_id)
+                 WHERE ended_at IS NULL;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+    }
+
     pub(crate) fn downgrade_to_v2(path: &Path) {
+        downgrade_to_v3(path);
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
             "DROP TABLE graph_sites; DROP TABLE graph_relations;
@@ -1325,8 +1656,8 @@ pub(crate) mod tests {
         let agent = store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap();
-        let invocation = store.start_invocation(agent, "codex", "gpt").unwrap();
-        store.end_invocation(invocation).unwrap();
+        let invocation = store.start_invocation(agent, "codex", "gpt", None).unwrap();
+        store.invocation_running(invocation).unwrap();
         let intent = store.record_intent(agent, "write a.rs").unwrap();
         store
             .update_journal(intent, JournalState::Attempted, None)
@@ -1420,8 +1751,8 @@ pub(crate) mod tests {
         let agent = store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap();
-        let invocation = store.start_invocation(agent, "codex", "gpt").unwrap();
-        store.end_invocation(invocation).unwrap();
+        let invocation = store.start_invocation(agent, "codex", "gpt", None).unwrap();
+        store.invocation_running(invocation).unwrap();
         store.record_intent(agent, "write a.rs").unwrap();
         store.record_decision(plan, "concern", "decision").unwrap();
         store.claim_paths(accepted, &["src/a.rs"]).unwrap();
@@ -1458,7 +1789,18 @@ pub(crate) mod tests {
         let (graph, rest): (Vec<_>, Vec<_>) = after
             .into_iter()
             .partition(|(table, _)| table.starts_with("graph_"));
-        assert_eq!(rest, before, "every version 2 row is kept exactly");
+        // Invocations change shape in version 4; see the version 3 migration.
+        let reshaped = |rows: &[(String, Vec<Vec<Value>>)]| {
+            rows.iter()
+                .filter(|(table, _)| table != "invocations")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            reshaped(&rest),
+            reshaped(&before),
+            "every version 2 row is kept exactly"
+        );
         assert_eq!(graph.len(), 4);
         for (table, rows) in graph {
             assert!(rows.is_empty(), "{table} starts empty");
@@ -1592,7 +1934,7 @@ pub(crate) mod tests {
                 .create_agent(Role::Planner, AgentScope::Plan(PlanId(99)))
                 .is_err()
         );
-        assert!(store.start_invocation(AgentId(99), "p", "m").is_err());
+        assert!(store.start_invocation(AgentId(99), "p", "m", None).is_err());
 
         // The database itself refuses dangling references and self-cycles.
         let raw = |sql: &str| store.conn.execute(sql, []).unwrap_err().to_string();
@@ -1684,6 +2026,252 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn invocation_lifecycle_is_explicit_and_final() {
+        let (_dir, mut store) = store();
+        let plan = store.create_plan("intent").unwrap();
+        let agent = store
+            .create_agent(Role::Planner, AgentScope::Plan(plan))
+            .unwrap();
+        let id = store
+            .start_invocation(agent, "claude", "haiku", Some("low"))
+            .unwrap();
+        let started = store.invocation(id).unwrap();
+        assert_eq!(
+            (started.agent, started.state, started.effort.as_deref()),
+            (agent, InvocationState::Starting, Some("low"))
+        );
+        assert_eq!((started.ended_at, started.end), (None, None));
+
+        store.invocation_running(id).unwrap();
+        assert!(store.invocation_running(id).is_err(), "already running");
+        assert_eq!(
+            store.invocation(id).unwrap().state,
+            InvocationState::Running
+        );
+        let live = err(store.finish_invocation(id, &ended(InvocationState::Running)));
+        assert!(live.contains("cannot end as running"), "{live}");
+
+        let end = InvocationEnd {
+            state: InvocationState::Succeeded,
+            failure: None,
+            diagnostic: None,
+            exit_code: Some(0),
+            provider_session: Some("session".into()),
+            usage: Usage::ProviderReported(TokenUsage {
+                input: 10,
+                output: 5,
+                cached_input: Some(4),
+                cache_write: None,
+                reasoning: Some(2),
+            }),
+        };
+        store.finish_invocation(id, &end).unwrap();
+        let finished = store.invocation(id).unwrap();
+        assert_eq!(finished.state, InvocationState::Succeeded);
+        assert!(finished.ended_at.is_some());
+        assert_eq!(finished.end, Some(end));
+        assert!(
+            store
+                .finish_invocation(id, &ended(InvocationState::Cancelled))
+                .is_err(),
+            "ends are final"
+        );
+        let kinds: Vec<_> = store
+            .events_after(0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .filter(|k| k.starts_with("invocation."))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "invocation.started",
+                "invocation.running",
+                "invocation.ended"
+            ]
+        );
+    }
+
+    #[test]
+    fn invocation_ends_must_be_consistent() {
+        let (_dir, mut store) = store();
+        let plan = store.create_plan("intent").unwrap();
+        let agent = store
+            .create_agent(Role::Planner, AgentScope::Plan(plan))
+            .unwrap();
+        let id = store.start_invocation(agent, "codex", "m", None).unwrap();
+        let tokens = TokenUsage::default();
+        let failed = |failure, diagnostic: Option<&str>| InvocationEnd {
+            failure,
+            diagnostic: diagnostic.map(Into::into),
+            ..ended(InvocationState::Failed)
+        };
+        for bad in [
+            failed(None, Some("why")),
+            failed(Some(FailureKind::NoResult), None),
+            InvocationEnd {
+                failure: Some(FailureKind::NoResult),
+                ..ended(InvocationState::Succeeded)
+            },
+            ended(InvocationState::Interrupted),
+            InvocationEnd {
+                provider_session: Some(String::new()),
+                ..ended(InvocationState::Cancelled)
+            },
+            InvocationEnd {
+                usage: Usage::ProviderReported(TokenUsage {
+                    input: u64::MAX,
+                    ..tokens
+                }),
+                ..ended(InvocationState::Succeeded)
+            },
+        ] {
+            assert!(store.finish_invocation(id, &bad).is_err(), "{bad:?}");
+            assert_eq!(
+                store.invocation(id).unwrap().state,
+                InvocationState::Starting
+            );
+        }
+        // A launch that never happened can still fail: `starting` may end.
+        let end = failed(Some(FailureKind::ExecutableMissing), Some("no claude"));
+        store.finish_invocation(id, &end).unwrap();
+        assert_eq!(store.invocation(id).unwrap().end, Some(end));
+    }
+
+    #[test]
+    fn invocation_transitions_are_enforced_by_the_store() {
+        use FailureKind::*;
+        let (_dir, mut store) = store();
+        let plan = store.create_plan("intent").unwrap();
+        let failed = |kind, exit_code| InvocationEnd {
+            failure: Some(kind),
+            diagnostic: Some("why".into()),
+            exit_code,
+            ..ended(InvocationState::Failed)
+        };
+        let invocation = |store: &mut Store| {
+            let agent = store
+                .create_agent(Role::Planner, AgentScope::Plan(plan))
+                .unwrap();
+            store.start_invocation(agent, "claude", "m", None).unwrap()
+        };
+        // Each refusal leaves the row and the event log exactly as they were.
+        let refuse = |store: &mut Store, id, end: &InvocationEnd| {
+            let (row, events) = (store.invocation(id).unwrap(), store.events_after(0, 1000));
+            assert!(store.finish_invocation(id, end).is_err(), "{end:?}");
+            assert_eq!(store.invocation(id).unwrap(), row, "{end:?}");
+            assert_eq!(store.events_after(0, 1000).unwrap(), events.unwrap());
+        };
+
+        // Nothing but a launch failure or interruption ends `starting`.
+        let starting = invocation(&mut store);
+        for end in [
+            succeeded(),
+            ended(InvocationState::Cancelled),
+            failed(ProviderError, None),
+            failed(NoResult, None),
+            failed(ExitStatus, Some(1)),
+            failed(SpawnFailed, Some(1)),
+        ] {
+            refuse(&mut store, starting, &end);
+        }
+        store
+            .finish_invocation(starting, &failed(SpawnFailed, None))
+            .unwrap();
+        let lost = invocation(&mut store);
+        let interrupted = InvocationEnd {
+            diagnostic: Some("lost".into()),
+            ..ended(InvocationState::Interrupted)
+        };
+        store.finish_invocation(lost, &interrupted).unwrap();
+
+        // Success needs a zero exit; a launched process cannot fail to launch.
+        let running = invocation(&mut store);
+        store.invocation_running(running).unwrap();
+        for end in [
+            ended(InvocationState::Succeeded),
+            InvocationEnd {
+                exit_code: Some(1),
+                ..succeeded()
+            },
+            failed(ExecutableMissing, None),
+            failed(SpawnFailed, None),
+        ] {
+            refuse(&mut store, running, &end);
+        }
+        store
+            .finish_invocation(running, &failed(ExitStatus, Some(2)))
+            .unwrap();
+
+        // Terminal states are final, whatever they would become.
+        for id in [starting, lost, running] {
+            for end in [
+                succeeded(),
+                ended(InvocationState::Cancelled),
+                interrupted.clone(),
+                failed(SpawnFailed, None),
+                failed(ExitStatus, Some(1)),
+            ] {
+                refuse(&mut store, id, &end);
+            }
+        }
+
+        // The schema itself refuses a success with a nonzero exit.
+        let other = invocation(&mut store);
+        store.invocation_running(other).unwrap();
+        store.finish_invocation(other, &succeeded()).unwrap();
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE invocations SET exit_code = 1 WHERE id = ?1",
+                    [other]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn migrating_version_3_keeps_what_invocations_knew() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        let mut store = Store::open(&path).unwrap();
+        let plan = store.create_plan("intent").unwrap();
+        let agent = |store: &mut Store| {
+            store
+                .create_agent(Role::Planner, AgentScope::Plan(plan))
+                .unwrap()
+        };
+        let (a, b) = (agent(&mut store), agent(&mut store));
+        let ended = store.start_invocation(a, "claude", "m1", None).unwrap();
+        store.invocation_running(ended).unwrap();
+        store.finish_invocation(ended, &succeeded()).unwrap();
+        let live = store.start_invocation(b, "codex", "m2", None).unwrap();
+        drop(store);
+        downgrade_to_v3(&path);
+        let before = rows_besides(&path, "invocations");
+
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        let was_ended = store.invocation(ended).unwrap();
+        assert_eq!(was_ended.state, InvocationState::Interrupted);
+        assert!(was_ended.ended_at.is_some());
+        let end = was_ended.end.unwrap();
+        assert_eq!((end.failure, end.usage), (None, Usage::Unavailable));
+        assert!(end.diagnostic.is_some());
+        let was_live = store.invocation(live).unwrap();
+        assert_eq!(
+            (was_live.state, was_live.ended_at, was_live.end),
+            (InvocationState::Running, None, None)
+        );
+        // Still live: the agent cannot be embodied twice.
+        assert!(store.start_invocation(b, "codex", "m2", None).is_err());
+        drop(store);
+        assert_eq!(rows_besides(&path, "invocations"), before);
+    }
+
+    #[test]
     fn logical_agents_are_distinct_from_invocations() {
         let (_dir, mut store) = store();
         let (plan, _, generation) = running_generation(&mut store);
@@ -1713,12 +2301,23 @@ pub(crate) mod tests {
             .create_agent(Role::Verifier, AgentScope::Generation(generation))
             .unwrap();
 
-        let first = store.start_invocation(executor, "claude", "m1").unwrap();
-        let message = err(store.start_invocation(executor, "claude", "m1"));
+        let first = store
+            .start_invocation(executor, "claude", "m1", None)
+            .unwrap();
+        let message = err(store.start_invocation(executor, "claude", "m1", None));
         assert!(message.contains("UNIQUE"), "{message}");
-        store.end_invocation(first).unwrap();
-        assert!(store.end_invocation(first).is_err());
-        let second = store.start_invocation(executor, "codex", "m2").unwrap();
+        store.invocation_running(first).unwrap();
+        store
+            .finish_invocation(first, &ended(InvocationState::Cancelled))
+            .unwrap();
+        assert!(
+            store
+                .finish_invocation(first, &ended(InvocationState::Cancelled))
+                .is_err()
+        );
+        let second = store
+            .start_invocation(executor, "codex", "m2", None)
+            .unwrap();
 
         let attempts = store.invocations(executor).unwrap();
         assert_eq!(

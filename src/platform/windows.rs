@@ -6,6 +6,7 @@ use std::iter;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, Prefix};
+use std::process::Child;
 
 use tempfile::NamedTempFile;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -47,6 +48,22 @@ pub(crate) fn literal_name(name: &str) -> bool {
         || name.ends_with(['.', ' '])
         || device
         || short)
+}
+
+/// Whether the executable at `path` runs as itself when spawned. Windows
+/// runs a batch script through `cmd.exe`, which reinterprets its arguments,
+/// so a `.bat` or `.cmd` file does not.
+pub(crate) fn runs_directly(path: &Path) -> bool {
+    !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("bat") || e.eq_ignore_ascii_case("cmd"))
+}
+
+/// Windows cannot ask a process without a console of its own to stop
+/// gracefully, so no request is sent; the caller terminates it outright.
+pub(crate) fn request_termination(_child: &Child) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// Opens `path` if it is a regular file; `None` for a symlink, junction or
@@ -194,6 +211,16 @@ mod tests {
             "com10",
         ] {
             assert!(literal_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn batch_scripts_do_not_run_directly() {
+        for path in [r"C:\bin\codex.cmd", r"C:\bin\codex.CMD", r"x.Bat"] {
+            assert!(!runs_directly(Path::new(path)), "{path}");
+        }
+        for path in [r"C:\bin\codex.exe", r"C:\bin\claude", r"a.cmd.exe"] {
+            assert!(runs_directly(Path::new(path)), "{path}");
         }
     }
 
