@@ -8,7 +8,10 @@
 //! policy belong to the layers that will use this store.
 //!
 //! Accepted source is written only through `crate::source`, which publishes
-//! the recovery object of any content before recording it here.
+//! the recovery object of any content before recording it here. CodeGraph
+//! facts are written only through `crate::graph`, which validates them first.
+
+mod graph;
 
 use std::fmt;
 use std::path::Path;
@@ -24,9 +27,10 @@ use rusqlite::{
 /// Stamped into the SQLite header (`application_id`) so an agentctl store is
 /// recognized by what it is, not merely by its schema version number.
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"agct");
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SCHEMA: &str = include_str!("state/schema.sql");
 const MIGRATE_V1: &str = include_str!("state/migrate_v1.sql");
+const MIGRATE_V2: &str = include_str!("state/migrate_v2.sql");
 /// The version 1 `accepted_sources` definition, exactly as SQLite keeps it.
 const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
     path          TEXT    PRIMARY KEY,
@@ -916,7 +920,8 @@ fn create(path: &Path) -> Result<()> {
 }
 
 /// Brings an existing store's schema to `SCHEMA_VERSION`, refusing files it
-/// does not own or understand. Each future version adds one arm here.
+/// does not own or understand. Each version migrates to the next in turn,
+/// all in one transaction.
 fn migrate(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (id, version): (i32, i64) = tx.query_row(
@@ -926,6 +931,15 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     ensure!(id == APPLICATION_ID, "not an agentctl state database");
+    match version {
+        1..=SCHEMA_VERSION => {}
+        v if v > SCHEMA_VERSION => bail!(
+            "state schema version {v} is newer than this agentctl supports \
+             ({SCHEMA_VERSION}); upgrade agentctl"
+        ),
+        v => bail!("unknown state schema version {v}"),
+    }
+    let mismatch = || format!("state database does not match agentctl schema version {version}");
     if version == 1 {
         let sources: Option<String> = tx
             .query_row(
@@ -934,32 +948,25 @@ fn migrate(conn: &mut Connection) -> Result<()> {
                 |r| r.get(0),
             )
             .optional()?;
-        ensure!(
-            sources.as_deref() == Some(V1_ACCEPTED_SOURCES),
-            "state database does not match agentctl schema version 1"
-        );
+        ensure!(sources.as_deref() == Some(V1_ACCEPTED_SOURCES), mismatch());
         tx.execute_batch(MIGRATE_V1)
             .context("migrating state schema version 1")?;
+    }
+    if version <= 2 {
+        tx.execute_batch(MIGRATE_V2).with_context(mismatch)?;
+    }
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(SCHEMA)?;
+    // A failed check rolls back any migration, leaving the file as found.
+    ensure!(
+        schema_objects(&tx)? == schema_objects(&expected)?,
+        mismatch()
+    );
+    if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
-    match version {
-        1 | SCHEMA_VERSION => {
-            let expected = Connection::open_in_memory()?;
-            expected.execute_batch(SCHEMA)?;
-            // A failed check rolls back any migration, leaving the file as found.
-            ensure!(
-                schema_objects(&tx)? == schema_objects(&expected)?,
-                "state database does not match agentctl schema version {version}"
-            );
-            tx.commit()?;
-            Ok(())
-        }
-        v if v > SCHEMA_VERSION => bail!(
-            "state schema version {v} is newer than this agentctl supports \
-             ({SCHEMA_VERSION}); upgrade agentctl"
-        ),
-        v => bail!("unknown state schema version {v}"),
-    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Every schema object `conn` defines, with the SQL that defined it. SQLite
@@ -1249,9 +1256,23 @@ pub(crate) mod tests {
         }
     }
 
+    /// Rewrites the store at `path` as schema version 2, which lacks only
+    /// the CodeGraph tables.
+    pub(crate) fn downgrade_to_v2(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE graph_sites; DROP TABLE graph_relations;
+             DROP TABLE graph_entities; DROP TABLE graph_sources;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+    }
+
     /// Rewrites the store at `path` as schema version 1, whose only
-    /// difference is the `accepted_sources` table, holding `accepted`.
+    /// difference from version 2 is the `accepted_sources` table, holding
+    /// `accepted`.
     pub(crate) fn downgrade_to_v1(path: &Path, accepted: &[(&str, &str, Option<GenerationId>)]) {
+        downgrade_to_v2(path);
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(&format!(
             "DROP TABLE accepted_sources; {V1_ACCEPTED_SOURCES};"
@@ -1267,16 +1288,16 @@ pub(crate) mod tests {
         conn.pragma_update(None, "user_version", 1).unwrap();
     }
 
-    /// Every row of every table except `accepted_sources`, by table.
-    fn rows_besides_accepted_sources(path: &Path) -> Vec<(String, Vec<Vec<Value>>)> {
+    /// Every row of every table except `excluded`, by table.
+    fn rows_besides(path: &Path, excluded: &str) -> Vec<(String, Vec<Vec<Value>>)> {
         let conn = Connection::open(path).unwrap();
         let tables: Vec<String> = conn
             .prepare(
                 "SELECT name FROM sqlite_schema
-                 WHERE type = 'table' AND name <> 'accepted_sources' ORDER BY name",
+                 WHERE type = 'table' AND name <> ?1 ORDER BY name",
             )
             .unwrap()
-            .query_map([], |r| r.get(0))
+            .query_map([excluded], |r| r.get(0))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -1319,9 +1340,12 @@ pub(crate) mod tests {
         let active = store.start_generation(second).unwrap();
         store.claim_paths(active, &["src/b.rs"]).unwrap();
         drop(store);
-        let before = rows_besides_accepted_sources(&path);
+        let before = rows_besides(&path, "accepted_sources");
         for (table, rows) in &before {
-            assert!(!rows.is_empty(), "{table} is exercised");
+            assert!(
+                !rows.is_empty() || table.starts_with("graph_"),
+                "{table} is exercised"
+            );
         }
 
         // Well-formed or not, no version 1 hash names a known recovery object.
@@ -1343,7 +1367,7 @@ pub(crate) mod tests {
             .query_row("SELECT count(*) FROM accepted_sources", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
-        assert_eq!(rows_besides_accepted_sources(&path), before);
+        assert_eq!(rows_besides(&path, "accepted_sources"), before);
 
         // The migrated store accepts source state established afresh.
         store
@@ -1386,6 +1410,106 @@ pub(crate) mod tests {
             .is_err(),
             "the version 1 table is left in place"
         );
+    }
+
+    /// A store at `path` holding state of every kind the version 2 schema
+    /// has, including accepted content and accepted absence.
+    fn populated_v2(path: &Path) {
+        let mut store = Store::open(path).unwrap();
+        let (plan, first, accepted) = running_generation(&mut store);
+        let agent = store
+            .create_agent(Role::Planner, AgentScope::Plan(plan))
+            .unwrap();
+        let invocation = store.start_invocation(agent, "codex", "gpt").unwrap();
+        store.end_invocation(invocation).unwrap();
+        store.record_intent(agent, "write a.rs").unwrap();
+        store.record_decision(plan, "concern", "decision").unwrap();
+        store.claim_paths(accepted, &["src/a.rs"]).unwrap();
+        store
+            .record_baseline(&[("src/base.rs", Some(&hash(4))), ("src/none.rs", None)])
+            .unwrap();
+        store
+            .accept_generation(
+                accepted,
+                &[("src/a.rs", Some(&hash(1))), ("src/gone.rs", None)],
+            )
+            .unwrap();
+        let second = store.add_task(plan, "next", &[first]).unwrap();
+        let active = store.start_generation(second).unwrap();
+        store.claim_paths(active, &["src/b.rs"]).unwrap();
+        drop(store);
+        downgrade_to_v2(path);
+    }
+
+    #[test]
+    fn migrating_version_2_keeps_all_state_and_indexes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.db");
+        populated_v2(&path);
+        let before = rows_besides(&path, "");
+        for (table, rows) in &before {
+            assert!(!rows.is_empty(), "{table} is exercised");
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        drop(store);
+        let after = rows_besides(&path, "");
+        let (graph, rest): (Vec<_>, Vec<_>) = after
+            .into_iter()
+            .partition(|(table, _)| table.starts_with("graph_"));
+        assert_eq!(rest, before, "every version 2 row is kept exactly");
+        assert_eq!(graph.len(), 4);
+        for (table, rows) in graph {
+            assert!(rows.is_empty(), "{table} starts empty");
+        }
+
+        // Nothing is promoted into graph facts: sources are merely unindexed.
+        let store = Store::open(&path).unwrap();
+        use crate::graph::Freshness;
+        assert_eq!(
+            store.graph_status("src/a.rs").unwrap(),
+            Freshness::Unindexed
+        );
+        assert_eq!(
+            store.graph_status("src/base.rs").unwrap(),
+            Freshness::Unindexed
+        );
+        assert_eq!(
+            store.graph_status("src/gone.rs").unwrap(),
+            Freshness::Absent
+        );
+        assert_eq!(
+            store.graph_status("src/none.rs").unwrap(),
+            Freshness::Absent
+        );
+        assert!(store.graph_status("src/b.rs").is_err(), "untracked");
+    }
+
+    #[test]
+    fn refuses_version_2_files_without_agentctl_schema_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("altered.db", "DROP TRIGGER events_no_update"),
+            ("extra.db", "CREATE TABLE notes (body TEXT)"),
+            // Claims version 2 yet already holds a (forged) graph table.
+            ("forged.db", "CREATE TABLE graph_sources (path TEXT)"),
+        ];
+        for (name, change) in cases {
+            let path = dir.path().join(name);
+            populated_v2(&path);
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(change).unwrap();
+            drop(conn);
+            let before = std::fs::read(&path).unwrap();
+            let message = err(Store::open(&path));
+            assert!(
+                message.contains("does not match agentctl schema version 2"),
+                "{name}: {message}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{name}");
+            assert_eq!(version(&path), 2, "{name}");
+        }
     }
 
     #[test]

@@ -86,6 +86,14 @@ impl Objects {
         Ok(())
     }
 
+    /// The length of object `hash`'s bytes, failing unless they hash to
+    /// `hash`.
+    pub(super) fn len(&self, hash: &str) -> Result<u64> {
+        let mut counted = Counting(0);
+        self.copy_to(hash, &mut counted)?;
+        Ok(counted.0)
+    }
+
     fn path(&self, hash: &str) -> Result<PathBuf> {
         check_hash(hash)?;
         Ok(self.dir.join(hash))
@@ -120,6 +128,20 @@ impl<W: Write> Write for Hashing<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.1.flush()
+    }
+}
+
+/// Discards what is written, counting its bytes.
+struct Counting(u64);
+
+impl Write for Counting {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

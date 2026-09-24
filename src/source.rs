@@ -174,6 +174,11 @@ pub fn restore(project: &Project, store: &Store, paths: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The length of the accepted content named `hash`.
+pub(crate) fn content_len(project: &Project, hash: &str) -> Result<u64> {
+    Objects::open(&project.root.join(STATE_DIR))?.len(hash)
+}
+
 /// The accepted content hash of a tracked source path, `None` for accepted
 /// absence.
 fn accepted(project: &Project, store: &Store, path: &str) -> Result<Option<String>> {
