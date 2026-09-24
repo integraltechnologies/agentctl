@@ -225,7 +225,7 @@ impl<R: BufRead, W: Write> Prompter<R, W> {
 mod tests {
     use super::*;
     use crate::config::tests::sample;
-    use crate::project::STATE_DIR;
+    use crate::project::{STATE_DB, STATE_DIR};
     use std::fs;
 
     fn init(cwd: &Path, input: &str, available: bool) -> (Result<()>, String) {
@@ -299,6 +299,28 @@ mod tests {
         assert!(dir.path().join(STATE_DIR).is_dir());
         assert!(output.contains("appears unavailable"), "{output}");
         assert!(output.contains("no index was built"), "{output}");
+    }
+
+    #[test]
+    fn deleted_local_state_is_rehydrated_without_touching_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = sample().to_toml();
+        fs::write(dir.path().join(CONFIG_FILE), &original).unwrap();
+        init(dir.path(), "n\n", true).0.unwrap();
+        let project = Project::load(dir.path()).unwrap();
+        let plan = project.hydrate().unwrap().create_plan("old").unwrap();
+
+        fs::remove_dir_all(dir.path().join(STATE_DIR)).unwrap();
+        init(dir.path(), "n\n", true).0.unwrap();
+
+        assert!(dir.path().join(STATE_DIR).join(STATE_DB).is_file());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap(),
+            original
+        );
+        let mut store = project.hydrate().unwrap();
+        assert!(store.plan(plan).is_err(), "local state starts fresh");
+        store.create_plan("new").unwrap();
     }
 
     #[test]

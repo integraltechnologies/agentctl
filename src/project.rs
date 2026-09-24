@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::config::Config;
+use crate::state::Store;
 
 pub const CONFIG_FILE: &str = "agentctl.toml";
 pub const STATE_DIR: &str = ".agentctl";
+pub const STATE_DB: &str = "state.db";
 
 #[derive(Debug)]
 pub struct Project {
@@ -57,11 +59,13 @@ impl Project {
         })
     }
 
-    /// Ensures the local, Git-ignored `.agentctl/` state directory exists.
-    pub fn hydrate(&self) -> Result<()> {
+    /// Ensures the local, Git-ignored `.agentctl/` state directory exists and
+    /// opens its canonical state store, creating it if absent.
+    pub fn hydrate(&self) -> Result<Store> {
         let state = self.root.join(STATE_DIR);
         fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
-        ignore_state_dir(&self.root)
+        ignore_state_dir(&self.root)?;
+        Store::open(&state.join(STATE_DB))
     }
 }
 
@@ -87,11 +91,13 @@ fn ignore_state_dir(root: &Path) -> Result<()> {
     } else {
         "\n"
     };
+    // One write, so concurrent appends cannot interleave within the line.
+    let line = format!("{separator}/{STATE_DIR}/\n");
     OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-        .and_then(|mut file| writeln!(file, "{separator}/{STATE_DIR}/"))
+        .and_then(|mut file| file.write_all(line.as_bytes()))
         .with_context(|| format!("updating {}", path.display()))
 }
 

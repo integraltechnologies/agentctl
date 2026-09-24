@@ -1,9 +1,6 @@
-mod config;
-mod init;
-mod project;
-
 use std::io;
 
+use agentctl::init;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
