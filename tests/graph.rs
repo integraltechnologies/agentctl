@@ -2009,7 +2009,6 @@ fn python_semantic_table() -> Vec<Row> {
 /// A stand-in for `scip-python` on PATH, so the provider boundary itself is
 /// exercised through the real CLI without the real tool.
 fn fake_provider(f: &Fixture, body: &str) -> String {
-    use std::os::unix::fs::PermissionsExt;
     let bin = f.temp.0.join(format!("fake-bin-{}", body.len()));
     fs::create_dir_all(&bin).unwrap();
     let script = bin.join("scip-python");
@@ -2021,7 +2020,13 @@ fn fake_provider(f: &Fixture, body: &str) -> String {
         ),
     )
     .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    // The stand-in is a POSIX shell script; only Unix needs (and has) an
+    // executable bit. Windows CI compiles this test target without running it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     format!("{}:{}", bin.display(), path_without_scip_python())
 }
 
