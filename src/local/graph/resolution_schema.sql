@@ -13,6 +13,9 @@ CREATE TABLE graph_resolutions (
     target_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     rule TEXT NOT NULL,
+    -- Which semantic provider proved this, when a provider did. NULL for the
+    -- deterministic fast path, whose evidence is the `rule` alone.
+    provider TEXT,
     PRIMARY KEY(workspace_id, edge_id),
     FOREIGN KEY(workspace_id, edge_id) REFERENCES graph_edges(workspace_id, edge_id) ON DELETE CASCADE,
     FOREIGN KEY(workspace_id, target_id) REFERENCES graph_entities(workspace_id, entity_id) ON DELETE CASCADE

@@ -1,6 +1,7 @@
 //! Tree-sitter is confined to this adapter. Resolution is intentionally conservative:
 //! a relation gets a target only when exactly one compatible declaration is
 //! syntactically visible, and never through a name a local binding shadows.
+use super::bindings;
 use super::{
     Edge, Entity, EntityKind, Language, Provenance, RelationKind, ResolutionRule, SourceRange,
     model::stable_id,
@@ -53,6 +54,9 @@ pub(super) fn extract(source: &str, provenance: Provenance) -> Result<Derivation
         shadowed: vec![],
         scopes: vec![],
         globs: BTreeSet::new(),
+        bindings: BTreeMap::new(),
+        imports: BTreeMap::new(),
+        macro_sites: BTreeSet::new(),
         occurrences: BTreeMap::new(),
         visited: 0,
     };
@@ -83,6 +87,14 @@ struct Builder<'a> {
     scopes: Vec<BTreeSet<String>>,
     /// Modules declaring `use super::*;`.
     globs: BTreeSet<usize>,
+    /// Import/alias bindings this file introduces, by the module that owns
+    /// them: `(owner, local name) -> path`. See [`super::bindings`].
+    bindings: BTreeMap<(usize, String), String>,
+    /// Edge index of each IMPORTS relation → the path it imports.
+    imports: BTreeMap<usize, String>,
+    /// Edge indexes of call sites observed inside Rust macro invocations. See
+    /// [`Builder::macro_calls`]: they are recorded, never resolved here.
+    macro_sites: BTreeSet<usize>,
     occurrences: BTreeMap<String, usize>,
     visited: usize,
 }
@@ -145,6 +157,34 @@ fn parent_key(key: &str) -> Option<String> {
     key.rsplit_once("::").map(|(parent, _)| parent.to_string())
 }
 
+/// Prefix marking which binding produced a path hint, so workspace resolution
+/// can record the evidence the extractor actually had. Absent for a path the
+/// source wrote out itself.
+pub(super) fn rule_tag(rule: ResolutionRule) -> &'static str {
+    match rule {
+        ResolutionRule::ImportBinding => "import|",
+        ResolutionRule::AliasBinding => "alias|",
+        _ => "",
+    }
+}
+
+/// A receiver worth naming, or `()` for a computed one. Tree-sitter reports the
+/// whole callee expression for a member call, so `a.b().c()` would otherwise be
+/// observed as the target name `a.b().c` — a string that names nothing, matches
+/// nothing, and drowns the unresolved digests shown to planners and verifiers.
+/// A receiver that is a plain identifier or path is kept, because `self.m`,
+/// `Type::m` and a Python/TypeScript module path `pkg.util.m` are resolvable;
+/// anything else becomes `()`, which stays an unresolvable member observation
+/// rather than a fabricated name.
+fn receiver_name(text: &str) -> &str {
+    let simple = !text.is_empty()
+        && text
+            .split("::")
+            .flat_map(|segment| segment.split('.'))
+            .all(|segment| is_ident(segment) || segment == "self" || segment == "Self");
+    if simple { text } else { "()" }
+}
+
 fn is_ident(s: &str) -> bool {
     let s = s.strip_prefix("r#").unwrap_or(s);
     !s.is_empty()
@@ -174,7 +214,7 @@ fn skip_group(s: &str, open: usize) -> Option<usize> {
 }
 
 /// `a::<T>::b` → `a::b`; whitespace removed. Leaves anything unbalanced as-is.
-fn normalize_path(text: &str) -> String {
+pub(super) fn normalize_path(text: &str) -> String {
     let compact: String = text.split_whitespace().collect();
     let mut out = String::with_capacity(compact.len());
     let mut i = 0;
@@ -473,6 +513,14 @@ impl Builder<'_> {
             (self.provenance.language, node.kind()),
             (Language::Rust, "function_item")
                 | (Language::Python, "function_definition" | "class_definition")
+                | (
+                    Language::TypeScript | Language::Tsx | Language::JavaScript,
+                    "function_declaration"
+                        | "function_expression"
+                        | "arrow_function"
+                        | "method_definition"
+                        | "class_declaration"
+                )
         )
     }
 
@@ -494,6 +542,17 @@ impl Builder<'_> {
             ) => node.child_by_field_name("left"),
             (Language::Python, "named_expression") => node.child_by_field_name("name"),
             (Language::Python, "as_pattern") => node.child_by_field_name("alias"),
+            // A parameter or `const`/`let`/`var` name shadows an import of the
+            // same name, so TS/JS must track them now that bare names resolve.
+            (Language::TypeScript | Language::Tsx | Language::JavaScript, "formal_parameters") => {
+                Some(node)
+            }
+            (
+                Language::TypeScript | Language::Tsx | Language::JavaScript,
+                "variable_declarator" | "required_parameter" | "optional_parameter",
+            ) => node
+                .child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("pattern")),
             _ => None,
         }
     }
@@ -535,8 +594,36 @@ impl Builder<'_> {
             (Language::Rust, "use_declaration")
             | (Language::Python, "import_statement" | "import_from_statement")
             | (Language::TypeScript | Language::Tsx | Language::JavaScript, "import_statement") => {
-                let name = self.text(node).to_string();
-                self.edge(owner, None, RelationKind::Imports, &name, node)?;
+                let source = self.source;
+                let import = bindings::from_import(
+                    self.provenance.language,
+                    &self.provenance.path,
+                    node,
+                    &|n: Node| source[n.byte_range()].to_string(),
+                );
+                // One IMPORTS relation per imported path, observed at the node
+                // naming it, so each can resolve to its own target. A statement
+                // that names nothing the extractor can follow (a glob, a
+                // package specifier) is still observed, as itself, unresolved.
+                if import.targets.is_empty() {
+                    let name = self.text(node).to_string();
+                    self.edge(owner, None, RelationKind::Imports, &name, node)?;
+                }
+                for (path, at) in import.targets {
+                    self.imports.insert(self.edges.len(), path.clone());
+                    self.edge(
+                        owner,
+                        None,
+                        RelationKind::Imports,
+                        path.trim_start_matches("::"),
+                        at,
+                    )?;
+                }
+                // Record what local names this import introduces, so a later
+                // bare use of one resolves as the path it was imported from.
+                for (local, path) in import.bindings {
+                    self.bindings.entry((owner, local)).or_insert(path);
+                }
                 if self.provenance.language == Language::Rust
                     && self.entities[owner].kind == EntityKind::Module
                     && node
@@ -560,6 +647,9 @@ impl Builder<'_> {
                     .to_string();
                 self.edge(owner, None, RelationKind::DependsOn, &name, node)?;
             }
+            (Language::Rust, "macro_invocation") => {
+                self.macro_calls(node, owner)?;
+            }
             (Language::Rust, "impl_item") => {
                 if let Some(trait_node) = node.child_by_field_name("trait") {
                     let name = self.text(trait_node).to_string();
@@ -568,7 +658,7 @@ impl Builder<'_> {
             }
             (_, "call_expression" | "call") => {
                 if let Some(function) = node.child_by_field_name("function") {
-                    let target = self.text(function).to_string();
+                    let (target, function) = self.callee(function);
                     if matches!(
                         self.provenance.language,
                         Language::TypeScript | Language::Tsx | Language::JavaScript
@@ -625,13 +715,179 @@ impl Builder<'_> {
         Ok(())
     }
 
+    /// Call-shaped token sequences inside a macro invocation's arguments.
+    ///
+    /// Tree-sitter keeps macro arguments as unparsed token trees, so a call in
+    /// `assert_eq!(foo(), 1)`, `format!("{}", x.name())` or `json!({"k": f()})`
+    /// is not a call expression and would otherwise leave no trace at all —
+    /// the graph would claim a relation is absent when it merely cannot see it.
+    /// Each `path(`, `a::b(` or `.method(` sequence (nested token trees
+    /// included, nested macro names excluded) becomes an *unresolved* CALLS
+    /// site anchored on the callee identifier. Without expansion agentctl
+    /// cannot know what a macro does with its tokens, so these sites are never
+    /// resolved syntactically: they count as unknown in coverage and impact,
+    /// and only a semantic provider's column-exact occurrence can prove them.
+    fn macro_calls(&mut self, invocation: Node<'_>, owner: usize) -> Result<()> {
+        // `default` and `union` are contextual keywords: inside a token tree
+        // tree-sitter lexes them as keyword tokens, yet `T::default()` is an
+        // ordinary call.
+        let segment = |n: &Node<'_>| matches!(n.kind(), "identifier" | "default" | "union");
+        let head = |n: &Node<'_>| segment(n) || matches!(n.kind(), "self" | "crate" | "super");
+        let mut trees: Vec<Node<'_>> = invocation
+            .children(&mut invocation.walk())
+            .filter(|c| c.kind() == "token_tree")
+            .collect();
+        while let Some(tree) = trees.pop() {
+            let tokens: Vec<Node<'_>> = tree.children(&mut tree.walk()).collect();
+            let mut i = 0;
+            while i < tokens.len() {
+                let token = tokens[i];
+                if token.kind() == "token_tree" {
+                    trees.push(token);
+                    i += 1;
+                    continue;
+                }
+                if !head(&token) {
+                    i += 1;
+                    continue;
+                }
+                let mut end = i;
+                while end + 2 < tokens.len()
+                    && tokens[end + 1].kind() == "::"
+                    && segment(&tokens[end + 2])
+                {
+                    end += 2;
+                }
+                let called = tokens
+                    .get(end + 1)
+                    .is_some_and(|n| n.kind() == "token_tree" && self.text(*n).starts_with('('));
+                if called && segment(&tokens[end]) {
+                    let member = end == i && i > 0 && tokens[i - 1].kind() == ".";
+                    let name = if member {
+                        let receiver = i
+                            .checked_sub(2)
+                            .map(|r| tokens[r])
+                            .filter(head)
+                            .map_or("()".to_string(), |r| self.text(r).to_string());
+                        format!("{receiver}.{}", self.text(token))
+                    } else {
+                        self.source[tokens[i].start_byte()..tokens[end].end_byte()]
+                            .split_whitespace()
+                            .collect::<String>()
+                    };
+                    self.macro_sites.insert(self.edges.len());
+                    self.edge(owner, None, RelationKind::Calls, &name, tokens[end])?;
+                }
+                i = end + 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Resolves relations whose unique target is visible in this file, and
     /// records a normalized path hint for Rust qualified paths that may name a
+    /// The observed call target, and the node whose span identifies it.
+    ///
+    /// For a member call the span narrows to the member identifier, which is
+    /// what a semantic provider reports an occurrence at, and the receiver is
+    /// reduced to a name or `()`. For everything else the callee node is
+    /// already the identity. Generic call syntax (`f::<T>()`) unwraps to the
+    /// function it parameterizes so the turbofish never enters the name.
+    fn callee<'n>(&self, function: Node<'n>) -> (String, Node<'n>) {
+        let function = if function.kind() == "generic_function" {
+            function.child_by_field_name("function").unwrap_or(function)
+        } else {
+            function
+        };
+        let member = match function.kind() {
+            "field_expression" => function.child_by_field_name("field"),
+            "attribute" => function.child_by_field_name("attribute"),
+            "member_expression" => function.child_by_field_name("property"),
+            _ => None,
+        };
+        match member.zip(function.child_by_field_name("object").or_else(|| {
+            // Rust's field_expression names its receiver `value`.
+            function.child_by_field_name("value")
+        })) {
+            Some((member, receiver)) => (
+                format!(
+                    "{}.{}",
+                    receiver_name(&compact(self.text(receiver), 64)),
+                    self.text(member)
+                ),
+                member,
+            ),
+            None => (self.text(function).to_string(), function),
+        }
+    }
+    /// Rewrites a name through this file's import bindings, if one applies.
+    ///
+    /// `helper` where the file wrote `use util::helper` becomes `util::helper`;
+    /// `u.helper` where it wrote `import util as u` becomes `util::helper`. Only
+    /// the *first* segment is substituted — a binding renames a name, it does
+    /// not describe what lives beneath it — and the search walks outward
+    /// through enclosing modules so a nested item sees its file's imports.
+    fn bound_path(
+        bindings: &BTreeMap<(usize, String), String>,
+        scope: &LocalScope<'_>,
+        source: usize,
+        text: &str,
+    ) -> Option<(String, ResolutionRule)> {
+        let (head, rest) = match text.split_once("::") {
+            Some((head, rest)) => (head, Some(rest)),
+            None => match text.split_once('.') {
+                Some((head, rest)) => (head, Some(rest)),
+                None => (text, None),
+            },
+        };
+        if !is_ident(head) {
+            return None;
+        }
+        let mut module = Some(scope.module[source]);
+        while let Some(m) = module {
+            if let Some(path) = bindings.get(&(m, head.to_string())) {
+                // Imported under its own name, or renamed by an alias.
+                let rule = if path.rsplit("::").next() == Some(head) {
+                    ResolutionRule::ImportBinding
+                } else {
+                    ResolutionRule::AliasBinding
+                };
+                return Some((
+                    match rest {
+                        Some(rest) => format!("{path}::{}", rest.replace('.', "::")),
+                        None => path.clone(),
+                    },
+                    rule,
+                ));
+            }
+            module = scope.parent_module(m);
+        }
+        None
+    }
     /// declaration in another file (resolved later, workspace-wide).
     fn resolve_local(&mut self) {
         let scope = LocalScope::new(self.provenance.language, &self.entities, &self.globs);
         let root = crate_root(&self.provenance.path);
-        for (edge, &shadowed) in self.edges.iter_mut().zip(&self.shadowed) {
+        // Resolution is the last extraction step, so the binding table is
+        // consumed here rather than borrowed alongside the edges it rewrites.
+        let bindings = std::mem::take(&mut self.bindings);
+        let imports = std::mem::take(&mut self.imports);
+        let macro_sites = std::mem::take(&mut self.macro_sites);
+        for (i, (edge, &shadowed)) in self.edges.iter_mut().zip(&self.shadowed).enumerate() {
+            // Unexpanded macro content: observed, never resolved syntactically.
+            if macro_sites.contains(&i) {
+                continue;
+            }
+            // An import names its target by path; the workspace pass resolves
+            // it exactly like any other path, so a same-file target and a
+            // cross-file one take the same, single route.
+            if let Some(path) = imports.get(&i) {
+                let source = scope.index[&edge.source];
+                edge.path_hint = scope
+                    .hint(source, path, &root)
+                    .map(|hint| format!("{}{hint}", rule_tag(ResolutionRule::ImportBinding)));
+                continue;
+            }
             if edge.target.is_some()
                 || !matches!(
                     edge.kind,
@@ -645,6 +901,27 @@ impl Builder<'_> {
             if let Some((target, rule)) = scope.resolve(source, edge.kind, &text, shadowed) {
                 edge.target = Some(self.entities[target].id.clone());
                 edge.resolution = Some(rule);
+                continue;
+            }
+            // A name this file imported is the path it was imported from. A
+            // local binding that shadows the name wins, so a shadowed name is
+            // never rewritten through an import.
+            let bound = (!shadowed)
+                .then(|| Self::bound_path(&bindings, &scope, source, &text))
+                .flatten();
+            if let Some((path, rule)) = bound {
+                if let Some((target, _)) = scope.resolve(source, edge.kind, &path, false) {
+                    edge.target = Some(self.entities[target].id.clone());
+                    edge.resolution = Some(rule);
+                    continue;
+                }
+                // Only a hint: the target lives in another file, so the
+                // workspace pass resolves it. Tag the hint with the evidence
+                // that produced the path, so the recorded rule says "imported"
+                // rather than "happened to be a qualified path".
+                edge.path_hint = scope
+                    .hint(source, &path, &root)
+                    .map(|hint| format!("{}{hint}", rule_tag(rule)));
             } else if self.provenance.language == Language::Rust {
                 edge.path_hint = scope.hint(source, &text, &root);
             }
@@ -834,10 +1111,19 @@ impl<'a> LocalScope<'a> {
                     .map(|t| (t, ResolutionRule::LexicalScope))
             }
             Language::TypeScript | Language::Tsx | Language::JavaScript => {
-                let method = text.strip_prefix("this.")?;
-                (kind == RelationKind::Calls)
-                    .then(|| self.receiver_method(source, method))
+                if kind != RelationKind::Calls {
+                    return None;
+                }
+                if let Some(method) = text.strip_prefix("this.") {
+                    return self.receiver_method(source, method);
+                }
+                // A bare name calling a function declared in the same file is
+                // as provable here as it is in Rust or Python; a local binding
+                // that shadows it still wins.
+                (is_ident(text) && !shadowed)
+                    .then(|| self.lexical(source, text, kind))
                     .flatten()
+                    .map(|t| (t, ResolutionRule::LexicalScope))
             }
         }
     }
@@ -932,8 +1218,18 @@ impl<'a> LocalScope<'a> {
         }
     }
 
-    /// `abs:<key>` for anchored paths, `rel:<crate root>|<path>` otherwise.
+    /// `abs:<key>` for anchored paths, `py:<path>` for Python absolute import
+    /// paths, `rel:<crate root>|<path>` otherwise.
     fn hint(&self, source: usize, text: &str, crate_root: &str) -> Option<String> {
+        // A repository-anchored key, from an import relative to its file.
+        if let Some(key) = text.strip_prefix("::") {
+            return key.split("::").all(is_ident).then(|| format!("abs:{key}"));
+        }
+        // Every other path Python hints is an absolute import path (bound
+        // names and import targets); see `resolve::Hint::Rooted`.
+        if self.language == Language::Python {
+            return text.split("::").all(is_ident).then(|| format!("py:{text}"));
+        }
         let segments: Vec<&str> = text.split("::").collect();
         if segments.len() < 2 || segments.iter().any(|s| !is_ident(s)) {
             return None;

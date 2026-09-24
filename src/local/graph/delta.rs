@@ -7,7 +7,7 @@
 //!
 //! Cross-generation identity (see `docs/architecture.md#cross-generation-identity`):
 //! an old and a new entity are the same entity only when they have the same
-//! Stage-1 entity ID and their `(path, kind, qualified_name)` group holds exactly
+//! indexed entity ID and their `(path, kind, qualified_name)` group holds exactly
 //! one declaration in both generations. The ID already binds repository, path,
 //! language, kind and lexical qualified name, so a body edit, signature edit or
 //! line shift keeps identity, while a rename or a move is a removal plus an

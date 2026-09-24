@@ -1,39 +1,116 @@
 use super::*;
+use crate::local::terminal::{Report, name};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
 };
 
+/// Whether the indexed generation's relations carry semantic evidence.
+fn semantic_line(stamp: Option<&SemanticStamp>) -> String {
+    match stamp {
+        Some(stamp) => format!("CURRENT ({})", stamp.providers.join(", ")),
+        None => {
+            "STRUCTURAL ONLY — relations that need types, traits or macro expansion stay unresolved"
+                .into()
+        }
+    }
+}
+
 pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
     let root = env::current_dir()?;
     match args {
+        // Explicitly separate from indexing: the deterministic graph is ready
+        // in milliseconds and must not wait on a provider that takes seconds.
+        ["repo", "enrich"] => {
+            let outcomes = store.enrich_semantic(&root)?;
+            let mut report = Report::default();
+            for outcome in &outcomes {
+                match outcome {
+                    SemanticOutcome::Current {
+                        languages,
+                        provider,
+                        resolved,
+                        occurrences,
+                        timing,
+                    } => {
+                        report
+                            .section(format!(
+                                "Semantic enrichment ({})",
+                                languages
+                                    .iter()
+                                    .map(|l| format!("{l:?}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ))
+                            .field("Status", "CURRENT")
+                            .field("Provider", provider)
+                            .field("Occurrences", occurrences)
+                            .field(
+                                "Proven",
+                                format!("{resolved} relation(s) syntax could not prove"),
+                            )
+                            .field(
+                                "Timing",
+                                format!(
+                                    "provider {} ms, parse {} ms, match {} ms, write {} ms",
+                                    timing.provider_ms,
+                                    timing.parse_ms,
+                                    timing.match_ms,
+                                    timing.write_ms
+                                ),
+                            );
+                    }
+                    SemanticOutcome::Unavailable { languages, reason } => {
+                        report
+                            .section(format!("Semantic enrichment ({})", languages.iter().map(|l| format!("{l:?}")).collect::<Vec<_>>().join(", ")))
+                            .field("Status", "UNAVAILABLE")
+                            .field("Reason", reason)
+                            .text("Relations syntax cannot prove stay UNKNOWN, which is not proof they are absent.");
+                    }
+                }
+            }
+            report
+                .section("")
+                .text("Re-indexing discards semantic evidence; run agentctl repo enrich again after re-indexing.");
+            output(json, &outcomes, &report.to_string())
+        }
         ["repo", "index"] => {
             let stats = store.index_repository(&root)?;
-            output(
-                json,
-                &stats,
-                &format!(
-                    "{} discovered; {} indexed ({} existing changed), {} reused, {} deleted, {} failed\n{} entities, {} edges ({} resolved workspace-wide); {} ms\nGeneration: {}",
-                    stats.discovered,
-                    stats.indexed,
-                    stats.changed,
-                    stats.reused,
-                    stats.deleted,
-                    stats.failed,
-                    stats.entities,
-                    stats.edges,
-                    stats.resolved,
-                    stats.duration_ms,
-                    generation_line(stats.generation.as_ref())
-                ),
-            )?;
-            if !json {
-                println!(
-                    "{}",
-                    crate::local::terminal::human(&lifecycle_line(&store.ontology_status(&root)?))
-                );
-            }
+            let human = if json {
+                String::new()
+            } else {
+                let mut report = Report::new("Index");
+                report
+                    .field(
+                        "Files",
+                        format!(
+                            "{} discovered, {} indexed ({} changed), {} reused, {} deleted, {} failed",
+                            stats.discovered,
+                            stats.indexed,
+                            stats.changed,
+                            stats.reused,
+                            stats.deleted,
+                            stats.failed
+                        ),
+                    )
+                    .field(
+                        "Graph",
+                        format!(
+                            "{} entities, {} edges ({} resolved workspace-wide)",
+                            stats.entities, stats.edges, stats.resolved
+                        ),
+                    )
+                    .field("Generation", generation_line(stats.generation.as_ref()))
+                    .field("Semantic", semantic_line(store.index_status(&root)?.semantic()))
+                    .field("Duration", format!("{} ms", stats.duration_ms));
+                lifecycle_report(&mut report, &store.ontology_status(&root)?);
+                if store.index_status(&root)?.semantic().is_none() {
+                    report.next(["agentctl repo enrich    (attach semantic evidence, if a provider is installed)"]);
+                }
+                report.to_string()
+            };
+            output(json, &stats, &human)?;
             require(
                 stats.failed == 0,
                 "index is partial: file failures invalidated old facts; inspect repo index --status",
@@ -42,36 +119,49 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
         ["ontology", command, rest @ ..] => ontology(store, &root, command, rest, json),
         ["repo", "index", "--status"] => {
             let status = store.index_status(&root)?;
-            output(
-                json,
-                &status,
-                &format!(
-                    "Repository: {}\nWorkspace: {}\nIndex: {}\n{} indexed files, {} stale, {} failed; {} entities, {} edges\nLast index: {}\nGeneration: {}\nBackends: {}",
-                    status.repository_id.as_str(),
-                    status.workspace_id.as_str(),
-                    if status.fresh {
-                        "hash-checked"
-                    } else {
-                        "missing/stale/partial"
-                    },
-                    status.indexed_files,
-                    status.stale_files.len(),
-                    status.failed_files.len(),
-                    status.entities,
-                    status.edges,
-                    status.index.as_ref().map_or("never".into(), |m| format!(
-                        "{} ({})",
-                        m.indexed_at_ms, m.version
-                    )),
-                    generation_line(status.generation()),
-                    status
-                        .backends
-                        .iter()
-                        .map(|(backend, count)| format!("{backend}: {count} files"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )
+            output(json, &status, &{
+                let mut report = Report::new("Index");
+                report
+                    .field("Repository", status.repository_id.as_str())
+                    .field("Workspace", status.workspace_id.as_str())
+                    .field(
+                        "Status",
+                        if status.fresh {
+                            "FRESH (hash-checked)"
+                        } else {
+                            "STALE (missing, stale or partial)"
+                        },
+                    )
+                    .field(
+                        "Files",
+                        format!(
+                            "{} indexed, {} stale, {} failed",
+                            status.indexed_files,
+                            status.stale_files.len(),
+                            status.failed_files.len()
+                        ),
+                    )
+                    .field(
+                        "Graph",
+                        format!("{} entities, {} edges", status.entities, status.edges),
+                    )
+                    .field(
+                        "Last index",
+                        status.index.as_ref().map_or("never".into(), |m| {
+                            format!("{} ms ({})", m.indexed_at_ms, m.version)
+                        }),
+                    )
+                    .field("Generation", generation_line(status.generation()))
+                    .field("Semantic", semantic_line(status.semantic()));
+                report.section("Backends");
+                for (backend, count) in &status.backends {
+                    report.field(backend, format!("{count} file(s)"));
+                }
+                if !status.fresh {
+                    report.next(["agentctl repo index"]);
+                }
+                report.to_string()
+            })
         }
         ["code", command, query, flags @ ..] => {
             let context = ["context", "impact", "neighbors"].contains(command);
@@ -134,7 +224,7 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
                         RelationKind::References
                     };
                     let result = graph.relations(query, true, Some(kind), limit)?;
-                    let lines = result
+                    let mut lines: Vec<String> = result
                         .data
                         .iter()
                         .map(|e| {
@@ -150,6 +240,14 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
                             )
                         })
                         .collect();
+                    // Without this an empty answer reads as "nothing calls it".
+                    if let Some(unresolved) = &result.unresolved {
+                        lines.push(format!(
+                            "{} unresolved site(s) name this symbol and are not proven relations: {}",
+                            unresolved.sites,
+                            unresolved.paths.join(", ")
+                        ));
+                    }
                     output(json, &result, &human_results(&result.freshness, lines))
                 }
                 "context" | "impact" | "neighbors" => {
@@ -162,33 +260,37 @@ pub(crate) fn run(store: &mut Store, args: &[&str], json: bool) -> Result<()> {
                     let mut lines: Vec<_> = result
                         .primary
                         .iter()
-                        .map(|r| format!("primary  {}", entity_line(&r.entity)))
+                        .map(|r| format!("primary   {}", entity_line(&r.entity)))
                         .collect();
                     lines.extend(
                         result
                             .neighbors
                             .iter()
-                            .map(|e| format!("neighbor {}", entity_line(e))),
+                            .map(|e| format!("neighbor  {}", entity_line(e))),
                     );
                     lines.extend(
                         result
                             .tests
                             .iter()
-                            .map(|e| format!("test     {}", entity_line(e))),
+                            .map(|e| format!("test      {}", entity_line(e))),
                     );
                     lines.push(format!(
-                        "{} relations; bounded/truncated={}\n{}",
+                        "\n{} relation(s){}\n{}",
                         result.relations.len(),
-                        result.truncated,
+                        if result.truncated {
+                            "; truncated to limits"
+                        } else {
+                            ""
+                        },
                         result.meaning
                     ));
                     if *command == "context" {
                         let memory = store.memory_for_code(&root, &result, memory_limits)?;
                         for m in &memory.items {
                             lines.push(format!(
-                                "memory [{} {:?}] {}: {}",
-                                serde_json::to_string(&m.trust)?.trim_matches('"'),
-                                m.validity,
+                                "memory    [{} {}] {}: {}",
+                                name(&m.trust),
+                                name(&m.validity),
                                 m.id,
                                 m.content
                             ));
@@ -279,17 +381,27 @@ fn ontology(
         "status" => {
             require(positional.is_empty(), "ontology status takes no arguments")?;
             let status = store.ontology_status(root)?;
-            output(json, &status, &lifecycle_line(&status))
+            let mut report = Report::default();
+            lifecycle_report(&mut report, &status);
+            output(json, &status, &report.to_string())
         }
         "list" => {
             require(positional.is_empty(), "ontology list takes no arguments")?;
             let records = store.ontology_generations(root, limit.unwrap_or(20).min(1000))?;
-            let lines: Vec<_> = records.iter().map(record_line).collect();
-            output(json, &records, &lines.join("\n"))
+            let mut report = Report::default();
+            if records.is_empty() {
+                report.text("No ontology generations; run agentctl repo index");
+            }
+            for record in &records {
+                record_report(&mut report, "Generation", record);
+            }
+            output(json, &records, &report.to_string())
         }
         "show" => {
             let record = store.ontology_generation(root, one("a generation ID")?)?;
-            output(json, &record, &record_line(&record))
+            let mut report = Report::default();
+            record_report(&mut report, "Generation", &record);
+            output(json, &record, &report.to_string())
         }
         "delta" => {
             let delta = match (flags.get("from"), flags.get("to"), positional.as_slice()) {
@@ -329,41 +441,40 @@ fn ontology(
                 one("a generation ID")?,
                 flags.get("reason").copied(),
             )?;
-            output(json, &record, &format!("Accepted {}", record_line(&record)))
+            let mut report = Report::default();
+            record_report(&mut report, "Generation accepted", &record);
+            output(json, &record, &report.to_string())
         }
         _ => {
             let reason = flags
                 .get("reason")
                 .ok_or_else(|| Error::Invalid("ontology reject needs --reason TEXT".into()))?;
             let record = store.reject_generation(root, one("a generation ID")?, reason)?;
-            output(json, &record, &format!("Rejected {}", record_line(&record)))
+            let mut report = Report::default();
+            record_report(&mut report, "Generation rejected", &record);
+            output(json, &record, &report.to_string())
         }
     }
 }
 
-fn record_line(r: &OntologyGeneration) -> String {
+fn record_report(report: &mut Report, title: &str, r: &OntologyGeneration) {
     let origin = match &r.origin {
-        GenerationOrigin::External => "external".to_string(),
+        GenerationOrigin::External => "external (repo index)".to_string(),
         GenerationOrigin::Runtime { plan_id, task_id } => format!(
             "runtime {}{}",
             plan_id.as_str(),
             task_id
                 .as_ref()
-                .map(|t| format!("/{}", t.as_str()))
+                .map(|t| format!(" / {}", t.as_str()))
                 .unwrap_or_default()
         ),
     };
-    let decision = r
-        .closure
-        .as_ref()
-        .or(r.acceptance.as_ref())
-        .map(|d| format!(" [{:?}]", d.reason))
-        .unwrap_or_default();
+    let decision = r.closure.as_ref().or(r.acceptance.as_ref());
     let delta = match &r.delta {
         DeltaStatus::NoBase => "no base".to_string(),
-        DeltaStatus::Unavailable { reason } => format!("delta unavailable: {reason}"),
+        DeltaStatus::Unavailable { reason } => format!("unavailable: {reason}"),
         DeltaStatus::Recorded { summary: s, .. } => format!(
-            "vs {}: entities +{} -{} ~{}, relations +{} -{}, {} files ({} semantic){}",
+            "vs {}\nentities +{} -{} ~{}; relations +{} -{}; {} files ({} semantic){}",
             r.base.as_deref().unwrap_or("-"),
             s.entities_added,
             s.entities_removed,
@@ -373,54 +484,73 @@ fn record_line(r: &OntologyGeneration) -> String {
             s.files,
             s.semantic_files,
             if s.unproven_identity > 0 {
-                format!(", {} with unproven identity", s.unproven_identity)
+                format!("; {} with unproven identity", s.unproven_identity)
             } else {
                 String::new()
             }
         ),
     };
-    format!(
-        "{}  {:?}{}  sequence {}  {}\n  {} files, {} entities, {} relations; {}",
-        r.generation_id,
-        r.state,
-        decision,
-        r.generation.sequence,
-        origin,
-        r.files,
-        r.entities,
-        r.relations,
-        delta
-    )
+    report
+        .section(title)
+        .field("ID", &r.generation_id)
+        .field("Status", name(&r.state))
+        .field_opt("Decision", decision.map(|d| name(&d.reason)))
+        .field("Sequence", r.generation.sequence)
+        .field("Origin", origin)
+        .field(
+            "Content",
+            format!(
+                "{} files, {} entities, {} relations",
+                r.files, r.entities, r.relations
+            ),
+        )
+        .field("Delta", delta);
 }
 
-fn lifecycle_line(s: &OntologyStatus) -> String {
-    let accepted = s.accepted.as_ref().map_or("none".into(), |a| {
-        format!("{} (sequence {})", a.generation_id, a.generation.sequence)
-    });
-    let mut lines = vec![format!("Accepted ontology: {accepted}")];
+/// The accepted/indexed generation relationship, as its own section.
+fn lifecycle_report(report: &mut Report, s: &OntologyStatus) {
+    report.section("Ontology").field(
+        "Accepted",
+        s.accepted.as_ref().map_or("none".into(), |a| {
+            format!("{} (sequence {})", a.generation_id, a.generation.sequence)
+        }),
+    );
     if s.live_accepted {
-        lines.push("Indexed generation is the accepted generation.".into());
-    } else if let Some(observed) = &s.observed {
-        lines.push(format!(
-            "Indexed generation is NOT accepted: {}",
-            record_line(observed)
-        ));
-        if observed.state == GenerationState::Candidate {
-            lines.push(format!(
-                "Inspect: agentctl ontology delta {id}\nAccept:  agentctl ontology accept {id}",
-                id = observed.generation_id
-            ));
-        }
-    } else {
-        lines.push("Indexed generation has no lifecycle record; run agentctl repo index".into());
+        report.text("Indexed generation is the accepted generation.");
+        return;
     }
-    lines.join("\n")
+    let Some(observed) = &s.observed else {
+        report
+            .field("Indexed", "no lifecycle record")
+            .next(["agentctl repo index"]);
+        return;
+    };
+    report.field(
+        "Indexed",
+        format!(
+            "{} — {}, NOT accepted",
+            observed.generation_id,
+            name(&observed.state)
+        ),
+    );
+    if observed.state == GenerationState::Candidate {
+        report.next([
+            format!(
+                "Inspect: agentctl ontology delta {}",
+                observed.generation_id
+            ),
+            format!(
+                "Accept:  agentctl ontology accept {}",
+                observed.generation_id
+            ),
+        ]);
+    }
 }
 
 fn delta_lines(full: &SemanticDelta, selected: &SemanticDelta) -> String {
     let s = &full.summary;
     let mut lines = vec![format!(
-        "{} (sequence {}) -> {} (sequence {})\nentities +{} -{} ~{}; relations +{} -{}; {} files ({} semantic); {} unproven identity",
+        "Delta {} (sequence {}) -> {} (sequence {})\n  entities +{} -{} ~{}; relations +{} -{}; {} files ({} semantic); {} unproven identity\n",
         full.from.generation_id,
         full.from.generation.sequence,
         full.to.generation_id,
@@ -436,8 +566,11 @@ fn delta_lines(full: &SemanticDelta, selected: &SemanticDelta) -> String {
     )];
     for f in &selected.files {
         lines.push(format!(
-            "file {:?}  {}  ({} entity, {} relation changes)",
-            f.content, f.path, f.entities, f.relations
+            "file      {:<9}  {}  ({} entity, {} relation changes)",
+            name(&f.content),
+            f.path,
+            f.entities,
+            f.relations
         ));
     }
     for e in &selected.entities {
@@ -446,16 +579,12 @@ fn delta_lines(full: &SemanticDelta, selected: &SemanticDelta) -> String {
         } else {
             format!(
                 " {}",
-                e.fields
-                    .iter()
-                    .map(|f| format!("{f:?}").to_uppercase())
-                    .collect::<Vec<_>>()
-                    .join(",")
+                e.fields.iter().map(name).collect::<Vec<_>>().join(",")
             )
         };
         lines.push(format!(
-            "entity {:?}{}  {:?} {}  {}{}",
-            e.change,
+            "entity    {:<9}{}  {:?} {}  {}{}",
+            name(&e.change),
             if e.identity == IdentityBasis::DuplicateOrdinal {
                 " (unproven identity)"
             } else {
@@ -469,8 +598,8 @@ fn delta_lines(full: &SemanticDelta, selected: &SemanticDelta) -> String {
     }
     for r in &selected.relations {
         lines.push(format!(
-            "relation {:?}  {:?} {} -> {}  ({} -> {})",
-            r.change,
+            "relation  {:<9}  {:?} {} -> {}  ({} -> {})",
+            name(&r.change),
             r.kind,
             r.source.as_str(),
             r.target.as_str(),
@@ -490,7 +619,7 @@ fn generation_line(generation: Option<&GraphGeneration>) -> String {
 
 fn entity_line(e: &Entity) -> String {
     format!(
-        "{}  {}:{}  {:?}\n  {}",
+        "{}  {}:{}  {:?}\n          {}",
         e.qualified_name,
         e.provenance.path,
         e.range.start_line,
@@ -502,18 +631,12 @@ fn human_results(status: &IndexStatus, mut lines: Vec<String>) -> String {
     if lines.is_empty() {
         lines.push("No matching indexed facts".into());
     }
-    lines.insert(
-        0,
-        format!(
-            "Workspace: {} — {}",
-            status.workspace_id.as_str(),
-            if status.fresh {
-                "hash-checked source observation"
-            } else {
-                "PARTIAL: failed files excluded (see repo index --status)"
-            }
-        ),
-    );
+    if !status.fresh {
+        lines.insert(
+            0,
+            "Index is PARTIAL: failed files are excluded (agentctl repo index --status)\n".into(),
+        );
+    }
     lines.join("\n")
 }
 fn output(json: bool, value: &impl Serialize, human: &str) -> Result<()> {

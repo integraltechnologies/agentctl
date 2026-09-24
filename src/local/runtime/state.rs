@@ -38,6 +38,15 @@ pub struct PendingTask {
     /// Ontology generation against which executor context was issued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ontology_generation: Option<String>,
+    /// Canonical source immediately *before* this branch was published into it.
+    /// Serial results omit it: they never leave canonical source, so their diff
+    /// and their checks already share one identity. For a concurrent branch the
+    /// diff is captured in an isolated worktree while the checks run on
+    /// canonical source, and this is the only identity in that chain the run
+    /// record would otherwise discard — `after` already holds what publication
+    /// produced, so nothing else needs storing to state the whole relationship.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciled_from: Option<ArtifactRef>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +109,26 @@ pub struct RunRecord {
     /// relay, and omitted while empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub context: BTreeMap<String, context::ContextLedger>,
+    /// Bounded relaunch budget already spent per task. A relaunch is only ever
+    /// granted when the workspace still equals this run's `expected` source, so
+    /// the counter records recoveries from launches that provably mutated
+    /// nothing — never a retry of unverified work.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub executor_relaunches: BTreeMap<TaskId, u32>,
+    /// The last executor result agentctl captured but has not accepted. It is
+    /// the exact authority `agentctl run restore` uses to discard a refused
+    /// result: only files this diff recorded may be rewritten, so an operator's
+    /// own edits can never be destroyed. Cleared the moment a task is VERIFIED.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<ArtifactRef>,
+    /// The last source this run actually *verified*, which is what discarding a
+    /// refused result must rewind to. It is deliberately not `expected`:
+    /// reconciliation publishes a concurrent branch into canonical source and
+    /// advances `expected` before that branch is verified, so `expected` can
+    /// carry work no verifier has accepted. Advanced only alongside a
+    /// TASK_VERIFIED transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<ArtifactRef>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -118,7 +147,7 @@ pub struct RuntimeJob {
     /// authority identity; this path makes isolation inspectable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_root: Option<String>,
-    /// Planner jobs have no Stage 0 plan/job row. This is their sole usage
+    /// Planner jobs have no protocol plan/job row. This is their sole usage
     /// observation; plan-associated jobs continue using canonical usage events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner_usage: Option<TokenUsageEvent>,
@@ -160,6 +189,40 @@ pub struct RuntimeJob {
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
     pub failure: Option<String>,
+    /// How a failed or refused exchange is classified. Absent on successes and
+    /// on jobs recorded before the taxonomy existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<OutcomeClass>,
+}
+
+/// What a provider exchange that did not yield accepted output means for the
+/// control plane. The class decides whether agentctl may try again; the
+/// failure text says why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OutcomeClass {
+    /// Timeout, transient process failure, or a reply that is not the
+    /// canonical document: retrying cannot change accepted state.
+    RetryableProviderFailure,
+    /// Authentication, quota/rate limit or unavailable provider: retrying now
+    /// is pointless, but the work is not wrong and may resume later.
+    NonretryableProviderFailure,
+    /// A valid canonical document that deliberately declines the work (an
+    /// executor BLOCKED/FAILED result). Never retried automatically.
+    SemanticRejection,
+    /// A parseable canonical document that violates an agentctl contract rule.
+    ValidationFailure,
+}
+
+impl std::fmt::Display for OutcomeClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RetryableProviderFailure => "RETRYABLE_PROVIDER_FAILURE",
+            Self::NonretryableProviderFailure => "NONRETRYABLE_PROVIDER_FAILURE",
+            Self::SemanticRejection => "SEMANTIC_REJECTION",
+            Self::ValidationFailure => "VALIDATION_FAILURE",
+        })
+    }
 }
 
 pub(super) fn event(

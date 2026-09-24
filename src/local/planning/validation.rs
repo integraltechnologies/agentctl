@@ -55,7 +55,15 @@ pub(super) fn checks(policy: &ProjectConfig, v: &VerificationRequirements) -> Re
     for r in &v.requirement_refs {
         require(
             policy.verification.contains_key(r),
-            format!("verification reference {r} is not defined in project policy"),
+            format!(
+                "[PLAN-VERIFICATION] verification reference {r} is not defined in project policy; use only keys of policy.verification ({})",
+                policy
+                    .verification
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         )?;
     }
     Ok(())
@@ -213,9 +221,11 @@ pub(super) fn source_matches(
 pub(super) fn validate(c: &Connection, info: &RepositoryInfo, p: &ExecutionPlan) -> Result<()> {
     require(
         size(p)? <= 262144 && p.packet.tasks.len() <= 32,
-        "execution plan exceeds 256 KiB / 32 tasks",
+        "[PLAN-BOUNDS] execution plan exceeds 256 KiB / 32 tasks",
     )?;
-    p.packet.validate()?;
+    p.packet
+        .validate()
+        .map_err(|e| Error::Invalid(format!("[PLAN-TASK-IDS] {e}")))?;
     provenance(&p.metadata.provenance)?;
     let prepared = request(c, info, &p.metadata.request_id)?;
     check_intent(&prepared.request.intent)?;
@@ -225,7 +235,7 @@ pub(super) fn validate(c: &Connection, info: &RepositoryInfo, p: &ExecutionPlan)
     )?;
     require(
         p.packet.objective == prepared.request.intent.objective,
-        "plan objective differs from durable user intent",
+        "[PLAN-OBJECTIVE] packet.objective must equal planner_packet.request.intent.objective byte for byte",
     )?;
     require(
         p.metadata.created_at_ms >= prepared.request.created_at_ms
@@ -254,7 +264,10 @@ pub(super) fn validate(c: &Connection, info: &RepositoryInfo, p: &ExecutionPlan)
                     .contains(r)
             }) && (!required.evidence_required
                 || p.packet.integration_verification.evidence_required),
-            "integration weakens requested verification",
+            format!(
+                "[PLAN-VERIFICATION] integration_verification must include requirement_refs {:?} with evidence_required {}",
+                required.requirement_refs, required.evidence_required
+            ),
         )?;
     }
     let integration = &p.metadata.integration;
@@ -275,11 +288,20 @@ pub(super) fn validate(c: &Connection, info: &RepositoryInfo, p: &ExecutionPlan)
                 .definition_of_done
                 .iter()
                 .all(|d| integration.expectations.contains(d)),
-        "integration must carry requested done criteria",
+        format!(
+            "[PLAN-DONE] integration_expectations must be nonempty and contain every requested done criterion verbatim; missing: {:?}",
+            prepared
+                .request
+                .intent
+                .definition_of_done
+                .iter()
+                .filter(|d| !integration.expectations.contains(d))
+                .collect::<Vec<_>>()
+        ),
     )?;
     require(
         p.metadata.contracts.len() == p.packet.tasks.len(),
-        "every task requires exactly one verification contract",
+        "[PLAN-OUTPUT] every task requires exactly one task_contracts entry",
     )?;
     let mut seen = BTreeSet::new();
     let mut graph_refs = BTreeSet::new();
@@ -287,17 +309,26 @@ pub(super) fn validate(c: &Connection, info: &RepositoryInfo, p: &ExecutionPlan)
     for contract in &p.metadata.contracts {
         require(
             seen.insert(contract.task_id.clone()),
-            "duplicate verification contract",
+            format!(
+                "[PLAN-OUTPUT] duplicate task_contracts entry for {}",
+                contract.task_id.as_str()
+            ),
         )?;
         let task = p
             .packet
             .tasks
             .iter()
             .find(|t| t.task_id == contract.task_id)
-            .ok_or_else(|| Error::Invalid("contract names an unknown task".into()))?;
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "[PLAN-OUTPUT] task_contracts names {}, which is not a packet task",
+                    contract.task_id.as_str()
+                ))
+            })?;
+        let t = task.task_id.as_str();
         require(
             size(task)? <= 16384 && size(contract)? <= 8192,
-            "task/contract exceeds 16/8 KiB",
+            format!("[PLAN-BOUNDS] task {t} or its contract exceeds 16/8 KiB"),
         )?;
         require(
             contract.independent_verifier && contract.task_packet_hash == hash(task)?,
@@ -305,26 +336,36 @@ pub(super) fn validate(c: &Connection, info: &RepositoryInfo, p: &ExecutionPlan)
         )?;
         require(
             !task.read_scope.is_empty() || !task.write_scope.is_empty(),
-            "task must have bounded explicit scope",
+            format!("[PLAN-SCOPE] task {t} has neither read_scope nor write_scope"),
         )?;
         require(
             task.read_scope.len() + task.write_scope.len() <= 32
                 && task.graph_entities.len() <= 32
                 && contract.memory_refs.len() <= 32
                 && contract.exclusions.len() <= 32,
-            "task reference/scope limits exceeded",
+            format!(
+                "[PLAN-BOUNDS] task {t} exceeds 32 scope entries, graph_entities, memory_refs or exclusions"
+            ),
         )?;
         texts(&contract.non_goals, "task non-goals")?;
         for exclude in &contract.exclusions {
             crate::validation::repo_path(exclude.path())?;
         }
-        checks(&policy, &task.verification)?;
-        validate_invariants(c, info, &policy, &task.invariant_refs)?;
+        checks(&policy, &task.verification)
+            .map_err(|e| Error::Invalid(format!("task {t}: {e}")))?;
+        validate_invariants(c, info, &policy, &task.invariant_refs)
+            .map_err(|e| Error::Invalid(format!("[PLAN-INVARIANTS] task {t}: {e}")))?;
         require(
             task.invariant_refs
                 .iter()
                 .all(|r| prepared.context.invariants.contains_key(r)),
-            "task adds an invariant outside prepared intent; prepare a new request including it",
+            format!(
+                "[PLAN-INVARIANTS] task {t} lists invariant(s) {:?} that are not keys of planner_packet.context.invariants",
+                task.invariant_refs
+                    .iter()
+                    .filter(|r| !prepared.context.invariants.contains_key(*r))
+                    .collect::<Vec<_>>()
+            ),
         )?;
         require(
             prepared
@@ -333,11 +374,22 @@ pub(super) fn validate(c: &Connection, info: &RepositoryInfo, p: &ExecutionPlan)
                 .invariant_refs
                 .iter()
                 .all(|r| task.invariant_refs.contains(r)),
-            "task omits a critical request/project invariant",
+            format!(
+                "[PLAN-INVARIANTS] task {t} omits required invariant(s) {:?}; every task's invariant_refs must contain every id in planner_packet.request.intent.invariant_refs",
+                prepared
+                    .request
+                    .intent
+                    .invariant_refs
+                    .iter()
+                    .filter(|r| !task.invariant_refs.contains(r))
+                    .collect::<Vec<_>>()
+            ),
         )?;
         for (scopes, write) in [(&task.read_scope, false), (&task.write_scope, true)] {
             for s in scopes {
-                safe_scope(&info.root, &policy, s, write)?;
+                safe_scope(&info.root, &policy, s, write).map_err(|e| {
+                    Error::Invalid(format!("[PLAN-SCOPE] task {t} path {}: {e}", s.path()))
+                })?;
                 require(
                     prepared.request.intent.scope.is_empty()
                         || prepared.request.intent.scope.iter().any(|parent| {
@@ -345,14 +397,27 @@ pub(super) fn validate(c: &Connection, info: &RepositoryInfo, p: &ExecutionPlan)
                                 && (matches!(parent, ScopePath::Directory { .. })
                                     || matches!(s, ScopePath::File { .. }))
                         }),
-                    "task exceeds requested scope",
+                    format!(
+                        "[PLAN-SCOPE] task {t} path {} lies outside the requested scope {:?}",
+                        s.path(),
+                        prepared
+                            .request
+                            .intent
+                            .scope
+                            .iter()
+                            .map(ScopePath::path)
+                            .collect::<Vec<_>>()
+                    ),
                 )?;
                 require(
                     !contract
                         .exclusions
                         .iter()
                         .any(|excluded| overlap(excluded, s)),
-                    "task scope contradicts an exclusion",
+                    format!(
+                        "[PLAN-EXCLUSIONS] task {t} declares scope {} that overlaps one of its own exclusions",
+                        s.path()
+                    ),
                 )?;
             }
         }
@@ -367,19 +432,34 @@ pub(super) fn validate(c: &Connection, info: &RepositoryInfo, p: &ExecutionPlan)
                 .optional()?;
             let e: graph::Entity = serde_json::from_str(&json.ok_or_else(|| {
                 Error::Invalid(format!(
-                    "graph reference {} is missing in this workspace",
+                    "[PLAN-GRAPH-REFS] task {t} references {}, which is not an entity id in this workspace; copy exact graph:<64 hex> ids from planner_packet or use []",
                     id.as_str()
                 ))
             })?)?;
             require(
                 p.metadata.source.support.contains(&e.provenance),
-                "graph reference is outside prepared source support; prepare context including its file",
+                format!(
+                    "[PLAN-GRAPH-REFS] task {t} references {} in {}, which is not a prepared support file ({}); drop the reference",
+                    id.as_str(),
+                    e.provenance.path,
+                    p.metadata
+                        .source
+                        .support
+                        .iter()
+                        .map(|s| s.path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             )?;
             require(
                 task.read_scope
                     .iter()
                     .any(|s| permits(s, &e.provenance.path)),
-                "graph reference requires explicit read scope",
+                format!(
+                    "[PLAN-GRAPH-REFS] task {t} references {} in {}, which is outside its read_scope; add that file to read_scope or drop the reference",
+                    id.as_str(),
+                    e.provenance.path
+                ),
             )?;
         }
         memory_refs.extend(contract.memory_refs.iter().cloned());
@@ -389,36 +469,37 @@ pub(super) fn validate(c: &Connection, info: &RepositoryInfo, p: &ExecutionPlan)
         "plan reference bounds exceeded",
     )?;
     for id in memory_refs {
-        memory::planning_reference(c, info, &id, prepared.context.limits.memory.notes > 0)?;
+        memory::planning_reference(c, info, &id, prepared.context.limits.memory.notes > 0)
+            .map_err(|e| Error::Invalid(format!("[PLAN-MEMORY] {}: {e}", id.as_str())))?;
     }
     if let Some(replan) = &p.metadata.replan {
         text(&replan.reason, 1024, "replan reason")?;
         require(
             replan.previous_plan_id != p.packet.plan_id,
-            "self-replan is invalid",
+            "[PLAN-REPLAN] self-replan is invalid",
         )?;
         let prior = load(c, info, &replan.previous_plan_id)?;
         require(
             matches!(prior.state, PlanState::Validated | PlanState::Active)
                 || prior.state == PlanState::Superseded
                     && prior.superseded_by.as_ref() == Some(&p.packet.plan_id),
-            "prior plan is terminal or was superseded by another replacement",
+            "[PLAN-REPLAN] prior plan is terminal or was superseded by another replacement",
         )?;
         let states = store::task_states(c, &info.repository_id, &replan.previous_plan_id)?;
         require(
             replan.previously_verified_tasks.len() + replan.replaced_tasks.len() <= 64,
-            "too many replan references",
+            "[PLAN-REPLAN] too many replan references",
         )?;
         for id in &replan.previously_verified_tasks {
             require(
                 states.get(id) == Some(&TaskState::Verified),
-                "replan preserved-history reference is not VERIFIED",
+                "[PLAN-REPLAN] replan preserved-history reference is not VERIFIED",
             )?;
         }
         for id in &replan.replaced_tasks {
             require(
                 states.contains_key(id),
-                "replan replaced-history task is missing",
+                "[PLAN-REPLAN] replan replaced-history task is missing",
             )?;
         }
         require(
@@ -426,7 +507,7 @@ pub(super) fn validate(c: &Connection, info: &RepositoryInfo, p: &ExecutionPlan)
                 .previously_verified_tasks
                 .iter()
                 .all(|id| !replan.replaced_tasks.contains(id)),
-            "replan marks a task both retained and replaced",
+            "[PLAN-REPLAN] replan marks a task both retained and replaced",
         )?;
     }
     Ok(())
@@ -475,7 +556,7 @@ pub(super) fn integration_proof(
             ..
         } = event
         {
-            // Recheck historical packet ownership too: older Stage 4 databases
+            // Recheck historical packet ownership too: older databases
             // may contain proofs accepted before workspace binding was enforced.
             v.validate()?;
             require(

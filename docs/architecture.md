@@ -121,9 +121,17 @@ never an invented zero.
 | `~/.config/agentctl/config.toml` | machine configuration |
 | `~/.local/share/agentctl/state.sqlite3` | canonical database |
 | `~/.local/share/agentctl/runtime/` | `blobs/`: private content-addressed artifacts (source snapshots, diffs, bounded provider output, command logs), verified by hash and length on read; `scratch/`: per-job scratch directories; `locks/`: workspace leases |
+| `~/.local/share/agentctl-worktrees/` | managed linked worktrees for concurrent executors, per workspace and plan |
 | `~/.cache/agentctl/` | reconstructible cache; never the only copy of anything |
 
-All three roots honor absolute `XDG_*` overrides. See
+A managed worktree is a worker *workspace*, so it deliberately sits beside the
+data root rather than inside it: the security compiler refuses any workspace
+that lies within agentctl machine state, and that state stays fully denied to
+workers. Worktrees the durable run record no longer refers to are reclaimed at
+the start of every run and when a plan completes, so a crashed branch cannot
+accumulate.
+
+All four roots honor absolute `XDG_*` overrides. See
 [configuration.md](configuration.md#locations).
 
 **SQLite.** The database uses synchronous `rusqlite` with bundled SQLite. There is
@@ -215,8 +223,22 @@ involved.
   identity, since agentctl parses no Cargo.toml or workspace metadata to prove
   what that segment names. Cross-file resolutions live in a derived table
   rebuilt in the index transaction, so re-deriving one file never cascades
-  away another file's relations. Imports and re-exports are not followed,
-  macros are not expanded, and there is no type inference.
+  away another file's relations. Each imported path is its own `IMPORTS`
+  relation, resolved like any other path: Rust `crate::`/`super::`/`self::`
+  and in-crate paths, Python and TypeScript imports relative to the importing
+  file, and Python absolute imports anchored at the repository root (or a
+  unique multi-segment suffix). External, ambiguous and re-exported targets
+  stay unresolved; macros are not expanded, and there is no type inference.
+- **Semantic enrichment.** `repo enrich` runs each installed language
+  provider (`rust-analyzer`, `scip-python`; both via SCIP) and attaches what it
+  proves to the same `graph_resolutions` rows with rule `SEMANTIC_PROVIDER` and
+  the provider's identity. The boundary is a normalized occurrence (file,
+  line, column and unit, name, opaque symbol); a site is matched by the
+  rightmost occurrence inside its own span, and a target by the one innermost
+  declaration of that name around the symbol's single definition. Ambiguity,
+  missing providers, failures, unreadable output and sources that change while
+  the provider runs all leave relations UNKNOWN. Re-indexing discards semantic
+  rows, so they never outlive their generation.
 - **Generations.** Each index pass records a generation: a fingerprint over the
   index version and every indexed file's path, content hash, backend, and
   diagnostic, plus a per-workspace sequence that advances only when the
@@ -455,7 +477,7 @@ lifecycle adds:
 
 A delta says what changed. Impact analysis answers the next question — *what
 existing code or behavior could that plausibly affect, and what proves it?* —
-over the same Stage-1 ontology, with no second graph, no embeddings and no
+over the same accepted ontology, with no second graph, no embeddings and no
 model. The invariant is that **no impact claim exists without a machine
 inspectable evidence path through already-observed facts**, and that anything
 the ontology cannot prove is represented rather than guessed.
@@ -470,7 +492,7 @@ of three observed facts, and nothing else can create one:
   syntactic relations never form a hop;
 - **containment**, used only for the container of a declaration that was added
   or removed, whose composition therefore changed;
-- a **Stage-1 test association**, carrying its `AssociationBasis` so a
+- a **graph test association**, carrying its `AssociationBasis` so a
   container guess is never read as proven coverage.
 
 Items are typed by what the evidence shows:
@@ -491,7 +513,7 @@ is unproven), `DEPTH_LIMIT`, `FANOUT_LIMIT` and `ENTITY_ABSENT`.
 
 ### Seeds and change sensitivity
 
-Seeds come from a Stage-3 `SemanticDelta`, or from named entities analyzed as a
+Seeds come from a generation `SemanticDelta`, or from named entities analyzed as a
 prospective change. The delta's rule table is:
 
 - an **entity change** always seeds that entity. A `MODIFIED` entity whose only
@@ -536,7 +558,7 @@ it never widens read or write scope, it carries no source text, it adds no
 file to the request's provenance-bound support set, and it is the *first*
 record shed under the byte budget, so a packet with impact never displaces
 context a packet without it would have carried. Impact discovery is not
-authorization; out-of-envelope source still goes through the Stage-2 relay.
+authorization; out-of-envelope source still goes through the context relay.
 
 `ontology impact --plan <id>` reads an observed delta against a plan's declared
 write scope, which answers what a reviewer should check because of what
@@ -573,7 +595,7 @@ context. Memory content is data, never instructions.
 ## Planning
 
 ```text
-objective ─▶ plan prepare ─▶ PlannerPacket (frozen) ─▶ planner ─▶ ExecutionPlan
+objective ─▶ plan prepare ─▶ PlannerPacket (frozen) ─▶ planner ─▶ PlanDecision ─▶ ExecutionPlan
                                                                      │ import
                                                                      ▼
                                             VALIDATED ──activate──▶ ACTIVE ──▶ COMPLETE
@@ -603,6 +625,14 @@ objective ─▶ plan prepare ─▶ PlannerPacket (frozen) ─▶ planner ─�
   The integration contract is bound to the whole PlanPacket, requires all task
   verifications and the final diff and evidence, and states overall expectations.
   Hashes are BLAKE3 over compact JSON in declared field order.
+- **PlanDecision.** What a planner actually returns: the PlanPacket, one
+  contract decision per task (memory references, exclusions, non-goals), the
+  integration expectations, and an optional replan reference. agentctl derives
+  the envelope around it — every hash, the frozen source, the request identity
+  and the timestamps — so a contract binding its exact task is a property of
+  the control plane rather than a claim a provider makes. Measured: asking a
+  provider to hand-write the whole envelope produced an otherwise valid plan
+  followed by one surplus closing brace on every attempt, and no plan at all.
 - **Import.** Performs strict deserialization and protocol validation, then checks
   scope (within the request scope, clear of protected paths, `.git`, and symlink
   ancestors), references, source baseline, and contracts. Import produces
@@ -877,7 +907,7 @@ indexed generation. Plan-linked and runtime footprints are narrower: they must
 be the live plan-owned candidate's own accepted-base delta. The projection adds
 no table, artifact, graph, score, or policy gate. File, entity, visibility,
 identity, and resolved-relation records are the machine-inspectable evidence.
-Production/test separation reuses the Stage-1
+Production/test separation reuses the index's
 test-kind and path conventions and exposes that basis. Public surface is only
 claimed where the extractor records visibility (currently Rust). Review signals
 form a closed set and embed the exact facts that triggered them.
@@ -885,20 +915,20 @@ form a closed set and embed the exact facts that triggered them.
 The report must name the exact two ontology generation points and the compared-
 to generation must still be the indexed generation. Stale data fails closed.
 Plan review adds declared write scope and plan-level verification references
-only after the Stage-3 runtime ownership rule attributes the exact candidate to
+only after the runtime ownership rule attributes the exact candidate to
 that plan; neither changes the plan or proves that a particular entity was exercised. The
-integration verifier receives a compact report before the Stage-3 acceptance
+integration verifier receives a compact report before the ontology acceptance
 boundary. Planning receives none: before implementation there is no structural
 delta to report, and speculative structure would be weaker than the existing
 bounded context and impact view.
 
 The analyzer abstains from configuration/persistence classification, semantic
 duplication, unresolved import claims, non-Rust export claims, and per-entity
-test coverage. A later policy may interpret its signals; Stage 5 itself never
+test coverage. A later policy may interpret its signals; the footprint itself never
 accepts or rejects a generation and never grants context or filesystem access.
 Analysis currently materializes the complete recorded delta-derived fact and
 signal inputs before applying presentation limits. The 64 MiB `SemanticDelta`
-artifact ceiling remains the outer bound; Stage 5 does not add a separate
+artifact ceiling remains the outer bound; the footprint does not add a separate
 streaming or analysis-budget mechanism.
 
 ## Routing and prompt compilation

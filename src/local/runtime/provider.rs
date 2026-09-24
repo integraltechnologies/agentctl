@@ -46,6 +46,13 @@ pub trait ProviderAdapter: Send {
         config: &RoleConfig,
     ) -> Result<Box<dyn RunningProcess>>;
     fn collect(&self, output: &ProcessOutput) -> Result<Value>;
+    /// Provider-specific recognition of an infrastructure condition in a
+    /// failed exchange: `Some((retryable, summary))` when the raw output proves
+    /// one (for example an authentication or quota refusal). Only mechanical
+    /// signals the provider itself emits; never a judgement of model prose.
+    fn fault(&self, _output: &ProcessOutput) -> Option<(bool, String)> {
+        None
+    }
     /// A single final observation, never inferred from text length or cost.
     fn usage(&self, _output: &ProcessOutput) -> Result<Usage> {
         Ok(Usage::default())
@@ -143,6 +150,7 @@ impl ProviderAdapter for CodexAdapter {
                 serde_json::to_string(&process.scratch.join("codex-state"))?
             ),
         ]);
+        process.args.extend(codex_contract_args(input)?);
         if process.api_key.is_some() {
             process.args.extend([
                 "-c".into(),
@@ -164,6 +172,61 @@ impl ProviderAdapter for CodexAdapter {
     fn collect(&self, output: &ProcessOutput) -> Result<Value> {
         Ok(strict_json::from_slice(&output.stdout)?)
     }
+    fn fault(&self, output: &ProcessOutput) -> Option<(bool, String)> {
+        let text = String::from_utf8_lossy(&output.stderr);
+        let line = |needle: &str| {
+            text.lines()
+                .find(|l| l.contains(needle))
+                .map(|l| l.trim().chars().take(300).collect::<String>())
+        };
+        line("usage limit")
+            .or_else(|| line("rate limit"))
+            .or_else(|| line("401 Unauthorized"))
+            .or_else(|| line("Not logged in"))
+            .map(|summary| (false, summary))
+    }
+}
+/// The canonical role contract as Codex developer instructions: a
+/// configuration value Codex sends in its own developer channel, separate from
+/// the user turn. Codex's native `--output-schema` is not used: it requests
+/// strict structured output, which requires every property to be required,
+/// while canonical schemas legitimately have optional fields. The schema
+/// therefore travels in the job input and the reply is parsed strictly.
+pub fn codex_contract_args(input: &JobInput) -> Result<Vec<String>> {
+    let compiled = input
+        .compiled
+        .as_ref()
+        .ok_or_else(|| Error::Invalid("adapter requires compiled role instructions".into()))?;
+    Ok(vec![
+        "-c".into(),
+        // A JSON string is a valid TOML basic string.
+        format!(
+            "developer_instructions={}",
+            serde_json::to_string(&compiled.system)?
+        ),
+    ])
+}
+/// The canonical role contract through Claude Code's native channels: the
+/// system prompt (appended, so the CLI keeps its own tool instructions) and
+/// validated structured output, which arrives in the envelope's
+/// `structured_output` field. The CLI's validator does not accept the
+/// draft-2020-12 `$schema` identifier, so only that key is dropped; the schema
+/// itself is unchanged.
+pub fn claude_contract_args(input: &JobInput) -> Result<Vec<String>> {
+    let compiled = input
+        .compiled
+        .as_ref()
+        .ok_or_else(|| Error::Invalid("adapter requires compiled role instructions".into()))?;
+    let mut schema = compiled.schema.clone();
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("$schema");
+    }
+    Ok(vec![
+        "--append-system-prompt".into(),
+        compiled.system.clone(),
+        "--json-schema".into(),
+        serde_json::to_string(&schema)?,
+    ])
 }
 impl ProviderAdapter for ClaudeAdapter {
     fn fork(&self) -> Option<Box<dyn ProviderAdapter>> {
@@ -215,8 +278,6 @@ impl ProviderAdapter for ClaudeAdapter {
             "--tools".into(),
             if input.role == AgentRole::Executor && process.writable {
                 "Read,Edit,Write"
-            } else if input.role == AgentRole::Planner {
-                "Read,Bash"
             } else {
                 "Read"
             }
@@ -224,13 +285,12 @@ impl ProviderAdapter for ClaudeAdapter {
             "--allowedTools".into(),
             if input.role == AgentRole::Executor && process.writable {
                 "Read,Edit,Write"
-            } else if input.role == AgentRole::Planner {
-                "Read,Bash"
             } else {
                 "Read"
             }
             .into(),
         ];
+        process.args.extend(claude_contract_args(input)?);
         if let Some(model) = &config.model {
             process.args.extend(["--model".into(), model.clone()]);
         }
@@ -245,7 +305,8 @@ impl ProviderAdapter for ClaudeAdapter {
             response.get("is_error").and_then(Value::as_bool) != Some(true),
             "Claude reported a failed result",
         )?;
-        if let Some(value) = response.get("structured_output") {
+        // Native structured output: the CLI validated it against the schema.
+        if let Some(value) = response.get("structured_output").filter(|v| !v.is_null()) {
             return Ok(value.clone());
         }
         Ok(strict_json::from_str(
@@ -254,6 +315,29 @@ impl ProviderAdapter for ClaudeAdapter {
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::Invalid("Claude output is missing its JSON result".into()))?,
         )?)
+    }
+    fn fault(&self, output: &ProcessOutput) -> Option<(bool, String)> {
+        let response: Value = serde_json::from_slice(&output.stdout).ok()?;
+        if response.get("is_error").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let status = response.get("api_error_status").and_then(Value::as_u64);
+        let summary = response
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("Claude reported an error")
+            .chars()
+            .take(300)
+            .collect::<String>();
+        match status {
+            Some(401 | 403) => Some((false, format!("authentication refused ({summary})"))),
+            Some(429) => Some((false, format!("rate or usage limit ({summary})"))),
+            Some(500..=599) => Some((
+                true,
+                format!("provider server error {status:?} ({summary})"),
+            )),
+            _ => Some((true, summary)),
+        }
     }
     fn usage(&self, output: &ProcessOutput) -> Result<Usage> {
         let response: Value = serde_json::from_slice(&output.stdout)?;

@@ -1,4 +1,4 @@
-//! Stage 5 structural economy: concrete delta facts, conservative
+//! Structural footprint economy: concrete delta facts, conservative
 //! classification, bounded review signals, and unchanged authority/lifecycle.
 #[allow(dead_code)]
 mod common;
@@ -242,7 +242,7 @@ fn added_removed_and_public_declarations_are_distinguished() {
 }
 
 #[test]
-fn visibility_expansion_is_reported_only_where_stage1_supports_it() {
+fn visibility_expansion_is_reported_only_where_the_index_records_it() {
     let f = Fixture::new(&[
         ("src/core.rs", "fn hidden() {}\n"),
         ("pkg/tool.py", "def hidden():\n    return 1\n"),

@@ -394,20 +394,6 @@ impl Store {
 
     /// Inserts an immutable plan and all its tasks atomically, initially PLANNED.
     /// A single-task plan is the creation API for an individual TaskPacket.
-    pub fn create_plan(
-        &mut self,
-        repo: &RepositoryId,
-        plan: &PlanPacket,
-        timestamp_ms: u64,
-    ) -> Result<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        insert_plan(&tx, repo, plan, timestamp_ms)?;
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn plan(&self, repo: &RepositoryId, id: &PlanId) -> Result<Option<PlanPacket>> {
         plan(&self.connection, repo, id)
     }
@@ -484,7 +470,7 @@ impl Store {
             "task transition plan/verifier workspace mismatch",
         )?;
         let links = Links {
-            // Stage-4 tasks inherit their canonical workspace from the
+            // Execution-plan tasks inherit their canonical workspace from the
             // execution plan on every transition. A verifier job is an
             // additional equality check, not the sole source of identity.
             workspace_id: plan_workspace.or(verifier_workspace),
@@ -508,25 +494,16 @@ impl Store {
         Ok(())
     }
 
-    pub fn register_job(&mut self, repo: &RepositoryId, job: &AgentJob) -> Result<()> {
-        self.register_job_at(repo, None, job)
-    }
-
+    /// Every job is bound to the workspace that issued it. There is no
+    /// repository-only registration: an unbound job could not be reconciled
+    /// with the checkout its work belongs to.
     pub fn register_job_in_workspace(
         &mut self,
         repo: &RepositoryId,
         workspace: &WorkspaceId,
         job: &AgentJob,
     ) -> Result<()> {
-        self.register_job_at(repo, Some(workspace), job)
-    }
-
-    fn register_job_at(
-        &mut self,
-        repo: &RepositoryId,
-        workspace: Option<&WorkspaceId>,
-        job: &AgentJob,
-    ) -> Result<()> {
+        let workspace = Some(workspace);
         job.validate()?;
         require(
             job.state == JobState::Queued,
@@ -573,10 +550,6 @@ impl Store {
 
     pub fn job(&self, repo: &RepositoryId, id: &JobId) -> Result<Option<AgentJob>> {
         job(&self.connection, repo, id)
-    }
-
-    pub fn job_workspace(&self, repo: &RepositoryId, id: &JobId) -> Result<Option<WorkspaceId>> {
-        associated_workspace(&self.connection, "jobs", "job_id", repo, id.as_str())
     }
 
     pub fn jobs(&self, repo: &RepositoryId) -> Result<Vec<AgentJob>> {
@@ -649,29 +622,13 @@ impl Store {
         Ok(())
     }
 
-    pub fn record_evidence(
-        &mut self,
-        repo: &RepositoryId,
-        evidence: &EvidenceRecord,
-    ) -> Result<()> {
-        self.record_evidence_at(repo, None, evidence)
-    }
-
     pub fn record_evidence_in_workspace(
         &mut self,
         repo: &RepositoryId,
         workspace: &WorkspaceId,
         evidence: &EvidenceRecord,
     ) -> Result<()> {
-        self.record_evidence_at(repo, Some(workspace), evidence)
-    }
-
-    fn record_evidence_at(
-        &mut self,
-        repo: &RepositoryId,
-        workspace: Option<&WorkspaceId>,
-        evidence: &EvidenceRecord,
-    ) -> Result<()> {
+        let workspace = Some(workspace);
         evidence.validate()?;
         let json = encode(evidence, MAX_METADATA_BYTES)?;
         if let Some(reference) = &evidence.full_log_ref {
@@ -735,25 +692,13 @@ impl Store {
         )
     }
 
-    pub fn append_agent_event(&mut self, repo: &RepositoryId, event: &AgentEvent) -> Result<i64> {
-        self.append_agent_event_at(repo, None, event)
-    }
-
     pub fn append_agent_event_in_workspace(
         &mut self,
         repo: &RepositoryId,
         workspace: &WorkspaceId,
         event: &AgentEvent,
     ) -> Result<i64> {
-        self.append_agent_event_at(repo, Some(workspace), event)
-    }
-
-    fn append_agent_event_at(
-        &mut self,
-        repo: &RepositoryId,
-        workspace: Option<&WorkspaceId>,
-        event: &AgentEvent,
-    ) -> Result<i64> {
+        let workspace = Some(workspace);
         event.validate()?;
         encode(event, MAX_METADATA_BYTES)?;
         let tx = self
@@ -1012,7 +957,7 @@ fn decode_validated<T: DeserializeOwned + Validate>(json: &str) -> Result<T> {
 
 fn utf8(path: &Path) -> Result<&str> {
     path.to_str()
-        .ok_or_else(|| Error::Invalid("Stage 1 requires UTF-8 repository paths".into()))
+        .ok_or_else(|| Error::Invalid("repository paths must be UTF-8".into()))
 }
 
 fn strings(
@@ -1328,7 +1273,7 @@ pub(super) fn validate_verifier(
         "verification requires a successfully finished executor job",
     )?;
     validate_evidence(connection, repo, &proof.evidence)?;
-    // Stage 4 plans own a concrete workspace. Legacy Stage 1 plans deliberately
+    // Execution plans own a concrete workspace. Legacy protocol-only plans deliberately
     // retain repository-only semantics, including unbound jobs/evidence.
     let workspace: Option<String> = connection
         .query_row(

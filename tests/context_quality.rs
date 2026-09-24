@@ -1,4 +1,4 @@
-//! Stage 1 ontology/context quality: implementation-first selection, bounded
+//! Ontology/context quality: implementation-first selection, bounded
 //! relation noise, value-ordered truncation, conservative resolution, graph
 //! generations and backward compatibility.
 #[allow(dead_code)]
@@ -335,11 +335,27 @@ fn truncation_sheds_graph_noise_before_implementation_excerpts() {
         let g = &p.context.graph;
         assert!(p.serialized_bytes <= budget);
         // Shedding order is an observable contract: nothing more valuable goes
-        // while less valuable material remains.
+        // while less valuable material remains: test material, then
+        // unresolved summaries, the impact outlook and relations, and only
+        // then neighbors.
+        let test_excerpts = |p: &PlannerPacket| {
+            let tests: BTreeSet<_> = p.context.graph.tests.iter().map(|t| t.id.clone()).collect();
+            p.context
+                .excerpts
+                .iter()
+                .filter(|x| x.entity.as_ref().is_some_and(|id| tests.contains(id)))
+                .count()
+        };
         if g.neighbors.len() < full.context.graph.neighbors.len() {
             assert!(
-                g.unresolved.is_empty() && g.relations.is_empty(),
+                g.unresolved.is_empty() && g.relations.is_empty() && p.context.impact.is_none(),
                 "{budget}"
+            );
+        }
+        if full.context.impact.is_some() && p.context.impact.is_none() {
+            assert!(
+                g.tests.len() <= 1 && test_excerpts(&p) == 0 && g.unresolved.is_empty(),
+                "impact shed before test material at {budget}"
             );
         }
         // While every neighbor survives, only test excerpts may have been shed.
@@ -757,7 +773,7 @@ fn foreign_generation_bindings_are_rejected_at_import() {
         .unwrap();
 }
 
-/// Rewrites a current packet into the pre-Stage-1 persisted form: full
+/// Rewrites a current packet into the legacy persisted form: full
 /// provenance on every graph record, no source table, generation, associations,
 /// summaries or excerpt entity bindings, and the previous graph version.
 fn legacy(packet: &PlannerPacket) -> Value {
@@ -802,7 +818,7 @@ fn legacy(packet: &PlannerPacket) -> Value {
 }
 
 #[test]
-fn pre_stage_one_planner_packets_stay_readable_but_cannot_seed_new_plans() {
+fn legacy_planner_packets_stay_readable_but_cannot_seed_new_plans() {
     let f = Fixture::new(&[("src/lib.rs", "pub fn legacy_packet_target() {}\n".into())]);
     let p = f.prepare("Adjust the legacy packet target", PlanningLimits::default());
     let mut old = legacy(&p);
@@ -978,4 +994,56 @@ fn issue_three_request_reaches_the_capture_implementation_in_this_repository() {
         .unwrap()
         .data;
     assert_eq!(symbol.len(), 1);
+}
+
+/// On this repository: a realistic objective that names the Claude
+/// adapter's methods must retrieve them — not generic, high-fan-out helpers —
+/// and carry the file that implements them, inside the default budget.
+#[test]
+fn named_symbols_in_the_objective_reach_the_planner_packet_in_this_repository() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let Ok(info) = RepositoryInfo::discover(&root) else {
+        eprintln!("skipping: {} is not a Git checkout", root.display());
+        return;
+    };
+    let temp = TempDir::new();
+    let mut store = Store::open(&temp.0.join("state.sqlite3"), 5000).unwrap();
+    store.register_repository(info).unwrap();
+    assert_eq!(store.index_repository(&root).unwrap().failed, 0);
+    let mut request = intent(
+        "Make the Claude provider adapter reliable for strict JSON roles: ClaudeAdapter::launch should pass the role's JSON schema through Claude Code's --json-schema option, and ClaudeAdapter::collect must keep refusing anything that is not exactly one JSON document.",
+    );
+    request.verification = Some(VerificationRequirements {
+        requirement_refs: vec!["test".into()],
+        evidence_required: true,
+    });
+    let p = store
+        .prepare_plan(&root, request, PlanningLimits::default())
+        .unwrap();
+    assert!(p.serialized_bytes <= 32768);
+    let primary: Vec<&str> = p
+        .context
+        .graph
+        .primary
+        .iter()
+        .map(|e| e.entity.qualified_name.as_str())
+        .collect();
+    for named in ["ClaudeAdapter::launch", "ClaudeAdapter::collect"] {
+        assert!(
+            primary
+                .iter()
+                .any(|q| q.starts_with("src::local::runtime::provider::") && q.ends_with(named)),
+            "{named} missing from {primary:?}"
+        );
+    }
+    assert!(
+        p.request
+            .source
+            .support
+            .iter()
+            .any(|s| s.path == "src/local/runtime/provider.rs")
+    );
+    for generic in ["src::local::mod::require", "src::local::mod::Result"] {
+        assert!(!primary.contains(&generic), "{generic} took a primary slot");
+    }
 }

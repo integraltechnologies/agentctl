@@ -377,7 +377,7 @@ fn lifecycle_has_no_verification_shortcut_or_rejection_loop() {
         value
             .validate_task_transition(&a, &states, next, None)
             .unwrap();
-        assert!(!next.is_complete());
+        assert_ne!(next, TaskState::Verified);
         states.insert(a.clone(), next);
     }
     let mut rejection = verification(false);
@@ -406,8 +406,8 @@ fn lifecycle_has_no_verification_shortcut_or_rejection_loop() {
             .validate_task_transition(&a, &states, TaskState::Verified, Some(&verification(false)))
             .is_err()
     );
-    assert!(TaskState::Verified.is_complete());
-    assert!(!TaskState::Rejected.is_complete());
+    assert_eq!(TaskState::Verified, TaskState::Verified);
+    assert_ne!(TaskState::Rejected, TaskState::Verified);
     assert!(TaskState::Blocked.can_transition_to(TaskState::Planned));
     assert!(!TaskState::Blocked.can_transition_to(TaskState::Executing));
 }
@@ -683,8 +683,8 @@ fn experiment_boundaries_are_generic_and_finite() {
 
 #[test]
 fn legacy_boundary_definition_json_without_action_defaults_to_record_only() {
-    // A document written before Stage 9D's `action` field existed: only `boundary_id`
-    // and `condition`, exactly as Stage 0's original contract allowed.
+    // A document written before the `action` field existed: only `boundary_id`
+    // and `condition`, exactly as the original protocol contract allowed.
     let legacy = json!({
         "boundary_id": "legacy-threshold",
         "condition": {"kind": "METRIC_THRESHOLD", "metric": "loss", "comparison": "LESS_THAN", "value": 0.5}

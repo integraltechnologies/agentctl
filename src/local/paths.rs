@@ -7,9 +7,7 @@ use std::{
 
 use serde::Serialize;
 
-use super::repository::RepositoryId;
 use super::{Error, Result, require};
-use crate::protocol::EvidenceId;
 
 /// Explicit input keeps path tests independent of process-global environment variables.
 #[derive(Debug, Clone, Default)]
@@ -38,11 +36,16 @@ pub struct MachinePaths {
     pub data_root: PathBuf,
     pub database: PathBuf,
     pub cache_root: PathBuf,
+    /// Managed linked worktrees for concurrent executors. Deliberately a
+    /// sibling of `data_root`, never inside it: a worktree is a worker
+    /// *workspace*, and `security::compile` refuses any workspace that lies
+    /// inside agentctl machine state (which stays fully denied to workers).
+    pub worktree_root: PathBuf,
 }
 
 impl MachinePaths {
     pub fn resolve(context: &PathContext) -> Result<Self> {
-        let resolve = |override_path: &Option<PathBuf>, fallback: &str| -> Result<PathBuf> {
+        let base = |override_path: &Option<PathBuf>, fallback: &str| -> Result<PathBuf> {
             let base = if let Some(path) = override_path.as_ref().filter(|p| p.is_absolute()) {
                 path.clone()
             } else {
@@ -56,14 +59,16 @@ impl MachinePaths {
                 home.join(fallback)
             };
             absolute_path(&base)?;
-            Ok(base.join("agentctl"))
+            Ok(base)
         };
-        let config_root = resolve(&context.config_home, ".config")?;
-        let data_root = resolve(&context.data_home, ".local/share")?;
-        let cache_root = resolve(&context.cache_home, ".cache")?;
+        let config_root = base(&context.config_home, ".config")?.join("agentctl");
+        let data_home = base(&context.data_home, ".local/share")?;
+        let cache_root = base(&context.cache_home, ".cache")?.join("agentctl");
+        let data_root = data_home.join("agentctl");
         Ok(Self {
             machine_config: config_root.join("config.toml"),
             database: data_root.join("state.sqlite3"),
+            worktree_root: data_home.join("agentctl-worktrees"),
             config_root,
             data_root,
             cache_root,
@@ -75,18 +80,6 @@ impl MachinePaths {
             ensure_directory(dir)?;
         }
         Ok(())
-    }
-
-    /// Convention only: this function does not create or capture artifacts.
-    pub fn evidence_directory(&self, repo: &RepositoryId, evidence: &EvidenceId) -> PathBuf {
-        self.data_root
-            .join("artifacts")
-            .join(repo.as_str())
-            .join(evidence.as_str())
-    }
-
-    pub fn repository_cache(&self, repo: &RepositoryId) -> PathBuf {
-        self.cache_root.join(repo.as_str())
     }
 }
 

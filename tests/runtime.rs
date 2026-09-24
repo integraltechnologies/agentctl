@@ -481,8 +481,10 @@ fn diagnostic_exit_codes_preserve_human_and_json_rows() {
     for json_mode in [false, true] {
         for (args, valid) in [
             (vec!["role", "show", "executor"], true),
-            (vec!["role", "show", "recon"], false),
-            (vec!["route", "check"], false),
+            (vec!["role", "show", "not-a-role"], false),
+            // Every launchable role is configured here, and there are no
+            // advertised roles agentctl cannot launch, so the sweep passes.
+            (vec!["route", "check"], true),
             (vec!["route", "unknown"], false),
         ] {
             let mut args = args;
@@ -1105,14 +1107,22 @@ fn reject_and_unknown_failure_never_select_fallback() {
             },
         );
         let p = f.plan();
+        let rejecting = matches!(mode, Mode::Reject);
         assert!(f.run(&p, mode, seen(), false).is_err());
+        // A verifier REJECT ends the plan. A provider crash that changed
+        // nothing is retried on the same route within its bound and then leaves
+        // the run resumable; neither ever selects a fallback route.
         assert_eq!(
             f.store()
                 .runtime_status(&f.root, &p.packet.plan_id)
                 .unwrap()
                 .unwrap()
                 .state,
-            RunState::Blocked
+            if rejecting {
+                RunState::Blocked
+            } else {
+                RunState::Running
+            }
         );
         assert!(
             f.store()
@@ -1428,7 +1438,7 @@ enum Mode {
     VerifierDrift,
     IntegrationDrift,
     Planner(Box<ExecutionPlan>),
-    /// Stage 3: each executor declares a new function that calls the file's
+    /// Ontology lifecycle: each executor declares a new function that calls the file's
     /// existing one, so every task changes the ontology.
     Declare,
     /// `Declare`, but the integration verifier moves the source (drift).
@@ -1437,6 +1447,11 @@ enum Mode {
     DeclareRejecting(&'static str),
     /// `Declare`, but only the final integration verifier rejects.
     DeclareThenIntegrationReject,
+    /// Verifiers cite only what their compiled prompt tells them to cite.
+    ContractReader,
+    /// The integration verifier cites the done-criteria prose it was shown
+    /// instead of the required check IDs (the observed NEW-2 behavior).
+    EchoExpectations,
 }
 impl Mode {
     fn declares(&self) -> bool {
@@ -1489,7 +1504,7 @@ impl ProviderAdapter for Fake {
         }
         let value = match input.role {
             AgentRole::Planner => match &self.mode {
-                Mode::Planner(p) => serde_json::to_value(p).unwrap(),
+                Mode::Planner(p) => common::plan_decision(&serde_json::to_value(p).unwrap()),
                 _ => json!({}),
             },
             AgentRole::Executor => {
@@ -1566,10 +1581,22 @@ impl ProviderAdapter for Fake {
                         && input.task_id.is_none();
                 let target: VerificationTarget =
                     serde_json::from_value(input.artifact["target"].clone()).unwrap();
-                let requirements = if input.task_id.is_some() {
-                    vec!["unit".into()]
-                } else {
-                    vec!["integration".into()]
+                let (requirements, invariants) = match self.mode {
+                    Mode::ContractReader => (
+                        compiled_refs(input, "requirement_refs"),
+                        compiled_refs(input, "invariant_refs"),
+                    ),
+                    Mode::EchoExpectations if input.task_id.is_none() => (
+                        input.artifact["contract"]["expectations"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|e| e.as_str().unwrap().to_string())
+                            .collect(),
+                        vec![],
+                    ),
+                    _ if input.task_id.is_some() => (vec!["unit".into()], vec![]),
+                    _ => (vec!["integration".into()], vec![]),
                 };
                 serde_json::to_value(VerificationPacket {
                     version: ProtocolVersion::V1,
@@ -1602,7 +1629,7 @@ impl ProviderAdapter for Fake {
                         serde_json::from_value(input.artifact["evidence"].clone()).unwrap()
                     },
                     requirement_refs: requirements,
-                    invariant_refs: vec![],
+                    invariant_refs: invariants,
                     notes: None,
                     context_request: None,
                 })
@@ -1627,6 +1654,21 @@ impl ProviderAdapter for Fake {
             _ => Usage::default(),
         })
     }
+}
+/// What a provider reading only its compiled prompt finds under
+/// `required_refs.<field>`: the prompt's final line is the issued input.
+fn compiled_refs(input: &JobInput, field: &str) -> Vec<String> {
+    let bytes = &input.compiled.as_ref().expect("compiled prompt").bytes;
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    let issued: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    issued["artifact"]["required_refs"][field]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .map(|id| id.as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 fn success(stdout: Vec<u8>) -> ProcessOutput {
     ProcessOutput {
@@ -1821,23 +1863,47 @@ fn executor_failures_and_spoofing_never_launch_dependents() {
         let f = Fixture::new();
         let p = f.plan();
         let inputs = seen();
+        let mechanical = matches!(mode, Mode::Malformed | Mode::Crash);
         assert!(f.run(&p, mode, inputs.clone(), false).is_err());
-        assert_eq!(inputs.lock().unwrap().len(), 1);
+        let inputs = inputs.lock().unwrap();
+        // Only the first task's executor ever launched: never a verifier, never
+        // a dependent. A mechanical failure that changed nothing is retried
+        // within MAX_PROVIDER_RETRIES; one that edited source never is.
+        assert!(inputs.iter().all(|i| i.role == AgentRole::Executor
+            && i.task_id.as_ref() == Some(&p.packet.tasks[0].task_id)));
+        assert_eq!(
+            inputs.len(),
+            if mechanical {
+                1 + MAX_PROVIDER_RETRIES as usize
+            } else {
+                1
+            }
+        );
         assert_eq!(
             f.store()
                 .runtime_status(&f.root, &p.packet.plan_id)
                 .unwrap()
                 .unwrap()
                 .state,
-            RunState::Blocked
+            if mechanical {
+                RunState::Running
+            } else {
+                RunState::Blocked
+            }
         );
+        // A paused mechanical failure rejected nothing, so only the refusals
+        // demonstrate rejection without advancing accepted truth.
         assert_eq!(
             capability_status(
                 &f,
                 &p,
                 ControlPlaneCapability::RejectFailureWithoutAdvancingAcceptedTruth
             ),
-            CapabilityStatus::Supported
+            if mechanical {
+                CapabilityStatus::NotDemonstrated
+            } else {
+                CapabilityStatus::Supported
+            }
         );
     }
 }
@@ -1906,17 +1972,64 @@ fn deterministic_check_failure_cannot_be_overridden_by_model() {
     assert_eq!(inputs.lock().unwrap().len(), 1);
 }
 #[test]
-fn provider_timeout_is_terminal_and_resume_does_not_retry() {
+fn provider_timeout_is_retried_within_bound_then_resumes_by_relaunch() {
     let mut f = Fixture::new();
     f.config.timeout_ms = 10;
     let p = f.plan();
-    assert!(f.run(&p, Mode::Timeout, seen(), false).is_err());
+    let hung = seen();
+    let error = f.run(&p, Mode::Timeout, hung.clone(), false).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            local::Error::Provider {
+                class: OutcomeClass::RetryableProviderFailure,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(error.to_string().contains("timed out"), "{error}");
+    // Bounded: the first attempt plus MAX_PROVIDER_RETRIES fresh jobs.
+    assert_eq!(
+        hung.lock().unwrap().len(),
+        1 + MAX_PROVIDER_RETRIES as usize
+    );
+    let jobs = f
+        .store()
+        .runtime_jobs(&f.root, Some(&p.packet.plan_id))
+        .unwrap();
+    assert!(jobs.iter().all(|j| {
+        j.state == RuntimeJobState::Failed
+            && j.failure_class == Some(OutcomeClass::RetryableProviderFailure)
+    }));
+    // Nothing uncertain exists, so the run is resumable rather than ended.
+    let run = f
+        .store()
+        .runtime_status(&f.root, &p.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, RunState::Running);
     let inputs = seen();
-    assert!(f.run(&p, Mode::Pass, inputs.clone(), false).is_err());
-    assert!(inputs.lock().unwrap().is_empty());
+    assert_eq!(
+        f.run(&p, Mode::Pass, inputs.clone(), false).unwrap().state,
+        RunState::Complete
+    );
+    assert!(!inputs.lock().unwrap().is_empty());
+    let run = f
+        .store()
+        .runtime_status(&f.root, &p.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        run.executor_relaunches
+            .get(&p.packet.tasks[0].task_id)
+            .copied(),
+        Some(1),
+        "the resumed launch is counted against the bounded relaunch budget"
+    );
 }
 #[test]
-fn planner_output_reuses_stage4_import_and_never_activates_partially() {
+fn planner_output_reuses_plan_import_and_never_activates_partially() {
     for valid in [true, false] {
         let f = Fixture::new();
         let prepared = f.prepare();
@@ -1947,6 +2060,72 @@ fn planner_output_reuses_stage4_import_and_never_activates_partially() {
             assert_eq!(v.state, PlanState::Validated);
         }
         assert_eq!(input.lock().unwrap()[0].role, AgentRole::Planner);
+    }
+}
+
+/// A compiled planner request must declare exactly one output contract. The
+/// role profile's `reporting`, the recorded provenance and the artifact's
+/// instruction all reach the provider together, so a stale name in any of them
+/// asks a real model for two different documents at once.
+#[test]
+fn planner_prompt_declares_one_unambiguous_output_contract() {
+    let f = Fixture::new();
+    let prepared = f.prepare();
+    let p = artifact(&prepared);
+    let mut store = f.store();
+    let input = seen();
+    let mut runtime = Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(p)),
+                seen: input.clone(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap();
+    runtime.plan(&f.root, &prepared.request.request_id).unwrap();
+
+    let seen = input.lock().unwrap();
+    let job = &seen[0];
+    assert_eq!(job.role, AgentRole::Planner);
+    let compiled = job.compiled.as_ref().expect("planner prompt is compiled");
+
+    // The contract agentctl actually parses back is a PlanDecision.
+    assert_eq!(
+        compiled.provenance.output_contract, "PlanDecision / protocol 1",
+        "recorded provenance must name the contract agentctl parses"
+    );
+
+    // The role block the provider reads must name the same contract.
+    let text = String::from_utf8(compiled.bytes.clone()).unwrap();
+    let (role_line, _) = text.split_once('\n').expect("role block then context");
+    let role: Value =
+        serde_json::from_str(&role_line[role_line.find('{').expect("role json")..]).unwrap();
+    assert_eq!(role["reporting"], json!("PlanDecision"));
+
+    // Every `*_schema` the instruction names must actually be issued: a
+    // dangling reference points the provider at a schema it never received.
+    let artifact = &job.artifact;
+    let issued: std::collections::BTreeSet<&str> = artifact
+        .as_object()
+        .expect("planner artifact object")
+        .keys()
+        .filter(|k| k.ends_with("_schema"))
+        .map(String::as_str)
+        .collect();
+    assert!(issued.contains("decision_schema"), "{issued:?}");
+    let instruction = artifact["instruction"].as_str().expect("instruction");
+    for word in instruction.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if word.ends_with("_schema") {
+            assert!(
+                issued.contains(word),
+                "instruction names {word}, which is not issued: {issued:?}"
+            );
+        }
     }
 }
 /// Issue #1 through the runtime: a literal framework path is captured, written by
@@ -2086,14 +2265,23 @@ fn provider_jobs_record_exact_content_free_context_manifests() {
                 job.request_id.as_ref()
             )
         );
-        let compiled = &input.compiled.as_ref().unwrap().bytes;
-        assert_eq!(
-            (m.bytes.total, prompt.bytes),
-            (compiled.len(), compiled.len())
-        );
+        // Everything agentctl sends: the user-turn payload plus the canonical
+        // role contract on its own channel.
+        let compiled = input.compiled.as_ref().unwrap();
+        let sent = compiled.bytes.len() + compiled.system.len();
+        assert_eq!((m.bytes.total, prompt.bytes), (sent, sent));
         assert_eq!(
             m.bytes.categories.iter().map(|c| c.bytes).sum::<usize>(),
-            compiled.len()
+            sent
+        );
+        assert_eq!(
+            prompt.contract.as_deref().map(|c| c.split('/').nth(1)),
+            Some(Some(match job.role {
+                AgentRole::Planner => "PLANNER",
+                AgentRole::Executor => "EXECUTOR",
+                AgentRole::Verifier if job.task_id.is_some() => "TASK_VERIFIER",
+                AgentRole::Verifier => "INTEGRATION_VERIFIER",
+            }))
         );
         assert_eq!(
             m.bytes.provider_hidden,
@@ -2149,7 +2337,9 @@ fn provider_jobs_record_exact_content_free_context_manifests() {
                 // The planner-selected symbol lives in src/api.rs, so every
                 // executor is issued that definition as a hash-bound excerpt,
                 // plus its own planner-named write target as a whole file.
-                assert!(String::from_utf8_lossy(compiled).contains("MANIFEST_SOURCE_CANARY"));
+                assert!(
+                    String::from_utf8_lossy(&compiled.bytes).contains("MANIFEST_SOURCE_CANARY")
+                );
                 assert!(m.paths.iter().any(|s| s.path == "src/api.rs"
                     && s.kind == manifest::SuppliedKind::Excerpt
                     && s.content_hash.is_some()));
@@ -2204,7 +2394,7 @@ fn provider_jobs_record_exact_content_free_context_manifests() {
 /// bounds capture by the real invariant -- 64 MiB / 20000 files in aggregate -- rather
 /// than an arbitrary fixed per-file ceiling, so an irrelevant file larger than the old
 /// 2 MiB cap no longer fails a capture that comfortably fits the aggregate budget.
-/// Regression for the producer/runtime mismatch in agentctl issue #2 (Stage 2B).
+/// Regression for the producer/runtime mismatch in agentctl issue #2.
 #[test]
 fn run_planner_succeeds_with_irrelevant_oversized_workspace_file_in_budget() {
     let f = Fixture::new();
@@ -2240,7 +2430,7 @@ fn run_planner_succeeds_with_irrelevant_oversized_workspace_file_in_budget() {
     .unwrap();
 }
 /// Capture must stay bounded: a single file that alone exceeds the 64 MiB aggregate
-/// workspace budget still fails closed. Regression for agentctl issue #2 (Stage 2C):
+/// workspace budget still fails closed. Regression for agentctl issue #2:
 /// this used to surface as the same ambiguous "runtime file/artifact exceeds size
 /// limit" message shared with git-index reads and CAS artifact readback, which was
 /// impossible to distinguish from a `PlannerPacket`/artifact size problem. The
@@ -2374,7 +2564,6 @@ fn field(message: &str, prefix: &str) -> u64 {
 /// filesystem name limit) so `status` never has to stat a name the OS would
 /// reject as too long.
 fn inflate_git_index_past(root: &Path, target_bytes: u64) {
-    use std::io::Write;
     let blob = Command::new("git")
         .current_dir(root)
         .args(["hash-object", "-w", "--stdin"])
@@ -2406,6 +2595,7 @@ fn inflate_git_index_past(root: &Path, target_bytes: u64) {
         feed.push_str(&"x".repeat(PATH_LEN - prefix.len()));
         feed.push('\n');
     }
+    use std::io::Write;
     let mut child = Command::new("git")
         .current_dir(root)
         .args(["update-index", "--index-info"])
@@ -2424,7 +2614,7 @@ fn inflate_git_index_past(root: &Path, target_bytes: u64) {
 }
 /// The `.git/index` read during workspace capture shares `read_file`'s bounded
 /// reader with ordinary source files, but its size ceiling is a distinct
-/// invariant from the aggregate workspace-content budget (Stage 2C). This
+/// invariant from the aggregate workspace-content budget. This
 /// grows the on-disk index past its 16 MiB ceiling with synthetic entries that
 /// are never realized as real files, proving the diagnostic path is reachable
 /// without replacing `.git/index` with something Git itself would refuse to
@@ -2466,7 +2656,7 @@ fn run_planner_reports_git_index_diagnostic_for_oversized_index() {
 }
 /// Aggregation, not any single file, drives the workspace-capture budget:
 /// three files that would each comfortably fit alone -- all well past the
-/// obsolete 2 MiB per-file ceiling Stage 2B removed -- must still fail closed
+/// obsolete 2 MiB per-file ceiling (since removed) -- must still fail closed
 /// once their combined content crosses the real 64 MiB aggregate.
 /// `fs::read_dir` order is unspecified, so this asserts only the arithmetic
 /// invariant the check enforces (captured-so-far plus the offending file's
@@ -2656,9 +2846,9 @@ fn run_planner_accepts_workspace_at_exact_file_count_boundary() {
     .plan(&f.root, &prepared.request.request_id)
     .unwrap();
 }
-/// Combined Stage 2E acceptance for Issue #2's originally confusing symptoms:
+/// Combined acceptance for issue #2's originally confusing symptoms:
 /// a `PlannerPacket` sized close to its configured planning byte budget (not
-/// trivially small, as in the Stage 2B regression above) must still be
+/// trivially small, as in the issue #2 regression above) must still be
 /// produced, frozen, and consumed by the runtime -- reaching planner job
 /// creation -- even though the workspace separately contains an unrelated
 /// file well past the old, now-removed 2 MiB per-file ceiling but comfortably
@@ -3459,9 +3649,11 @@ fn extra_failed_interrupted_and_duplicate_attempts_do_not_expand_the_narrowed_re
 }
 
 #[test]
-fn interrupted_provider_is_persisted_and_never_relaunched_automatically() {
+fn interrupted_provider_relaunches_only_while_the_workspace_is_provably_unchanged() {
     let f = Fixture::new();
     let p = f.plan();
+    // An abrupt controller loss during launch. Nothing ran, so nothing was
+    // written: the tree is still the issued baseline.
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.run(
             &p,
@@ -3471,25 +3663,83 @@ fn interrupted_provider_is_persisted_and_never_relaunched_automatically() {
         )))
         .is_err()
     );
+    let interrupted = f
+        .store()
+        .runtime_jobs(&f.root, Some(&p.packet.plan_id))
+        .unwrap();
+    assert_eq!(interrupted.len(), 1);
+
+    // The lost launch is durable as INTERRUPTED, its canonical job FAILED, and
+    // the task is relaunched rather than ending the plan.
     let inputs = seen();
-    assert!(f.run(&p, Mode::Pass, inputs.clone(), false).is_err());
-    assert!(inputs.lock().unwrap().is_empty());
+    assert_eq!(
+        f.run(&p, Mode::Pass, inputs.clone(), false).unwrap().state,
+        RunState::Complete
+    );
+    assert!(
+        !inputs.lock().unwrap().is_empty(),
+        "the task was relaunched"
+    );
     let jobs = f
         .store()
         .runtime_jobs(&f.root, Some(&p.packet.plan_id))
         .unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].state, RuntimeJobState::Interrupted);
+    let lost = jobs
+        .iter()
+        .find(|j| j.job_id == interrupted[0].job_id)
+        .unwrap();
+    assert_eq!(lost.state, RuntimeJobState::Interrupted);
     assert_eq!(
         f.store()
             .job(
                 &RepositoryInfo::discover(&f.root).unwrap().repository_id,
-                &jobs[0].job_id
+                &lost.job_id
             )
             .unwrap()
             .unwrap()
             .state,
         JobState::Failed
+    );
+    let run = f
+        .store()
+        .runtime_status(&f.root, &p.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        run.executor_relaunches
+            .get(&p.packet.tasks[0].task_id)
+            .copied(),
+        Some(1),
+        "the relaunch is counted against a bounded budget"
+    );
+}
+
+/// The proof obligation behind a relaunch: an executor that touched the tree is
+/// never relaunched, because its mutation is unverified work.
+#[test]
+fn an_executor_that_mutated_the_workspace_is_never_relaunched() {
+    let f = Fixture::new();
+    let p = f.plan();
+    // Writes outside the write scope: the result is refused and retained.
+    let error = f
+        .run(&p, Mode::Scope, seen(), false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("outside allowed scope"), "{error}");
+    let inputs = seen();
+    let again = f.run(&p, Mode::Pass, inputs.clone(), false).unwrap_err();
+    assert!(
+        inputs.lock().unwrap().is_empty(),
+        "no relaunch over a mutated workspace: {again}"
+    );
+    assert_eq!(
+        f.store()
+            .runtime_status(&f.root, &p.packet.plan_id)
+            .unwrap()
+            .unwrap()
+            .executor_relaunches
+            .len(),
+        0
     );
 }
 
@@ -3594,7 +3844,10 @@ fn v6_runtime_migration_is_additive_atomic_and_missing_guards_fail_closed() {
     );
     c.execute_batch("DROP TABLE runtime_jobs").unwrap();
     drop(c);
-    assert_eq!(f.store().status().unwrap().schema_version, 13);
+    assert_eq!(
+        f.store().status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION
+    );
     assert_eq!(
         f.store()
             .execution_plan(&f.root, &p.packet.plan_id)
@@ -3777,8 +4030,7 @@ fn ignored_files_are_not_an_escape_from_actual_diff_scope_checks() {
 }
 
 #[test]
-fn full_fake_planner_to_integration_flow_and_hash_helper_use_canonical_contracts() {
-    use std::io::Write;
+fn full_fake_planner_to_integration_flow_derives_canonical_contracts() {
     let f = Fixture::new();
     let prepared = f.prepare();
     let p = artifact(&prepared);
@@ -3807,24 +4059,27 @@ fn full_fake_planner_to_integration_flow_and_hash_helper_use_canonical_contracts
         RunState::Complete
     );
     assert_eq!(inputs.lock().unwrap().len(), 10);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .args(["run", "packet-hashes"])
-        .env("HOME", f.temp.0.join("nonexistent-home"))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
+    // The planner states no hash at all: agentctl derives every contract hash
+    // from the packet it imported, so a contract cannot fail to bind its task.
+    let view = f
+        .store()
+        .execution_plan(&f.root, &p.packet.plan_id)
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&serde_json::to_vec_pretty(&p.packet).unwrap())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    let hashes: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(hashes["plan_packet_hash"], hash(&p.packet).unwrap());
-    assert!(!f.temp.0.join("nonexistent-home").exists());
+    assert_eq!(
+        view.plan.metadata.integration.plan_packet_hash,
+        hash(&view.plan.packet).unwrap()
+    );
+    for contract in &view.plan.metadata.contracts {
+        let task = view
+            .plan
+            .packet
+            .tasks
+            .iter()
+            .find(|t| t.task_id == contract.task_id)
+            .unwrap();
+        assert_eq!(contract.task_packet_hash, hash(task).unwrap());
+        assert!(contract.independent_verifier);
+    }
 }
 
 #[test]
@@ -3841,7 +4096,7 @@ fn correction_requires_explicit_replacement_and_stops_at_configured_bound() {
         &["commit", "--quiet", "-m", "human replan baseline"],
     );
     f.store().index_repository(&f.root).unwrap();
-    // Stage 3: preserving the rejected edit is the human's explicit decision.
+    // Preserving the rejected edit is the human's explicit decision.
     common::accept_observation(&mut f.store(), &f.root);
     let mut replacement = artifact(&f.prepare());
     replacement.packet.plan_id = PlanId::new("plan:correction").unwrap();
@@ -4031,7 +4286,7 @@ fn same_provider_policy_never_reuses_another_engineering_sessions_workers() {
         .unwrap();
     assert!(
         a.store()
-            .complete_execution_plan(&a.root, &pa.packet.plan_id, &proof, &ia[0].source)
+            .complete_execution_plan_accepting(&a.root, &pa.packet.plan_id, &proof, &ia[0].source)
             .is_err()
     );
 }
@@ -4082,7 +4337,10 @@ fn old_v7_runtime_metadata_remains_inspectable_without_silent_ownership_backfill
         c.query_row::<String, _, _>("SELECT record_json FROM runtime_runs", [], |r| r.get(0))
             .unwrap()
     );
-    assert_eq!(f.store().status().unwrap().schema_version, 13);
+    assert_eq!(
+        f.store().status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION
+    );
     assert!(
         f.store()
             .runtime_jobs(&f.root, None)
@@ -5066,7 +5324,7 @@ fn installed_native_auth_preflight_without_api_keys() {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3: the runtime's ontology acceptance boundary.
+// The runtime's ontology acceptance boundary.
 // ---------------------------------------------------------------------------
 
 type States = Vec<(u64, local::graph::GenerationState)>;
@@ -5101,7 +5359,7 @@ impl Fixture {
     }
 }
 
-/// The functions each task of the fixture plan declares, as Stage-1 names them.
+/// The functions each task of the fixture plan declares, as the index names them.
 fn declared(stems: &[&str]) -> std::collections::BTreeSet<String> {
     stems
         .iter()
@@ -5994,4 +6252,610 @@ fn an_unexplained_observation_during_a_run_blocks_further_context() {
         f.generation_states(),
         vec![(1, G::Accepted), (2, G::Abandoned), (3, G::Candidate)]
     );
+}
+
+/// NEW-1 negative side: a serial result never leaves canonical source, so its
+/// diff and its deterministic checks already share one source identity. It must
+/// not carry the concurrent publication chain, which would assert a journey it
+/// never took.
+#[test]
+fn serial_task_verifier_artifact_claims_no_reconciliation_chain() {
+    let f = Fixture::new();
+    let p = f.plan();
+    let inputs = seen();
+    let run = f.run(&p, Mode::Pass, inputs.clone(), false).unwrap();
+    assert_eq!(run.state, RunState::Complete);
+
+    let inputs = inputs.lock().unwrap();
+    let verifiers: Vec<&JobInput> = inputs
+        .iter()
+        .filter(|i| i.role == AgentRole::Verifier && i.task_id.is_some())
+        .collect();
+    assert!(!verifiers.is_empty(), "no task verifier ran");
+    for input in verifiers {
+        assert!(
+            input.artifact["reconciliation"].is_null(),
+            "serial task {:?} must not claim a publication chain: {}",
+            input.task_id,
+            input.artifact["reconciliation"]
+        );
+        // The evidence it does have is already self-consistent: the diff and the
+        // checks were produced against the same canonical source.
+        assert!(input.artifact["diff"].is_object());
+    }
+}
+
+/// NEW-2: a verifier is told, in its compiled input, exactly which stable IDs
+/// a PASS must cite. A provider that follows that input completes the plan;
+/// one that cites done-criteria prose instead is still refused, because the
+/// validation that caught the real incident is unchanged.
+#[test]
+fn verifiers_are_told_which_ids_a_pass_must_cite_and_prose_still_fails_closed() {
+    let f = Fixture::new();
+    let p = f.plan();
+    let inputs = seen();
+    let result = f
+        .run(&p, Mode::ContractReader, inputs.clone(), false)
+        .unwrap();
+    assert_eq!(result.state, RunState::Complete);
+    let inputs = inputs.lock().unwrap();
+    let verifiers: Vec<&JobInput> = inputs
+        .iter()
+        .filter(|i| i.role == AgentRole::Verifier)
+        .collect();
+    assert_eq!(
+        verifiers.len(),
+        5,
+        "four packet verifiers and one integration"
+    );
+    for input in &verifiers {
+        let text = String::from_utf8(input.compiled.as_ref().unwrap().bytes.clone()).unwrap();
+        assert!(text.contains("\"required_refs\""), "{text}");
+        assert!(
+            text.contains("copied verbatim"),
+            "the instruction is compiled in"
+        );
+        let expected = if input.task_id.is_some() {
+            input.artifact["task"]["verification"]["requirement_refs"].clone()
+        } else {
+            input.artifact["plan"]["integration_verification"]["requirement_refs"].clone()
+        };
+        assert_eq!(json!(compiled_refs(input, "requirement_refs")), expected);
+    }
+    let integration = verifiers.iter().find(|i| i.task_id.is_none()).unwrap();
+    assert_eq!(
+        compiled_refs(integration, "requirement_refs"),
+        ["integration"]
+    );
+    // The prose that misled the real provider is still issued, as criteria.
+    assert!(
+        !integration.artifact["contract"]["expectations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    drop(inputs);
+
+    let f = Fixture::new();
+    let p = f.plan();
+    let error = f
+        .run(&p, Mode::EchoExpectations, seen(), false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("PASS must cover every required check"),
+        "{error}"
+    );
+    assert_ne!(
+        f.store()
+            .execution_plan(&f.root, &p.packet.plan_id)
+            .unwrap()
+            .state,
+        PlanState::Complete
+    );
+}
+
+/// Planner honesty at the provider boundary: under severe byte pressure the
+/// compiled planner prompt — the bytes a real provider receives — still states
+/// that relation knowledge is incomplete, even after the detail that
+/// explained it was shed.
+#[test]
+fn a_starved_compiled_planner_prompt_still_states_relation_incompleteness() {
+    let f = Fixture::new();
+    // A relation no resolver can prove: a member call on a computed receiver.
+    fs::write(
+        f.root.join("src/cache_extra.rs"),
+        "pub fn cache_invalidation_sweep(v: &Vec<u32>) -> usize { v.iter().count() }\n",
+    )
+    .unwrap();
+    f.store().index_repository(&f.root).unwrap();
+    let candidate = f
+        .store()
+        .ontology_status(&f.root)
+        .unwrap()
+        .candidate
+        .unwrap();
+    f.store()
+        .accept_generation(&f.root, &candidate.generation_id, None)
+        .unwrap();
+    let prepared = f
+        .store()
+        .prepare_plan(
+            &f.root,
+            RequestDraft {
+                objective: "Implement cache persistence graph CLI regression support".into(),
+                query: Some("cache_invalidation_sweep".into()),
+                scope: vec![ScopePath::Directory { path: "src".into() }],
+                constraints: vec![],
+                definition_of_done: vec!["Cache regression checks pass".into()],
+                verification: Some(requirements("integration")),
+                invariant_refs: vec![],
+                provenance: PlanningProvenance {
+                    actor: "human".into(),
+                    source_refs: vec!["objective".into()],
+                    provider: None,
+                },
+            },
+            PlanningLimits {
+                bytes: 7000,
+                files: 1,
+                excerpt_bytes: 24,
+                excerpt_lines: 1,
+                ..PlanningLimits::default()
+            },
+        )
+        .unwrap();
+    let mut store = f.store();
+    let input = seen();
+    let mut runtime = Runtime::new(
+        &mut store,
+        f.paths.clone(),
+        f.config.clone(),
+        BTreeMap::from([(
+            "test".into(),
+            Box::new(Fake {
+                mode: Mode::Planner(Box::new(artifact(&prepared))),
+                seen: input.clone(),
+            }) as Box<dyn ProviderAdapter>,
+        )]),
+    )
+    .unwrap();
+    runtime.plan(&f.root, &prepared.request.request_id).unwrap();
+    let seen = input.lock().unwrap();
+    let text = String::from_utf8(seen[0].compiled.as_ref().unwrap().bytes.clone()).unwrap();
+    let issued: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    let packet = &issued["artifact"]["planner_packet"]["context"];
+    let coverage = &packet["graph"]["coverage"];
+    assert_eq!(
+        packet["graph"]["primary"][0]["entity"]["name"],
+        json!("cache_invalidation_sweep")
+    );
+    assert!(packet["truncated"].as_bool().unwrap(), "{packet}");
+    // The detail that named the unresolved sites is gone...
+    assert_eq!(packet["graph"]["unresolved"], json!([]), "{packet}");
+    assert!(
+        coverage["unresolved_sites"].as_u64().unwrap() > 0,
+        "incompleteness must reach the provider: {coverage}"
+    );
+    assert_eq!(coverage["detail_shed"], json!(true), "{coverage}");
+}
+
+// ============ canonical contracts, failure taxonomy, bounded retries ============
+
+/// One scripted outcome per launch, in launch order; `Pass` (and an exhausted
+/// script) delegates to the ordinary passing fake.
+#[derive(Clone, Debug)]
+enum Step {
+    Pass,
+    /// A transient process failure: nonzero exit, nothing written.
+    Crash,
+    /// A reply that is not the canonical document.
+    Malformed,
+    /// A provider-emitted quota refusal (see `Scripted::fault`).
+    Quota,
+    /// A valid executor result that declines the task.
+    Declined(ResultStatus, &'static str),
+}
+struct Scripted {
+    steps: Arc<Mutex<std::collections::VecDeque<Step>>>,
+    inner: Fake,
+}
+impl ProviderAdapter for Scripted {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+    fn launch(
+        &mut self,
+        input: &JobInput,
+        process: ProcessSpec,
+        config: &RoleConfig,
+    ) -> local::Result<Box<dyn RunningProcess>> {
+        let step = self.steps.lock().unwrap().pop_front().unwrap_or(Step::Pass);
+        let output =
+            |exit: i32, stdout: &[u8], stderr: &[u8]| -> local::Result<Box<dyn RunningProcess>> {
+                Ok(Box::new(Immediate(Some(ProcessOutput {
+                    exit: Some(exit),
+                    stdout: stdout.to_vec(),
+                    stderr: stderr.to_vec(),
+                    failure: None,
+                }))))
+            };
+        match step {
+            Step::Pass => self.inner.launch(input, process, config),
+            Step::Crash => {
+                self.inner.seen.lock().unwrap().push(input.clone());
+                output(9, b"", b"transient provider crash")
+            }
+            Step::Malformed => {
+                self.inner.seen.lock().unwrap().push(input.clone());
+                output(0, b"```json\n{}\n```", b"")
+            }
+            Step::Quota => {
+                self.inner.seen.lock().unwrap().push(input.clone());
+                output(1, b"", b"ERROR: You've hit your usage limit")
+            }
+            Step::Declined(status, code) => {
+                self.inner.seen.lock().unwrap().push(input.clone());
+                let task: TaskPacket =
+                    serde_json::from_value(input.artifact["task"].clone()).unwrap();
+                let result = ResultPacket {
+                    version: ProtocolVersion::V1,
+                    task_id: task.task_id,
+                    executor_job_id: input.job_id.clone(),
+                    status,
+                    changed_paths: vec![],
+                    changed_entities: vec![],
+                    evidence: vec![],
+                    notes: None,
+                    failure: Some(FailureInfo {
+                        code: code.into(),
+                        summary: "the required change lies outside this task's write scope".into(),
+                    }),
+                    context_request: None,
+                };
+                output(0, &serde_json::to_vec(&result).unwrap(), b"")
+            }
+        }
+    }
+    fn collect(&self, output: &ProcessOutput) -> local::Result<Value> {
+        Ok(agentctl::local::security::json::from_slice(&output.stdout)?)
+    }
+    fn fault(&self, output: &ProcessOutput) -> Option<(bool, String)> {
+        String::from_utf8_lossy(&output.stderr)
+            .contains("usage limit")
+            .then(|| (false, "usage limit reached".into()))
+    }
+}
+impl Fixture {
+    fn run_scripted(
+        &self,
+        p: &ExecutionPlan,
+        steps: Vec<Step>,
+        seen: Arc<Mutex<Vec<JobInput>>>,
+    ) -> local::Result<RunRecord> {
+        let mut s = self.store();
+        Runtime::new(
+            &mut s,
+            self.paths.clone(),
+            self.config.clone(),
+            BTreeMap::from([(
+                "test".into(),
+                Box::new(Scripted {
+                    steps: Arc::new(Mutex::new(steps.into())),
+                    inner: Fake {
+                        mode: Mode::Pass,
+                        seen,
+                    },
+                }) as Box<dyn ProviderAdapter>,
+            )]),
+        )
+        .unwrap()
+        .with_check_launcher(Box::new(Checks { fail: false }))
+        .run(&self.root, &p.packet.plan_id)
+    }
+}
+fn retries(f: &Fixture) -> usize {
+    let info = RepositoryInfo::discover(&f.root).unwrap();
+    f.store()
+        .events(Some(&info.repository_id), None, None, 1000)
+        .unwrap()
+        .iter()
+        .filter(|e| serde_json::to_string(e).unwrap().contains("PROVIDER_RETRY"))
+        .count()
+}
+
+/// Every role's compiled input carries its canonical role contract, and both
+/// real adapters convey that exact text through their own channel: Claude as
+/// an appended system prompt plus native structured output, Codex as
+/// developer instructions. Nothing role-specific lives in either adapter.
+#[test]
+fn every_role_receives_the_canonical_contract_through_both_adapters() {
+    let f = Fixture::new();
+    let p = f.plan();
+    let inputs = seen();
+    assert_eq!(
+        f.run(&p, Mode::Pass, inputs.clone(), false).unwrap().state,
+        RunState::Complete
+    );
+    let inputs = inputs.lock().unwrap();
+    let mut seen_contracts = std::collections::BTreeSet::new();
+    for input in inputs.iter() {
+        let contract = contract::RoleContract::of(input.role, &input.artifact);
+        seen_contracts.insert(format!("{contract:?}"));
+        let compiled = input.compiled.as_ref().unwrap();
+        assert_eq!(compiled.system, contract.text());
+        for rule in contract.rules() {
+            assert!(compiled.system.contains(rule.text), "{}", rule.id);
+        }
+        // The output schema a provider is held to is the one in the input.
+        assert_eq!(compiled.schema, input.artifact[contract.output().1]);
+
+        let claude = claude_contract_args(input).unwrap();
+        let at = |flag: &str| claude.iter().position(|a| a == flag).unwrap() + 1;
+        assert_eq!(claude[at("--append-system-prompt")], compiled.system);
+        let schema: Value = serde_json::from_str(&claude[at("--json-schema")]).unwrap();
+        let mut expected = compiled.schema.clone();
+        expected.as_object_mut().unwrap().remove("$schema");
+        assert_eq!(schema, expected);
+
+        let codex = codex_contract_args(input).unwrap();
+        let value = codex[1].strip_prefix("developer_instructions=").unwrap();
+        let parsed: toml::Value = toml::from_str(&format!("v = {value}")).unwrap();
+        assert_eq!(parsed["v"].as_str().unwrap(), compiled.system);
+    }
+    assert_eq!(
+        seen_contracts.len(),
+        3,
+        "executor, task verifier and integration verifier: {seen_contracts:?}"
+    );
+}
+
+#[test]
+fn the_planner_contract_states_every_rule_the_plan_validator_cites() {
+    let text = contract::RoleContract::Planner.text();
+    for id in [
+        "PLAN-OUTPUT",
+        "PLAN-OBJECTIVE",
+        "PLAN-TASK-IDS",
+        "PLAN-DONE",
+        "PLAN-INVARIANTS",
+        "PLAN-VERIFICATION",
+        "PLAN-CHECK-SEMANTICS",
+        "PLAN-SCOPE",
+        "PLAN-GRAPH-REFS",
+        "PLAN-EXCLUSIONS",
+        "PLAN-MEMORY",
+        "PLAN-REPLAN",
+        "PLAN-BOUNDS",
+        "PLAN-CORRECTION",
+    ] {
+        assert!(text.contains(&format!("[{id}]")), "{id}");
+    }
+    // The task-level check semantics the planner is judged against.
+    assert!(text.contains("WHOLE repository"));
+    assert!(text.contains("Never split a breaking change"));
+    let validator = include_str!("../src/local/planning/validation.rs");
+    for cited in validator.split("[PLAN-").skip(1) {
+        let id = format!("PLAN-{}", cited.split(']').next().unwrap());
+        assert!(text.contains(&format!("[{id}]")), "validator cites {id}");
+    }
+}
+
+/// A transient executor crash and a malformed verifier reply are each retried
+/// once as fresh jobs; the plan completes, and neither consumes a correction
+/// round (which remain for engineering corrections).
+#[test]
+fn mechanical_failures_are_retried_within_bound_without_consuming_correction_rounds() {
+    let f = Fixture::new();
+    let p = f.plan();
+    let inputs = seen();
+    let run = f
+        .run_scripted(
+            &p,
+            vec![Step::Crash, Step::Pass, Step::Malformed, Step::Pass],
+            inputs.clone(),
+        )
+        .unwrap();
+    assert_eq!(run.state, RunState::Complete);
+    assert_eq!(run.correction_round, 0);
+    assert_eq!(retries(&f), 2);
+    let jobs = f
+        .store()
+        .runtime_jobs(&f.root, Some(&p.packet.plan_id))
+        .unwrap();
+    let failed: Vec<_> = jobs
+        .iter()
+        .filter(|j| j.state == RuntimeJobState::Failed)
+        .collect();
+    assert_eq!(failed.len(), 2);
+    assert!(
+        failed
+            .iter()
+            .all(|j| { j.failure_class == Some(OutcomeClass::RetryableProviderFailure) })
+    );
+    assert!(failed.iter().any(|j| j.role == AgentRole::Executor));
+    assert!(failed.iter().any(|j| j.role == AgentRole::Verifier));
+    // Every retry was a fresh job with its own identity.
+    let ids: std::collections::BTreeSet<_> = jobs.iter().map(|j| &j.job_id).collect();
+    assert_eq!(ids.len(), jobs.len());
+}
+
+/// A quota refusal is not retried: it stops at once with the provider's own
+/// reason, leaves nothing uncertain, and the run resumes when the provider is
+/// available again.
+#[test]
+fn nonretryable_quota_failure_stops_honestly_and_resumes_later() {
+    let f = Fixture::new();
+    let p = f.plan();
+    let inputs = seen();
+    let error = f
+        .run_scripted(&p, vec![Step::Quota], inputs.clone())
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.starts_with("NONRETRYABLE_PROVIDER_FAILURE: usage limit reached"),
+        "{message}"
+    );
+    assert!(message.contains("agentctl run resume"), "{message}");
+    assert_eq!(inputs.lock().unwrap().len(), 1, "never retried");
+    assert_eq!(retries(&f), 0);
+    let run = f
+        .store()
+        .runtime_status(&f.root, &p.packet.plan_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, RunState::Running);
+    assert!(run.accepted.is_empty());
+    let resumed = seen();
+    assert_eq!(
+        f.run_scripted(&p, vec![], resumed.clone()).unwrap().state,
+        RunState::Complete
+    );
+}
+
+/// A valid executor result that declines the task is reported with the
+/// executor's own code and summary, the task and job identities, and the next
+/// step; it is never retried and never counted as success.
+#[test]
+fn an_executor_that_declines_is_reported_with_its_own_diagnosis() {
+    for (status, code, prefix) in [
+        (
+            ResultStatus::Blocked,
+            "WRITE_SCOPE_CONFLICT",
+            "EXECUTOR_BLOCKED",
+        ),
+        (
+            ResultStatus::Failed,
+            "WRITE_PERMISSION_DENIED",
+            "EXECUTOR_FAILED",
+        ),
+    ] {
+        let f = Fixture::new();
+        let p = f.plan();
+        let inputs = seen();
+        let message = f
+            .run_scripted(&p, vec![Step::Declined(status, code)], inputs.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains(&format!(
+                "{prefix}: {code}: the required change lies outside this task's write scope [task task:0, executor job runtime:"
+            )),
+            "{message}"
+        );
+        assert!(message.contains("no files were changed"), "{message}");
+        assert!(!message.contains("invented evidence"), "{message}");
+        assert_eq!(
+            inputs.lock().unwrap().len(),
+            1,
+            "a declined task is not retried"
+        );
+        let run = f
+            .store()
+            .runtime_status(&f.root, &p.packet.plan_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.state, RunState::Blocked);
+        assert!(run.reason.unwrap().contains(code));
+        let job = f
+            .store()
+            .runtime_jobs(&f.root, Some(&p.packet.plan_id))
+            .unwrap()
+            .into_iter()
+            .find(|j| j.role == AgentRole::Executor)
+            .unwrap();
+        assert_eq!(job.failure_class, Some(OutcomeClass::SemanticRejection));
+        assert!(job.failure.unwrap().contains(code));
+    }
+}
+
+struct Planners {
+    decisions: std::collections::VecDeque<Value>,
+    seen: Arc<Mutex<Vec<JobInput>>>,
+}
+impl ProviderAdapter for Planners {
+    fn capabilities(&self) -> Capabilities {
+        Fake {
+            mode: Mode::Pass,
+            seen: seen(),
+        }
+        .capabilities()
+    }
+    fn launch(
+        &mut self,
+        input: &JobInput,
+        _: ProcessSpec,
+        _: &RoleConfig,
+    ) -> local::Result<Box<dyn RunningProcess>> {
+        self.seen.lock().unwrap().push(input.clone());
+        let decision = self.decisions.pop_front().expect("scripted decision");
+        Ok(Box::new(Immediate(Some(success(
+            serde_json::to_vec(&decision).unwrap(),
+        )))))
+    }
+    fn collect(&self, output: &ProcessOutput) -> local::Result<Value> {
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+}
+
+/// A planner decision refused for a planner-contract rule gets exactly one
+/// fresh correction attempt, told the rule, task, offending value and expected
+/// form; a second refusal ends it. Validation itself is unchanged.
+#[test]
+fn planner_contract_refusal_gets_one_bounded_correction_with_the_exact_rule() {
+    for second_valid in [true, false] {
+        let f = Fixture::new();
+        let prepared = f.prepare();
+        let valid = common::plan_decision(&serde_json::to_value(artifact(&prepared)).unwrap());
+        let mut invalid = valid.clone();
+        invalid["packet"]["tasks"][0]["graph_entities"] = json!(["src::api::cache_api"]);
+        let inputs = seen();
+        let mut store = f.store();
+        let result = Runtime::new(
+            &mut store,
+            f.paths.clone(),
+            f.config.clone(),
+            BTreeMap::from([(
+                "test".into(),
+                Box::new(Planners {
+                    decisions: vec![
+                        invalid.clone(),
+                        if second_valid {
+                            valid.clone()
+                        } else {
+                            invalid.clone()
+                        },
+                    ]
+                    .into(),
+                    seen: inputs.clone(),
+                }) as Box<dyn ProviderAdapter>,
+            )]),
+        )
+        .unwrap()
+        .plan(&f.root, &prepared.request.request_id);
+        let inputs = inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 2, "one decision and exactly one correction");
+        assert!(inputs[0].artifact.get("correction").is_none());
+        let correction = &inputs[1].artifact["correction"];
+        let refusal = correction["refusal"].as_str().unwrap();
+        assert!(refusal.contains("[PLAN-GRAPH-REFS]"), "{refusal}");
+        assert!(refusal.contains("task:0"), "{refusal}");
+        assert!(refusal.contains("src::api::cache_api"), "{refusal}");
+        assert!(refusal.contains("graph:<64 hex>"), "{refusal}");
+        assert_eq!(correction["previous_decision"], invalid);
+        assert_ne!(inputs[0].job_id, inputs[1].job_id, "a fresh planner job");
+        let jobs = f.store().runtime_jobs(&f.root, None).unwrap();
+        assert_eq!(
+            jobs.iter()
+                .filter(|j| j.failure_class == Some(OutcomeClass::ValidationFailure))
+                .count(),
+            if second_valid { 1 } else { 2 }
+        );
+        if second_valid {
+            assert_eq!(result.unwrap().state, PlanState::Validated);
+        } else {
+            let message = result.unwrap_err().to_string();
+            assert!(message.contains("[PLAN-GRAPH-REFS]"), "{message}");
+        }
+    }
 }

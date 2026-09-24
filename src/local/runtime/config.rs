@@ -42,7 +42,26 @@ impl ConcurrencyConfig {
         )
     }
 }
-/// Hard maxima of the Stage 2 context relay. Configuration may choose values
+/// Relaunches agentctl will spend on one task whose launch provably mutated
+/// nothing (controller crash, provider timeout, unusable reply). Machine-owned
+/// and deliberately not configurable: it exists so a transient failure does not
+/// end a plan, not as a retry policy.
+pub const MAX_EXECUTOR_RELAUNCHES: u32 = 2;
+
+/// Fresh provider jobs agentctl may spend, within one invocation, on a
+/// mechanically unusable exchange (timeout, transient exit, a reply that is
+/// not the canonical document, or a verifier/executor contract violation).
+/// Each retry is its own durable job. Executors are retried only when the
+/// workspace is provably unchanged. Machine-owned and not configurable: it
+/// absorbs provider noise; engineering corrections remain replacement plans.
+pub const MAX_PROVIDER_RETRIES: u32 = 2;
+
+/// Fresh planner jobs agentctl issues after a planner decision is refused for
+/// a planner-contract rule, each told the exact refusal. Distinct from
+/// runtime correction rounds, which replace an executed plan.
+pub const MAX_PLAN_CORRECTIONS: u32 = 1;
+
+/// Hard maxima of the context relay. Configuration may choose values
 /// inside them; worker output, planner output and project policy cannot.
 pub const HARD_MAX_CONTEXT_ROUNDS: u32 = 4;
 pub const HARD_MAX_VERIFIER_CONTEXT_ROUNDS: u32 = 2;
@@ -57,8 +76,8 @@ const fn protocol_max_request_bytes() -> u32 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContextVisibility {
-    /// The whole workspace is readable (the default until provider dogfood
-    /// proves the relay; see docs/security.md).
+    /// The whole workspace is readable (the default until the relay is proven
+    /// with real providers; see docs/security.md).
     #[default]
     Workspace,
     /// Executor and verifier jobs read only the repository files actually

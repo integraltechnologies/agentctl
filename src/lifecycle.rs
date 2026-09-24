@@ -6,10 +6,6 @@ use crate::protocol::*;
 use crate::validation::{Validate, ValidationError, ensure};
 
 impl TaskState {
-    pub fn is_complete(self) -> bool {
-        self == Self::Verified
-    }
-
     /// Structural edge only. Use PlanPacket::validate_task_transition for DAG/proof guards.
     pub fn can_transition_to(self, next: Self) -> bool {
         use TaskState::*;

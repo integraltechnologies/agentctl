@@ -7,7 +7,7 @@
 //!                                  refused before launch (never unsandboxed)
 //! ```
 //!
-//! Planning, routing, lifecycle, verification, analytics, experiments and Stage 9
+//! Planning, routing, lifecycle, verification, analytics, experiments and experiment-event
 //! decisions only build `ProcessSpec`s; none of them sees a platform API. The
 //! policy vocabulary here (read/write roots, denied control-plane paths, network,
 //! environment allowlist, resource ceilings) is independent of Seatbelt, Landlock
@@ -236,7 +236,7 @@ impl ResourceLimits {
     }
 }
 
-/// Stage 9 event-volume ceiling per experiment attempt. Machine-owned; a project
+/// Experiment-event volume ceiling per attempt. Machine-owned; a project
 /// may only lower it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -535,10 +535,14 @@ pub struct DeniedPath {
     pub write: bool,
     /// Controller-issued subpaths (scratch, provider auth files) re-allowed inside.
     pub except: Vec<PathBuf>,
+    /// Exact paths re-allowed inside, without re-allowing anything beneath
+    /// them. A directory listed here stays listable while its contents stay
+    /// denied, which is what issued visibility needs for path resolution.
+    pub except_files: Vec<PathBuf>,
     pub reason: &'static str,
 }
 
-/// Stage 2 issued-context visibility of a provider frontend: instead of the
+/// Issued-context visibility of a provider frontend: instead of the
 /// whole workspace (and its Git directories), only the repository files issued
 /// to the job are readable, and a writable job may write only its write scope
 /// (which the backends also make readable). Checks and experiments never use it.
@@ -562,6 +566,13 @@ pub struct FilesystemPolicy {
     pub write_roots: Vec<PathBuf>,
     /// Individual files writable (device nodes, provider auth files).
     pub write_files: Vec<PathBuf>,
+    /// Authorized files that may also be replaced atomically: a sibling named
+    /// `<file>.<suffix>` may be created, written, renamed onto the file or
+    /// removed, and no other sibling. Editors write such a temporary next to
+    /// the target and rename it into place; without it an authorized edit is
+    /// mechanically impossible. Enforced where the backend can match names
+    /// (macOS Seatbelt); elsewhere the grant is not made (exact file only).
+    pub write_siblings: Vec<PathBuf>,
     /// Always win over every grant.
     pub denied: Vec<DeniedPath>,
 }
@@ -704,7 +715,24 @@ pub fn platform_read_roots() -> Vec<PathBuf> {
             push_unique(&mut roots, real);
         }
     }
+    if let Some(temp) = platform_temp_root() {
+        push_unique(&mut roots, temp);
+    }
     roots
+}
+
+/// The OS-shared temporary directory, canonicalized (`/tmp` resolves to
+/// `/private/tmp` on macOS). Workers get their own `TMPDIR` in scratch, but
+/// third-party provider CLIs also use the platform location directly — the
+/// Claude Code CLI keeps a per-uid directory there — so it is a platform root
+/// like `/usr`, not a host-specific exception. Nothing in agentctl state, the
+/// workspace, Git metadata or a credential store is reachable through it:
+/// those denials are compiled after every grant and win.
+pub(crate) fn platform_temp_root() -> Option<PathBuf> {
+    if !cfg!(unix) {
+        return None;
+    }
+    fs::canonicalize("/tmp").ok().filter(|p| p.is_dir())
 }
 
 /// Individual system files whose symlink targets live outside the default roots
@@ -973,7 +1001,7 @@ fn environment(
         // relied upon for any agentctl guarantee.
         env.insert("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB".into(), "1".into());
         if let Some(native) = &spec.native_auth {
-            for (name, value) in native.variables() {
+            for (name, value) in native.variables(&scratch_home) {
                 match value {
                     Some(value) => env.insert(name.into(), value),
                     None => env.remove(name),
@@ -1031,6 +1059,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
     let program = resolve_program(&spec.executable, &spec.cwd, &path_var)?;
 
     let mut fs_policy = FilesystemPolicy {
+        write_siblings: vec![],
         workspace: workspace.clone(),
         scratch: scratch.clone(),
         ..Default::default()
@@ -1057,9 +1086,58 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
     if let Some(visibility) = issued {
         // Only what was issued; the workspace tree and Git object store stay
         // unreadable, so neither can recover unissued source.
+        let mut readable = vec![];
         for file in &visibility.read_files {
-            push_unique(&mut fs_policy.read_files, inside_workspace(file)?);
+            readable.push(inside_workspace(file)?);
         }
+        let mut writable = vec![];
+        for path in &visibility.write_paths {
+            writable.push(inside_workspace(path)?);
+        }
+        // A process must be able to resolve its own working directory: getcwd()
+        // and relative path resolution read the directory entries themselves,
+        // and without this every provider CLI fails before it starts. Only the
+        // exact directories on the path to an issued item are listed — never a
+        // subtree — so this discloses the names in those directories and no
+        // file contents anywhere.
+        let mut directories = vec![workspace.clone()];
+        for path in readable.iter().chain(&writable) {
+            for ancestor in path.ancestors().skip(1) {
+                if !ancestor.starts_with(&workspace) {
+                    break;
+                }
+                push_unique(&mut directories, ancestor.to_path_buf());
+            }
+        }
+        directories.retain(|directory| directory.is_dir());
+        for path in readable.iter().chain(&writable).chain(&directories) {
+            push_unique(&mut fs_policy.read_files, path.clone());
+        }
+        // Issued visibility is a denial, not merely a missing grant. Without
+        // this, any broader read root that happens to contain the checkout —
+        // an operator `read_roots` entry, or the platform temp directory when
+        // the repository lives under it — would silently restore workspace-wide
+        // access and the mode would confine nothing.
+        let mut except = readable.clone();
+        except.extend(writable.iter().cloned());
+        fs_policy.denied.push(DeniedPath {
+            path: workspace.clone(),
+            read: true,
+            metadata: false,
+            write: false,
+            except,
+            except_files: directories.clone(),
+            reason: "issued-context visibility: unissued repository content",
+        });
+        fs_policy.denied.push(DeniedPath {
+            path: workspace.clone(),
+            read: false,
+            metadata: false,
+            write: true,
+            except: writable,
+            except_files: vec![],
+            reason: "issued-context visibility: write targets only",
+        });
     } else {
         push_unique(&mut fs_policy.read_roots, workspace.clone());
         for git in &spec.git_directories {
@@ -1086,7 +1164,11 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
         match issued {
             Some(visibility) => {
                 for path in &visibility.write_paths {
-                    push_unique(&mut fs_policy.write_roots, inside_workspace(path)?);
+                    let path = inside_workspace(path)?;
+                    if !path.is_dir() {
+                        push_unique(&mut fs_policy.write_siblings, path.clone());
+                    }
+                    push_unique(&mut fs_policy.write_roots, path);
                 }
             }
             None => push_unique(&mut fs_policy.write_roots, workspace.clone()),
@@ -1144,6 +1226,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
         metadata: true,
         write: true,
         except: vec![scratch.clone()],
+        except_files: vec![],
         reason: "agentctl canonical state",
     });
     for (path, reason) in [
@@ -1156,6 +1239,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
             metadata: true,
             write: true,
             except: vec![],
+            except_files: vec![],
             reason,
         });
     }
@@ -1177,6 +1261,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
                 metadata: false,
                 write: true,
                 except: vec![],
+                except_files: vec![],
                 reason: "Git/agentctl/provider control plane",
             });
         }
@@ -1201,6 +1286,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
                 metadata: false,
                 write: true,
                 except,
+                except_files: vec![],
                 reason: "provider-private home",
             });
         }
@@ -1216,6 +1302,7 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
                 metadata: false,
                 write: true,
                 except: vec![],
+                except_files: vec![],
                 reason: "credential store",
             });
         }
@@ -1228,11 +1315,15 @@ pub fn compile(spec: &ProcessSpec) -> Result<SecurityPolicy> {
             metadata: false,
             write: true,
             except: vec![],
+            except_files: vec![],
             reason: "project protected path",
         });
     }
-    // A grant that sits inside a (non-excepted) denial is not a grant.
-    for grant in [&workspace, &scratch] {
+    // A grant that sits inside a (non-excepted) denial is not a grant. The
+    // check is over the write surface actually granted, which under issued
+    // visibility is the write targets rather than the workspace root.
+    let granted: Vec<PathBuf> = fs_policy.write_roots.clone();
+    for grant in granted.iter().chain([&scratch]) {
         require(
             !fs_policy.denied.iter().any(|d| {
                 d.write
@@ -1662,7 +1753,7 @@ mod tests {
         assert!(check(&root, &deny).is_err());
     }
 
-    /// Stage 8A SEC-8A-01/SEC-8A-02: a backend that cannot shut the system
+    /// A backend that cannot shut the system
     /// service broker cannot confine a worker at all, because a broker-started
     /// process is outside the sandbox, the process group, the environment and
     /// the inherited descriptors at once. It is required unconditionally - of
@@ -1907,10 +1998,10 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// Stage 8A SEC-8A-03: `[commands.KEY].program` in `.agentctl/project.toml`
-    /// is repository-controlled, and an absolute path there used to add the
+    /// `[commands.KEY].program` in `.agentctl/project.toml` is
+    /// repository-controlled, so an absolute path there must never add the
     /// program's whole install directory to the worker's read roots - a grant
-    /// the stated invariant says repository configuration can never make. The
+    /// repository configuration can never make. The
     /// machine operator's own programs must keep that grant, because ordinary
     /// toolchains read files beside their executable.
     #[test]
@@ -1977,7 +2068,12 @@ mod tests {
                 .filesystem
                 .read_roots
                 .iter()
-                .any(|r| tools.starts_with(r) && r != &base.join("tools")),
+                // Platform roots (the OS temp directory among them) are granted
+                // to every worker regardless of repository configuration, so a
+                // fixture that happens to live under one proves nothing here.
+                .any(|r| tools.starts_with(r)
+                    && r != &base.join("tools")
+                    && !platform_read_roots().contains(r)),
             "no ancestor of the program's directory may be granted either"
         );
         // Operator authority is unchanged: the install directory stays granted,

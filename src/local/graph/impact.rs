@@ -1,10 +1,10 @@
-//! Stage 4: semantic impact analysis over the accepted Stage-1 ontology,
-//! seeded by a Stage-3 semantic delta or by a planner's prospective edit.
+//! Semantic impact analysis over the accepted ontology, seeded by a semantic
+//! delta or by a planner's prospective edit.
 //!
 //! The core invariant is that no impact claim exists without a machine
 //! inspectable evidence chain through already-observed repository facts: every
 //! [`ImpactItem`] carries the ordered [`ImpactStep`]s that reached it, and each
-//! step names a resolved relation, a containment link, or a Stage-1 test
+//! step names a resolved relation, a containment link, or a graph test
 //! association. Lexical similarity, name coincidence and graph proximity never
 //! create an item; where the ontology cannot prove connectivity the traversal
 //! stops and records an [`ImpactBoundary`] instead of inventing an edge.
@@ -29,7 +29,7 @@ pub enum ImpactClass {
     /// Reached through a node the ontology proves re-exposes the change (an
     /// implementation, an import, or an exported declaration).
     ContractExposure,
-    /// A test associated with a changed or affected entity by the Stage-1
+    /// A test associated with a changed or affected entity by the graph's
     /// association rules. Candidate coverage, never proven coverage.
     VerificationRelevance,
     /// The container whose composition changed because a declaration it owns
@@ -264,7 +264,7 @@ pub struct ImpactReport {
     pub meaning: String,
 }
 
-const MEANING: &str = "Evidence-backed impact candidates only: every item is reached by resolved relations, containment or Stage-1 test association from a changed entity. Absence of an item is not proof of no impact; open questions are listed as boundaries. This report grants no read or write authority.";
+const MEANING: &str = "Evidence-backed impact candidates only: every item is reached by resolved relations, containment or graph test association from a changed entity. Absence of an item is not proof of no impact; open questions are listed as boundaries. This report grants no read or write authority.";
 
 /// Impact never widens authority. The field exists so a consumer cannot read a
 /// report as permission.
@@ -563,9 +563,9 @@ impl Walk<'_> {
         );
         // Past the first hop, only proven re-exposure continues: implementing
         // the changed declaration, or being an exported declaration whose own
-        // contract the change reached. IMPORTS is not included here because
-        // Stage 1 does not resolve IMPORTS edges, so this arm is currently
-        // unreachable for that kind.
+        // contract the change reached. A resolved IMPORTS relation is a
+        // direct dependency, not a re-exposure: syntax does not tell a
+        // `pub use` re-export from a private import, so it stops here.
         let reexposes = matches!(kind, RelationKind::Implements);
         let carries =
             entity.kind != EntityKind::Test && (reexposes || (from.contract && exported(&entity)));
@@ -748,7 +748,9 @@ fn analyze(
     })
 }
 
-fn short_name(qualified: &str) -> String {
+/// Last path segment of a qualified name. Shared with relation queries,
+/// which report unresolved sites by the same short name.
+pub(super) fn short_name(qualified: &str) -> String {
     qualified
         .rsplit(['.', ':'])
         .next()

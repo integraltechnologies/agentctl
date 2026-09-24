@@ -4,6 +4,7 @@ pub(crate) mod cli;
 pub mod concurrency;
 pub mod config;
 pub mod context;
+pub mod contract;
 pub mod credentials;
 pub mod diffview;
 pub(crate) mod liveness;
@@ -18,8 +19,8 @@ pub use session::{AgentLifetime, AgentOwnership, EngineeringSession};
 mod state;
 use state::*;
 pub use state::{
-    BatchLaunchAuthority, ReconciliationIntent, ReconciliationPath, RunRecord, RunState,
-    RuntimeJob, RuntimeJobState,
+    BatchLaunchAuthority, OutcomeClass, ReconciliationIntent, ReconciliationPath, RunRecord,
+    RunState, RuntimeJob, RuntimeJobState,
 };
 mod capability;
 pub use capability::{

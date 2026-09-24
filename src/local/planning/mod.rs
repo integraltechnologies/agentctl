@@ -46,6 +46,19 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate(&tx, &info, plan)?;
+        require(
+            tx.query_row(
+                "SELECT 1 FROM execution_plans WHERE repo_id=?1 AND plan_id=?2",
+                params![info.repository_id.as_str(), plan.packet.plan_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none(),
+            format!(
+                "[PLAN-OUTPUT] plan {} already exists in this repository; a plan identity is permanent, so issue a new plan_id (or supersede the existing plan)",
+                plan.packet.plan_id.as_str()
+            ),
+        )?;
         store::insert_plan(&tx, &info.repository_id, &plan.packet, now_ms()?)?;
         tx.execute("INSERT INTO execution_plans(repo_id,plan_id,request_id,workspace_id,metadata_json,state,updated_at_ms) VALUES (?1,?2,?3,?4,?5,'VALIDATED',?6)",params![info.repository_id.as_str(),plan.packet.plan_id.as_str(),plan.metadata.request_id.as_str(),info.workspace_id.as_str(),serde_json::to_string(&plan.metadata)?,now_ms()?])?;
         audit(
@@ -111,6 +124,19 @@ impl Store {
             "activation requires VALIDATED plan",
         )?;
         validate(&tx, &info, &view.plan)?;
+        if let Some(active) = tx
+            .query_row(
+                "SELECT plan_id FROM execution_plans WHERE repo_id=?1 AND workspace_id=?2 AND state='ACTIVE'",
+                params![info.repository_id.as_str(), info.workspace_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Err(Error::Invalid(format!(
+                "workspace already has an ACTIVE execution plan ({active}); complete, cancel or supersede it before activating {}",
+                id.as_str()
+            )));
+        }
         tx.execute("UPDATE execution_plans SET state='ACTIVE',updated_at_ms=?3 WHERE repo_id=?1 AND plan_id=?2",params![info.repository_id.as_str(),id.as_str(),now_ms()?])?;
         audit(
             &tx,
@@ -118,6 +144,35 @@ impl Store {
             Some(id),
             &JournalEntry::ExecutionPlanActivated {
                 plan_id: id.clone(),
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Controller-owned cancellation: the caller already holds the runtime
+    /// permit, so the runtime-ownership refusal below does not apply.
+    pub(crate) fn cancel_execution_plan_owned(
+        &mut self,
+        info: &RepositoryInfo,
+        id: &PlanId,
+        reason: &str,
+    ) -> Result<()> {
+        text(reason, 1024, "cancellation reason")?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let view = load(&tx, info, id)?;
+        mutable(&view)?;
+        quiescent(&tx, info, id)?;
+        tx.execute("UPDATE execution_plans SET state='CANCELLED',updated_at_ms=?3 WHERE repo_id=?1 AND plan_id=?2",params![info.repository_id.as_str(),id.as_str(),now_ms()?])?;
+        graph::close_for_plan(&tx, info, id, None, graph::DecisionReason::PlanCancelled)?;
+        audit(
+            &tx,
+            info,
+            Some(id),
+            &JournalEntry::ExecutionPlanCancelled {
+                plan_id: id.clone(),
+                reason: reason.into(),
             },
         )?;
         tx.commit()?;
@@ -132,6 +187,23 @@ impl Store {
         let view = load(&tx, &info, id)?;
         mutable(&view)?;
         quiescent(&tx, &info, id)?;
+        // A plan the controller has run belongs to the controller: the database
+        // enforces that with a trigger, so say what to do instead of surfacing
+        // its message.
+        require(
+            tx.query_row(
+                "SELECT 1 FROM runtime_runs WHERE repo_id=?1 AND plan_id=?2",
+                params![info.repository_id.as_str(), id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none(),
+            format!(
+                "{} has controller-owned runtime history; cancel it with agentctl run cancel {}",
+                id.as_str(),
+                id.as_str()
+            ),
+        )?;
         tx.execute("UPDATE execution_plans SET state='CANCELLED',updated_at_ms=?3 WHERE repo_id=?1 AND plan_id=?2",params![info.repository_id.as_str(),id.as_str(),now_ms()?])?;
         graph::close_for_plan(&tx, &info, id, None, graph::DecisionReason::PlanCancelled)?;
         audit(
@@ -271,23 +343,11 @@ impl Store {
         tasks.sort_by(|a, b| a.packet.task_id.cmp(&b.packet.task_id));
         Ok(tasks)
     }
-    /// Accept externally recorded integration proof; does not run any check or job.
-    pub fn complete_execution_plan(
-        &mut self,
-        start: &Path,
-        id: &PlanId,
-        proof: &VerificationPacket,
-        source: &SourceStateRef,
-    ) -> Result<()> {
-        self.complete_plan(start, id, proof, source, false)
-            .map(|_| ())
-    }
-
-    /// Runtime completion: the plan's verified ontology candidate is accepted
-    /// in the same transaction that completes the plan, so neither can commit
-    /// without the other. Returns the accepted generation, if the plan changed
-    /// the accepted facts.
-    pub(crate) fn complete_execution_plan_accepting(
+    /// The only plan-completion path: the plan's verified ontology candidate is
+    /// accepted in the same transaction that completes the plan, so neither can
+    /// commit without the other. Returns the accepted generation, if the plan
+    /// changed the accepted facts.
+    pub fn complete_execution_plan_accepting(
         &mut self,
         start: &Path,
         id: &PlanId,

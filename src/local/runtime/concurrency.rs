@@ -1,4 +1,4 @@
-//! Deterministic Stage-7 task compatibility. This is derived evidence, not a
+//! Deterministic task compatibility for concurrent execution. This is derived evidence, not a
 //! second dependency graph or a heuristic score: an absent proof fails closed.
 
 use super::*;
@@ -129,7 +129,13 @@ fn write_state(
     Ok(())
 }
 
-fn materialize(root: &Path, expected: &SourceSnapshot, artifacts: &Artifacts) -> Result<()> {
+/// Rewrites `root` until it is byte-for-byte the recorded snapshot. Used both
+/// to seed an isolated worktree and to discard a refused result.
+pub(super) fn materialize(
+    root: &Path,
+    expected: &SourceSnapshot,
+    artifacts: &Artifacts,
+) -> Result<()> {
     require(
         expected.ignored.is_empty(),
         "UNKNOWN: isolated execution cannot reproduce ignored-file metadata safely",
@@ -182,10 +188,7 @@ pub(super) fn create_workspace(
         store
             .connection
             .query_row("SELECT lower(hex(randomblob(8)))", [], |row| row.get(0))?;
-    let parent = paths
-        .data_root
-        .join("runtime/worktrees")
-        .join(plan.as_str().replace(':', "-"));
+    let parent = plan_worktrees(paths, info, plan);
     paths::ensure_directory(&parent)?;
     let root = parent.join(format!("{}-{nonce}", task.as_str().replace(':', "-")));
     let root_text = root
@@ -222,6 +225,58 @@ pub(super) fn create_workspace(
 
 pub(super) fn remove_workspace(info: &RepositoryInfo, root: &str) -> Result<()> {
     git(&info.root, &["worktree", "remove", "--force", root])
+}
+
+/// Managed worktrees for one plan, under the machine worktree root. The
+/// workspace segment keeps linked worktrees of different checkouts apart even
+/// when two plans share an ID across repositories.
+pub(super) fn plan_worktrees(
+    paths: &paths::MachinePaths,
+    info: &RepositoryInfo,
+    plan: &PlanId,
+) -> PathBuf {
+    paths
+        .worktree_root
+        .join(info.workspace_id.as_str())
+        .join(plan.as_str().replace(':', "-"))
+}
+
+/// Drops every managed worktree of this workspace that durable runtime state
+/// does not still refer to, then prunes Git's own registrations. The caller
+/// holds the exclusive workspace lease, so anything outside `keep` is abandoned
+/// by definition: a branch whose controller died, or a plan that already ended.
+/// Failures are reported but never abort a run; a leftover directory must not
+/// be able to block recovery.
+pub(super) fn prune_workspaces(
+    paths: &paths::MachinePaths,
+    info: &RepositoryInfo,
+    keep: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut removed = vec![];
+    let root = paths.worktree_root.join(info.workspace_id.as_str());
+    let plans = match fs::read_dir(&root) {
+        Ok(plans) => plans,
+        Err(_) => return removed,
+    };
+    for plan in plans.flatten() {
+        let branches = match fs::read_dir(plan.path()) {
+            Ok(branches) => branches,
+            Err(_) => continue,
+        };
+        for branch in branches.flatten() {
+            let path = branch.path();
+            let Some(text) = path.to_str() else { continue };
+            if keep.contains(text) {
+                continue;
+            }
+            let _ = remove_workspace(info, text);
+            let _ = fs::remove_dir_all(&path);
+            removed.push(text.to_owned());
+        }
+        let _ = fs::remove_dir(plan.path());
+    }
+    let _ = git(&info.root, &["worktree", "prune"]);
+    removed
 }
 
 pub(super) fn live_generation_id(store: &Store, info: &RepositoryInfo) -> Result<String> {
@@ -853,6 +908,7 @@ mod tests {
                 reasons: vec![CompatibilityReason::DisjointDeclaredScopes],
             }],
             ontology_generation: Some("generation:test".into()),
+            reconciled_from: None,
         };
         let error = reconciliation_intent(&task, &pending, &current, &artifacts).unwrap_err();
         assert!(error.to_string().contains("RECONCILIATION_CONFLICT"));

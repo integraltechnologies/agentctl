@@ -1,4 +1,5 @@
 //! Content-bound, workspace-specific repository intelligence. No source execution.
+mod bindings;
 pub(crate) mod cli;
 mod delta;
 pub mod files;
@@ -9,6 +10,7 @@ mod model;
 mod parser;
 mod query;
 mod resolve;
+mod semantic;
 mod wire;
 pub use delta::{
     Change, ContentChange, DeltaSummary, EntityChange, EntityFacts, EntityField, FactsRef,
@@ -31,7 +33,8 @@ pub use lifecycle::{
 };
 pub(crate) use lifecycle::{accept_for_plan, close_for_plan, require_accepted, require_issuable};
 pub use model::*;
-pub use query::{GraphQuery, QueryResult, SearchMode, objective_query};
+pub use query::{GraphQuery, QueryResult, SearchMode, objective_query, symbol_mentions};
+pub use semantic::{SemanticOutcome, SemanticTiming};
 
 use super::{
     Error, Result, now_ms,
@@ -95,6 +98,7 @@ impl Store {
             source: info.source.clone(),
             stats: stats.clone(),
             generation: previous.clone(),
+            semantic: None,
         };
         tx.execute("INSERT INTO graph_indexes(workspace_id,repo_id,metadata_json) VALUES (?1,?2,?3) ON CONFLICT(workspace_id) DO UPDATE SET metadata_json=excluded.metadata_json",
             params![info.workspace_id.as_str(), info.repository_id.as_str(), serde_json::to_string(&initial)?])?;
@@ -217,7 +221,8 @@ impl Store {
         let changed = previous
             .as_ref()
             .is_none_or(|g| g.fingerprint != fingerprint);
-        if changed || stats.indexed > 0 || stats.deleted > 0 {
+        let rebuilt = changed || stats.indexed > 0 || stats.deleted > 0;
+        if rebuilt {
             resolve::rebuild(&tx, info.workspace_id.as_str())?;
         }
         let generation = match previous {
@@ -241,6 +246,11 @@ impl Store {
             source: after.source,
             stats: stats.clone(),
             generation: Some(generation.clone()),
+            // Semantic rows survive only when nothing was re-derived.
+            semantic: old_metadata
+                .as_ref()
+                .and_then(|m| m.semantic.clone())
+                .filter(|s| !rebuilt && s.generation == generation),
         };
         tx.execute(
             "UPDATE graph_indexes SET metadata_json=?2 WHERE workspace_id=?1",
@@ -346,6 +356,54 @@ fn stored_files(
 /// (used by the index pass and by the schema migration that introduced them).
 pub(crate) fn rebuild_resolutions(connection: &Connection, workspace: &str) -> Result<()> {
     resolve::rebuild(connection, workspace)
+}
+
+impl Store {
+    /// Enriches the current generation with what a language semantic provider
+    /// can prove, if one is installed.
+    ///
+    /// Deliberately explicit rather than part of indexing: the deterministic
+    /// pass is milliseconds and must never wait on a provider that takes
+    /// seconds. The graph is fully usable before this runs and after it fails.
+    /// Enrichment is idempotent, and re-indexing discards what it added,
+    /// because resolutions are rebuilt whenever the generation changes.
+    pub fn enrich_semantic(&mut self, start: &Path) -> Result<Vec<semantic::SemanticOutcome>> {
+        let info = checked_workspace(self, start)?;
+        require(
+            status(&self.connection, &info)?.fresh,
+            "semantic enrichment requires a complete fresh index; run agentctl repo index",
+        )?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcomes = semantic::run(&tx, &info, info.workspace_id.as_str())?;
+        let providers: Vec<String> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                semantic::SemanticOutcome::Current { provider, .. } => Some(provider.clone()),
+                semantic::SemanticOutcome::Unavailable { .. } => None,
+            })
+            .collect();
+        if let Some(mut metadata) = metadata(&tx, &info)? {
+            metadata.semantic = match (&metadata.generation, providers.is_empty()) {
+                (Some(generation), false) => Some(SemanticStamp {
+                    generation: generation.clone(),
+                    providers,
+                    enriched_at_ms: now_ms()?,
+                }),
+                _ => None,
+            };
+            tx.execute(
+                "UPDATE graph_indexes SET metadata_json=?2 WHERE workspace_id=?1",
+                params![
+                    info.workspace_id.as_str(),
+                    serde_json::to_string(&metadata)?
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(outcomes)
+    }
 }
 
 /// The persisted generation of the workspace's index, without rehashing sources.

@@ -5,7 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 /// Bump for any extraction, resolution, identity, or discovery-policy change.
-pub const INDEX_VERSION: &str = "agentctl-graph-2";
+pub const INDEX_VERSION: &str = "agentctl-graph-4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +117,15 @@ pub enum ResolutionRule {
     /// A qualified path whose normalized suffix names exactly one compatible
     /// declaration in the workspace. Re-exports and imports are not followed.
     QualifiedPath,
+    /// A name this file imported under its own name (`use a::b` then `b()`),
+    /// resolved as the path it was imported from.
+    ImportBinding,
+    /// A name this file imported under a different one (`use a::b as c` then
+    /// `c()`), resolved through the alias to the path it renames.
+    AliasBinding,
+    /// Proven by a language semantic provider, not by syntax. Carries the
+    /// provider's identity so the claim is attributable and re-checkable.
+    SemanticProvider,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +194,21 @@ pub struct IndexMetadata {
     /// Absent (None) only in metadata written before generations existed.
     #[serde(default)]
     pub generation: Option<GraphGeneration>,
+    /// Semantic enrichment attached to `generation`, if any. Written only by
+    /// `repo enrich`; any index pass that rebuilds workspace resolutions drops
+    /// it together with the semantic rows, so it can never describe facts
+    /// that are gone. Absent means the relations are structural only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<SemanticStamp>,
+}
+
+/// Which semantic providers proved relations for which generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticStamp {
+    pub generation: GraphGeneration,
+    pub providers: Vec<String>,
+    pub enriched_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +233,13 @@ pub struct IndexStatus {
 impl IndexStatus {
     pub fn generation(&self) -> Option<&GraphGeneration> {
         self.index.as_ref().and_then(|m| m.generation.as_ref())
+    }
+    /// Semantic facts exist for the indexed generation.
+    pub fn semantic(&self) -> Option<&SemanticStamp> {
+        self.index
+            .as_ref()
+            .and_then(|m| m.semantic.as_ref())
+            .filter(|s| Some(&s.generation) == self.generation())
     }
 }
 
@@ -271,6 +302,36 @@ pub struct UnresolvedSummary {
     pub names: Vec<String>,
 }
 
+/// How complete the relation picture is, counted before any byte shedding and
+/// never shed itself. `relations` is only what agentctl proved; without this a
+/// budget-starved packet whose detailed `unresolved` records were dropped reads
+/// exactly like a packet whose entities genuinely have no further relations.
+/// The two must never be confusable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationCoverage {
+    /// Relation sites among the selected entities with no resolved target.
+    pub unresolved_sites: usize,
+    /// Distinct entities holding at least one such site.
+    pub unresolved_entities: usize,
+    /// Detailed unresolved/impact records were dropped for budget; the counts
+    /// above still describe the full picture.
+    pub detail_shed: bool,
+    /// Semantic enrichment is attached to this generation. When false every
+    /// relation is structural and receiver-, trait- and macro-dependent sites
+    /// are unresolved by construction, not because nothing is there.
+    #[serde(default)]
+    pub semantic: bool,
+}
+
+impl RelationCoverage {
+    /// True only when every observed relation site among the selected entities
+    /// resolved. Anything else means "incomplete", never "nothing exists".
+    pub fn complete(&self) -> bool {
+        self.unresolved_sites == 0
+    }
+}
+
 /// Serialized with one normalized source table instead of per-record provenance
 /// (see `wire.rs`); records are rehydrated with their full provenance on read.
 #[derive(Debug, Clone)]
@@ -285,6 +346,8 @@ pub struct ContextPacket {
     pub tests: Vec<Entity>,
     pub associations: Vec<TestAssociation>,
     pub unresolved: Vec<UnresolvedSummary>,
+    /// Survives byte shedding; see [`RelationCoverage`].
+    pub coverage: RelationCoverage,
     pub limits: ContextLimits,
     pub truncated: bool,
     pub freshness: IndexStatus,

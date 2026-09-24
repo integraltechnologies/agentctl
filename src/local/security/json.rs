@@ -1,4 +1,4 @@
-//! Strict parsing for untrusted JSON (provider output, Stage 9 frames).
+//! Strict parsing for untrusted JSON (provider output, experiment-event frames).
 //!
 //! `serde_json::Value` silently keeps the last of duplicate object keys, so two
 //! consumers of the same bytes could disagree about a field. Untrusted input is

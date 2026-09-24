@@ -53,10 +53,11 @@ fn decompose(
     chains: &mut Vec<PathBuf>,
     budget: &mut usize,
 ) -> Result<()> {
-    if holes
-        .iter()
-        .any(|h| grant.starts_with(&h.path) && !h.except.iter().any(|e| grant.starts_with(e)))
-    {
+    if holes.iter().any(|h| {
+        grant.starts_with(&h.path)
+            && !h.except.iter().any(|e| grant.starts_with(e))
+            && !h.except_files.iter().any(|e| grant == e)
+    }) {
         return Ok(());
     }
     if !holes
@@ -658,9 +659,11 @@ mod tests {
             metadata: false,
             write: true,
             except: vec![],
+            except_files: vec![],
             reason: "fixture",
         };
         let policy = FilesystemPolicy {
+            write_siblings: vec![],
             workspace: ws.clone(),
             scratch: base.join("state/data/scratch"),
             read_roots: vec![ws.clone(), base.join("state")],

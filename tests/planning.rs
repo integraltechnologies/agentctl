@@ -135,13 +135,16 @@ impl Fixture {
     fn memory(&self, trust: MemoryTrustClass) -> agentctl::local::memory::MemoryEntry {
         let job = if trust == MemoryTrustClass::AgentNote {
             let mut s = self.store();
-            s.create_plan(&self.info.repository_id, &common::plan(), 1)
-                .unwrap();
+            common::seed_plan(&self.db, self.info.repository_id.as_str(), &common::plan());
             let mut j = common::samples()["agent-job"].clone();
             j["state"] = json!("QUEUED");
             j["started_at_ms"] = Value::Null;
-            s.register_job(&self.info.repository_id, &decode(j))
-                .unwrap();
+            s.register_job_in_workspace(
+                &self.info.repository_id,
+                &self.info.workspace_id,
+                &decode(j),
+            )
+            .unwrap();
             Some(JobId::new("job:executor-a").unwrap())
         } else {
             None
@@ -358,7 +361,12 @@ fn finished_job_at(
         s.register_job_in_workspace(&f.info.repository_id, workspace, &job)
             .unwrap();
     } else {
-        s.register_job(&f.info.repository_id, &job).unwrap();
+        // Workspace binding is mandatory for every job agentctl registers now.
+        // A migrated v1 database can still hold an unbound row, so the unbound
+        // case is written the only way it can still occur.
+        s.register_job_in_workspace(&f.info.repository_id, &f.info.workspace_id, &job)
+            .unwrap();
+        unbind(f, "jobs", "job_id", id.as_str());
     }
     s.transition_job(
         &f.info.repository_id,
@@ -389,10 +397,21 @@ fn evidence_at(f: &Fixture, id: &str, workspace: Option<&WorkspaceId>) -> Eviden
             .unwrap();
     } else {
         f.store()
-            .record_evidence(&f.info.repository_id, &decode(e))
+            .record_evidence_in_workspace(&f.info.repository_id, &f.info.workspace_id, &decode(e))
             .unwrap();
+        unbind(f, "evidence", "evidence_id", id);
     }
     EvidenceRef(EvidenceId::new(id).unwrap())
+}
+/// Clears a workspace binding directly, reproducing a row migrated from a
+/// database written before binding became mandatory.
+fn unbind(f: &Fixture, table: &str, key: &str, id: &str) {
+    f.sql()
+        .execute(
+            &format!("UPDATE {table} SET workspace_id=NULL WHERE repo_id=?1 AND {key}=?2"),
+            rusqlite::params![f.info.repository_id.as_str(), id],
+        )
+        .unwrap();
 }
 fn execute(f: &Fixture, p: &ExecutionPlan, i: usize) {
     let id = &p.packet.tasks[i].task_id;
@@ -848,7 +867,7 @@ fn integration_pass_with_registered_evidence_is_required_for_completion() {
     let proof = final_proof(&f, &p);
     assert!(
         f.store()
-            .complete_execution_plan(&f.root, &p.packet.plan_id, &proof, &final_source())
+            .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &proof, &final_source())
             .is_err()
     );
     for i in 0..4 {
@@ -859,7 +878,7 @@ fn integration_pass_with_registered_evidence_is_required_for_completion() {
     wrong.requirement_refs = vec!["unit".into()];
     assert!(
         f.store()
-            .complete_execution_plan(&f.root, &p.packet.plan_id, &wrong, &final_source())
+            .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &wrong, &final_source())
             .is_err()
     );
     let mut wrong = proof.clone();
@@ -869,7 +888,7 @@ fn integration_pass_with_registered_evidence_is_required_for_completion() {
     };
     assert!(
         f.store()
-            .complete_execution_plan(&f.root, &p.packet.plan_id, &wrong, &final_source())
+            .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &wrong, &final_source())
             .is_err()
     );
     let mut wrong = proof.clone();
@@ -881,18 +900,18 @@ fn integration_pass_with_registered_evidence_is_required_for_completion() {
     }
     assert!(
         f.store()
-            .complete_execution_plan(&f.root, &p.packet.plan_id, &wrong, &final_source())
+            .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &wrong, &final_source())
             .is_err()
     );
     let mut source = final_source();
     source.revision = "git:other".into();
     assert!(
         f.store()
-            .complete_execution_plan(&f.root, &p.packet.plan_id, &proof, &source)
+            .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &proof, &source)
             .is_err()
     );
     f.store()
-        .complete_execution_plan(&f.root, &p.packet.plan_id, &proof, &final_source())
+        .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &proof, &final_source())
         .unwrap();
     let v = f
         .store()
@@ -917,7 +936,7 @@ fn stale_source_graph_policy_and_memory_references_are_rejected() {
     assert!(f.store().import_execution_plan(&f.root, &p).is_err());
     f.store().index_repository(&f.root).unwrap();
     assert!(f.store().import_execution_plan(&f.root, &p).is_err());
-    // Stage 3: the reindexed edit is a candidate until deliberately accepted.
+    // The reindexed edit is a candidate until deliberately accepted.
     common::accept_observation(&mut f.store(), &f.root);
     let fresh = f.prepare();
     let mut p = artifact(&fresh, "fresh", false);
@@ -1159,7 +1178,10 @@ fn v4_migration_is_additive_reopen_safe_and_preserves_memory_graph_events() {
         f.store().memory_show(&f.root, &m.id, false).unwrap().entry,
         m
     );
-    assert_eq!(f.store().status().unwrap().schema_version, 13);
+    assert_eq!(
+        f.store().status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION
+    );
     assert_eq!(
         c.prepare("PRAGMA foreign_key_check")
             .unwrap()
@@ -1232,6 +1254,8 @@ fn real_cli_planner_artifact_boundary_roundtrips_across_processes() {
             "prepare",
             "--objective",
             "Add deterministic cache invalidation to repository indexing",
+            "--verify",
+            "integration",
             "--query",
             "cache invalidation",
             "--json",
@@ -1310,7 +1334,7 @@ fn real_cli_planner_artifact_boundary_roundtrips_across_processes() {
 /// An unrelated file in the workspace, well past the runtime's old (and since
 /// removed) 2 MiB per-file workspace-capture ceiling, must not affect the
 /// `PlannerPacket` producer at all: `PlanningLimits.bytes` and workspace
-/// source capture are separate contracts (Stage 2A/2B/2C). This exercises
+/// source capture are separate contracts. This exercises
 /// that across real process boundaries, reusing the established `cli_json`
 /// cross-process pattern above rather than a parallel harness.
 #[test]
@@ -1331,6 +1355,8 @@ fn real_cli_plan_context_is_unaffected_by_an_in_budget_oversized_workspace_file(
             "prepare",
             "--objective",
             "Add deterministic cache invalidation to repository indexing",
+            "--verify",
+            "integration",
             "--query",
             "cache invalidation",
             "--json",
@@ -1617,7 +1643,7 @@ fn cancellation_refuses_unfinished_jobs_and_completion_audit_rolls_back() {
     f.sql().execute_batch("CREATE TRIGGER fail_completion BEFORE INSERT ON events WHEN json_extract(NEW.entry_json,'$.kind')='EXECUTION_PLAN_COMPLETED' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
     assert!(
         f.store()
-            .complete_execution_plan(&f.root, &p.packet.plan_id, &proof, &final_source())
+            .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &proof, &final_source())
             .is_err()
     );
     let view = f
@@ -1751,7 +1777,7 @@ fn linked_worktree_integration_jobs_and_final_evidence_are_rejected() {
         assert_completion_binding_rejected(&f, &p, &wrong);
     }
     f.store()
-        .complete_execution_plan(&f.root, &p.packet.plan_id, &valid, &final_source())
+        .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &valid, &final_source())
         .unwrap();
     assert_eq!(
         f.store()
@@ -1766,7 +1792,7 @@ fn assert_completion_binding_rejected(f: &Fixture, p: &ExecutionPlan, proof: &Ve
     let events = count(&f.sql(), "events");
     let error = f
         .store()
-        .complete_execution_plan(&f.root, &p.packet.plan_id, proof, &final_source())
+        .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, proof, &final_source())
         .unwrap_err();
     assert!(error.to_string().contains("workspace"), "{error}");
     let view = f
@@ -1792,7 +1818,7 @@ fn integration_rechecks_workspace_ownership_of_historically_accepted_packets() {
     }
     let proof = final_proof(&f, &p);
     let c = f.sql();
-    // Simulate records accepted by the old Stage 4 gate; immutable event payloads
+    // Simulate records accepted by the old plan gate; immutable event payloads
     // are untouched. Completion must not grandfather the old ownership defect.
     for (table, key, id) in [
         ("jobs", "job_id", "historical-proof:0:exec"),
@@ -1814,7 +1840,7 @@ fn integration_rechecks_workspace_ownership_of_historically_accepted_packets() {
         .unwrap();
     }
     f.store()
-        .complete_execution_plan(&f.root, &p.packet.plan_id, &proof, &final_source())
+        .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &proof, &final_source())
         .unwrap();
 }
 
@@ -1855,7 +1881,7 @@ fn direct_sql_cannot_complete_a_plan_even_with_non_null_payloads_or_replace() {
     );
     assert_eq!(completion_events(&c), 0);
     f.store()
-        .complete_execution_plan(&f.root, &p.packet.plan_id, &proof, &final_source())
+        .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &proof, &final_source())
         .unwrap();
     let reopened = Store::read_only(&f.db, 5000)
         .unwrap()
@@ -1894,7 +1920,7 @@ fn failed_authorized_update_rolls_back_audit_and_allows_retry_on_same_store() {
     c.execute_batch("CREATE TRIGGER fail_complete_update AFTER UPDATE ON execution_plans WHEN NEW.state='COMPLETE' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
     let mut s = f.store();
     assert!(
-        s.complete_execution_plan(&f.root, &p.packet.plan_id, &proof, &final_source())
+        s.complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &proof, &final_source())
             .is_err()
     );
     assert_eq!(
@@ -1905,7 +1931,7 @@ fn failed_authorized_update_rolls_back_audit_and_allows_retry_on_same_store() {
     assert_eq!(completion_events(&c), 0);
     c.execute_batch("DROP TRIGGER fail_complete_update;")
         .unwrap();
-    s.complete_execution_plan(&f.root, &p.packet.plan_id, &proof, &final_source())
+    s.complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &proof, &final_source())
         .unwrap();
     assert_eq!(completion_events(&c), 1);
 }
@@ -1926,7 +1952,10 @@ fn v5_completion_guard_migration_preserves_plan_payloads_and_events() {
     downgrade_completion(&c);
     assert!(Store::read_only(&f.db, 5000).is_err());
     let s = f.store();
-    assert_eq!(s.status().unwrap().schema_version, 13);
+    assert_eq!(
+        s.status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION
+    );
     let view = s.execution_plan(&f.root, &p.packet.plan_id).unwrap();
     assert_eq!(
         serde_json::to_value(&view.plan).unwrap(),
@@ -1950,7 +1979,7 @@ fn completed_plan(f: &Fixture, prefix: &str) -> ExecutionPlan {
     }
     let proof = final_proof(f, &p);
     f.store()
-        .complete_execution_plan(&f.root, &p.packet.plan_id, &proof, &final_source())
+        .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &proof, &final_source())
         .unwrap();
     p
 }
@@ -2049,15 +2078,18 @@ fn legacy_complete_valid_history_migrates_without_live_checkout_and_preserves_by
         verify(&f, &p, i, true);
     }
     let proof = final_proof(&f, &p);
+    // Complete through the only production path, then reduce the database to
+    // the v5 shape a historical completion was written in. Completion and
+    // ontology acceptance are one transaction now, so the legacy row can no
+    // longer be produced by an API — only by a database that predates it.
     let mut application = f.store();
-    let c = f.sql();
-    downgrade_completion(&c);
-    // Exercise validated application completion while the database is still v5,
-    // retaining the already-open connection so no implicit migration happens.
     application
-        .complete_execution_plan(&f.root, &p.packet.plan_id, &proof, &final_source())
+        .complete_execution_plan_accepting(&f.root, &p.packet.plan_id, &proof, &final_source())
         .unwrap();
     drop(application);
+    let c = f.sql();
+    common::strip_ontology_lifecycle(&c);
+    downgrade_completion(&c);
     assert_eq!(
         c.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
@@ -2066,7 +2098,10 @@ fn legacy_complete_valid_history_migrates_without_live_checkout_and_preserves_by
     let before = legacy_snapshot(&c);
     // A historical completion must not depend on current policy/source freshness.
     fs::rename(&f.root, f.temp.0.join("moved-checkout")).unwrap();
-    assert_eq!(f.store().status().unwrap().schema_version, 13);
+    assert_eq!(
+        f.store().status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION
+    );
     let after = legacy_snapshot(&c);
     assert_eq!(&after[2..], &before[2..]);
     assert_eq!(completion_events(&c), 1);
@@ -2085,7 +2120,7 @@ fn legacy_complete_valid_history_migrates_without_live_checkout_and_preserves_by
             .status()
             .unwrap()
             .schema_version,
-        13
+        agentctl::local::store::DATABASE_VERSION
     );
 }
 
@@ -2179,7 +2214,10 @@ fn legacy_complete_sibling_and_unbound_packet_ownership_fail_migration() {
         .unwrap();
     }
     // Explicitly restoring the genuine original records permits a later retry.
-    assert_eq!(f.store().status().unwrap().schema_version, 13);
+    assert_eq!(
+        f.store().status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION
+    );
     assert_eq!(completion_events(&c), 1);
 }
 
@@ -2282,7 +2320,10 @@ fn legacy_complete_mixed_valid_and_invalid_plans_roll_back_entire_upgrade() {
 fn legacy_complete_empty_migration_still_allows_normal_v6_completion() {
     let f = Fixture::new();
     downgrade_completion(&f.sql());
-    assert_eq!(f.store().status().unwrap().schema_version, 13);
+    assert_eq!(
+        f.store().status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION
+    );
     // An upgraded database has no ontology lifecycle yet; one index pass
     // records (and, being complete, bootstraps) the accepted generation.
     f.store().index_repository(&f.root).unwrap();
@@ -2331,4 +2372,175 @@ fn completion_migration_conflicts_roll_back_and_missing_guards_fail_closed() {
             if name == "execution_completion_guard" { "execution_initial_state" } else { "execution_completion_guard" })).unwrap();
         drop(f.store());
     }
+}
+
+/// Phase A/1A: shedding removes detail, never the fact that relation knowledge
+/// is incomplete. A starved packet whose unresolved records and impact outlook
+/// were dropped must still be distinguishable from one whose entities genuinely
+/// have no further relations — otherwise the planner can scope a change to a
+/// dependency set it was never shown.
+#[test]
+fn byte_pressure_sheds_relation_detail_but_never_the_incompleteness() {
+    let f = Fixture::new();
+    // An ordinary unresolvable relation: a member call on a computed receiver.
+    write(
+        &f.root,
+        "src/cache_extra.rs",
+        "pub fn cache_invalidation_sweep(v: &Vec<u32>) -> usize { v.iter().count() }\n",
+    );
+    f.store().index_repository(&f.root).unwrap();
+    let candidate = f
+        .store()
+        .ontology_status(&f.root)
+        .unwrap()
+        .candidate
+        .unwrap();
+    f.store()
+        .accept_generation(&f.root, &candidate.generation_id, None)
+        .unwrap();
+    let full = f
+        .store()
+        .prepare_plan(&f.root, intent(), PlanningLimits::default())
+        .unwrap();
+    let coverage = full.context.graph.coverage.clone();
+    assert!(
+        !coverage.complete(),
+        "fixture must have unresolved relations for this test to mean anything: {coverage:?}"
+    );
+    assert!(!coverage.detail_shed, "nothing was shed at full budget");
+
+    let starved = f
+        .store()
+        .prepare_plan(
+            &f.root,
+            intent(),
+            PlanningLimits {
+                bytes: 7000,
+                files: 1,
+                excerpt_bytes: 24,
+                excerpt_lines: 1,
+                ..PlanningLimits::default()
+            },
+        )
+        .unwrap();
+    let c = &starved.context.graph.coverage;
+
+    // Detail may be gone...
+    assert!(starved.context.truncated);
+    assert!(
+        starved.context.impact.is_none() || starved.context.graph.unresolved.is_empty(),
+        "this test only proves something if detail was actually shed"
+    );
+    // ...but the incompleteness itself is still stated, and still counted.
+    assert!(
+        !c.complete(),
+        "a starved packet must not read as a complete relation set: {c:?}"
+    );
+    assert!(c.unresolved_sites >= coverage.unresolved_sites.min(1));
+    assert!(c.detail_shed, "shedding must be recorded: {c:?}");
+}
+
+/// Every CLI entry into `plan prepare` either yields a request that
+/// `run planner` can plan (it carries the checks the plan is judged by) or
+/// refuses at prepare time with an actionable reason. None produces an
+/// artifact that later turns out to be unusable.
+#[test]
+fn every_cli_prepare_path_yields_a_plannable_request_or_refuses_up_front() {
+    let f = Fixture::new();
+    cli_json(&f, &["init", "--json"]);
+    cli_json(&f, &["repo", "init", "--json"]);
+    cli_json(&f, &["repo", "index", "--json"]);
+    let objective = f.temp.0.join("objective.txt");
+    fs::write(&objective, "Add deterministic cache invalidation").unwrap();
+    let request = f.temp.0.join("request.json");
+    let mut draft = serde_json::to_value(intent()).unwrap();
+    draft["verification"] = Value::Null;
+    fs::write(&request, serde_json::to_vec(&draft).unwrap()).unwrap();
+    let objective = objective.to_str().unwrap();
+    let request = request.to_str().unwrap();
+    let verification = |v: &Value| v["request"]["intent"]["verification"].clone();
+
+    // Two profiles are declared: no silent choice between them.
+    for entry in [
+        vec!["--objective", "Add deterministic cache invalidation"],
+        vec!["--objective-file", objective],
+        vec!["--request-file", request],
+    ] {
+        let mut args = vec!["plan", "prepare"];
+        args.extend(&entry);
+        let o = cli(&f, &args);
+        assert!(!o.status.success(), "{entry:?}");
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            stderr.contains("--verify") && stderr.contains("integration, unit"),
+            "{entry:?}: {stderr}"
+        );
+        args.extend(["--verify", "unit", "--json"]);
+        let v = cli_json(&f, &args);
+        assert_eq!(
+            verification(&v),
+            json!({"requirement_refs": ["unit"], "evidence_required": true}),
+            "{entry:?}"
+        );
+    }
+    // An undeclared check is refused at prepare time, naming the rule.
+    let o = cli(
+        &f,
+        &[
+            "plan",
+            "prepare",
+            "--objective",
+            "x y z",
+            "--verify",
+            "nope",
+        ],
+    );
+    assert!(!o.status.success());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("[PLAN-VERIFICATION]") && stderr.contains("nope"),
+        "{stderr}"
+    );
+
+    // With exactly one declared profile, that profile is the default.
+    let mut policy = ProjectConfig::load(&f.root).unwrap();
+    policy.verification.remove("integration");
+    write(
+        &f.root,
+        ".agentctl/project.toml",
+        &toml::to_string(&policy).unwrap(),
+    );
+    let v = cli_json(
+        &f,
+        &[
+            "plan",
+            "prepare",
+            "--objective",
+            "Add deterministic cache invalidation",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        verification(&v),
+        json!({"requirement_refs": ["unit"], "evidence_required": true})
+    );
+}
+
+/// A reader that closes the pipe early (`agentctl … | head`) ends
+/// the command quietly instead of a panic on the broken pipe.
+#[test]
+fn a_closed_stdout_pipe_ends_the_cli_quietly() {
+    let f = Fixture::new();
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let o = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .current_dir(&f.root)
+        .arg("--help")
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(o.status.success(), "{:?} {stderr}", o.status);
 }

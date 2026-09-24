@@ -1,4 +1,4 @@
-//! Stage 9B structured experiment facts. These records are deliberately factual:
+//! Structured experiment facts. These records are deliberately factual:
 //! this module has no threshold evaluation, planner hook, or process-control path.
 use super::*;
 use crate::local::security::{EventVolumeLimits, json as strict_json};

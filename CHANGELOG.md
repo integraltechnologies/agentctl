@@ -37,7 +37,7 @@ to storage, configuration, or the CLI.
   `SemanticDelta` or a proposed edit, the bounded set of existing code that
   could be affected, with a machine-inspectable evidence chain for every
   claim. Evidence is only resolved relations, containment of an added or
-  removed declaration, and Stage-1 test associations (basis carried); nothing
+  removed declaration, and graph test associations (basis carried); nothing
   is derived from lexical similarity, name coincidence or graph proximity.
   Items are classed `DIRECT_DEPENDENCY`, `CONTRACT_EXPOSURE`,
   `VERIFICATION_RELEVANCE` or `CONTAINMENT_OWNERSHIP`; open questions are kept
@@ -80,7 +80,7 @@ to storage, configuration, or the CLI.
   executor and verifier jobs may then read only the repository files issued to
   them (plus an executor's write scope), with the workspace tree and Git
   directories removed from their read roots. The default remains `workspace`
-  pending provider dogfood; see docs/security.md.
+  pending validation with real provider processes; see docs/security.md.
 - Context manifests. Every planner, executor, and verifier job records what
   agentctl supplied: identities, the graph generation, the repository paths and
   ranges (hash-bound), graph entity, memory, and invariant IDs, and exact byte

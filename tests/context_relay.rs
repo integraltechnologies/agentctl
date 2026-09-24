@@ -1,4 +1,4 @@
-//! Stage 2 planner-mediated context relay: planner-authored initial context,
+//! Planner-mediated context relay: planner-authored initial context,
 //! the typed request/resolution/delta lifecycle, fresh re-issue, machine-owned
 //! budgets, planner escalation, verifier independence and diff compaction.
 #[allow(dead_code)]
@@ -820,7 +820,7 @@ fn script(executor: Vec<Reply>, verifier: Vec<Reply>) -> Script {
     Script { executor, verifier }
 }
 
-/// Part A/L1: a Directory read scope authorizes requests; it injects nothing.
+/// A Directory read scope authorizes requests; it injects nothing.
 /// The executor receives exactly the planner's references — one symbol with its
 /// definition and in-envelope relation stubs, the File write target, the
 /// selected memory and the task's checks — and no other repository file.
@@ -925,7 +925,7 @@ fn directory_read_scope_injects_no_files_and_every_item_traces_to_the_planner() 
     assert_eq!(recorded.reference, issued.symbols[0].entity.id.as_str());
 }
 
-/// Part B/D/F/L2: an under-contextualized executor requests one symbol, the
+/// An under-contextualized executor requests one symbol, the
 /// resolver grants it inside the envelope, and a *fresh* second job receives
 /// base plus delta and finishes the task normally.
 #[test]
@@ -1016,7 +1016,7 @@ fn an_inside_envelope_request_is_granted_and_re_issued_as_a_fresh_job() {
     }
 }
 
-/// Part C/K: an executor that edited the workspace cannot also ask for context.
+/// An executor that edited the workspace cannot also ask for context.
 #[test]
 fn a_context_request_after_editing_fails_closed() {
     let f = Fixture::new();
@@ -1048,7 +1048,7 @@ fn a_context_request_after_editing_fails_closed() {
     assert_eq!(tasks[0].state, TaskState::Blocked);
 }
 
-/// Part E/L3: a request that needs a path outside the envelope is never
+/// A request that needs a path outside the envelope is never
 /// granted automatically. The run blocks for a planner, the executor cannot
 /// widen its own scope by retrying, and a denial leaves the task blocked.
 #[test]
@@ -1130,7 +1130,7 @@ fn an_out_of_envelope_request_escalates_and_a_denial_keeps_the_task_blocked() {
     );
 }
 
-/// Part E/F: an approval is validated and re-resolved under the wider
+/// An approval is validated and re-resolved under the wider
 /// envelope, and `run resume` re-issues the task as a fresh job carrying the
 /// planner-approved delta.
 #[test]
@@ -1262,7 +1262,7 @@ fn a_planner_approval_widens_the_envelope_and_re_issues_a_fresh_job() {
     );
 }
 
-/// Part 7/L5: machine-owned round budgets end the loop, whatever the worker asks.
+/// Machine-owned round budgets end the loop, whatever the worker asks.
 #[test]
 fn repeated_requests_stop_at_the_machine_owned_round_budget() {
     let mut f = Fixture::new();
@@ -1298,7 +1298,7 @@ fn repeated_requests_stop_at_the_machine_owned_round_budget() {
     assert_eq!(run.state, RunState::Blocked);
 }
 
-/// Part 7/K: the per-round byte budget refuses one oversized request.
+/// The per-round byte budget refuses one oversized request.
 #[test]
 fn a_request_over_the_round_byte_budget_is_denied() {
     let mut f = Fixture::new();
@@ -1318,7 +1318,7 @@ fn a_request_over_the_round_byte_budget_is_denied() {
     assert_eq!(ledger.granted_bytes, 0);
 }
 
-/// Part 7/K: the cumulative budget ends a relay that stays inside the
+/// The cumulative budget ends a relay that stays inside the
 /// per-round limit but adds up across rounds.
 #[test]
 fn accumulated_deltas_stop_at_the_cumulative_task_byte_budget() {
@@ -1350,7 +1350,7 @@ fn accumulated_deltas_stop_at_the_cumulative_task_byte_budget() {
     assert!(ledger.granted_bytes > 0 && ledger.granted_bytes <= 8192);
 }
 
-/// Part E: an approval can never exceed the plan's own requested scope, so a
+/// An approval can never exceed the plan's own requested scope, so a
 /// planner cannot use an escalation to leave the plan's boundary.
 #[test]
 fn an_approval_cannot_exceed_the_planning_requests_own_scope() {
@@ -1373,22 +1373,45 @@ fn an_approval_cannot_exceed_the_planning_requests_own_scope() {
             .to_string()
             .contains("NEEDS_PLANNER_CONTEXT_APPROVAL")
     );
-    let (approval, _) = f.pending_decision(&plan);
-    let message = f.decide(&approval).unwrap_err().to_string();
+    // The report must not offer an approval the validator would refuse: it says
+    // the escalation is unapprovable, names the paths beyond planning
+    // authority, and templates a DENY instead.
+    let (offered, pending) = f.pending_decision(&plan);
+    assert_eq!(pending["approvable"], serde_json::json!(false));
+    assert_eq!(
+        pending["beyond_planning_authority"],
+        serde_json::json!(["src/security/mod.rs"])
+    );
+    assert_eq!(offered.decision, context::DecisionKind::Deny);
+    assert!(offered.read_scope_additions.is_empty());
+
+    // Hand-writing the approval anyway is still refused, and changes nothing.
+    let mut forced = offered.clone();
+    forced.decision = context::DecisionKind::Approve;
+    forced.read_scope_additions = vec![ScopePath::File {
+        path: "src/security/mod.rs".into(),
+    }];
+    let message = f.decide(&forced).unwrap_err().to_string();
     assert!(
         message.contains("exceeds the planning request's own scope"),
         "{message}"
     );
-    // A refused decision changes nothing: the escalation is still pending.
     let ledger = f.ledger(&plan, "executor:task:cache");
     assert_eq!(
         ledger.state,
         context::LedgerState::NeedsPlannerContextApproval
     );
     assert_eq!(ledger.rounds_used(), 0);
+
+    // The offered DENY is a real decision the control plane accepts.
+    f.decide(&offered).unwrap();
+    assert_eq!(
+        f.ledger(&plan, "executor:task:cache").state,
+        context::LedgerState::PlannerDenied
+    );
 }
 
-/// Part G/L6: a one-line edit to a ~160 KiB file produces a verifier diff of a
+/// A one-line edit to a ~160 KiB file produces a verifier diff of a
 /// few KiB that still carries both content hashes and the changed hunk.
 #[test]
 fn a_one_line_edit_to_a_large_file_keeps_verifier_diff_context_small() {
@@ -1436,7 +1459,7 @@ fn a_one_line_edit_to_a_large_file_keeps_verifier_diff_context_small() {
     }
 }
 
-/// Part H/L7: the verifier relay is independent. It re-issues a fresh verifier
+/// The verifier relay is independent. It re-issues a fresh verifier
 /// with its own delta and never carries executor request history.
 #[test]
 fn the_verifier_relay_is_independent_of_executor_request_history() {
@@ -1486,7 +1509,7 @@ fn the_verifier_relay_is_independent_of_executor_request_history() {
     }
 }
 
-/// Part H/K: a verifier cannot escalate, so an out-of-envelope verifier
+/// A verifier cannot escalate, so an out-of-envelope verifier
 /// request is denied and reaches no decision.
 #[test]
 fn an_out_of_envelope_verifier_request_is_denied_without_escalation() {
@@ -1521,7 +1544,7 @@ fn an_out_of_envelope_verifier_request_is_denied_without_escalation() {
     assert_eq!(tasks[0].state, TaskState::Blocked);
 }
 
-/// Part 9/L8: source or ontology drift between rounds fails closed rather than
+/// Source or ontology drift between rounds fails closed rather than
 /// issuing a delta derived from stale assumptions.
 #[test]
 fn drift_between_context_rounds_fails_closed() {
@@ -1563,7 +1586,7 @@ fn drift_between_context_rounds_fails_closed() {
     }
 }
 
-/// Stage 3: a context base and its escalation are bound to the ontology
+/// A context base and its escalation are bound to the ontology
 /// generation they were derived from. When the accepted generation moves on,
 /// they stay inspectable but never become usable again, not even when the
 /// source returns to byte-identical content (same fingerprint, new position).
@@ -1649,7 +1672,7 @@ fn context_from_an_older_ontology_generation_is_never_reused_after_it_moves() {
     assert!(seen.lock().unwrap().is_empty(), "nothing is re-issued");
 }
 
-/// Part L9: the same relay state machine, driven through both providers' real
+/// The same relay state machine, driven through both providers' real
 /// output paths (Codex returns bare JSON; Claude wraps it in a result field).
 #[test]
 fn the_relay_runs_through_fake_claude_and_codex_output_paths() {
@@ -1690,7 +1713,7 @@ fn the_relay_runs_through_fake_claude_and_codex_output_paths() {
     }
 }
 
-/// Part 11/L10: manifests account for base and delta bytes exactly, and never
+/// Manifests account for base and delta bytes exactly, and never
 /// copy repository text.
 #[test]
 fn manifests_account_base_and_delta_bytes_exactly_without_copying_source() {
@@ -1711,7 +1734,8 @@ fn manifests_account_base_and_delta_bytes_exactly_without_copying_source() {
         let m = job.context_manifest.clone().unwrap();
         let input = inputs.iter().find(|i| i.job_id == job.job_id).unwrap();
         let value = serde_json::to_value(input).unwrap();
-        let compiled = input.compiled.as_ref().unwrap().bytes.len();
+        let compiled = input.compiled.as_ref().unwrap();
+        let compiled = compiled.bytes.len() + compiled.system.len();
         assert_eq!(m.bytes.total, compiled);
         assert_eq!(
             m.bytes.categories.iter().map(|c| c.bytes).sum::<usize>(),
@@ -1758,7 +1782,7 @@ fn manifests_account_base_and_delta_bytes_exactly_without_copying_source() {
     }
 }
 
-/// Part D: memory is dereferenced, not searched. A memory entry linked inside
+/// Memory is dereferenced, not searched. A memory entry linked inside
 /// the envelope resolves; the planner's own reference is already issued.
 #[test]
 fn memory_inside_the_envelope_resolves_and_outside_it_escalates() {
@@ -1784,7 +1808,7 @@ fn memory_inside_the_envelope_resolves_and_outside_it_escalates() {
     assert_eq!(memory.trust, MemoryTrustClass::Canonical);
 }
 
-/// Part K: every malformed, foreign, stale, ambiguous, unissuable or oversized
+/// Every malformed, foreign, stale, ambiguous, unissuable or oversized
 /// request fails closed, grants nothing, and leaves understandable state.
 #[test]
 fn malformed_foreign_stale_and_unissuable_requests_all_fail_closed() {
@@ -1865,16 +1889,28 @@ fn malformed_foreign_stale_and_unissuable_requests_all_fail_closed() {
             "ITEM_UNRESOLVABLE",
         ),
     ];
+    let attempts = 1 + MAX_PROVIDER_RETRIES as usize;
     for (name, reply, expected) in cases {
         let f = Fixture::new();
         let plan = f.plan("src/cache/api.rs");
-        let (outcome, inputs) = f.run(&plan, script(vec![reply, Reply::Edit], vec![]));
+        // The same bad request on every attempt a retry could make: a request
+        // that breaks the protocol is a contract violation agentctl may retry
+        // as a fresh job (nothing was edited); a well-formed one the relay
+        // refuses is an answer, never retried. Either way nothing is granted.
+        let mut replies = vec![reply; attempts];
+        replies.push(Reply::Edit);
+        let (outcome, inputs) = f.run(&plan, script(replies, vec![]));
         let message = outcome.unwrap_err().to_string();
         assert!(
             message.contains(expected),
             "{name}: expected {expected}, got {message}"
         );
-        assert_eq!(executors(&inputs.lock().unwrap()).len(), 1, "{name}");
+        let launched = executors(&inputs.lock().unwrap()).len();
+        if message.starts_with("VALIDATION_FAILURE") {
+            assert_eq!(launched, attempts, "{name}");
+        } else {
+            assert_eq!(launched, 1, "{name}");
+        }
         let run = f
             .store()
             .runtime_status(&f.root, &plan.packet.plan_id)
@@ -1892,18 +1928,28 @@ fn malformed_foreign_stale_and_unissuable_requests_all_fail_closed() {
     }
 }
 
-/// Part K: a provider that crashes in a re-issued round leaves the granted
+/// A provider that crashes in a re-issued round leaves the granted
 /// delta persisted and the task blocked, never half-accepted.
 #[test]
 fn a_provider_crash_in_a_re_issued_round_leaves_the_grant_persisted() {
     let f = Fixture::new();
     let plan = f.plan("src/cache/api.rs");
-    let (outcome, inputs) = f.run(
-        &plan,
-        script(vec![Reply::RequestCallee, Reply::Crash], vec![]),
-    );
+    let attempts = 1 + MAX_PROVIDER_RETRIES as usize;
+    let mut replies = vec![Reply::RequestCallee];
+    replies.extend(vec![Reply::Crash; attempts]);
+    let (outcome, inputs) = f.run(&plan, script(replies, vec![]));
     assert!(outcome.is_err());
-    assert_eq!(executors(&inputs.lock().unwrap()).len(), 2);
+    // The request round, then the re-issued round crashing on every attempt.
+    assert_eq!(executors(&inputs.lock().unwrap()).len(), 1 + attempts);
+    // Nothing uncertain exists, so the run pauses instead of ending.
+    assert_eq!(
+        f.store()
+            .runtime_status(&f.root, &plan.packet.plan_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RunState::Running
+    );
     let ledger = f.ledger(&plan, "executor:task:cache");
     assert_eq!(ledger.state, context::LedgerState::Open);
     assert_eq!(ledger.rounds_used(), 1);
@@ -1930,7 +1976,7 @@ fn a_provider_crash_in_a_re_issued_round_leaves_the_grant_persisted() {
     assert_eq!(tasks[0].state, TaskState::Blocked);
 }
 
-/// Part 12/D: issued source is hash-bound. The definition of a symbol in the
+/// Issued source is hash-bound. The definition of a symbol in the
 /// file the executor just changed cannot be reissued: its ontology row no
 /// longer matches the captured source, so the relay fails closed instead of
 /// handing a verifier text that was never in the diff. (Identity facts from
@@ -1959,7 +2005,7 @@ fn a_definition_from_the_just_changed_file_fails_closed_as_stale() {
     assert_eq!(ledger.granted_bytes, 0);
 }
 
-/// Part N: the relay is inspectable and decidable from the CLI. Inspection is
+/// The relay is inspectable and decidable from the CLI. Inspection is
 /// read-only, and a decision is an operator document, never provider output.
 #[test]
 fn the_context_relay_is_inspectable_and_decidable_from_the_cli() {
@@ -2022,7 +2068,7 @@ fn the_context_relay_is_inspectable_and_decidable_from_the_cli() {
     assert!(prompt(executors(&inputs)[0]).contains("CANARY_STORE"));
 }
 
-/// Part J: with `visibility = "issued"` a job is confined to the repository
+/// With `visibility = "issued"` a job is confined to the repository
 /// files it was actually issued -- for an executor its planner-named write
 /// target, for a verifier nothing at all, since a verifier receives diff hunks
 /// rather than whole files. The default requests no confinement.
@@ -2094,4 +2140,37 @@ fn journal_phases(f: &Fixture) -> Vec<String> {
         .unwrap()
         .map(|p| p.unwrap().unwrap_or_default())
         .collect()
+}
+
+/// Language-native symbol names through the production relay: an executor that names a symbol
+/// by its Rust path (`crate::…` or `<crate name>::…`) gets it resolved to the
+/// canonical entity and granted inside its envelope, not denied.
+#[test]
+fn source_language_symbol_names_resolve_through_the_relay() {
+    for name in [
+        "fixture::cache::store::store_read",
+        "crate::cache::store::store_read",
+    ] {
+        let f = Fixture::new();
+        let plan = f.plan("src/cache/api.rs");
+        let (outcome, inputs) = f.run(
+            &plan,
+            script(
+                vec![
+                    Reply::Request(
+                        vec![ContextRequestItem::SymbolByName { name: name.into() }],
+                        8192,
+                    ),
+                    Reply::Edit,
+                ],
+                vec![],
+            ),
+        );
+        assert_eq!(outcome.unwrap().state, RunState::Complete, "{name}");
+        let rounds = executors(&inputs.lock().unwrap()).len();
+        assert_eq!(rounds, 2, "{name}: a granted round, then the edit");
+        let ledger = f.ledger(&plan, "executor:task:cache");
+        assert_eq!(ledger.rounds_used(), 1, "{name}");
+        assert!(ledger.granted_bytes > 0, "{name}");
+    }
 }

@@ -11,9 +11,29 @@ use std::{
 pub struct QueryResult<T> {
     pub freshness: IndexStatus,
     pub data: T,
+    /// Only set by relation queries (`callers`, `refs`). Omitted elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unresolved: Option<UnresolvedRelations>,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// What a relation query could not prove. `data` carries only edges whose
+/// target was resolved to an entity, so an empty `data` is not evidence that
+/// nothing calls or references the symbol: syntactic call/reference sites that
+/// name it but were never resolved are reported here instead of being dropped
+/// silently. Never a dependency claim — an unresolved site may name something
+/// else entirely.
+#[derive(Debug, Serialize)]
+pub struct UnresolvedRelations {
+    /// Unresolved call/reference/implements sites naming this symbol.
+    pub sites: usize,
+    /// Bounded list of files holding them.
+    pub paths: Vec<String>,
+    pub meaning: &'static str,
+}
+
+const UNRESOLVED_MEANING: &str = "Syntactic sites naming this symbol whose target was never resolved to an entity. They are open questions, not callers: absence of a resolved relation is not proof that none exists.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
     Exact,
     Prefix,
@@ -48,6 +68,73 @@ fn token_list(text: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn is_path_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !s.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// The self type an `impl` header implements for: `impl<'a> Runtime<'a>` →
+/// `Runtime`, `impl fmt::Display for Money` → `Money`.
+fn impl_self_type(header: &str) -> String {
+    let mut rest = header.trim_start_matches("impl").trim_start();
+    if rest.starts_with('<') {
+        let mut depth = 0;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        rest = rest[i + 1..].trim_start();
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let target = rest.rsplit_once(" for ").map_or(rest, |(_, t)| t);
+    let target = target.split('<').next().unwrap_or(target);
+    target
+        .trim_start_matches(['&', ' '])
+        .trim_start_matches("mut ")
+        .rsplit("::")
+        .next()
+        .unwrap_or(target)
+        .trim()
+        .to_string()
+}
+
+/// Code symbols a natural-language request names explicitly: paths
+/// (`Money::from_cents`, `crate::words::shortest`), snake_case and CamelCase
+/// identifiers. Plain words are left to lexical ranking. Bounded to 16.
+pub fn symbol_mentions(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for raw in text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':')) {
+        let token = raw.trim_matches(':');
+        let path = token.split("::").filter(|s| !s.is_empty()).count() >= 2;
+        let snake = token.contains('_') && token.len() >= 4;
+        let camel = token.len() >= 4
+            && token
+                .chars()
+                .zip(token.chars().skip(1))
+                .any(|(a, b)| a.is_lowercase() && b.is_uppercase());
+        if (path || snake || camel)
+            && token
+                .split("::")
+                .all(|s| s.is_empty() || is_path_segment(s))
+            && !out.iter().any(|t| t == token)
+        {
+            out.push(token.to_string());
+            if out.len() == 16 {
+                break;
+            }
+        }
+    }
+    out
 }
 
 pub fn identifier_tokens(text: &str) -> BTreeSet<String> {
@@ -378,11 +465,35 @@ impl GraphQuery<'_> {
         QueryResult {
             freshness: self.freshness.clone(),
             data,
+            unresolved: None,
         }
     }
 
     fn find(&self, name: &str, mode: SearchMode, limit: usize) -> Result<Vec<Entity>> {
         validate_query(name, limit)?;
+        // Several whitespace-separated terms: each must appear, in any order,
+        // in the name or qualified name (case-insensitive; `_` counts as a
+        // space). The first term narrows in SQL, the rest filter here.
+        let terms: Vec<String> = name
+            .split_whitespace()
+            .map(|t| t.to_lowercase().replace('_', " "))
+            .collect();
+        if mode == SearchMode::Substring && terms.len() > 1 {
+            let words: Vec<&str> = name.split_whitespace().collect();
+            let mut out = vec![];
+            for e in self.find(words[0], SearchMode::Substring, 100)? {
+                let hay = format!("{} {}", e.name, e.qualified_name)
+                    .to_lowercase()
+                    .replace('_', " ");
+                if terms.iter().all(|t| hay.contains(t.as_str())) {
+                    out.push(e);
+                    if out.len() == limit {
+                        break;
+                    }
+                }
+            }
+            return Ok(out);
+        }
         let escaped = name
             .replace('\\', "\\\\")
             .replace('%', "\\%")
@@ -416,7 +527,7 @@ impl GraphQuery<'_> {
     }
 
     fn one(&self, symbol: &str) -> Result<Entity> {
-        let mut found = self.find(symbol, SearchMode::Exact, 2)?;
+        let mut found = self.exact_matches(symbol, 2)?;
         require(
             found.len() == 1,
             "symbol is absent or ambiguous; use code symbol/code locate and select a qualified name or graph ID",
@@ -453,8 +564,114 @@ impl GraphQuery<'_> {
 
     /// Exact ID, name or qualified-name matches, at most `limit`. Several
     /// matches are reported, never resolved by guessing.
-    pub(crate) fn exact_matches(&self, name: &str, limit: usize) -> Result<Vec<Entity>> {
-        self.find(name, SearchMode::Exact, limit)
+    pub fn exact_matches(&self, name: &str, limit: usize) -> Result<Vec<Entity>> {
+        let exact = self.find(name, SearchMode::Exact, limit)?;
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        self.source_path_matches(name, limit)
+    }
+
+    /// Entities a source-language path names: `crate::words::shortest`,
+    /// `textstats::words::shortest`, `words::shortest` or
+    /// `ClaudeAdapter::launch` for canonical `src::words::shortest` /
+    /// `…::provider::impl ProviderAdapter for ClaudeAdapter::launch`.
+    ///
+    /// Deterministic and conservative. An entity's source path is its file
+    /// module path (without `src`, `lib`, `main`, `mod` or `__init__`), then
+    /// its enclosing items, with an `impl` block reduced to its self type. A
+    /// `crate::` path must equal it exactly; otherwise the first non-empty
+    /// tier wins: equal, equal after a leading crate name, or ending with a
+    /// requested path of at least two segments. Every entity of the winning
+    /// tier is returned; callers treat more than one as ambiguous.
+    pub(crate) fn source_path_matches(&self, name: &str, limit: usize) -> Result<Vec<Entity>> {
+        let trimmed = name.trim().trim_end_matches("()");
+        let mut segments: Vec<&str> = trimmed.split("::").map(str::trim).collect();
+        // `crate::…` is an absolute path from the crate root; `self::…` names
+        // an unknown current module and is treated as relative.
+        let absolute = segments.first() == Some(&"crate");
+        segments.retain(|s| !matches!(*s, "crate" | "self"));
+        let Some(last) = segments.last().copied() else {
+            return Ok(vec![]);
+        };
+        if (!absolute && segments.len() < 2) || segments.iter().any(|s| !is_path_segment(s)) {
+            return Ok(vec![]);
+        }
+        let mut cache = Cache::new();
+        let mut paths = vec![];
+        for candidate in self.find(last, SearchMode::Exact, 64)? {
+            let path = self.source_path(&mut cache, &candidate)?;
+            paths.push((candidate, path));
+        }
+        // Tiers, most specific first; the first non-empty tier is the answer,
+        // so a longer, exact path is never shadowed by a looser reading.
+        let exact = |p: &[String]| p.iter().map(String::as_str).eq(segments.iter().copied());
+        let prefixed = |p: &[String]| {
+            !absolute
+                && p.iter()
+                    .map(String::as_str)
+                    .eq(segments[1..].iter().copied())
+        };
+        let suffix = |p: &[String]| {
+            !absolute
+                && p.len() > segments.len()
+                && p[p.len() - segments.len()..]
+                    .iter()
+                    .map(String::as_str)
+                    .eq(segments.iter().copied())
+        };
+        for tier in [&exact as &dyn Fn(&[String]) -> bool, &prefixed, &suffix] {
+            let found: Vec<Entity> = paths
+                .iter()
+                .filter(|(_, p)| tier(p))
+                .map(|(e, _)| e.clone())
+                .take(limit)
+                .collect();
+            if !found.is_empty() {
+                return Ok(found);
+            }
+        }
+        Ok(vec![])
+    }
+
+    /// See [`Self::source_path_matches`].
+    fn source_path(&self, cache: &mut Cache, entity: &Entity) -> Result<Vec<String>> {
+        let stem = entity
+            .provenance
+            .path
+            .rsplit_once('.')
+            .map_or(entity.provenance.path.as_str(), |(stem, _)| stem);
+        let mut module: Vec<String> = stem.split('/').map(str::to_owned).collect();
+        if module.first().is_some_and(|s| s == "src") && module.len() > 1 {
+            module.remove(0);
+        }
+        if module
+            .last()
+            .is_some_and(|s| matches!(s.as_str(), "lib" | "main" | "mod" | "__init__"))
+        {
+            module.pop();
+        }
+        let mut items = vec![];
+        let mut current = Some(entity.clone());
+        while let Some(e) = current {
+            if matches!(e.kind, EntityKind::File | EntityKind::Module)
+                && e.qualified_name == stem.replace('/', "::")
+            {
+                break;
+            }
+            items.push(if e.name.starts_with("impl") {
+                impl_self_type(&e.name)
+            } else {
+                e.name.clone()
+            });
+            current = match &e.parent {
+                Some(parent) => self.load(cache, parent)?,
+                None => None,
+            };
+        }
+        items.reverse();
+        module.extend(items);
+        Ok(module)
     }
 
     /// Resolved structural relations (no containment/test-container links) of
@@ -518,7 +735,7 @@ impl GraphQuery<'_> {
         ))
     }
 
-    /// Tests associated with `target` by the Stage 1 association rules.
+    /// Tests associated with `target` by the graph's test-association rules.
     pub(crate) fn associated_tests(
         &self,
         target: &Entity,
@@ -633,7 +850,23 @@ impl GraphQuery<'_> {
     ) -> Result<QueryResult<Vec<Edge>>> {
         validate_query(symbol, limit)?;
         let entity = self.one(symbol)?;
-        Ok(self.result(self.edges(&entity.id, Some(incoming), kind, limit)?))
+        let edges = self.edges(&entity.id, Some(incoming), kind, limit)?;
+        // An empty answer must not read as "nothing references this". Incoming
+        // relation queries report the unresolved sites naming the symbol so the
+        // caller can tell "none" from "not proven".
+        let mut result = self.result(edges);
+        if incoming {
+            let (sites, paths) =
+                self.unresolved_references(&super::impact::short_name(&entity.qualified_name), 8)?;
+            if sites > 0 {
+                result.unresolved = Some(UnresolvedRelations {
+                    sites,
+                    paths,
+                    meaning: UNRESOLVED_MEANING,
+                });
+            }
+        }
+        Ok(result)
     }
 
     fn scan(&self, mut visit: impl FnMut(Row) -> Result<()>) -> Result<()> {
@@ -658,7 +891,13 @@ impl GraphQuery<'_> {
     /// then IDF-weighted scoring into bounded implementation and test lanes.
     /// Memory is O(lanes + indexed files); time is O(entities) per query (a
     /// known full scan, not a graph load).
-    fn rank(&self, query: &str, keep: usize, within: &dyn Fn(&str) -> bool) -> Result<Ranked> {
+    fn rank(
+        &self,
+        query: &str,
+        keep: usize,
+        within: &dyn Fn(&str) -> bool,
+        pinned: &BTreeSet<GraphEntityId>,
+    ) -> Result<Ranked> {
         let terms = terms(query)?;
         let mut path_tokens: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         // Distinct query terms a file's own declarations (names and signatures,
@@ -753,7 +992,10 @@ impl GraphQuery<'_> {
             // Coordination: evidence for more distinct query terms outweighs one
             // rare-word coincidence; neutral (x1) for single-term matches.
             lexical = lexical * (1 + matched) / 2;
-            let exact = row.name == query || row.qualified == query || row.id == query;
+            let exact = row.name == query
+                || row.qualified == query
+                || row.id == query
+                || pinned.iter().any(|p| p.as_str() == row.id);
             if lexical == 0 && !exact {
                 return Ok(());
             }
@@ -792,7 +1034,7 @@ impl GraphQuery<'_> {
 
     pub fn locate(self, query: &str, limit: usize) -> Result<QueryResult<Vec<LocatedEntity>>> {
         validate_query(query, limit)?;
-        let ranked = self.rank(query, LANE.max(limit), &|_| true)?;
+        let ranked = self.rank(query, LANE.max(limit), &|_| true, &BTreeSet::new())?;
         let mut all: Vec<Candidate> = ranked
             .implementation
             .into_iter()
@@ -939,7 +1181,7 @@ impl GraphQuery<'_> {
 
     pub fn context(self, query: &str, limits: ContextLimits) -> Result<ContextPacket> {
         check_limits(limits)?;
-        self.context_data(query, limits, &|_| true)
+        self.context_data(query, limits, &|_| true, &BTreeSet::new())
     }
     /// Context selected only among entities whose file `within` accepts (a
     /// task or request scope), so a narrow scope is filled with its own best
@@ -951,7 +1193,20 @@ impl GraphQuery<'_> {
         within: &dyn Fn(&str) -> bool,
     ) -> Result<ContextPacket> {
         check_limits(limits)?;
-        self.context_data(query, limits, within)
+        self.context_data(query, limits, within, &BTreeSet::new())
+    }
+    /// [`Self::context_within`] with entities the request named explicitly
+    /// (already resolved to exactly one entity each) ranked as exact symbols,
+    /// so a named implementation is never outranked by a lexically busier one.
+    pub fn context_pinned(
+        self,
+        query: &str,
+        limits: ContextLimits,
+        within: &dyn Fn(&str) -> bool,
+        pinned: &BTreeSet<GraphEntityId>,
+    ) -> Result<ContextPacket> {
+        check_limits(limits)?;
+        self.context_data(query, limits, within, pinned)
     }
     pub fn impact(self, symbol: &str, limits: ContextLimits) -> Result<ContextPacket> {
         check_limits(limits)?;
@@ -960,7 +1215,7 @@ impl GraphQuery<'_> {
     pub fn neighborhood(self, symbol: &str, limits: ContextLimits) -> Result<ContextPacket> {
         check_limits(limits)?;
         self.one(symbol)?;
-        self.context_data(symbol, limits, &|_| true)
+        self.context_data(symbol, limits, &|_| true, &BTreeSet::new())
     }
 
     fn packet(
@@ -980,6 +1235,10 @@ impl GraphQuery<'_> {
             tests: vec![],
             associations: vec![],
             unresolved: vec![],
+            coverage: RelationCoverage {
+                semantic: self.freshness.semantic().is_some(),
+                ..RelationCoverage::default()
+            },
             limits,
             truncated,
             freshness: self.freshness.clone(),
@@ -992,8 +1251,9 @@ impl GraphQuery<'_> {
         query: &str,
         limits: ContextLimits,
         within: &dyn Fn(&str) -> bool,
+        pinned: &BTreeSet<GraphEntityId>,
     ) -> Result<ContextPacket> {
-        let ranked = self.rank(query, LANE.max(limits.primary * 4), within)?;
+        let ranked = self.rank(query, LANE.max(limits.primary * 4), within, pinned)?;
         let mut cache = Cache::new();
         let mut truncated = false;
         let mut implementation: BTreeMap<GraphEntityId, Candidate> = ranked
@@ -1274,6 +1534,13 @@ impl GraphQuery<'_> {
         for id in summarized {
             let (summaries, capped) = self.unresolved(&id)?;
             truncated |= capped;
+            // Counted here, before any byte shedding downstream can drop the
+            // detailed records: `coverage` is what stops a starved packet from
+            // reading as "these entities have no further relations".
+            packet.coverage.unresolved_sites += summaries.iter().map(|s| s.count).sum::<usize>();
+            if summaries.iter().any(|s| s.count > 0) {
+                packet.coverage.unresolved_entities += 1;
+            }
             packet.unresolved.extend(summaries);
         }
         packet.truncated = truncated;

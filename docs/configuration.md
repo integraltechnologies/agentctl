@@ -137,10 +137,10 @@ variable that points at the real location.
 
 ### `[runtime.roles.<role>]`
 
-Maps a role to a provider. The built-in roles are `planner`, `executor`,
-`verifier`, `recon`, and `reviewer`. Only `planner`, `executor`, and `verifier`
-can be launched by the runtime today. `recon`, `reviewer`, and custom roles can
-be configured and inspected.
+Maps a role to a provider. The built-in roles are `planner`, `executor`, and
+`verifier` — the three the runtime can launch. Configuration and project policy
+may add further profiles for inspection, and `agentctl role show` rejects a name
+that is not a role at all.
 
 | Field | Rules |
 | --- | --- |
@@ -148,10 +148,8 @@ be configured and inspected.
 | `model` | optional opaque string passed to the CLI (≤128 bytes) |
 | `effort` | optional opaque string passed to the CLI (≤128 bytes) |
 
-`agentctl route check` validates every known role, including `recon` and
-`reviewer`, and exits nonzero if any of them is unrouted. To check only the roles
-you use, run `agentctl route planner`, `agentctl route executor`, and
-`agentctl route verifier`.
+`agentctl route check` validates every known role and exits nonzero if any of
+them is unrouted.
 
 ### `[runtime.profiles.<role>]`
 

@@ -1,4 +1,4 @@
-//! Stage 5 dogfood over agentctl's own source ontology. The candidate mixes
+//! Structural-footprint dogfood over agentctl's own source ontology. The candidate mixes
 //! production declarations, test structure, and non-structural text so the
 //! footprint demonstrates information that raw diff size cannot provide.
 #[allow(dead_code)]
@@ -46,7 +46,7 @@ fn copy_tree(from: &Path, to: &Path) {
 }
 
 #[test]
-fn stage_five_dogfood_over_agentctls_own_source() {
+fn footprint_dogfood_over_agentctls_own_source() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if RepositoryInfo::discover(&manifest).is_err() {
         eprintln!("skipping: {} is not a Git checkout", manifest.display());
@@ -104,7 +104,7 @@ fn stage_five_dogfood_over_agentctls_own_source() {
     let report_bytes = serde_json::to_vec(&report).unwrap().len();
     let raw_lines = production.lines().count() + verification.lines().count();
 
-    eprintln!("--- Stage 5 dogfood: agentctl's own ontology ---");
+    eprintln!("--- Footprint dogfood: agentctl's own ontology ---");
     eprintln!(
         "raw changed lines: {raw_lines}; production files +{}; test files +{}; production declarations +{}; test declarations +{}",
         report.summary.production_files_added,

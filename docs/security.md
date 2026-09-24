@@ -128,9 +128,14 @@ and reported, but they do not block launches.
 
 - File contents and directory listings are deny-by-default. Only the OS and
   toolchain roots (`/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/opt`, `/nix`,
-  Xcode, and a few system files), the workspace, scratch, the repository's Git
-  directories, the program's own install directory, and operator-granted
-  `read_roots` are readable.
+  Xcode, the platform temp directory, and a few system files), the workspace,
+  scratch, the repository's Git directories, the program's own install
+  directory, and operator-granted `read_roots` are readable. The platform temp
+  directory is read-only and a platform root like `/usr`: provider CLIs use it
+  directly regardless of `TMPDIR`, and the Claude Code CLI will not start
+  without it. Nothing in agentctl state, the workspace under issued visibility,
+  Git metadata or a credential store becomes reachable through it — those
+  denials are compiled after every grant and win.
 - `stat` metadata stays readable so path resolution works. This can reveal whether
   a file exists and how large it is, but not what it contains.
 - Writes are deny-by-default. Network denial includes localhost and Unix-domain
@@ -222,14 +227,20 @@ that distinction:
 Under `issued`, the workspace tree and the repository's Git directories are not
 read roots, so `.git` cannot be used to recover unissued source, and the
 executor's write roots are its planner-authored write scope rather than the
-whole workspace. Checks and experiments are unaffected: they keep the
-read-only workspace access they need. agentctl state, credentials and the
-control plane stay denied exactly as before.
+whole workspace. The workspace is additionally *denied*, excepting only the
+issued files, the write scope and the exact directories on the path to them, so
+a broader read root — an operator `read_roots` entry, or the platform temp
+directory when the checkout lives under it — cannot silently restore
+workspace-wide access. Those directories stay listable because a process must
+be able to resolve its own working directory; their contents do not become
+readable. Checks and experiments are unaffected: they keep the read-only
+workspace access they need. agentctl state, credentials and the control plane
+stay denied exactly as before.
 
 **The default is `workspace`, and `issued` is opt-in.** Before the default can
 flip, the following must be settled:
 
-- **Provider dogfood.** Both Claude Code and Codex must be shown to work
+- **Real-provider validation.** Both Claude Code and Codex must be shown to work
   through the relay under confinement — including whatever they read at startup
   in the working directory and in `.git`. This has not been measured with real
   provider processes yet, and a provider that needs an unissued path would fail
@@ -244,6 +255,12 @@ flip, the following must be settled:
 - **Linux write targets.** Landlock rules need an existing path, so a write
   target that does not exist yet cannot be granted on Linux; such a task must
   create files under a granted directory instead.
+- **Atomic replacement.** Editors replace a file by writing `<file>.tmp.*`
+  beside it and renaming it into place. On macOS, an authorized File write
+  target also admits exactly its `<file>.<suffix>` siblings (create, write,
+  rename onto the target, remove); every other sibling stays unwritable.
+  Landlock cannot match names, so on Linux the grant stays exact-file and such
+  an edit is refused.
 
 ## Environment isolation
 

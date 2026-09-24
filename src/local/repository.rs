@@ -100,7 +100,7 @@ pub struct RepositorySourceState {
     pub workspace_id: WorkspaceId,
     pub head_commit: Option<String>,
     pub dirty: bool,
-    /// Always None in Stage 1. Even clean Git status is not a whole-filesystem fingerprint.
+    /// Always None: even clean Git status is not a whole-filesystem fingerprint.
     pub worktree_fingerprint: Option<String>,
     pub observed_at_ms: u64,
 }
@@ -229,7 +229,7 @@ impl RepositoryInfo {
             self.source.repository_id == self.repository_id
                 && self.source.workspace_id == self.workspace_id
                 && self.source.worktree_fingerprint.is_none(),
-            "invalid Stage 1 source-state envelope",
+            "invalid source-state envelope",
         )
     }
 }
@@ -260,7 +260,7 @@ fn canonical_git_path(git: &Git, args: &[&str]) -> Result<PathBuf> {
         fs::canonicalize(value).map_err(|e| Error::Invalid(format!("Git path {value:?}: {e}")))?;
     require(
         path.to_str().is_some(),
-        "Stage 1 repository metadata requires UTF-8 filesystem paths",
+        "repository metadata requires UTF-8 filesystem paths",
     )?;
     Ok(path)
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::local::terminal::{Report, name};
 use std::{env, fs::OpenOptions, io::Read};
 
 pub(crate) fn read(path: &str, limit: u64) -> Result<String> {
@@ -30,6 +31,7 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
                     "--objective",
                     "--objective-file",
                     "--request-file",
+                    "--verify",
                     "--query",
                     "--bytes",
                     "--primary",
@@ -83,6 +85,45 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
         if let Some(q) = flags.get("--query") {
             intent.query = Some(q.to_string());
         }
+        // Every entry path must yield a request `run planner` can plan: the
+        // checks each task and the integration are judged by are part of it.
+        if let Some(keys) = flags.get("--verify") {
+            require(
+                intent.verification.is_none(),
+                "--verify conflicts with the request file's own verification",
+            )?;
+            intent.verification = Some(VerificationRequirements {
+                requirement_refs: keys
+                    .split(',')
+                    .map(|k| k.trim().to_string())
+                    .filter(|k| !k.is_empty())
+                    .collect(),
+                evidence_required: true,
+            });
+        }
+        if intent.verification.is_none() {
+            let policy = ProjectConfig::load(&root)?;
+            let declared: Vec<String> = policy.verification.keys().cloned().collect();
+            match declared.as_slice() {
+                [only] => {
+                    intent.verification = Some(VerificationRequirements {
+                        requirement_refs: vec![only.clone()],
+                        evidence_required: true,
+                    })
+                }
+                [] => {
+                    return Err(Error::Invalid(
+                        "plan prepare: the project declares no [verification.KEY] profile, so no plan could be verified; declare one in .agentctl/project.toml".into(),
+                    ));
+                }
+                many => {
+                    return Err(Error::Invalid(format!(
+                        "plan prepare: choose the checks the plan is judged by with --verify KEY[,KEY] (declared: {})",
+                        many.join(", ")
+                    )));
+                }
+            }
+        }
         let mut limits = PlanningLimits::default();
         for (name, target) in [
             ("--bytes", &mut limits.bytes),
@@ -103,17 +144,38 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
             }
         }
         let p = store.prepare_plan(&root, intent, limits)?;
-        return output(
-            json,
-            &p,
-            &format!(
-                "Prepared {}: {} serialized bytes; truncated={}\nUse plan context {} --json for the immutable planner input.",
-                p.request.request_id.as_str(),
-                p.serialized_bytes,
-                p.context.truncated,
-                p.request.request_id.as_str()
-            ),
-        );
+        return output(json, &p, &{
+            let id = p.request.request_id.as_str();
+            Report::new("Planning request prepared")
+                .field("Request", id)
+                .field("Objective", first_line(&p.request.intent.objective))
+                .field(
+                    "Verify",
+                    p.request
+                        .intent
+                        .verification
+                        .as_ref()
+                        .map(|v| v.requirement_refs.join(", "))
+                        .unwrap_or_default(),
+                )
+                .field(
+                    "Context",
+                    format!(
+                        "{} bytes{}",
+                        p.serialized_bytes,
+                        if p.context.truncated {
+                            " (truncated to limits)"
+                        } else {
+                            ""
+                        }
+                    ),
+                )
+                .next([
+                    format!("agentctl run planner {id}"),
+                    format!("Inspect the frozen planner input: agentctl plan context {id} --json"),
+                ])
+                .to_string()
+        });
     }
     if command == "list" {
         let mut all = false;
@@ -135,7 +197,29 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
             }
         }
         let list = store.execution_plans(&root, all, limit)?;
-        return output(json, &list, &serde_json::to_string_pretty(&list)?);
+        let human = if list.is_empty() {
+            format!(
+                "No {}plans in this workspace",
+                if all { "" } else { "validated or active " }
+            )
+        } else {
+            let width = list
+                .iter()
+                .map(|p| p.plan_id.as_str().len())
+                .max()
+                .unwrap_or(0);
+            let mut lines = vec![format!("{:<width$}  {:<10}  OBJECTIVE", "PLAN", "STATUS")];
+            for p in &list {
+                lines.push(format!(
+                    "{:<width$}  {:<10}  {}",
+                    p.plan_id.as_str(),
+                    name(&p.state),
+                    first_line(&p.objective)
+                ));
+            }
+            lines.join("\n")
+        };
+        return output(json, &list, &human);
     }
     if command == "import" {
         require(args.len() == 1, "plan import requires one JSON file")?;
@@ -144,11 +228,9 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
         return output(
             json,
             &view,
-            &format!(
-                "Imported and validated {}: {} tasks; {} bytes. Not active.",
-                view.plan.packet.plan_id.as_str(),
-                view.plan.packet.tasks.len(),
-                size(&view.plan)?
+            &plan_report(
+                &format!("Plan imported ({} bytes)", size(&view.plan)?),
+                &view,
             ),
         );
     }
@@ -167,7 +249,31 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
             let manifest = crate::local::runtime::manifest::for_packet(&packet)?;
             return output(json, &manifest, &serde_json::to_string_pretty(&manifest)?);
         }
-        return output(json, &packet, &serde_json::to_string_pretty(&packet)?);
+        let id = packet.request.request_id.as_str();
+        let human = Report::new("Planning request")
+            .field("Request", id)
+            .field("Objective", first_line(&packet.request.intent.objective))
+            .field(
+                "Context",
+                format!(
+                    "{} bytes{}",
+                    packet.serialized_bytes,
+                    if packet.context.truncated {
+                        " (truncated to limits)"
+                    } else {
+                        ""
+                    }
+                ),
+            )
+            .text("")
+            .text(format!(
+                "Frozen planner input:  agentctl plan context {id} --json"
+            ))
+            .text(format!(
+                "Context manifest:      agentctl plan context {id} --manifest"
+            ))
+            .to_string();
+        return output(json, &packet, &human);
     }
     let id = PlanId::new(
         *args
@@ -210,7 +316,37 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
                 if command == "blocked" {
                     tasks.retain(|t| !t.structurally_ready && t.state != TaskState::Verified);
                 }
-                return output(json, &tasks, &serde_json::to_string_pretty(&tasks)?);
+                let human = if tasks.is_empty() {
+                    format!("No {command} tasks")
+                } else {
+                    let mut report = Report::default();
+                    for t in &tasks {
+                        report
+                            .section(format!("Task {}", t.packet.task_id.as_str()))
+                            .field("Status", name(&t.state))
+                            .field(
+                                "Ready",
+                                crate::local::terminal::yes_no(t.structurally_ready),
+                            )
+                            .field("Objective", first_line(&t.packet.objective));
+                        if !t.packet.dependencies.is_empty() {
+                            report.field(
+                                "Depends",
+                                t.packet
+                                    .dependencies
+                                    .iter()
+                                    .map(|d| d.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            );
+                        }
+                        if !t.reasons.is_empty() {
+                            report.field("Waiting", t.reasons.join("\n"));
+                        }
+                    }
+                    report.to_string()
+                };
+                return output(json, &tasks, &human);
             }
         }
         _ => {
@@ -221,9 +357,75 @@ pub(crate) fn run(store: &mut Store, command: &str, args: &[&str], json: bool) -
     }
     let view = store.execution_plan(&root, &id)?;
     if command == "export" {
+        // A document for `plan import`, not a report: JSON in both modes.
         return output(json, &view.plan, &serde_json::to_string_pretty(&view.plan)?);
     }
-    output(json, &view, &serde_json::to_string_pretty(&view)?)
+    let title = match command {
+        "validate" => "Plan validated",
+        "activate" => "Plan activated",
+        "supersede" => "Plan superseded",
+        "cancel" => "Plan cancelled",
+        _ => "Plan",
+    };
+    output(json, &view, &plan_report(title, &view))
+}
+
+/// The first line of operator/planner text, bounded for one-line display.
+fn first_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() > 96 {
+        format!("{}…", line.chars().take(95).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
+fn plan_report(title: &str, view: &ExecutionPlanView) -> String {
+    let packet = &view.plan.packet;
+    let plan = packet.plan_id.as_str();
+    let mut report = Report::new(title);
+    report
+        .field("Plan", plan)
+        .field("Status", name(&view.state))
+        .field("Objective", first_line(&packet.objective))
+        .field("Request", view.plan.metadata.request_id.as_str())
+        .field_opt(
+            "Replaces",
+            view.plan
+                .metadata
+                .replan
+                .as_ref()
+                .map(|r| r.previous_plan_id.as_str()),
+        )
+        .field_opt(
+            "Superseded",
+            view.superseded_by.as_ref().map(PlanId::as_str),
+        )
+        .field_opt(
+            "Integration",
+            view.integration_proof.as_ref().map(|p| name(&p.decision)),
+        )
+        .field_opt(
+            "Final source",
+            view.final_source.as_ref().map(|s| s.revision.as_str()),
+        );
+    report.section(format!("Tasks ({})", packet.tasks.len()));
+    for task in &packet.tasks {
+        report.field(task.task_id.as_str(), first_line(&task.objective));
+    }
+    match view.state {
+        PlanState::Validated => {
+            report.next([format!("agentctl plan activate {plan}")]);
+        }
+        PlanState::Active => {
+            report.next([
+                format!("agentctl run plan {plan} --dry-run"),
+                format!("agentctl run plan {plan}"),
+            ]);
+        }
+        _ => {}
+    }
+    report.to_string()
 }
 fn output(json: bool, value: &impl serde::Serialize, human: &str) -> Result<()> {
     if json {

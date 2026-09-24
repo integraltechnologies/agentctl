@@ -1,6 +1,6 @@
-//! Stage 5: a bounded, derived view of permanent structural change.
+//! Structural footprint: a bounded, derived view of permanent structural change.
 //!
-//! The report is a projection of a Stage-3 [`SemanticDelta`]. It does not scan
+//! The report is a projection of a [`SemanticDelta`]. It does not scan
 //! source, persist metrics, infer intent, or score quality. Every fact retains
 //! the entity/file/relation identity that caused it, and review signals merely
 //! select those same facts for inspection. Unsupported claims (configuration,
@@ -16,7 +16,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-const MEANING: &str = "Derived structural facts and review signals, not a quality score or rejection policy. Test classification uses observed test kinds and Stage-1 path conventions; public surface is known only where Stage 1 records visibility (currently Rust). Configuration, persistence/schema machinery, semantic duplication, unresolved imports, and verification exercise are not inferred. This report grants no context or filesystem authority.";
+const MEANING: &str = "Derived structural facts and review signals, not a quality score or rejection policy. Test classification uses observed test kinds and indexed test-path conventions; public surface is known only where the index records visibility (currently Rust). Configuration, persistence/schema machinery, semantic duplication, unresolved imports, and verification exercise are not inferred. This report grants no context or filesystem authority.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

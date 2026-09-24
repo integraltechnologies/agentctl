@@ -107,9 +107,10 @@ Alpha limitations to know about:
 
 - Only Claude Code and Codex CLI adapters exist. Codex token usage is not
   reported.
-- READY tasks with proven-disjoint scopes and accepted-ontology impact may run
-  concurrently in managed linked worktrees. Unknown or conflicting work stays
-  serial, and reconciliation, verification, and acceptance remain serialized.
+- READY tasks with proven-disjoint scopes and accepted-ontology impact run
+  concurrently in managed linked worktrees, each a sandboxed worker of its own.
+  Unknown or conflicting work stays serial, and reconciliation, verification,
+  and acceptance remain serialized.
 - The runtime supports modest repositories: up to 20,000 files and 64 MiB, with no
   symlinks, hardlinks, or submodules in the checkout. Verifier diffs carry exact
   hunks with bounded context, so they scale with the size of a change rather than
@@ -120,12 +121,16 @@ Alpha limitations to know about:
   never granted automatically: it blocks the run for an explicit planner
   decision (`agentctl run context`). Verifiers cannot escalate at all.
 - Hard issued-context confinement (`[runtime.context] visibility = "issued"`) is
-  opt-in; the default still lets a worker read the workspace. See
+  opt-in; the default still lets a worker read the workspace. Under `issued` a
+  worker can resolve its own working directory and list the directories on the
+  path to an issued file, but no unissued file content is readable. See
   [docs/security.md](docs/security.md#issued-context-visibility).
-- The code graph is syntactic. It resolves a relation only when exactly one
-  declaration is visible: in-file lexical scope and methods, and Rust qualified
-  paths across files. Imports, re-exports, and calls on variables stay
-  unresolved.
+- The code graph is syntactic by default. It resolves a relation only when
+  exactly one declaration is provable: in-file lexical scope and methods,
+  qualified paths, and import statements and the names they bind (Rust, Python,
+  TypeScript/JavaScript). Re-exports, globs, and calls on variables stay
+  UNKNOWN unless an installed semantic provider (`rust-analyzer`, or
+  `scip-python` for Python) proves them with `agentctl repo enrich`.
 - Process-tree cleanup on macOS and Linux is best effort, and resource limits are
   mostly per process. See [docs/security.md](docs/security.md#known-limitations).
 - agentctl never commits or pushes. You review and commit results yourself.

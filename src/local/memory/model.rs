@@ -5,10 +5,15 @@ use crate::{
     },
     protocol::*,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(try_from = "String", into = "String")]
+#[schemars(
+    with = "String",
+    description = "memory:<id> — an existing memory entry"
+)]
 pub struct MemoryId(String);
 impl MemoryId {
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
@@ -238,15 +243,18 @@ pub struct MemorySummary {
     pub workspace_id: Option<WorkspaceId>,
     pub content_truncated: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryContext {
-    pub items: Vec<MemorySummary>,
-    pub limits: MemoryLimits,
-    pub truncated: bool,
-}
+/// Wire shape of `agentctl code context --json`: graph context and the bounded
+/// memory selected for it, in one document.
 #[derive(Debug, Serialize)]
 pub struct CodeContextWithMemory {
     #[serde(flatten)]
     pub graph: crate::local::graph::ContextPacket,
     pub memory: MemoryContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryContext {
+    pub items: Vec<MemorySummary>,
+    pub limits: MemoryLimits,
+    pub truncated: bool,
 }

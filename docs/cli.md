@@ -1,13 +1,19 @@
 # Command guide
 
 This guide covers every command group in `agentctl` and `agenttop`. `agentctl
---help` prints the full syntax.
+--help` lists the command groups; `agentctl <command> --help` (or `agentctl help
+<command>`) prints that group's full syntax.
 
 ## Conventions
 
 - Put `--json` **last** to get machine-readable output. Without it, output is
   human-readable, with untrusted text escaped.
-- Errors go to stderr with a nonzero exit code. Diagnostic commands (`doctor`,
+- Human output is organized as titled sections of aligned `Label  value` fields.
+  Statuses use the canonical protocol names (`BLOCKED`, `VERIFIED`, `ACCEPTED`),
+  and a `Next` section names the command to run when there is an obvious one.
+- Errors go to stderr with a nonzero exit code, as `agentctl: <message>`; a
+  canonical code such as `SOURCE_DRIFT` leads the message, and a recommended
+  recovery command is repeated under `Next`. Diagnostic commands (`doctor`,
   `security doctor`, `repo status`, `route`, `route check`, `role show`) print
   their report and still exit nonzero when something is wrong.
 - Repository-scoped commands act on the Git checkout that contains the current
@@ -51,9 +57,12 @@ inspectable and is never silently rekeyed.
 ```bash
 agentctl repo index           # incremental: only new, changed or version-stale files are reparsed
 agentctl repo index --status  # last index, backend versions, counts, stale paths, failures
+agentctl repo enrich          # optional: attach what installed semantic providers prove
+                              # (bound to the indexed generation; any re-index that re-derives a file drops it)
 
 agentctl code symbol <name-or-id>      # exact name, qualified name, or graph ID
-agentctl code search <text>            # name substring
+                                       # (callers/refs/impact also accept source paths: crate::m::f, Type::method)
+agentctl code search <text>            # name substring; several words must all appear
 agentctl code file <path>              # entities in a file
 agentctl code locate <text>            # deterministic ranked lookup over names, paths, containers, signatures
 agentctl code refs <symbol>            # resolved references
@@ -74,8 +83,14 @@ agentctl code context <text> [--limit N] [--depth N] [--neighbors N] [--tests N]
 - **Precision:** results are syntactic, not compiler truth. A relation is
   resolved only when exactly one compatible declaration is visible. That covers
   in-file lexical scope (shadowing-aware), `self.`/`Self::`/`this.` methods, and
-  Rust qualified paths across files. Every resolved relation names its rule.
-  Imports, re-exports, and calls on variables stay unresolved. Context lists
+  qualified paths and import statements across files. Every resolved relation
+  names its rule. Re-exports, globs, and calls on variables stay unresolved
+  unless `repo enrich` proves them. Calls inside macro invocations
+  (`assert_eq!(f(), 1)`, `format!("{}", x.f())`) are recorded as unresolved
+  sites — never guessed, never absent — and only a semantic provider can prove
+  them. `repo index` and `repo index --status` say whether the indexed
+  generation is semantically enriched or structural only, and planner packets
+  carry the same flag. Context lists
   unresolved call sites only as bounded per-entity name summaries. Test links
   state their basis (resolved call, via a helper, shared container, or
   lexical), not proven coverage. `impact` reports known dependents, not
@@ -219,9 +234,9 @@ instructions.
 ## Planning
 
 ```bash
-agentctl plan prepare --objective TEXT [--query TEXT] [--bytes N] [--notes N]
-agentctl plan prepare --objective-file PATH
-agentctl plan prepare --request-file PATH       # a strict RequestDraft JSON document
+agentctl plan prepare --objective TEXT [--verify KEY[,KEY]] [--query TEXT] [--bytes N] [--notes N]
+agentctl plan prepare --objective-file PATH [--verify KEY[,KEY]]
+agentctl plan prepare --request-file PATH [--verify KEY[,KEY]]   # a strict RequestDraft JSON document
 agentctl plan context <request-id>              # the frozen planner input
 agentctl plan context <request-id> --manifest   # its context manifest: categories, bytes, paths, IDs
 agentctl plan import <execution-plan.json>      # externally produced plan → VALIDATED
@@ -236,6 +251,13 @@ agentctl plan list [--all] [--limit N]
 agentctl plan supersede <old-id> --with <new-id>
 agentctl plan cancel <plan-id> --reason TEXT
 ```
+
+Every prepared request names the project verification profiles the plan is
+judged by: `--verify`, the request file's own `verification`, or — when the
+project declares exactly one profile — that profile. With several and no
+choice, `plan prepare` refuses and lists them. Symbols the request names
+explicitly (`Money::add`, `ClaudeAdapter::launch`) are pinned as primary
+context when they resolve to exactly one entity.
 
 `plan prepare` requires a complete, fresh code index. It freezes a bounded
 **PlannerPacket**: the objective, project invariants and policy, graph context,
@@ -252,12 +274,20 @@ or policy do not fit the budget, `plan prepare` fails.
 Plans usually come from `agentctl run planner`. An external producer can instead
 write an **ExecutionPlan** (a PlanPacket plus metadata with one independent
 verification contract per task and a final integration contract) and import it.
-Contract hashes are BLAKE3 over compact JSON in declared field order. Compute them
-with:
+Contract hashes are BLAKE3 over compact JSON in declared field order.
 
-```bash
-agentctl run packet-hashes < plan-packet.json
-```
+A provider never writes that envelope. `agentctl run planner` asks for a
+**PlanDecision** — the packet, one contract decision per task (memory
+references, scope exclusions, non-goals), the integration expectations and an
+optional replan reference — and agentctl derives the rest: every hash, the
+frozen source, the request identity and all timestamps. A contract therefore
+cannot fail to bind its task.
+
+An exclusion carves a hole in a task's own declared scope: it is denied for
+both reading and writing, so it may never overlap a path the same task declares
+in `read_scope` or `write_scope`. A memory reference must name an existing
+entry (`memory:…`); the `config:…` entries shown in the planner packet are live
+project policy that agentctl enforces itself and are never referenceable.
 
 `tests/planning.rs` contains a complete construction example.
 
@@ -274,7 +304,7 @@ agentctl provider doctor                  # CLI --version and token-free login s
 agentctl roles
 agentctl role show <role>
 agentctl route <role> [--override role:provider[:model]]
-agentctl route check                      # every known role, including recon and reviewer
+agentctl route check                      # every known role
 
 agentctl run planner <request-id>         # planner provider produces a plan; imported as VALIDATED
 agentctl run plan <plan-id> --dry-run     # workspace, strategy, configured roles, ready tasks
@@ -307,7 +337,12 @@ following:
    integration verifier over the combined diff before the plan can become
    `COMPLETE`.
 4. Stops and blocks on rejection, failure, or unexpected source or policy drift
-   (`SOURCE_DRIFT`).
+   (`SOURCE_DRIFT`). A provider failure that left nothing uncertain pauses
+   instead (see [providers.md](providers.md#failures-and-retries)); resume it.
+5. Runs compatible ready tasks concurrently in isolated worktrees. If a
+   captured branch can no longer be proven unaffected by a sibling verified
+   first, it is withdrawn (never published) and the task runs again serially
+   on the current source.
 
 agentctl never commits, pushes, resets, or cleans your checkout. Review and commit
 the resulting changes yourself. Commit before preparing the next plan, because
@@ -540,4 +575,4 @@ agentctl schemas generate [--output DIR]   # write JSON Schemas (default: schema
 agentctl protocol validate <type> <file>   # structural and semantic validation of one document
 ```
 
-`agentctl --help` lists the protocol document types.
+`agentctl protocol --help` lists the protocol document types.

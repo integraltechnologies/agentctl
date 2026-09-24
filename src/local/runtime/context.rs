@@ -1,4 +1,4 @@
-//! Stage 2 planner-mediated context relay.
+//! Planner-mediated context relay.
 //!
 //! The planner is the authority over what a worker initially sees. An executor's
 //! base context is materialized only from planner-authored references: the
@@ -1025,6 +1025,17 @@ pub fn report(
     let info = graph::checked_workspace(store, root)?;
     let run = load_run(store, &info, plan)?
         .ok_or_else(|| Error::Invalid("runtime plan not found in this workspace".into()))?;
+    // The maximum authority any approval can carry. A template that proposed
+    // more than this would be refused by `run context decide`, so the report
+    // must not offer it.
+    let request_scope = store
+        .execution_plan(root, plan)
+        .and_then(|view| store.planning_context(root, &view.plan.metadata.request_id))
+        .map(|prepared| prepared.request.intent.scope)
+        .unwrap_or_default();
+    let grantable = |path: &str| {
+        request_scope.is_empty() || request_scope.iter().any(|parent| permits(parent, path))
+    };
     let mut subjects = vec![];
     for (key, ledger) in &run.context {
         let max_rounds = if ledger.role == AgentRole::Executor {
@@ -1046,22 +1057,46 @@ pub fn report(
                     .filter(|i| i.outcome == ItemOutcome::OutsideEnvelope)
                     .flat_map(|i| &i.paths)
                     .collect();
-                let additions: Vec<serde_json::Value> = outside
+                let (grantable_paths, ungrantable): (Vec<&String>, Vec<&String>) =
+                    outside.iter().copied().partition(|path| grantable(path));
+                let approvable = ungrantable.is_empty();
+                let additions: Vec<serde_json::Value> = grantable_paths
                     .iter()
                     .map(|p| serde_json::json!({"kind":"FILE","path":p}))
                     .collect();
+                // Offer APPROVE only when every requested path is inside the
+                // planning request's own scope; otherwise the only decision
+                // that can succeed is DENY, and the report says why.
                 pending = Some(serde_json::json!({
                     "request_hash": record.request.hash,
                     "outside_paths": outside,
-                    "decision_template": {
-                        "version": DECISION_VERSION,
-                        "plan_id": plan,
-                        "task_id": ledger.task_id,
-                        "request_hash": record.request.hash,
-                        "decision": "APPROVE",
-                        "read_scope_additions": additions,
-                        "reason": "<why this expansion is the planner's intent>",
-                        "actor": "<planner or operator>",
+                    "approvable": approvable,
+                    "beyond_planning_authority": ungrantable,
+                    "detail": if approvable { serde_json::Value::Null } else { serde_json::json!(
+                        "these paths lie outside the planning request's own scope, so no approval can grant them; DENY here and prepare a new request whose scope includes them"
+                    ) },
+                    "decision_template": if approvable {
+                        serde_json::json!({
+                            "version": DECISION_VERSION,
+                            "plan_id": plan,
+                            "task_id": ledger.task_id,
+                            "request_hash": record.request.hash,
+                            "decision": "APPROVE",
+                            "read_scope_additions": additions,
+                            "reason": "<why this expansion is the planner's intent>",
+                            "actor": "<planner or operator>",
+                        })
+                    } else {
+                        serde_json::json!({
+                            "version": DECISION_VERSION,
+                            "plan_id": plan,
+                            "task_id": ledger.task_id,
+                            "request_hash": record.request.hash,
+                            "decision": "DENY",
+                            "read_scope_additions": [],
+                            "reason": "<why this request is refused>",
+                            "actor": "<planner or operator>",
+                        })
                     },
                 }));
             }

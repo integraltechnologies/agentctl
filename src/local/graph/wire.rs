@@ -117,6 +117,7 @@ struct PacketOut<'a> {
     tests: Vec<EntityOut<'a>>,
     associations: &'a [TestAssociation],
     unresolved: &'a [UnresolvedSummary],
+    coverage: &'a RelationCoverage,
     limits: &'a ContextLimits,
     truncated: bool,
     freshness: &'a IndexStatus,
@@ -166,6 +167,7 @@ impl Serialize for ContextPacket {
             tests: self.tests.iter().map(Into::into).collect(),
             associations: &self.associations,
             unresolved: &self.unresolved,
+            coverage: &self.coverage,
             limits: &self.limits,
             truncated: self.truncated,
             freshness: &self.freshness,
@@ -231,6 +233,8 @@ struct PacketIn {
     associations: Vec<TestAssociation>,
     #[serde(default)]
     unresolved: Vec<UnresolvedSummary>,
+    #[serde(default)]
+    coverage: RelationCoverage,
     limits: ContextLimits,
     truncated: bool,
     freshness: IndexStatus,
@@ -321,6 +325,7 @@ impl<'de> Deserialize<'de> for ContextPacket {
             generation: raw.generation,
             associations: raw.associations,
             unresolved: raw.unresolved,
+            coverage: raw.coverage,
             limits: raw.limits,
             truncated: raw.truncated,
             freshness: raw.freshness,

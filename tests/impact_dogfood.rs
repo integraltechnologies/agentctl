@@ -1,4 +1,4 @@
-//! Stage 4 dogfood over agentctl's own source tree.
+//! Impact-analysis dogfood over agentctl's own source tree.
 //!
 //! A realistic contract change is made to a helper whose important dependents
 //! live in a dozen other files, and the observed delta is analyzed. Every
@@ -56,7 +56,7 @@ fn copy_tree(from: &Path, to: &Path) {
 }
 
 #[test]
-fn stage_four_dogfood_over_agentctls_own_source() {
+fn impact_dogfood_over_agentctls_own_source() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if RepositoryInfo::discover(&manifest_dir).is_err() {
         eprintln!("skipping: {} is not a Git checkout", manifest_dir.display());
@@ -140,7 +140,7 @@ fn stage_four_dogfood_over_agentctls_own_source() {
         file_entity_bytes += serde_json::to_vec(&rows.data).unwrap().len();
     }
 
-    eprintln!("--- Stage 4 dogfood: agentctl's own ontology ---");
+    eprintln!("--- Impact dogfood: agentctl's own ontology ---");
     eprintln!(
         "seeds: {} ({} not traversed) in {:?}",
         report.summary.seeds, report.summary.seeds_skipped, seed_files

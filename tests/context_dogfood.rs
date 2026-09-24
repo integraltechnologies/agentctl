@@ -1,11 +1,11 @@
-//! Part M: a realistic Stage 2 dogfood over agentctl's own source tree.
+//! A realistic context-relay dogfood over agentctl's own source tree.
 //!
 //! The planner deliberately issues an incomplete executor context (one symbol
 //! plus the file the task may write), the executor asks for the symbol's
 //! callers, the relay grants them inside the task envelope, and a fresh second
 //! job finishes the work. Every measurement the stage asks for is printed with
 //! `--nocapture`, and the assertions compare the result against what the
-//! pre-Stage-2 runtime would have injected for the same task.
+//! pre-relay runtime would have injected for the same task.
 #[allow(dead_code)]
 mod common;
 use agentctl::{
@@ -37,7 +37,7 @@ const WRITE_TARGET: &str = "src/local/runtime/manifest.rs";
 const READ_SCOPE: &str = "src/local/runtime";
 /// Repository text that is relevant to neither the symbol nor the write target;
 /// none of it may reach a worker. `ScratchCleanup` lives *inside* the task's
-/// Directory read scope and the pre-Stage-2 fill would have injected its file,
+/// Directory read scope and the pre-relay fill would have injected its file,
 /// so its absence is what proves the envelope injects nothing.
 const UNRELATED: [&str; 5] = [
     "ScratchCleanup",
@@ -85,7 +85,9 @@ impl ProviderAdapter for Scripted {
             replies.remove(0)
         };
         let value = match (input.role, reply) {
-            (AgentRole::Planner, Reply::Plan(plan)) => serde_json::to_value(&*plan).unwrap(),
+            (AgentRole::Planner, Reply::Plan(plan)) => {
+                common::plan_decision(&serde_json::to_value(&*plan).unwrap())
+            }
             (AgentRole::Executor, Reply::Callers(entity)) => {
                 serde_json::to_value(ResultPacket {
                     version: ProtocolVersion::V1,
@@ -121,7 +123,7 @@ impl ProviderAdapter for Scripted {
                 let prior = fs::read_to_string(process.workspace.join(path)).unwrap();
                 fs::write(
                     process.workspace.join(path),
-                    format!("{prior}// Stage 2 dogfood: context round recorded here.\n"),
+                    format!("{prior}// Context-relay dogfood: context round recorded here.\n"),
                 )
                 .unwrap();
                 serde_json::to_value(ResultPacket {
@@ -276,7 +278,7 @@ fn category(m: &manifest::ContextManifest, prefix: &str) -> usize {
         .sum()
 }
 
-/// What the pre-Stage-2 runtime would have injected for this task: the first
+/// What the pre-relay runtime would have injected for this task: the first
 /// sixteen files under the Directory read scope in path order, each truncated
 /// to 4096 characters, chosen by the runtime rather than by the planner.
 fn legacy_directory_fill(root: &Path) -> (usize, usize, Vec<String>) {
@@ -297,7 +299,7 @@ fn legacy_directory_fill(root: &Path) -> (usize, usize, Vec<String>) {
 }
 
 #[test]
-fn stage_two_dogfood_over_agentctls_own_source() {
+fn context_relay_dogfood_over_agentctls_own_source() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if RepositoryInfo::discover(&manifest_dir).is_err() {
         eprintln!("skipping: {} is not a Git checkout", manifest_dir.display());
@@ -379,7 +381,7 @@ fn stage_two_dogfood_over_agentctls_own_source() {
     assert_eq!(indexed.failed, 0, "agentctl's own sources index cleanly");
     drop(initial);
 
-    // A realistic Stage 2 change: record the context round in the manifest the
+    // A realistic context-relay change: record the context round in the manifest the
     // engine builds. The planner selects one symbol and one write target, and
     // deliberately leaves the callers out of the issued context.
     let prepared = store()
@@ -579,7 +581,7 @@ fn stage_two_dogfood_over_agentctls_own_source() {
         m.issued.iter().filter(|i| i.authority == authority).count()
     };
 
-    eprintln!("\n===== Stage 2 dogfood: agentctl's own source tree =====");
+    eprintln!("\n===== Context-relay dogfood: agentctl's own source tree =====");
     eprintln!(
         "repository: {} indexed files, {} entities, {} edges",
         indexed.indexed + indexed.reused,
@@ -677,7 +679,7 @@ fn stage_two_dogfood_over_agentctls_own_source() {
     );
     // A Directory read scope holding the whole runtime module injects nothing.
     // What remains is the planner's own references, which here is less than half
-    // of what the pre-Stage-2 directory fill would have sent -- and that fill
+    // of what the pre-relay directory fill would have sent -- and that fill
     // was chosen by the runtime, not by the plan.
     assert!(
         category(&round_one, "artifact.context") * 2 < legacy_bytes,

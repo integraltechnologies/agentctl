@@ -1,4 +1,4 @@
-//! Stage 3: ontology generation lifecycle and semantic deltas, over real Git
+//! Ontology generation lifecycle and semantic deltas, over real Git
 //! repositories and the real index path. Oracles are the edits each test
 //! makes (which declarations it added, removed or changed), not the delta
 //! implementation's own bookkeeping.
@@ -445,7 +445,7 @@ fn a_cross_file_relation_appears_and_disappears_and_moves_with_the_resolution() 
 #[test]
 fn a_relation_can_disappear_from_a_file_whose_bytes_did_not_change() {
     // `helpers::go()` resolves by unique key suffix. A second `helpers::go`
-    // elsewhere makes it ambiguous, so Stage 1 abstains, and the delta must
+    // elsewhere makes it ambiguous, so the index abstains, and the delta must
     // say the relation disappeared from main.rs even though main.rs is untouched.
     let main = "mod helpers;\npub fn start() {\n    helpers::go();\n}\n";
     let f = Fixture::new(&[
@@ -560,7 +560,7 @@ fn renames_moves_and_container_changes_abstain_as_removal_plus_addition() {
 #[test]
 fn duplicate_declarations_never_fabricate_identity() {
     // Python permits redefinition: both `f`s share path, kind and name, so
-    // their Stage-1 IDs are ordinals in file order.
+    // their entity IDs are ordinals in file order.
     let two = "def g():\n    return 0\n\ndef f():\n    return 1\n\ndef f():\n    return 2\n";
     let f = Fixture::new(&[("pkg/m.py", two)]);
     // Deleting the first `f`: the survivor now carries ordinal 0, the ID the
@@ -1088,7 +1088,7 @@ fn lifecycle_rows_and_artifacts_are_guarded_against_out_of_band_changes() {
 }
 
 #[test]
-fn a_pre_stage_three_database_migrates_losslessly_and_bootstraps_on_the_next_index() {
+fn a_pre_lifecycle_database_migrates_losslessly_and_bootstraps_on_the_next_index() {
     let f = Fixture::new(&[("src/a.rs", A), ("src/b.rs", B)]);
     let before = f.store().index_status(&f.root).unwrap();
     let rows = |c: &rusqlite::Connection| -> Vec<String> {
@@ -1105,7 +1105,10 @@ fn a_pre_stage_three_database_migrates_losslessly_and_bootstraps_on_the_next_ind
     c.pragma_update(None, "user_version", 12).unwrap();
     drop(c);
     // Reopen migrates to 13 without touching facts or synthesizing history.
-    assert_eq!(f.store().status().unwrap().schema_version, 13);
+    assert_eq!(
+        f.store().status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION
+    );
     let c = common::sql(&f.db);
     assert_eq!(rows(&c), payloads);
     let unhashed: i64 = c
@@ -1151,7 +1154,10 @@ fn a_pre_stage_three_database_migrates_losslessly_and_bootstraps_on_the_next_ind
     );
     // Reopening again is a no-op.
     drop(c);
-    assert_eq!(f.store().status().unwrap().schema_version, 13);
+    assert_eq!(
+        f.store().status().unwrap().schema_version,
+        agentctl::local::store::DATABASE_VERSION
+    );
     assert_eq!(f.states().len(), 1);
 }
 
@@ -1166,7 +1172,7 @@ fn a_database_with_a_missing_lifecycle_guard_refuses_to_open() {
 }
 
 // ---------------------------------------------------------------------------
-// CLI (Part H).
+// CLI.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1211,9 +1217,10 @@ fn the_ontology_cli_observes_inspects_and_accepts() {
     let between = f.cli_json(&["ontology", "delta", "--from", &id, "--to", &base, "--json"]);
     assert_eq!(between["summary"]["entities_removed"], 1);
     let human = f.cli(&["ontology", "delta", &id]);
+    let human = String::from_utf8_lossy(&human.stdout);
     assert!(
-        String::from_utf8_lossy(&human.stdout)
-            .contains("entity Added  Function src::b::extra  src/b.rs")
+        human.contains("entity    ADDED      Function src::b::extra  src/b.rs"),
+        "{human}"
     );
     assert!(
         !f.cli(&["ontology", "delta", "--change", "RENAMED", "--json"])

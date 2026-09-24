@@ -313,26 +313,62 @@ impl<'a> Runtime<'a> {
                 profile_hash: planning::hash(&resolved.profile)?,
                 project_policy_hash: expected_policy_hash.into(),
             };
-            match self.invoke_attempt(
-                info,
-                plan,
-                request,
-                task,
-                role,
-                source,
-                artifact.clone(),
-                inventory.clone(),
-                lease,
-                &resolved.profile,
-                snapshot,
-                &project,
-                max_agents,
-            ) {
-                Err(Error::ProviderAvailability(reason)) => failures.push(routing::FailedRoute {
-                    route: config.clone(),
-                    reason,
-                }),
-                result => return result,
+            let mut retries = 0;
+            loop {
+                match self.invoke_attempt(
+                    info,
+                    plan,
+                    request,
+                    task,
+                    role,
+                    source,
+                    artifact.clone(),
+                    inventory.clone(),
+                    lease,
+                    &resolved.profile,
+                    snapshot.clone(),
+                    &project,
+                    max_agents,
+                ) {
+                    Err(Error::ProviderAvailability(reason)) => {
+                        failures.push(routing::FailedRoute {
+                            route: config.clone(),
+                            reason,
+                        });
+                        break;
+                    }
+                    Err(Error::Provider { class, detail })
+                        if retries < MAX_PROVIDER_RETRIES
+                            && self.retry_safe(info, plan, role, class, source)? =>
+                    {
+                        retries += 1;
+                        event(
+                            self.store,
+                            info,
+                            plan,
+                            None,
+                            "PROVIDER_RETRY",
+                            &serde_json::to_string(&serde_json::json!({
+                                "role": name,
+                                "task": task,
+                                "retry": retries,
+                                "max_retries": MAX_PROVIDER_RETRIES,
+                                "class": class,
+                                "failure": detail,
+                            }))?,
+                        )?;
+                    }
+                    Err(Error::Provider { class, detail }) if retries > 0 => {
+                        return Err(Error::Provider {
+                            class,
+                            detail: format!(
+                                "{detail} (after {retries} automatic retr{})",
+                                if retries == 1 { "y" } else { "ies" }
+                            ),
+                        });
+                    }
+                    result => return result,
+                }
             }
         }
         Err(Error::Invalid(format!(
@@ -428,6 +464,7 @@ impl<'a> Runtime<'a> {
             started_at_ms: None,
             finished_at_ms: None,
             failure: None,
+            failure_class: None,
         };
         create_job(self.store, &authority, &job, max_agents)?;
         if let Some(plan) = plan {
@@ -612,48 +649,109 @@ impl<'a> Runtime<'a> {
             } else if usage.validate().is_ok() {
                 job.planner_usage = Some(usage);
             }
-            require(
-                interruption.is_none() && output.failure.is_none() && output.exit == Some(0),
-                interruption
-                    .or(output.failure.clone())
-                    .unwrap_or_else(|| format!("provider exited {:?}", output.exit)),
-            )?;
-            let value = self
-                .adapters
-                .get(&config.provider)
-                .expect("selected adapter")
-                .collect(&output)?;
+            let contract = super::contract::RoleContract::of(role, &input.artifact);
+            let document = contract.output().0;
+            let adapter = &self.adapters[&config.provider];
+            if let Some(reason) = &interruption {
+                return Err(if reason == "timeout" {
+                    provider_failure(
+                        OutcomeClass::RetryableProviderFailure,
+                        format!("provider timed out after {} ms", profile.timeout_ms),
+                    )
+                } else {
+                    Error::Invalid(reason.clone())
+                });
+            }
+            if let Some(failure) = &output.failure {
+                return Err(provider_failure(
+                    OutcomeClass::RetryableProviderFailure,
+                    failure.clone(),
+                ));
+            }
+            // Provider-emitted infrastructure signals are consulted only on a
+            // failed exchange, never to reinterpret a successful one.
+            let faulted = |fallback: String| match adapter.fault(&output) {
+                Some((true, summary)) => provider_failure(
+                    OutcomeClass::RetryableProviderFailure,
+                    format!("{fallback}: {summary}"),
+                ),
+                Some((false, summary)) => {
+                    provider_failure(OutcomeClass::NonretryableProviderFailure, summary)
+                }
+                None => provider_failure(OutcomeClass::RetryableProviderFailure, fallback),
+            };
+            if output.exit != Some(0) {
+                return Err(faulted(format!("provider exited {:?}", output.exit)));
+            }
+            let value = adapter.collect(&output).map_err(|e| {
+                faulted(format!(
+                    "reply is not exactly one {document} JSON document ({e})"
+                ))
+            })?;
+            let malformed = |e: serde_json::Error| {
+                provider_failure(
+                    OutcomeClass::RetryableProviderFailure,
+                    format!("reply does not match the {document} schema ({e})"),
+                )
+            };
+            let invalid = |rule: &str, detail: String| {
+                provider_failure(
+                    OutcomeClass::ValidationFailure,
+                    format!("[{rule}] {detail}"),
+                )
+            };
             match role {
                 AgentRole::Executor => {
-                    let result: ResultPacket = serde_json::from_value(value.clone())?;
-                    result.validate()?;
-                    // A typed context request is the one accepted non-success:
-                    // validation already bound it to this job and forbade edits.
-                    require(
-                        Some(&result.task_id) == task
-                            && result.executor_job_id == job_id
-                            && (result.status == ResultStatus::Succeeded
-                                || result.context_request.is_some())
-                            && result.evidence.is_empty(),
-                        "executor result has incorrect issued identity/status or invented evidence",
-                    )?;
+                    let result: ResultPacket =
+                        serde_json::from_value(value.clone()).map_err(malformed)?;
+                    result
+                        .validate()
+                        .map_err(|e| invalid("EXEC-OUTPUT", e.to_string()))?;
+                    // Status is judged by the caller: a valid BLOCKED/FAILED
+                    // result is the executor's honest answer, not a malformed one.
+                    if Some(&result.task_id) != task || result.executor_job_id != job_id {
+                        return Err(invalid(
+                            "EXEC-OUTPUT",
+                            format!(
+                                "result names task {} / executor job {}, but this job is task {} / job {}",
+                                result.task_id.as_str(),
+                                result.executor_job_id.as_str(),
+                                task.map(TaskId::as_str).unwrap_or("-"),
+                                job_id.as_str()
+                            ),
+                        ));
+                    }
+                    if !result.evidence.is_empty() {
+                        return Err(invalid(
+                            "EXEC-OUTPUT",
+                            "evidence must be []; agentctl captures evidence itself".into(),
+                        ));
+                    }
                 }
                 AgentRole::Verifier => {
-                    let proof: VerificationPacket = serde_json::from_value(value.clone())?;
-                    proof.validate()?;
-                    require(
-                        proof.verifier_job_id == job_id
-                            && serde_json::to_value(&proof.target)? == input.artifact["target"]
-                            && serde_json::to_value(&proof.evidence)? == input.artifact["evidence"],
-                        "verifier result does not match issued job/target/captured evidence",
-                    )?;
+                    let proof: VerificationPacket =
+                        serde_json::from_value(value.clone()).map_err(malformed)?;
+                    proof
+                        .validate()
+                        .map_err(|e| invalid("VER-REFS", e.to_string()))?;
+                    if proof.verifier_job_id != job_id
+                        || serde_json::to_value(&proof.target)? != input.artifact["target"]
+                        || serde_json::to_value(&proof.evidence)? != input.artifact["evidence"]
+                    {
+                        return Err(invalid(
+                            "VER-OUTPUT",
+                            "verifier_job_id, target and evidence must equal the issued job id, target and evidence verbatim".into(),
+                        ));
+                    }
                     // A context request is not a decision and is never counted.
                     job.reported_verification =
                         proof.context_request.is_none().then_some(proof.decision);
                 }
                 AgentRole::Planner => {
-                    let output: planning::ExecutionPlan = serde_json::from_value(value.clone())?;
-                    output.packet.validate()?;
+                    // Shape only; the plan contract is validated by the caller,
+                    // which owns the bounded correction attempt.
+                    let _: super::planner::PlanDecision =
+                        serde_json::from_value(value.clone()).map_err(malformed)?;
                 }
             }
             job.output = Some(self.artifacts.json(&value)?);
@@ -684,6 +782,10 @@ impl<'a> Runtime<'a> {
             .as_ref()
             .err()
             .map(|e| e.to_string().chars().take(1024).collect());
+        job.failure_class = match &result {
+            Err(Error::Provider { class, .. }) => Some(*class),
+            _ => None,
+        };
         if plan.is_some() {
             self.store.transition_job(
                 &info.repository_id,
@@ -712,6 +814,41 @@ impl<'a> Runtime<'a> {
             },
         )?;
         Ok((job, result?))
+    }
+    /// Whether a failed exchange may be repeated as a fresh job without any
+    /// risk to canonical state. Planners and verifiers write nothing; an
+    /// executor only when the workspace is byte-identical to its issued source,
+    /// so no uncertain mutation can be carried into the retry. A planner's
+    /// contract violation goes to its own correction attempt instead.
+    fn retry_safe(
+        &self,
+        info: &RepositoryInfo,
+        plan: Option<&PlanId>,
+        role: AgentRole,
+        class: OutcomeClass,
+        source: &SourceSnapshot,
+    ) -> Result<bool> {
+        let eligible = match class {
+            OutcomeClass::RetryableProviderFailure => true,
+            OutcomeClass::ValidationFailure => role != AgentRole::Planner,
+            OutcomeClass::NonretryableProviderFailure | OutcomeClass::SemanticRejection => false,
+        };
+        if !eligible || self.cancelled(info, plan)? {
+            return Ok(false);
+        }
+        Ok(role != AgentRole::Executor || self.capture(info)? == *source)
+    }
+    /// The workspace is byte-identical to the last source this run recorded:
+    /// a captured pending result when one exists, otherwise the accepted source.
+    /// Captured concurrent branches are durable results in their own retained
+    /// worktrees and resume through normal reconciliation; only a publication
+    /// intent that is still unresolved makes the canonical tree uncertain.
+    fn unchanged_since_recorded(&self, info: &RepositoryInfo, run: &RunRecord) -> Result<bool> {
+        if run.reconciliation.is_some() {
+            return Ok(false);
+        }
+        let recorded = run.pending.as_ref().map_or(&run.expected, |p| &p.after);
+        Ok(self.capture(info)? == self.artifacts.decode::<SourceSnapshot>(recorded)?)
     }
     fn capture(&self, info: &RepositoryInfo) -> Result<SourceSnapshot> {
         let mut captured = source::capture_bound(
@@ -795,7 +932,7 @@ impl<'a> Runtime<'a> {
         context::inventory(&mut inventory, Some(base), deltas, round)?;
         let issued: Vec<&context::ContextDelta> = deltas.iter().map(|(d, _)| d).collect();
         Ok((
-            json!({"task":task.packet,"contract":task.contract,"invariants":task.invariants,"constraints":task.constraints,"context":base,"deltas":issued,"context_relay":relay,"result_schema":schemars::schema_for!(ResultPacket),"instruction":"Implement this TaskPacket from the issued context. `context` is everything agentctl issued for the planner's references (selected symbols with bounded definitions and in-envelope relation stubs, named files, selected memory, the task's checks); `deltas` is context approved in later rounds. read_scope is an authorization envelope for context requests, not content you already hold nor an invitation to browse the repository. If you cannot complete the task safely from it, make NO edits and return a ResultPacket with status BLOCKED, failure.code CONTEXT_REQUIRED, empty changed_paths, and a context_request naming issued entity IDs or literal paths within context_relay's budgets. Otherwise return ResultPacket with this invocation's job_id and task_id; evidence must be [], and agentctl captures evidence independently."}),
+            json!({"task":task.packet,"contract":task.contract,"invariants":task.invariants,"constraints":task.constraints,"context":base,"deltas":issued,"context_relay":relay,"result_schema":schemars::schema_for!(ResultPacket),"instruction":super::contract::EXECUTOR_INSTRUCTION}),
             inventory,
         ))
     }
@@ -1022,25 +1159,69 @@ impl<'a> Runtime<'a> {
         let (template_id, _) = self.identity()?;
         let template = super::planner::template(&prepared, template_id.as_str())?;
         let inventory = manifest::ContextInventory::planner(&prepared);
-        let (mut job,value) = self.invoke(&info,None,Some(request),None,AgentRole::Planner,&source,json!({"planner_packet":prepared,"output_template":template,"packet_schema":schemars::schema_for!(PlanPacket),"hash_helper":{"executable":std::env::current_exe()?,"argv":["run","packet-hashes"],"stdin":"the exact PlanPacket JSON"},"instruction":"Return an ExecutionPlan envelope shaped like output_template. Decompose tasks as needed with unique IDs and one contract per task; preserve the frozen source and request. Recompute task_packet_hash and plan_packet_hash using the read-only hash_helper (scratch files in TMPDIR are allowed). Hashes are BLAKE3 of typed compact serde serialization, not raw JSON formatting. Do not activate or write source. All output still undergoes Stage 4 validation."}),inventory,&lease,&prepared.request.source.policy_hash)?;
-        let result = (|| {
-            require(
-                source::capture(root, &self.artifacts)? == source,
-                "SOURCE_DRIFT during planner invocation",
+        let base = json!({"planner_packet":prepared,"output_template":template,"decision_schema":schemars::schema_for!(super::planner::PlanDecision),"instruction":super::contract::PLANNER_INSTRUCTION});
+        let mut correction: Option<Value> = None;
+        let mut attempt = 0;
+        loop {
+            let mut artifact = base.clone();
+            if let Some(correction) = &correction {
+                artifact["correction"] = correction.clone();
+            }
+            let (mut job, value) = self.invoke(
+                &info,
+                None,
+                Some(request),
+                None,
+                AgentRole::Planner,
+                &source,
+                artifact,
+                inventory.clone(),
+                &lease,
+                &prepared.request.source.policy_hash,
             )?;
-            let plan: planning::ExecutionPlan = serde_json::from_value(value)?;
-            require(
-                plan.metadata.request_id == *request,
-                "planner output belongs to another request",
-            )?;
-            self.store.import_execution_plan(root, &plan)
-        })();
-        if let Err(error) = &result {
+            let result = (|| {
+                require(
+                    source::capture(root, &self.artifacts)? == source,
+                    "SOURCE_DRIFT during planner invocation",
+                )?;
+                let decision: super::planner::PlanDecision = serde_json::from_value(value.clone())?;
+                let plan = super::planner::envelope(&prepared, decision)?;
+                self.store.import_execution_plan(root, &plan)
+            })();
+            let Err(error) = result else {
+                return result; // Import publishes VALIDATED; activation remains explicit.
+            };
+            let message = error.to_string();
             job.state = RuntimeJobState::Failed;
-            job.failure = Some(error.to_string().chars().take(1024).collect());
+            job.failure = Some(message.chars().take(1024).collect());
+            // Only a refusal that cites a planner-contract rule is the planner's
+            // own mistake; drift, policy or storage failures are not.
+            let correctable = message.contains("[PLAN-");
+            job.failure_class = correctable.then_some(OutcomeClass::ValidationFailure);
             save_job(self.store, &info, &job, "PLANNER_OUTPUT_REJECTED")?;
+            if !correctable || attempt >= super::config::MAX_PLAN_CORRECTIONS {
+                return Err(error);
+            }
+            attempt += 1;
+            event(
+                self.store,
+                &info,
+                None,
+                Some(&job.job_id),
+                "PLAN_CORRECTION_REQUESTED",
+                &message.chars().take(1024).collect::<String>(),
+            )?;
+            // Structured feedback for one fresh planner job: the exact refusal
+            // (rule id, task, offending value, expected form) and the decision
+            // it refers to. Validation is unchanged; nothing else is issued.
+            correction = Some(json!({
+                "attempt": attempt,
+                "max_attempts": super::config::MAX_PLAN_CORRECTIONS,
+                "refusal": message.chars().take(1024).collect::<String>(),
+                "previous_decision": value,
+                "instruction": "agentctl refused previous_decision for the reason in `refusal`, which names the violated planner-contract rule. Return a complete corrected PlanDecision that satisfies every planner-contract rule; change only what the refusal requires."
+            }));
         }
-        result // Import publishes VALIDATED; activation remains explicit.
     }
     pub fn run(&mut self, root: &Path, id: &PlanId) -> Result<RunRecord> {
         let info = graph::checked_workspace(self.store, root)?;
@@ -1089,7 +1270,8 @@ impl<'a> Runtime<'a> {
                 workspace_id: info.workspace_id.clone(),
                 state: RunState::Running,
                 baseline: baseline.clone(),
-                expected: baseline,
+                expected: baseline.clone(),
+                verified: Some(baseline),
                 policy_hash: view.plan.metadata.source.policy_hash.clone(),
                 accepted: BTreeMap::new(),
                 pending: None,
@@ -1099,6 +1281,8 @@ impl<'a> Runtime<'a> {
                 reason: None,
                 correction_round: round,
                 context: BTreeMap::new(),
+                executor_relaunches: BTreeMap::new(),
+                refused: None,
             };
             let adoption = (|| {
                 require(
@@ -1106,7 +1290,7 @@ impl<'a> Runtime<'a> {
                         && !info.source.dirty
                         && info.source.head_commit
                             == view.plan.metadata.source.observation.head_commit,
-                    "SOURCE_DRIFT: Stage 5 adoption requires the plan's clean committed baseline; reprepare/replan dirty work",
+                    "SOURCE_DRIFT: adopting the plan requires the plan's clean committed baseline; reprepare/replan dirty work",
                 )?;
                 require(
                     self.store.index_status(root)?.fresh,
@@ -1173,6 +1357,50 @@ impl<'a> Runtime<'a> {
                 self.checkpoint(&info, &run, "RECONCILIATION_PENDING")?;
                 return Err(error);
             }
+            // Provider infrastructure (not the work) failed, and the workspace
+            // is exactly what this run last recorded: nothing uncertain exists,
+            // so the run stays resumable instead of ending. A launch that did
+            // not start is relaunched on resume within MAX_EXECUTOR_RELAUNCHES;
+            // a pending result is re-verified; integration is re-run.
+            if matches!(
+                &error,
+                Error::Provider {
+                    class: OutcomeClass::RetryableProviderFailure
+                        | OutcomeClass::NonretryableProviderFailure,
+                    ..
+                }
+            ) && !self.cancelled(&info, Some(id))?
+                && self.unchanged_since_recorded(&info, &run)?
+            {
+                run.state = RunState::Running;
+                for task in self.store.tasks(&info.repository_id, Some(id))? {
+                    if matches!(task.state, TaskState::Ready | TaskState::Executing) {
+                        self.store.transition_task(
+                            &info.repository_id,
+                            &task.packet.task_id,
+                            task.state,
+                            TaskState::Blocked,
+                            None,
+                            now_ms()?,
+                        )?;
+                    }
+                }
+                self.checkpoint(&info, &run, "PROVIDER_UNAVAILABLE")?;
+                return Err(Error::Provider {
+                    class: match &error {
+                        Error::Provider { class, .. } => *class,
+                        _ => unreachable!("matched above"),
+                    },
+                    detail: format!(
+                        "{}; no uncertain change exists, so `agentctl run resume {}` continues when the provider is available",
+                        match &error {
+                            Error::Provider { detail, .. } => detail.as_str(),
+                            _ => "",
+                        },
+                        id.as_str()
+                    ),
+                });
+            }
             run.state = if self.cancelled(&info, Some(id))? {
                 RunState::Cancelled
             } else {
@@ -1209,6 +1437,112 @@ impl<'a> Runtime<'a> {
             )?;
             return Err(error);
         }
+        Ok(run)
+    }
+    /// Discards a refused executor result and puts the workspace back to the
+    /// source this run last accepted. Never an acceptance: task states, the
+    /// ontology and dependency locks are untouched, so a rejected task stays
+    /// REJECTED and its dependents stay locked. It exists so the operator does
+    /// not have to do Git surgery before replanning.
+    ///
+    /// Safety: only files inside this plan's own write scopes may differ from
+    /// the accepted source. Anything else means the tree also carries changes
+    /// the control plane never authorized, and restoring would destroy them,
+    /// so the command refuses and names them.
+    pub fn restore(&mut self, root: &Path, id: &PlanId) -> Result<RunRecord> {
+        let info = graph::checked_workspace(self.store, root)?;
+        let _lease = self.lease(&info)?;
+        let _permit = auth::authorize(
+            &self.store.connection,
+            &info.repository_id,
+            id.as_str(),
+            &session::for_plan(self.store, &info, id)?.id,
+        )?;
+        let mut run = load_run(self.store, &info, id)?.ok_or_else(|| {
+            Error::Invalid(format!(
+                "no runtime history for {}; there is nothing agentctl captured to discard",
+                id.as_str()
+            ))
+        })?;
+        require(
+            run.state != RunState::Complete,
+            "plan completed; its result is accepted truth and is not discardable",
+        )?;
+        // Refuses unless this plan is the workspace's own, and its history is
+        // readable, before anything is rewritten.
+        self.store.execution_plan(root, id)?;
+        // The last *verified* source, never `expected`: reconciliation advances
+        // `expected` to a published branch before any verifier has accepted it,
+        // and rewinding to that would leave the refused work in place.
+        let verified = run.verified.clone().ok_or_else(|| {
+            Error::Invalid(
+                "this run predates verified-source tracking, so the source it last verified is unknown; cancel it with agentctl run cancel and plan the replacement".into(),
+            )
+        })?;
+        let accepted: SourceSnapshot = self.artifacts.decode(&verified)?;
+        let current = self.capture(&info)?;
+        require(
+            current != accepted,
+            "workspace already equals the last verified source; nothing to discard",
+        )?;
+        // Exactly the files agentctl watched this plan's executor change, and
+        // nothing else, may be rewritten.
+        let captured = run
+            .refused
+            .clone()
+            .or_else(|| run.pending.as_ref().map(|pending| pending.diff.clone()))
+            .ok_or_else(|| {
+                Error::Invalid(
+                    "this run holds no captured executor result to discard, so nothing it recorded accounts for the current workspace; resolve those changes explicitly".into(),
+                )
+            })?;
+        let captured: CapturedDiff = self.artifacts.decode(&captured)?;
+        require(
+            captured.plan_id == *id,
+            "captured result belongs to another plan",
+        )?;
+        let executor_paths: BTreeSet<&String> =
+            captured.changes.iter().map(|change| &change.path).collect();
+        let unauthorized: Vec<&String> = current
+            .files
+            .keys()
+            .chain(accepted.files.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|path| current.files.get(*path) != accepted.files.get(*path))
+            .filter(|path| !executor_paths.contains(*path))
+            .collect();
+        require(
+            unauthorized.is_empty(),
+            format!(
+                "workspace also differs from the last verified source in files this plan's executor never wrote ({}); resolve those changes explicitly before discarding",
+                unauthorized
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )?;
+        concurrency::materialize(&info.root, &accepted, &self.artifacts)?;
+        // Rewriting tracked files does not reproduce the Git index's own hash,
+        // which is why `materialize` normalizes it; assert the same equality it
+        // guarantees rather than a stricter one that can never hold.
+        let mut observed = self.capture(&info)?;
+        observed.index_hash = accepted.index_hash.clone();
+        require(
+            observed == accepted,
+            "workspace could not be restored to the last verified source",
+        )?;
+        run.pending = None;
+        run.refused = None;
+        // The tree is now the verified source, so the run's expected source is
+        // that too: leaving it on the discarded publication would make every
+        // later drift check compare against source that no longer exists.
+        run.expected = verified;
+        run.state = RunState::Blocked;
+        run.reason =
+            Some("refused executor result discarded; a replacement plan is required".into());
+        self.checkpoint(&info, &run, "REFUSED_RESULT_DISCARDED")?;
         Ok(run)
     }
     /// Consumes a planner's explicit decision on an escalated context request.
@@ -1416,8 +1750,59 @@ impl<'a> Runtime<'a> {
         )?;
         Ok(run)
     }
-    /// Explicit human/orchestrator decision; never an automatic retry. Stage 4
-    /// still validates the replacement and retains all prior proof/history.
+    /// Stops a plan the controller owns, for good. A running plan is asked to
+    /// stop (the controller notices and winds down); a plan that has already
+    /// stopped is cancelled outright under controller authorization, which is
+    /// the only way to free the workspace for a replacement plan once runtime
+    /// history exists.
+    pub fn cancel(&mut self, root: &Path, id: &PlanId) -> Result<RunState> {
+        let info = graph::checked_workspace(self.store, root)?;
+        let _lease = self.lease(&info)?;
+        let mut run = load_run(self.store, &info, id)?
+            .ok_or_else(|| Error::Invalid("runtime plan not found".into()))?;
+        if run.state == RunState::Running {
+            self.store.runtime_cancel(root, id)?;
+            return Ok(RunState::Running);
+        }
+        require(
+            run.state != RunState::Complete,
+            "plan completed; its result is accepted truth and is not cancellable",
+        )?;
+        let _permit = auth::authorize(
+            &self.store.connection,
+            &info.repository_id,
+            id.as_str(),
+            &session::for_plan(self.store, &info, id)?.id,
+        )?;
+        for task in self.store.tasks(&info.repository_id, Some(id))? {
+            // Verified, Rejected and Blocked are settled; the rest are in flight
+            // and are stopped so no dependent can ever read them as runnable.
+            if !matches!(
+                task.state,
+                TaskState::Verified | TaskState::Rejected | TaskState::Blocked
+            ) {
+                self.store.transition_task(
+                    &info.repository_id,
+                    &task.packet.task_id,
+                    task.state,
+                    TaskState::Blocked,
+                    None,
+                    now_ms()?,
+                )?;
+            }
+        }
+        self.store.cancel_execution_plan_owned(
+            &info,
+            id,
+            "cancelled by the controller after the run stopped",
+        )?;
+        run.state = RunState::Cancelled;
+        run.reason = Some("plan cancelled; a replacement plan is required".into());
+        self.checkpoint(&info, &run, "PLAN_RUNTIME_CANCELLED")?;
+        Ok(RunState::Cancelled)
+    }
+    /// Explicit human/orchestrator decision; never an automatic retry. Plan
+    /// validation still checks the replacement and retains all prior proof/history.
     pub fn replace(&mut self, root: &Path, old: &PlanId, new: &PlanId) -> Result<()> {
         let info = graph::checked_workspace(self.store, root)?;
         let _lease = self.lease(&info)?;
@@ -1791,8 +2176,11 @@ impl<'a> Runtime<'a> {
                     "BRANCH_FAILED",
                     &format!("{}: {error}", task.as_str()),
                 )?;
-                // Preserve a failed branch worktree for explicit inspection.
-                let _ = workspace;
+                // A branch that produced no captured result owns nothing the
+                // control plane can still use: the journal holds the failure,
+                // and the worktree would otherwise accumulate forever.
+                let _ = concurrency::remove_workspace(info, &workspace.root);
+                let _ = std::fs::remove_dir_all(&workspace.root);
             }
         }
         *run = load_run(self.store, info, &run.plan_id)?.ok_or_else(|| {
@@ -1813,6 +2201,12 @@ impl<'a> Runtime<'a> {
             run.correction_round <= self.config.max_correction_rounds,
             "correction limit reached; needs planner escalation",
         )?;
+        // Managed worktrees this run's durable state no longer refers to are
+        // abandoned: the exclusive workspace lease means nothing else can own
+        // them. Reclaim them before anything else so a crashed branch cannot
+        // accumulate, and so Git's registrations stay accurate for the
+        // `worktree add` below.
+        self.reclaim_worktrees(info, run)?;
         // Publication recovery precedes job interruption handling, graph
         // refresh, verification, dependency release, and every new launch.
         if run.reconciliation.is_some() {
@@ -1922,7 +2316,28 @@ impl<'a> Runtime<'a> {
                 let generation = pending.ontology_generation.as_deref().ok_or_else(|| {
                     Error::Invalid("UNKNOWN: branch lacks issued ontology generation".into())
                 })?;
-                concurrency::revalidate_semantic(self.store, info, task, generation)?;
+                if let Err(error) =
+                    concurrency::revalidate_semantic(self.store, info, task, generation)
+                {
+                    // What verified siblings changed can no longer be proven
+                    // harmless to this branch (or provably is not). Its result
+                    // is not published; the task runs again, serially, against
+                    // the current accepted source. Nothing is accepted on the
+                    // way, and verified work stays verified.
+                    let message = error.to_string();
+                    let key = context::subject_key(AgentRole::Executor, Some(&task_id));
+                    let clean_ledger = run.context.get(&key).is_none_or(|ledger| {
+                        ledger.rounds_used() == 0 && ledger.approved_scope.is_empty()
+                    });
+                    if !(message.starts_with("UNKNOWN:")
+                        || message.starts_with("SEMANTIC_INTERFERENCE:"))
+                        || !clean_ledger
+                    {
+                        return Err(error);
+                    }
+                    self.serialize_branch(info, run, &task_id, &pending, &message)?;
+                    continue;
+                }
                 let current = self.expected(info, &run.expected)?;
                 let intent =
                     concurrency::reconciliation_intent(task, &pending, &current, &self.artifacts)?;
@@ -1941,6 +2356,11 @@ impl<'a> Runtime<'a> {
             let tasks = self.store.execution_tasks(&info.root, &run.plan_id)?;
             if tasks.iter().all(|t| t.state == TaskState::Verified) {
                 return self.integrate(info, plan, run, &current, lease);
+            }
+            if !tasks.iter().any(|task| task.structurally_ready)
+                && self.relaunch(info, run, &tasks)?
+            {
+                continue;
             }
             let ready: Vec<_> = tasks
                 .into_iter()
@@ -1982,6 +2402,138 @@ impl<'a> Runtime<'a> {
             self.execute_task(info, run, &task, lease)?;
         }
     }
+    /// Returns a blocked task to the schedulable set when its launch provably
+    /// mutated nothing: the workspace still equals this run's expected source,
+    /// no captured result names it, and its context relay is still open. That
+    /// is the whole safety argument — a controller crash, a provider timeout or
+    /// a malformed reply that left the tree byte-identical cannot have produced
+    /// work worth keeping, so relaunching reuses no unverified mutation.
+    ///
+    /// A rejected task, a deterministic check failure and any executor that
+    /// did touch the tree all leave the workspace different from `expected`
+    /// (or a state other than BLOCKED) and are never relaunched here.
+    fn relaunch(
+        &mut self,
+        info: &RepositoryInfo,
+        run: &mut RunRecord,
+        tasks: &[planning::TaskInspection],
+    ) -> Result<bool> {
+        if run.pending.is_some() || !run.branches.is_empty() {
+            return Ok(false);
+        }
+        // Proof obligation: the tree is exactly what it was before the launch.
+        if self.capture(info)? != self.artifacts.decode::<SourceSnapshot>(&run.expected)? {
+            return Ok(false);
+        }
+        let Some(task) = tasks.iter().find(|task| {
+            task.state == TaskState::Blocked
+                && !run.accepted.contains_key(&task.packet.task_id)
+                && task
+                    .packet
+                    .dependencies
+                    .iter()
+                    .all(|dependency| run.accepted.contains_key(dependency))
+                && run
+                    .context
+                    .get(&context::subject_key(
+                        AgentRole::Executor,
+                        Some(&task.packet.task_id),
+                    ))
+                    .is_none_or(|ledger| ledger.state == context::LedgerState::Open)
+        }) else {
+            return Ok(false);
+        };
+        let id = task.packet.task_id.clone();
+        let spent = run.executor_relaunches.entry(id.clone()).or_default();
+        if *spent >= MAX_EXECUTOR_RELAUNCHES {
+            return Ok(false);
+        }
+        *spent += 1;
+        let attempt = *spent;
+        self.store.transition_task(
+            &info.repository_id,
+            &id,
+            TaskState::Blocked,
+            TaskState::Planned,
+            None,
+            now_ms()?,
+        )?;
+        event(
+            self.store,
+            info,
+            Some(&run.plan_id),
+            None,
+            "EXECUTOR_RELAUNCHED",
+            &format!(
+                "{}: attempt {attempt} of {MAX_EXECUTOR_RELAUNCHES}; workspace proven unchanged since the issued baseline",
+                id.as_str()
+            ),
+        )?;
+        self.checkpoint(info, run, "EXECUTOR_RELAUNCHED")?;
+        Ok(true)
+    }
+    /// Withdraws a captured concurrent branch whose result can no longer be
+    /// published safely, and returns its task to PLANNED so it executes again,
+    /// serially, on the current canonical source. The durable record changes
+    /// first; the worktree is then dropped (reclaimed later if that fails).
+    fn serialize_branch(
+        &mut self,
+        info: &RepositoryInfo,
+        run: &mut RunRecord,
+        task_id: &TaskId,
+        pending: &PendingTask,
+        reason: &str,
+    ) -> Result<()> {
+        run.branches.remove(task_id);
+        run.context
+            .remove(&context::subject_key(AgentRole::Executor, Some(task_id)));
+        self.checkpoint(info, run, "BRANCH_SERIALIZED")?;
+        for (from, to) in [
+            (TaskState::AwaitingVerification, TaskState::Blocked),
+            (TaskState::Blocked, TaskState::Planned),
+        ] {
+            self.store
+                .transition_task(&info.repository_id, task_id, from, to, None, now_ms()?)?;
+        }
+        if let Some(root) = &pending.execution_workspace {
+            let _ = concurrency::remove_workspace(info, root);
+        }
+        event(
+            self.store,
+            info,
+            Some(&run.plan_id),
+            Some(&pending.executor),
+            "BRANCH_SERIALIZED",
+            &format!(
+                "{}: captured branch withdrawn, re-executing serially ({})",
+                task_id.as_str(),
+                reason.chars().take(300).collect::<String>()
+            ),
+        )
+    }
+    /// Reclaims every managed worktree of this workspace that the durable run
+    /// record does not still own. A captured branch and an unresolved
+    /// reconciliation intent are the only things that keep one alive.
+    fn reclaim_worktrees(&mut self, info: &RepositoryInfo, run: &RunRecord) -> Result<()> {
+        let keep: BTreeSet<String> = run
+            .branches
+            .values()
+            .chain(run.pending.iter())
+            .filter_map(|pending| pending.execution_workspace.clone())
+            .collect();
+        let removed = concurrency::prune_workspaces(&self.paths, info, &keep);
+        if !removed.is_empty() {
+            event(
+                self.store,
+                info,
+                Some(&run.plan_id),
+                None,
+                "WORKTREES_RECLAIMED",
+                &serde_json::to_string(&removed)?,
+            )?;
+        }
+        Ok(())
+    }
     fn recover_reconciliation(&mut self, info: &RepositoryInfo, run: &mut RunRecord) -> Result<()> {
         let intent = run
             .reconciliation
@@ -1998,6 +2550,11 @@ impl<'a> Runtime<'a> {
         let reconciled = concurrency::publish_reconciliation(&info.root, &intent, &self.artifacts)?;
         self.observe_boundary("reconciliation_files_complete");
         pending.after = self.artifacts.json(&reconciled)?;
+        // Publication refuses unless it reached `intended_source`, so these two
+        // identities are exactly "canonical before" and "canonical after this
+        // branch". Retaining the before is what lets the task verifier see the
+        // chain instead of inferring it.
+        pending.reconciled_from = Some(intent.expected_source.clone());
         run.branches.remove(&intent.task_id);
         run.pending = Some(pending);
         run.expected = intent.intended_source;
@@ -2132,10 +2689,14 @@ impl<'a> Runtime<'a> {
                     )?
                     .into_iter()
                     .filter(|j| j.role == AgentRole::Executor && !previous.contains(&j.job_id))
-                    .find_map(|j| {
-                        let input: JobInput = self.artifacts.decode(&j.input).ok()?;
-                        (input.task_id.as_ref() == Some(&id)).then_some(j.job_id)
+                    .filter(|j| {
+                        self.artifacts
+                            .decode::<JobInput>(&j.input)
+                            .is_ok_and(|input| input.task_id.as_ref() == Some(&id))
                     })
+                    // Retries are fresh jobs; the diff belongs to the last one.
+                    .max_by_key(|j| (j.created_at_ms, j.job_id.clone()))
+                    .map(|j| j.job_id)
                     .ok_or_else(|| {
                         Error::Invalid(format!(
                             "executor launch failed before issued job was persisted: {error}"
@@ -2170,8 +2731,48 @@ impl<'a> Runtime<'a> {
                 "DIFF_CAPTURED",
                 &reference.hash,
             )?;
-            let (job, value) = invocation?;
+            // Captured, not accepted. Recording it before the scope, exclusion
+            // and changed-path checks is what lets `run restore` discard a
+            // refused result later without guessing which files were the
+            // executor's.
+            run.refused = Some(reference.clone());
+            let (mut job, value) = invocation?;
             let reported: ResultPacket = serde_json::from_value(value)?;
+            if reported.status != ResultStatus::Succeeded && reported.context_request.is_none() {
+                // The executor's own, valid answer that it cannot do this task.
+                // Its code and summary are the blocking reason; agentctl never
+                // replaces a structured diagnosis with a generic refusal.
+                let failure = reported.failure.clone().unwrap_or(FailureInfo {
+                    code: "UNSPECIFIED".into(),
+                    summary: "no failure detail".into(),
+                });
+                let next = if diff.changes.is_empty() {
+                    "no files were changed; correct the plan with a replacement (agentctl run replace)"
+                } else {
+                    "its changes are retained but not accepted; discard them with agentctl run restore, then correct the plan"
+                };
+                let status = serde_json::to_value(reported.status)?;
+                let reason = format!(
+                    "EXECUTOR_{}: {}: {} [task {}, executor job {}]; {next}",
+                    status.as_str().unwrap_or("DECLINED"),
+                    failure.code,
+                    failure.summary.chars().take(600).collect::<String>(),
+                    id.as_str(),
+                    job.job_id.as_str()
+                );
+                job.failure = Some(reason.chars().take(1024).collect());
+                job.failure_class = Some(OutcomeClass::SemanticRejection);
+                save_job(
+                    self.store,
+                    self.authority_info.as_ref().unwrap_or(info),
+                    &job,
+                    "EXECUTOR_DECLINED",
+                )?;
+                return Err(Error::Provider {
+                    class: OutcomeClass::SemanticRejection,
+                    detail: reason,
+                });
+            }
             if let Some(request) = &reported.context_request {
                 // Fail closed: a context request must not leave unverified work
                 // behind, and this runtime has no safe rollback primitive.
@@ -2233,6 +2834,10 @@ impl<'a> Runtime<'a> {
                 execution_workspace: self.branch_workspace.clone(),
                 compatibility: self.branch_compatibility.clone(),
                 ontology_generation: self.branch_generation.clone(),
+                // Set only by reconciliation: a result captured here has not
+                // been published into canonical source yet, and a serial result
+                // never will be.
+                reconciled_from: None,
             };
             run.pending = Some(pending.clone());
             if self.persist_run {
@@ -2290,7 +2895,7 @@ impl<'a> Runtime<'a> {
     /// closest practical boundary before external process creation. SQLite and
     /// the filesystem cannot participate atomically in `adapter.launch`, so a
     /// cancellation or source mutation after this returns is the residual
-    /// cooperative race that requires Stage-8 enforcement to eliminate.
+    /// cooperative race that only OS sandbox enforcement eliminates.
     fn revalidate_launch_at_adapter(
         &mut self,
         info: &RepositoryInfo,
@@ -2603,6 +3208,36 @@ impl<'a> Runtime<'a> {
         )?;
         Ok(relay)
     }
+    /// Projects the publication chain a concurrent result went through, in the
+    /// same source-identity vocabulary the verifier already holds for its own
+    /// issued source and for every evidence record. A serial result never left
+    /// canonical source, so its diff and checks already share one identity and
+    /// this is `null` rather than a claim it cannot check.
+    ///
+    /// Nothing here is a second copy of durable state: `canonical_after` is
+    /// `pending.after`, `branch_result` is the captured diff's own after-image,
+    /// and only `canonical_before` had to be retained on the pending result.
+    /// The verifier can confirm the chain itself — `diff` is the artifact it
+    /// was shown, and `canonical_after` must equal both its issued source and
+    /// the `source_state` of every check evidence record.
+    fn reconciliation_chain(&self, pending: &PendingTask, after: &SourceSnapshot) -> Result<Value> {
+        let Some(from) = &pending.reconciled_from else {
+            return Ok(Value::Null);
+        };
+        let before: SourceSnapshot = self.artifacts.decode(from)?;
+        let captured: CapturedDiff = self.artifacts.decode(&pending.diff)?;
+        let branch: SourceSnapshot = self.artifacts.decode(&captured.after)?;
+        Ok(json!({
+            "task_id": pending.task_id,
+            "executor_job_id": pending.executor,
+            "diff": pending.diff,
+            "execution_workspace": pending.execution_workspace,
+            "branch_result": branch.source_ref()?,
+            "canonical_before": before.source_ref()?,
+            "canonical_after": after.source_ref()?,
+            "guarantee": "This executor ran in an isolated worktree, so `diff` was captured at `branch_result`. agentctl then published exactly `diff` onto `canonical_before`: every path was changed only from its recorded before-image, and publication refuses unless the resulting canonical source reaches `canonical_after`. `canonical_after` is therefore the exact result of this diff, and is the source this job was issued and the source every check evidence record is bound to.",
+        }))
+    }
     fn verify_pending(
         &mut self,
         info: &RepositoryInfo,
@@ -2689,13 +3324,16 @@ impl<'a> Runtime<'a> {
                     executor_job_id: pending.executor.clone(),
                 };
                 let records = self.evidence_input(info, &pending.evidence)?;
+                let reconciliation = self.reconciliation_chain(&pending, &after)?;
                 let (packet, contract, invariants) = (
                     task.clone(),
                     inspection.contract.clone(),
                     inspection.invariants.clone(),
                 );
+                let required =
+                    required_refs(&task.verification.requirement_refs, &task.invariant_refs);
                 let evidence = pending.evidence.clone();
-                let build = move |diff: Value, deltas: Value, relay: Value| json!({"task":packet,"contract":contract,"invariants":invariants,"target":target,"evidence":evidence,"evidence_records":records,"diff":diff,"deltas":deltas,"context_relay":relay,"verification_schema":schemars::schema_for!(VerificationPacket)});
+                let build = move |diff: Value, deltas: Value, relay: Value| json!({"task":packet,"contract":contract,"invariants":invariants,"target":target,"evidence":evidence,"evidence_records":records,"diff":diff,"reconciliation":reconciliation,"deltas":deltas,"context_relay":relay,"required_refs":required,"verification_schema":schemars::schema_for!(VerificationPacket),"instruction":VERIFIER_INSTRUCTION});
                 let (verifier, proof) = self.verify(
                     info,
                     run,
@@ -2746,6 +3384,9 @@ impl<'a> Runtime<'a> {
             )?;
         }
         run.expected = pending.after.clone();
+        // Only here: the task just passed its independent verifier, so this is
+        // the newest source a verifier has accepted.
+        run.verified = Some(pending.after.clone());
         let origin = graph::GenerationOrigin::Runtime {
             plan_id: run.plan_id.clone(),
             task_id: Some(pending.task_id.clone()),
@@ -2762,6 +3403,7 @@ impl<'a> Runtime<'a> {
             },
         );
         run.pending = None;
+        run.refused = None;
         self.checkpoint(info, run, "TASK_VERIFIED")?;
         // Task-verified work refreshes the working ontology as this plan's
         // candidate; it becomes accepted truth only at plan completion.
@@ -2934,7 +3576,7 @@ impl<'a> Runtime<'a> {
             .flat_map(|t| t.invariants)
             .collect();
         let records = self.evidence_input(info, &evidence)?;
-        // Stage 5 is most useful at the acceptance boundary: give the
+        // Structural facts are most useful at the acceptance boundary: give the
         // independent integration verifier a small read-only projection of the
         // exact accepted -> candidate ontology delta. No candidate means the
         // plan introduced no newly indexed generation.
@@ -2964,8 +3606,20 @@ impl<'a> Runtime<'a> {
             .flat_map(|t| t.read_scope.iter().chain(&t.write_scope).cloned())
             .collect();
         let (packet, contract) = (plan.packet.clone(), plan.metadata.integration.clone());
+        // Exactly what `validate_completion` demands: the plan's integration
+        // checks and every task's critical invariants.
+        let task_invariants: BTreeSet<String> = plan
+            .packet
+            .tasks
+            .iter()
+            .flat_map(|t| t.invariant_refs.iter().cloned())
+            .collect();
+        let required = required_refs(
+            &plan.packet.integration_verification.requirement_refs,
+            &task_invariants.into_iter().collect::<Vec<_>>(),
+        );
         let issued = evidence.clone();
-        let build = move |diff: Value, deltas: Value, relay: Value| json!({"plan":packet,"contract":contract,"invariants":invariants,"target":target,"evidence":issued,"evidence_records":records,"diff":diff,"structural_footprint":structural_footprint,"deltas":deltas,"context_relay":relay,"verification_schema":schemars::schema_for!(VerificationPacket)});
+        let build = move |diff: Value, deltas: Value, relay: Value| json!({"plan":packet,"contract":contract,"invariants":invariants,"target":target,"evidence":issued,"evidence_records":records,"diff":diff,"structural_footprint":structural_footprint,"deltas":deltas,"context_relay":relay,"required_refs":required,"verification_schema":schemars::schema_for!(VerificationPacket),"instruction":VERIFIER_INSTRUCTION});
         let (_, proof) = self.verify(
             info,
             run,
@@ -3009,6 +3663,7 @@ impl<'a> Runtime<'a> {
         )?;
         run.state = RunState::Complete;
         self.checkpoint(info, run, "PLAN_RUNTIME_COMPLETED")?;
+        self.reclaim_worktrees(info, run)?;
         if let Some(generation) = accepted {
             event(
                 self.store,
@@ -3021,4 +3676,19 @@ impl<'a> Runtime<'a> {
         }
         Ok(())
     }
+}
+
+use super::contract::VERIFIER_INSTRUCTION;
+
+fn provider_failure(class: OutcomeClass, detail: String) -> Error {
+    Error::Provider {
+        class,
+        detail: detail.chars().take(900).collect(),
+    }
+}
+
+/// The IDs `lifecycle` validation will require of a PASS, from the same
+/// fields it checks.
+fn required_refs(requirements: &[String], invariants: &[String]) -> Value {
+    json!({"requirement_refs": requirements, "invariant_refs": invariants})
 }

@@ -56,6 +56,12 @@ impl Fixture {
     fn repo(&self) -> &agentctl::local::repository::RepositoryId {
         &self.info.repository_id
     }
+    fn workspace(&self) -> &agentctl::local::repository::WorkspaceId {
+        &self.info.workspace_id
+    }
+    fn seed_plan(&self, packet: &PlanPacket) {
+        common::seed_plan(&self.paths.database, self.repo().as_str(), packet);
+    }
 }
 
 fn git(root: &Path, args: &[&str]) -> Output {
@@ -125,7 +131,9 @@ fn prepare_proof(store: &mut Store, f: &Fixture) {
         ("job:verifier", AgentRole::Verifier),
     ] {
         let job = queued_job(id, role);
-        store.register_job(f.repo(), &job).unwrap();
+        store
+            .register_job_in_workspace(f.repo(), f.workspace(), &job)
+            .unwrap();
         store
             .transition_job(
                 f.repo(),
@@ -146,7 +154,9 @@ fn prepare_proof(store: &mut Store, f: &Fixture) {
             .unwrap();
     }
     let evidence: EvidenceRecord = decode(samples()["evidence"].clone());
-    store.record_evidence(f.repo(), &evidence).unwrap();
+    store
+        .record_evidence_in_workspace(f.repo(), f.workspace(), &evidence)
+        .unwrap();
 }
 
 fn move_to_verifying(store: &mut Store, f: &Fixture) {
@@ -524,7 +534,7 @@ fn tasks_survive_reopen_and_invalid_or_stale_transitions_do_not_persist() {
     let task_id = TaskId::new("a").unwrap();
     {
         let mut store = f.store();
-        store.create_plan(f.repo(), &plan(), 10).unwrap();
+        f.seed_plan(&plan());
         assert_eq!(store.tasks(f.repo(), None).unwrap().len(), 2);
         assert!(
             store
@@ -575,7 +585,7 @@ fn tasks_survive_reopen_and_invalid_or_stale_transitions_do_not_persist() {
 fn verified_only_dependencies_are_enforced_using_durable_state() {
     let f = Fixture::new();
     let mut store = f.store();
-    store.create_plan(f.repo(), &plan(), 10).unwrap();
+    f.seed_plan(&plan());
     move_to_verifying(&mut store, &f);
     let a = TaskId::new("a").unwrap();
     let b = TaskId::new("b").unwrap();
@@ -636,7 +646,7 @@ fn verified_only_dependencies_are_enforced_using_durable_state() {
 fn rejected_tasks_do_not_restart_and_verifier_identity_is_checked() {
     let f = Fixture::new();
     let mut store = f.store();
-    store.create_plan(f.repo(), &plan(), 10).unwrap();
+    f.seed_plan(&plan());
     move_to_verifying(&mut store, &f);
     prepare_proof(&mut store, &f);
     let a = TaskId::new("a").unwrap();
@@ -687,8 +697,10 @@ fn jobs_survive_reopen_and_mutate_only_through_valid_transitions() {
     let job = queued_job("job:executor-a", AgentRole::Executor);
     {
         let mut store = f.store();
-        store.create_plan(f.repo(), &plan(), 10).unwrap();
-        store.register_job(f.repo(), &job).unwrap();
+        f.seed_plan(&plan());
+        store
+            .register_job_in_workspace(f.repo(), f.workspace(), &job)
+            .unwrap();
         assert!(
             store
                 .transition_job(
@@ -752,7 +764,11 @@ fn jobs_survive_reopen_and_mutate_only_through_valid_transitions() {
     bad.state = JobState::Succeeded;
     bad.started_at_ms = Some(100);
     bad.finished_at_ms = Some(120);
-    assert!(store.register_job(f.repo(), &bad).is_err());
+    assert!(
+        store
+            .register_job_in_workspace(f.repo(), f.workspace(), &bad)
+            .is_err()
+    );
 }
 
 #[test]
@@ -761,17 +777,35 @@ fn evidence_is_immutable_compact_metadata_with_external_log_references() {
     let record: EvidenceRecord = decode(samples()["evidence"].clone());
     {
         let mut store = f.store();
-        store.record_evidence(f.repo(), &record).unwrap();
-        assert!(store.record_evidence(f.repo(), &record).is_err());
+        store
+            .record_evidence_in_workspace(f.repo(), f.workspace(), &record)
+            .unwrap();
+        assert!(
+            store
+                .record_evidence_in_workspace(f.repo(), f.workspace(), &record)
+                .is_err()
+        );
         let mut large = record.clone();
         large.evidence_id = EvidenceId::new("evidence:large").unwrap();
         large.summary = "x".repeat(100_000);
-        assert!(store.record_evidence(f.repo(), &large).is_err());
+        assert!(
+            store
+                .record_evidence_in_workspace(f.repo(), f.workspace(), &large)
+                .is_err()
+        );
         large.summary = "compact".into();
         large.full_log_ref = Some("data:text/plain,embedded-log".into());
-        assert!(store.record_evidence(f.repo(), &large).is_err());
+        assert!(
+            store
+                .record_evidence_in_workspace(f.repo(), f.workspace(), &large)
+                .is_err()
+        );
         large.full_log_ref = Some("DATA:text/plain,embedded-log".into());
-        assert!(store.record_evidence(f.repo(), &large).is_err());
+        assert!(
+            store
+                .record_evidence_in_workspace(f.repo(), f.workspace(), &large)
+                .is_err()
+        );
     }
     assert_eq!(
         f.store()
@@ -780,9 +814,9 @@ fn evidence_is_immutable_compact_metadata_with_external_log_references() {
             .unwrap(),
         record
     );
-    let artifact = f.paths.evidence_directory(f.repo(), &record.evidence_id);
-    assert!(artifact.starts_with(f.paths.data_root.join("artifacts")));
-    assert!(!artifact.exists());
+    // Evidence records are compact metadata: agentctl never materializes a
+    // per-evidence artifact directory under the data root.
+    assert!(!f.paths.data_root.join("artifacts").exists());
 }
 
 #[test]
@@ -793,13 +827,23 @@ fn events_preserve_wire_packets_order_and_task_job_queries_after_reopen() {
     let (first, second);
     {
         let mut store = f.store();
-        store.create_plan(f.repo(), &plan(), 10).unwrap();
-        store.register_job(f.repo(), &job).unwrap();
-        first = store.append_agent_event(f.repo(), &event).unwrap();
-        assert!(store.append_agent_event(f.repo(), &event).is_err());
+        f.seed_plan(&plan());
+        store
+            .register_job_in_workspace(f.repo(), f.workspace(), &job)
+            .unwrap();
+        first = store
+            .append_agent_event_in_workspace(f.repo(), f.workspace(), &event)
+            .unwrap();
+        assert!(
+            store
+                .append_agent_event_in_workspace(f.repo(), f.workspace(), &event)
+                .is_err()
+        );
         event.event_id = "event:2".into();
         event.timestamp_ms = 50; // Sequence, not wall clock, defines append order.
-        second = store.append_agent_event(f.repo(), &event).unwrap();
+        second = store
+            .append_agent_event_in_workspace(f.repo(), f.workspace(), &event)
+            .unwrap();
     }
     assert!(second > first);
     let store = f.store();
@@ -833,36 +877,58 @@ fn events_preserve_wire_packets_order_and_task_job_queries_after_reopen() {
 fn events_reject_unknown_or_conflicting_durable_associations() {
     let f = Fixture::new();
     let mut store = f.store();
-    store.create_plan(f.repo(), &plan(), 10).unwrap();
+    f.seed_plan(&plan());
     let mut event: AgentEvent = decode(samples()["agent-event"].clone());
-    assert!(store.append_agent_event(f.repo(), &event).is_err()); // Unregistered job.
+    assert!(
+        store
+            .append_agent_event_in_workspace(f.repo(), f.workspace(), &event)
+            .is_err()
+    ); // Unregistered job.
     store
-        .register_job(f.repo(), &queued_job("job:executor-a", AgentRole::Executor))
+        .register_job_in_workspace(
+            f.repo(),
+            f.workspace(),
+            &queued_job("job:executor-a", AgentRole::Executor),
+        )
         .unwrap();
     event.context.role = Some(AgentRole::Verifier);
-    assert!(store.append_agent_event(f.repo(), &event).is_err());
+    assert!(
+        store
+            .append_agent_event_in_workspace(f.repo(), f.workspace(), &event)
+            .is_err()
+    );
     event.context.role = Some(AgentRole::Executor);
     event.context.task_id = Some(TaskId::new("b").unwrap());
     event.context.packet_id = event.context.task_id.clone();
-    assert!(store.append_agent_event(f.repo(), &event).is_err());
+    assert!(
+        store
+            .append_agent_event_in_workspace(f.repo(), f.workspace(), &event)
+            .is_err()
+    );
     event.context = common::context();
     event.event = AgentEventKind::CommandFinished {
         invocation_id: "cmd:1".into(),
         exit_status: 0,
         evidence: vec![EvidenceRef(EvidenceId::new("missing").unwrap())],
     };
-    assert!(store.append_agent_event(f.repo(), &event).is_err());
+    assert!(
+        store
+            .append_agent_event_in_workspace(f.repo(), f.workspace(), &event)
+            .is_err()
+    );
 }
 
 #[test]
 fn event_body_associations_are_indexed_even_without_optional_context() {
     let f = Fixture::new();
     let mut store = f.store();
-    store.create_plan(f.repo(), &plan(), 10).unwrap();
+    f.seed_plan(&plan());
     let event: AgentEvent = decode(
         json!({"version":"1","event_id":"loaded","timestamp_ms":10,"context":{},"event":{"kind":"TASK_PACKET_LOADED","task_id":"a"}}),
     );
-    store.append_agent_event(f.repo(), &event).unwrap();
+    store
+        .append_agent_event_in_workspace(f.repo(), f.workspace(), &event)
+        .unwrap();
     let events = store
         .events(Some(f.repo()), Some(&TaskId::new("a").unwrap()), None, 1)
         .unwrap();
@@ -892,9 +958,11 @@ fn append_only_guards_reject_sql_updates_and_deletes() {
 fn failed_journal_append_rolls_back_task_and_job_updates() {
     let f = Fixture::new();
     let mut store = f.store();
-    store.create_plan(f.repo(), &plan(), 10).unwrap();
+    f.seed_plan(&plan());
     let job = queued_job("job:executor-a", AgentRole::Executor);
-    store.register_job(f.repo(), &job).unwrap();
+    store
+        .register_job_in_workspace(f.repo(), f.workspace(), &job)
+        .unwrap();
     let before = store.status().unwrap().events;
     let connection = Connection::open(&f.paths.database).unwrap();
     connection.execute_batch("CREATE TRIGGER fail_append BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'injected journal failure'); END;").unwrap();
@@ -939,7 +1007,7 @@ fn failed_journal_append_rolls_back_task_and_job_updates() {
 fn failed_verified_transition_never_commits_without_its_event() {
     let f = Fixture::new();
     let mut store = f.store();
-    store.create_plan(f.repo(), &plan(), 10).unwrap();
+    f.seed_plan(&plan());
     move_to_verifying(&mut store, &f);
     prepare_proof(&mut store, &f);
     let before = store.status().unwrap().events;
@@ -966,33 +1034,9 @@ fn failed_verified_transition_never_commits_without_its_event() {
 }
 
 #[test]
-fn failed_plan_creation_rolls_back_all_rows_and_events() {
-    let f = Fixture::new();
-    let mut store = f.store();
-    store.create_plan(f.repo(), &plan(), 10).unwrap();
-    let before = store.status().unwrap();
-    let mut conflicting = plan();
-    conflicting.plan_id = PlanId::new("plan:2").unwrap();
-    assert!(store.create_plan(f.repo(), &conflicting, 20).is_err());
-    assert!(
-        store
-            .plan(f.repo(), &conflicting.plan_id)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(store.status().unwrap().events, before.events);
-    assert_eq!(store.status().unwrap().plans, before.plans);
-    let mut invalid = plan();
-    invalid.tasks[0]
-        .dependencies
-        .push(TaskId::new("b").unwrap());
-    assert!(store.create_plan(f.repo(), &invalid, 20).is_err());
-}
-
-#[test]
 fn independent_connections_serialize_writes_and_reject_stale_state() {
     let f = Fixture::new();
-    f.store().create_plan(f.repo(), &plan(), 10).unwrap();
+    f.seed_plan(&plan());
     let barrier = Arc::new(Barrier::new(2));
     let handles: Vec<_> = (0..2)
         .map(|_| {
@@ -1037,13 +1081,13 @@ fn concurrent_event_writers_preserve_every_observation() {
     let f = Fixture::new();
     let barrier = Arc::new(Barrier::new(3));
     let handles: Vec<_> = (0..3).map(|writer| {
-        let barrier = barrier.clone(); let database = f.paths.database.clone(); let repo = f.repo().clone();
+        let barrier = barrier.clone(); let database = f.paths.database.clone(); let repo = f.repo().clone(); let workspace = f.workspace().clone();
         std::thread::spawn(move || {
             let mut store = Store::open(&database, 5000).unwrap();
             barrier.wait();
             for i in 0..10 {
                 let event: AgentEvent = decode(json!({"version":"1","event_id":format!("writer:{writer}:{i}"),"timestamp_ms":i,"context":{},"event":{"kind":"AGENT_STARTED"}}));
-                store.append_agent_event(&repo, &event).unwrap();
+                store.append_agent_event_in_workspace(&repo, &workspace, &event).unwrap();
             }
         })
     }).collect();
@@ -1383,7 +1427,7 @@ fn workspace_source_and_job_evidence_locations_survive_reopen() {
         let mut store = f.store();
         store.register_repository(main.clone()).unwrap();
         store.register_repository(linked.clone()).unwrap();
-        store.create_plan(f.repo(), &plan(), 10).unwrap();
+        f.seed_plan(&plan());
         assert_eq!(store.tasks(&linked.repository_id, None).unwrap().len(), 2);
         store
             .register_job_in_workspace(f.repo(), &linked.workspace_id, &job)
@@ -1391,12 +1435,15 @@ fn workspace_source_and_job_evidence_locations_survive_reopen() {
         store
             .record_evidence_in_workspace(f.repo(), &main.workspace_id, &evidence)
             .unwrap();
+        // An event must be bound to the same workspace as the job it links to.
         assert!(
             store
                 .append_agent_event_in_workspace(f.repo(), &main.workspace_id, &event)
                 .is_err()
         );
-        store.append_agent_event(f.repo(), &event).unwrap();
+        store
+            .append_agent_event_in_workspace(f.repo(), &linked.workspace_id, &event)
+            .unwrap();
         store
             .transition_job(
                 f.repo(),
@@ -1457,8 +1504,8 @@ fn workspace_source_and_job_evidence_locations_survive_reopen() {
         linked.source
     );
     assert_eq!(
-        store.job_workspace(f.repo(), &job.job_id).unwrap(),
-        Some(linked.workspace_id.clone())
+        common::job_workspace(&f.paths.database, f.repo().as_str(), job.job_id.as_str()),
+        Some(linked.workspace_id.as_str().to_owned())
     );
     assert_eq!(
         store
@@ -1475,15 +1522,15 @@ fn workspace_source_and_job_evidence_locations_survive_reopen() {
             .iter()
             .all(|entry| entry.workspace_id.as_ref() == Some(&linked.workspace_id))
     );
+    // Every journal entry agentctl writes for a job, its evidence and its
+    // events now carries the workspace that owns it; there is no unbound write
+    // path left to produce one without.
     assert!(
         store
             .events(Some(f.repo()), None, None, 100)
             .unwrap()
             .iter()
-            .any(
-                |entry| matches!(entry.entry, JournalEntry::PlanCreated { .. })
-                    && entry.workspace_id.is_none()
-            )
+            .all(|entry| entry.workspace_id.is_some())
     );
 }
 
@@ -1629,8 +1676,8 @@ fn v1_migration_preserves_shared_ownership_workspace_links_and_historical_bytes(
             Some(evidence.clone())
         );
         assert_eq!(
-            store.job_workspace(f.repo(), &job.job_id).unwrap(),
-            Some(linked.workspace_id.clone())
+            common::job_workspace(&path, f.repo().as_str(), job.job_id.as_str()),
+            Some(linked.workspace_id.as_str().to_owned())
         );
         assert_eq!(
             store

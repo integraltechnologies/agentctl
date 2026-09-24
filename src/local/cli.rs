@@ -10,13 +10,11 @@ use super::{
     repository::{RepositoryId, RepositoryInfo},
     require,
     store::Store,
+    terminal::{Report, yes_no},
 };
 use crate::protocol::{JobId, TaskId};
 
 pub fn run(args: &[&str]) -> Result<()> {
-    if args == ["run", "packet-hashes"] {
-        return super::runtime::planner::packet_hashes();
-    }
     let json_mode = args.last() == Some(&"--json");
     let args = if json_mode {
         &args[..args.len() - 1]
@@ -26,7 +24,7 @@ pub fn run(args: &[&str]) -> Result<()> {
     let paths = MachinePaths::resolve(&PathContext::from_env())?;
     match args {
         ["analytics", rest @ ..] => super::analytics::run(&paths, rest, json_mode),
-        ["observe", rest @ ..] => super::observe::cli(&paths, rest),
+        ["observe", rest @ ..] => super::observe::cli(&paths, rest, json_mode),
         ["init"] => {
             paths.create_directories()?;
             let config = MachineConfig::initialize(&paths.machine_config)?;
@@ -34,7 +32,11 @@ pub fn run(args: &[&str]) -> Result<()> {
             output(
                 json_mode,
                 &json!({"paths": paths, "state": store.status()?}),
-                &format!("Initialized local state at {}", paths.database.display()),
+                &Report::new("Local state initialized")
+                    .field("Config", paths.machine_config.display())
+                    .field("Database", paths.database.display())
+                    .next(["agentctl repo init    (inside a Git checkout)"])
+                    .to_string(),
             )
         }
         ["doctor"] => doctor(&paths, json_mode),
@@ -67,7 +69,7 @@ pub fn run(args: &[&str]) -> Result<()> {
         }
         ["experiment", command, rest @ ..] => {
             let config = load_machine(&paths)?;
-            let mut store = if ["run", "cancel", "restart"].contains(command) {
+            let mut store = if ["run", "cancel", "restart", "reconcile"].contains(command) {
                 Store::open(&paths.database, config.busy_timeout_ms)?
             } else {
                 Store::read_only(&paths.database, config.busy_timeout_ms)?
@@ -92,9 +94,9 @@ pub fn run(args: &[&str]) -> Result<()> {
             };
             super::memory::cli::run(&mut store, command, rest, json_mode)
         }
-        graph @ (["repo", "index", ..] | ["code", ..] | ["ontology", ..]) => {
+        graph @ (["repo", "index" | "enrich", ..] | ["code", ..] | ["ontology", ..]) => {
             let config = load_machine(&paths)?;
-            let mut store = if graph == ["repo", "index"]
+            let mut store = if matches!(graph, ["repo", "index" | "enrich"])
                 || matches!(graph, ["ontology", "accept" | "reject", ..])
             {
                 Store::open(&paths.database, config.busy_timeout_ms)?
@@ -106,8 +108,10 @@ pub fn run(args: &[&str]) -> Result<()> {
         ["repo", "init"] => {
             let config = load_machine(&paths)?;
             let info = RepositoryInfo::discover(&env::current_dir()?)?;
-            // Validate database health before creating repository policy.
-            paths::check_file(&paths.database, false)?;
+            // Validate database health before creating repository policy. A
+            // missing database is not ill health on a fresh machine: the open
+            // below creates it, so only an existing non-regular file refuses.
+            paths::check_file(&paths.database, true)?;
             let mut store = Store::open(&paths.database, config.busy_timeout_ms)?;
             ProjectConfig::initialize(&info.root)?;
             let info = RepositoryInfo::discover(&info.root)?;
@@ -115,13 +119,13 @@ pub fn run(args: &[&str]) -> Result<()> {
             output(
                 json_mode,
                 &record,
-                &format!(
-                    "Repository: {}\nRegistered workspace: {}\nRoot: {}\nProject config: {}",
-                    record.info.repository_id.as_str(),
-                    record.info.workspace_id.as_str(),
-                    record.info.root.display(),
-                    paths::project_config(&record.info.root).display()
-                ),
+                &Report::new("Repository registered")
+                    .field("Repository", record.info.repository_id.as_str())
+                    .field("Workspace", record.info.workspace_id.as_str())
+                    .field("Root", record.info.root.display())
+                    .field("Config", paths::project_config(&record.info.root).display())
+                    .next(["agentctl repo index"])
+                    .to_string(),
             )
         }
         ["repo", "status"] => {
@@ -155,29 +159,36 @@ pub fn run(args: &[&str]) -> Result<()> {
                 "repository_registered": repository.is_some(), "registration": registered,
                 "project_config_path": paths::project_config(&info.root), "project_config": project,
                 "conflicting_registrations": conflicting_roots, "healthy": healthy, "database": store.status()?});
-            output(
-                json_mode,
-                &response,
-                &format!(
-                    "Repository: {}\nWorkspace: {}\nRoot: {}\nWorkspace registered: {}\nProject config: {}\nHEAD: {}\nDirty: {} (working tree not fingerprinted)\nLocal state: {}",
-                    info.repository_id.as_str(),
-                    info.workspace_id.as_str(),
-                    info.root.display(),
-                    registered.is_some(),
-                    if project.is_some() {
-                        "valid"
-                    } else {
-                        "absent; run agentctl repo init"
-                    },
-                    info.source.head_commit.as_deref().unwrap_or("unborn"),
-                    info.source.dirty,
-                    if healthy {
-                        "healthy"
-                    } else {
-                        "metadata mismatch; inspect registration"
-                    }
-                ),
-            )?;
+            output(json_mode, &response, &{
+                let mut report = Report::new("Repository");
+                report
+                    .field("Repository", info.repository_id.as_str())
+                    .field("Workspace", info.workspace_id.as_str())
+                    .field("Root", info.root.display())
+                    .field("Registered", yes_no(registered.is_some()))
+                    .field("Config", if project.is_some() { "valid" } else { "absent" })
+                    .field(
+                        "HEAD",
+                        info.source.head_commit.as_deref().unwrap_or("unborn"),
+                    )
+                    .field(
+                        "Dirty",
+                        format!(
+                            "{} (working tree not fingerprinted)",
+                            yes_no(info.source.dirty)
+                        ),
+                    )
+                    .field("State", if healthy { "HEALTHY" } else { "MISMATCH" });
+                if !healthy {
+                    report.next([
+                        "Registered metadata no longer matches this checkout.",
+                        "Inspect with: agentctl repo list",
+                    ]);
+                } else if registered.is_none() || project.is_none() {
+                    report.next(["agentctl repo init"]);
+                }
+                report.to_string()
+            })?;
             require(
                 healthy,
                 "registered repository/workspace metadata no longer matches this checkout",
@@ -190,10 +201,14 @@ pub fn run(args: &[&str]) -> Result<()> {
             let mut human = vec![];
             for repository in store.repositories()? {
                 let workspaces = store.workspaces(Some(&repository.repository_id))?;
+                if !human.is_empty() {
+                    human.push(String::new());
+                }
                 human.push(format!(
-                    "{}  {} workspace(s)",
+                    "{}  ({} workspace{})",
                     repository.repository_id.as_str(),
-                    workspaces.len()
+                    workspaces.len(),
+                    if workspaces.len() == 1 { "" } else { "s" }
                 ));
                 let mut workspace_rows = vec![];
                 for registered in workspaces {
@@ -230,10 +245,15 @@ pub fn run(args: &[&str]) -> Result<()> {
                         Err(error) => ("unavailable", Some(error.to_string())),
                     };
                     human.push(format!(
-                        "  {}  {}  {health}",
+                        "  {:<16}  {}\n  {:<16}  {}",
+                        health.to_uppercase(),
                         registered.info.workspace_id.as_str(),
+                        "",
                         registered.info.root.display()
                     ));
+                    if let Some(detail) = &detail {
+                        human.push(format!("  {:<16}  {detail}", ""));
+                    }
                     workspace_rows.push(
                         json!({"registration": registered, "health": health, "detail": detail}),
                     );
@@ -253,18 +273,20 @@ pub fn run(args: &[&str]) -> Result<()> {
             output(
                 json_mode,
                 &state,
-                &format!(
-                    "Schema {} ({})\n{} repositories, {} workspaces, {} plans, {} tasks, {} jobs, {} evidence records, {} events",
-                    state.schema_version,
-                    state.journal_mode,
-                    state.repositories,
-                    state.workspaces,
-                    state.plans,
-                    state.tasks,
-                    state.jobs,
-                    state.evidence,
-                    state.events
-                ),
+                &Report::new("Local state")
+                    .field(
+                        "Schema",
+                        format!("{} ({})", state.schema_version, state.journal_mode),
+                    )
+                    .section("Records")
+                    .field("Repositories", state.repositories)
+                    .field("Workspaces", state.workspaces)
+                    .field("Plans", state.plans)
+                    .field("Tasks", state.tasks)
+                    .field("Jobs", state.jobs)
+                    .field("Evidence", state.evidence)
+                    .field("Events", state.events)
+                    .to_string(),
             )
         }
         ["events", "list", filters @ ..] => {
@@ -314,32 +336,47 @@ pub fn run(args: &[&str]) -> Result<()> {
                 .map(|event| {
                     let value =
                         serde_json::to_value(&event.entry).expect("validated finite journal entry");
-                    format!(
-                        "{}  {}  {}  task={} job={}",
+                    let mut line = format!(
+                        "{:>6}  {}  {}",
                         event.sequence,
                         event.timestamp_ms,
                         value["kind"].as_str().unwrap_or("UNKNOWN"),
-                        event.task_id.as_ref().map(TaskId::as_str).unwrap_or("-"),
-                        event.job_id.as_ref().map(JobId::as_str).unwrap_or("-")
-                    )
+                    );
+                    if let Some(task) = &event.task_id {
+                        line.push_str(&format!("  task {}", task.as_str()));
+                    }
+                    if let Some(job) = &event.job_id {
+                        line.push_str(&format!("  job {}", job.as_str()));
+                    }
+                    line
                 })
                 .collect();
             let human = if human.is_empty() {
                 "No events".to_string()
             } else {
-                human.join("\n")
+                format!(
+                    "{:>6}  {:<13}  EVENT\n{}",
+                    "SEQ",
+                    "TIME (ms)",
+                    human.join("\n")
+                )
             };
             output(json_mode, &events, &human)
         }
-        _ => Err(Error::Invalid(
-            "invalid local command; run agentctl --help (place --json last)".into(),
-        )),
+        _ => Err(Error::Invalid(format!(
+            "unrecognized `{}` command; run agentctl {} --help (place --json last)",
+            args.join(" "),
+            args.first().unwrap_or(&"")
+        ))),
     }
 }
 
 fn load_machine(paths: &MachinePaths) -> Result<MachineConfig> {
-    paths::check_directory(&paths.config_root)?;
-    MachineConfig::load(&paths.machine_config)
+    // An uninitialized machine fails here first, so the directory check carries
+    // the same guidance the config load already gives; otherwise the operator's
+    // first command reports a raw missing-path error instead of the fix.
+    paths::check_directory(&paths.config_root)
+        .and_then(|()| MachineConfig::load(&paths.machine_config))
         .map_err(|e| Error::Invalid(format!("{e}; initialize missing state with agentctl init")))
 }
 
@@ -399,18 +436,27 @@ fn doctor(paths: &MachinePaths, json_mode: bool) -> Result<()> {
             .unwrap_or_else(|| paths.database.display().to_string()),
     });
     let healthy = checks.iter().all(|c| c.ok);
-    let human = checks
-        .iter()
-        .map(|check| {
+    let mut report = Report::new("Local state");
+    for check in &checks {
+        report.field(
+            check.name,
             format!(
-                "{} {}: {}",
-                if check.ok { "ok" } else { "FAIL" },
-                check.name,
+                "{:<4}  {}",
+                if check.ok { "OK" } else { "FAIL" },
                 check.detail
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+            ),
+        );
+    }
+    report
+        .section("Result")
+        .field("Status", if healthy { "HEALTHY" } else { "UNHEALTHY" });
+    if !healthy {
+        report.next([
+            "Repair the failing path, config or database above, then run agentctl doctor again.",
+            "A missing machine config or database is created by: agentctl init",
+        ]);
+    }
+    let human = report.to_string();
     output(
         json_mode,
         &json!({"healthy": healthy, "checks": checks, "state": database.ok()}),
@@ -503,39 +549,50 @@ fn security_doctor(paths: &MachinePaths, json_mode: bool) -> Result<()> {
         },
         "trust_boundary": "worker processes are untrusted; same-user host compromise is outside the claimed boundary",
     });
-    let mut human = vec![format!(
-        "Security backend: {} ({}){}",
-        report.backend,
-        report.platform,
-        if report.running_as_root {
-            " — RUNNING AS ROOT: workers refused"
-        } else {
-            ""
-        }
-    )];
+    use super::terminal::name;
+    let mut human = Report::new("Security");
+    human
+        .field(
+            "Backend",
+            format!("{} ({})", report.backend, report.platform),
+        )
+        .field_opt(
+            "Root",
+            report
+                .running_as_root
+                .then_some("RUNNING AS ROOT — every worker is refused"),
+        );
+    human.section("Capabilities");
     for c in &report.capabilities {
-        human.push(format!(
-            "{:<12} {:<27} {} — {}",
-            serde_json::to_value(c.status)?.as_str().unwrap_or_default(),
-            serde_json::to_value(c.capability)?
-                .as_str()
-                .unwrap_or_default(),
-            c.mechanism,
-            c.detail
-        ));
+        human.field(
+            &name(&c.capability),
+            format!("{:<11}  {}", name(&c.status), c.mechanism),
+        );
     }
-    human.push(match &self_test {
-        Ok(()) => {
-            "Self-test: PASSED (planted secret unreadable, outside/.git writes denied)".into()
-        }
-        Err(e) => format!("Self-test: FAILED: {e}"),
-    });
-    human.push(if unsupported.is_empty() {
-        "Hard requirements: all enforced".into()
-    } else {
-        format!("Hard requirements NOT enforced: {unsupported:?} — affected jobs are refused before launch")
-    });
-    output(json_mode, &value, &human.join("\n"))?;
+    human
+        .section("Result")
+        .field(
+            "Self-test",
+            match &self_test {
+                Ok(()) => {
+                    "PASSED (planted secret unreadable; outside and .git writes denied)".into()
+                }
+                Err(e) => format!("FAILED — {e}"),
+            },
+        )
+        .field(
+            "Required",
+            if unsupported.is_empty() {
+                "all enforced".to_string()
+            } else {
+                format!(
+                    "NOT ENFORCED: {} — affected jobs are refused before launch",
+                    unsupported.iter().map(name).collect::<Vec<_>>().join(", ")
+                )
+            },
+        );
+    human.text("Capability details: agentctl security doctor --json");
+    output(json_mode, &value, &human.to_string())?;
     require(
         baseline && unsupported.is_empty() && self_test.is_ok() && !report.running_as_root,
         "security doctor: required worker isolation is not enforced on this host; workers will be refused",

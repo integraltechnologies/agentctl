@@ -27,6 +27,20 @@ fn sbpl(path: &Path) -> Result<String> {
     Ok(format!("\"{text}\""))
 }
 
+/// `<file>.<suffix>` siblings of an authorized file, as an anchored regex.
+fn siblings(path: &Path) -> Result<String> {
+    let text = sbpl(path)?;
+    let text = &text[1..text.len() - 1];
+    let mut escaped = String::new();
+    for c in text.chars() {
+        if ".^$*+?()[]{}|".contains(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    Ok(format!("(regex #\"^{escaped}\\.[^/]+$\")"))
+}
+
 /// Pure SBPL compilation (unit-tested on every platform).
 pub(crate) fn profile(policy: &SecurityPolicy) -> Result<String> {
     let fs = &policy.filesystem;
@@ -37,12 +51,18 @@ pub(crate) fn profile(policy: &SecurityPolicy) -> Result<String> {
     for file in fs.read_files.iter().chain(&fs.write_files) {
         readable.push_str(&format!("(require-not (literal {}))", sbpl(file)?));
     }
+    for file in &fs.write_siblings {
+        readable.push_str(&format!("(require-not {})", siblings(file)?));
+    }
     let mut writable = String::new();
     for root in &fs.write_roots {
         writable.push_str(&format!("(require-not (subpath {}))", sbpl(root)?));
     }
     for file in &fs.write_files {
         writable.push_str(&format!("(require-not (literal {}))", sbpl(file)?));
+    }
+    for file in &fs.write_siblings {
+        writable.push_str(&format!("(require-not {})", siblings(file)?));
     }
     let mut profile = format!(
         "(version 1)(allow default)(deny file-read-data file-read-xattr (require-all {readable}))(deny file-write* (require-all {writable}))"
@@ -65,6 +85,14 @@ pub(crate) fn profile(policy: &SecurityPolicy) -> Result<String> {
         let mut filter = format!("(subpath {})", sbpl(&denied.path)?);
         for except in &denied.except {
             filter.push_str(&format!("(require-not (subpath {}))", sbpl(except)?));
+            // A denial that re-allows an atomically replaceable file re-allows
+            // its temporaries too, and nothing else beside it.
+            if fs.write_siblings.contains(except) {
+                filter.push_str(&format!("(require-not {})", siblings(except)?));
+            }
+        }
+        for except in &denied.except_files {
+            filter.push_str(&format!("(require-not (literal {}))", sbpl(except)?));
         }
         profile.push_str(&format!(
             "(deny {} (require-all {filter}))",
@@ -271,6 +299,7 @@ mod tests {
             class: WorkerClass::Tool,
             network: NetworkPolicy::DenyAll,
             filesystem: FilesystemPolicy {
+                write_siblings: vec![],
                 workspace: "/w".into(),
                 scratch: "/s/data/scratch".into(),
                 read_roots: vec!["/usr".into(), "/w".into()],
@@ -284,6 +313,7 @@ mod tests {
                         metadata: true,
                         write: true,
                         except: vec!["/s/data/scratch".into()],
+                        except_files: vec![],
                         reason: "state",
                     },
                     DeniedPath {
@@ -292,6 +322,7 @@ mod tests {
                         metadata: false,
                         write: true,
                         except: vec![],
+                        except_files: vec![],
                         reason: "git",
                     },
                 ],
@@ -306,10 +337,10 @@ mod tests {
         }
     }
 
-    /// Stage 8A SEC-8A-01: `(allow default)` left Mach bootstrap open, so any
-    /// worker could reach LaunchServices and have launchd start an unsandboxed
-    /// process. The bootstrap is now deny-by-default, and the ONLY re-allowance
-    /// is the securityd pair a native-login frontend needs.
+    /// An open Mach bootstrap (`(allow default)`) would let any worker reach
+    /// LaunchServices and have launchd start an unsandboxed process. The
+    /// bootstrap is deny-by-default, and the ONLY re-allowance is the
+    /// securityd pair a native-login frontend needs.
     #[test]
     fn mach_bootstrap_is_denied_by_default_with_keychain_as_the_only_allowance() {
         const KEYCHAIN: &str = "(allow mach-lookup (global-name \"com.apple.SecurityServer\") (global-name \"com.apple.securityd.xpc\"))";
@@ -351,7 +382,7 @@ mod tests {
         assert!(!profile(&tool).unwrap().contains("(allow mach-lookup"));
     }
 
-    /// Stage 8B F-2: the directories leading to a carved-out subpath of a
+    /// The directories leading to a carved-out subpath of a
     /// metadata-hidden tree answer `stat` (and nothing else), or `realpath` on
     /// anything inside the carve-out fails for every toolchain.
     #[test]

@@ -191,7 +191,7 @@ pub struct IntegrationVerificationContract {
     pub require_final_diff_and_evidence: bool,
     pub expectations: Vec<String>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReplanReference {
     pub previous_plan_id: PlanId,
@@ -212,7 +212,7 @@ pub struct PlanMetadata {
     pub integration: IntegrationVerificationContract,
     pub replan: Option<ReplanReference>,
 }
-/// Stage 4 envelope. The canonical Stage 0 PlanPacket remains the only task definition.
+/// Execution-plan envelope. The canonical protocol PlanPacket remains the only task definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionPlan {

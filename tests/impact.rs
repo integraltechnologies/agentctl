@@ -1,4 +1,4 @@
-//! Stage 4: semantic impact analysis. Every oracle here is the edit the test
+//! Semantic impact analysis. Every oracle here is the edit the test
 //! makes and the declarations it wrote, never the analyzer's own bookkeeping.
 //! The suite attacks the invariant that no impact claim exists without an
 //! evidence chain, and that uncertainty is represented instead of guessed.
@@ -156,26 +156,31 @@ impl Fixture {
             .unwrap()
     }
     fn prepare(&self, scope: Vec<ScopePath>, limits: PlanningLimits) -> PlannerPacket {
-        self.store()
-            .prepare_plan(
-                &self.root,
-                RequestDraft {
-                    objective: "Change the capture result".into(),
-                    query: Some("capture".into()),
-                    scope,
-                    constraints: vec![],
-                    definition_of_done: vec!["capture returns the new value".into()],
-                    verification: None,
-                    invariant_refs: vec![],
-                    provenance: PlanningProvenance {
-                        actor: "human".into(),
-                        source_refs: vec!["objective".into()],
-                        provider: None,
-                    },
+        self.try_prepare(scope, limits).unwrap()
+    }
+    fn try_prepare(
+        &self,
+        scope: Vec<ScopePath>,
+        limits: PlanningLimits,
+    ) -> agentctl::local::Result<PlannerPacket> {
+        self.store().prepare_plan(
+            &self.root,
+            RequestDraft {
+                objective: "Change the capture result".into(),
+                query: Some("capture".into()),
+                scope,
+                constraints: vec![],
+                definition_of_done: vec!["capture returns the new value".into()],
+                verification: None,
+                invariant_refs: vec![],
+                provenance: PlanningProvenance {
+                    actor: "human".into(),
+                    source_refs: vec!["objective".into()],
+                    provider: None,
                 },
-                limits,
-            )
-            .unwrap()
+            },
+            limits,
+        )
     }
     fn cli(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_agentctl"))
@@ -331,7 +336,7 @@ fn a_test_is_verification_relevance_however_it_is_associated() {
             ..
         }
     ));
-    // Reached by Stage-1 container association when the call itself is inside a
+    // Reached by container test association when the call itself is inside a
     // macro and therefore not an observed relation.
     let f = Fixture::new(&[(
         "src/core.rs",
@@ -831,43 +836,50 @@ fn the_planner_packet_carries_bounded_impact_that_widens_no_authority() {
 }
 
 #[test]
-fn impact_is_shed_before_any_context_when_the_byte_budget_is_tight() {
+fn impact_outlives_test_material_and_unresolved_summaries() {
     let f = Fixture::new(&layered());
     let generous = f.prepare(vec![], PlanningLimits::default());
     let outlook = generous.context.impact.as_ref().expect("an impact outlook");
     let brief = serde_json::to_vec(outlook).unwrap().len();
     assert!(brief > 64, "the brief is a real payload, not a stub");
-    // One byte less than the packet needs: shedding must drop the brief and
-    // stop there, leaving every pre-existing context record untouched.
-    let tight = f.prepare(
-        vec![],
-        PlanningLimits {
-            bytes: generous.serialized_bytes - 1,
-            ..PlanningLimits::default()
-        },
-    );
-    assert!(tight.context.impact.is_none(), "impact is shed first");
-    assert!(tight.serialized_bytes < generous.serialized_bytes);
-    assert_eq!(
-        tight.context.graph.primary.len(),
-        generous.context.graph.primary.len()
-    );
-    assert_eq!(
-        tight.context.graph.neighbors.len(),
-        generous.context.graph.neighbors.len()
-    );
-    assert_eq!(
-        tight.context.graph.relations.len(),
-        generous.context.graph.relations.len()
-    );
-    assert_eq!(
-        tight.context.excerpts.len(),
-        generous.context.excerpts.len()
-    );
-    assert_eq!(
-        tight.context.memory.items.len(),
-        generous.context.memory.items.len()
-    );
+    // Tighten the budget step by step: the impact outlook is relation
+    // knowledge a planner cannot recover by reading files, so it is shed only
+    // after test material and unresolved summaries, and before neighbors.
+    let mut budget = generous.serialized_bytes - 1;
+    let mut shed = false;
+    let mut first = true;
+    while budget >= 4096 {
+        let Ok(tight) = f.try_prepare(
+            vec![],
+            PlanningLimits {
+                bytes: budget,
+                ..PlanningLimits::default()
+            },
+        ) else {
+            break;
+        };
+        assert!(tight.serialized_bytes <= budget);
+        if tight.context.impact.is_none() {
+            shed = true;
+            assert!(tight.context.graph.unresolved.is_empty(), "{budget}");
+            assert!(tight.context.graph.tests.len() <= 1, "{budget}");
+            if first {
+                assert_eq!(
+                    tight.context.graph.primary.len(),
+                    generous.context.graph.primary.len(),
+                    "primaries outlive the impact outlook"
+                );
+                assert_eq!(
+                    tight.context.graph.neighbors.len(),
+                    generous.context.graph.neighbors.len(),
+                    "neighbors outlive the impact outlook"
+                );
+                first = false;
+            }
+        }
+        budget -= 256;
+    }
+    assert!(shed, "a tight enough budget must shed the outlook");
 }
 
 #[test]
@@ -1016,7 +1028,7 @@ fn the_cli_reports_impact_with_evidence_and_refuses_an_unknown_symbol() {
 }
 
 // ---------------------------------------------------------------------------
-// The Stage-2 authority boundary.
+// The context-authority boundary.
 // ---------------------------------------------------------------------------
 
 #[test]

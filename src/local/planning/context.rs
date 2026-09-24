@@ -63,9 +63,31 @@ impl Store {
         };
         let scope = intent.scope.clone();
         let within = |path: &str| scope.is_empty() || scope.iter().any(|s| permits(s, path));
-        let mut graph = self
-            .graph(start)?
-            .context_within(&query, limits.graph, &within)?;
+        // Symbols the request names explicitly are the strongest retrieval
+        // signal there is. Each is pinned only if it resolves to exactly one
+        // entity inside the scope; an ambiguous or unknown name pins nothing.
+        let mut pinned = BTreeSet::new();
+        let mut mentions = graph::symbol_mentions(&intent.objective);
+        for text in &intent.definition_of_done {
+            mentions.extend(graph::symbol_mentions(text));
+        }
+        if let Some(q) = &intent.query {
+            mentions.extend(graph::symbol_mentions(q));
+        }
+        for mention in mentions {
+            if pinned.len() >= limits.graph.primary {
+                break;
+            }
+            let found = self.graph(start)?.exact_matches(&mention, 2)?;
+            if let [one] = found.as_slice()
+                && within(&one.provenance.path)
+            {
+                pinned.insert(one.id.clone());
+            }
+        }
+        let mut graph =
+            self.graph(start)?
+                .context_pinned(&query, limits.graph, &within, &pinned)?;
         require(
             graph.freshness.fresh,
             "planning requires a complete fresh graph; inspect repo index --status",
@@ -105,6 +127,19 @@ impl Store {
             None
         } else {
             let report = graph::proposed_impact(&self.graph(start)?, &seeds, PLAN_IMPACT)?;
+            // The report's boundaries are *incoming* open questions ("these
+            // sites name a seed but were never resolved"), which the packet's
+            // own outgoing summaries cannot express. Fold their weight into the
+            // coverage counts now, so shedding the report later cannot take the
+            // gap with it.
+            graph.coverage.unresolved_sites += report
+                .boundaries
+                .iter()
+                .filter_map(|boundary| match &boundary.reason {
+                    graph::BoundaryReason::UnresolvedReferences { count, .. } => Some(*count),
+                    _ => None,
+                })
+                .sum::<usize>();
             let scope = intent.scope.clone();
             let covered = scope.clone();
             Some(graph::ImpactOutlook::new(report, scope, &|path| {
@@ -286,10 +321,16 @@ fn excerpts(
 }
 
 /// Removes the least valuable optional record, then everything that referred to
-/// it. Order: the impact outlook, unresolved summaries, relations, test
-/// excerpts, neighbors (with their excerpts), tests beyond the first, memory,
+/// it. Order: test excerpts, tests beyond the first, unresolved summaries, the
+/// impact outlook, relations, neighbors (with their excerpts), memory,
 /// secondary excerpts, the last test, primaries beyond the first, the final
 /// excerpt, the final primary.
+///
+/// Detail is shed; the *fact* that relation knowledge is incomplete is not.
+/// `graph.coverage` is counted before any shedding and is never dropped, so a
+/// starved packet still distinguishes "no relation exists" from "resolution is
+/// incomplete" — the records that explained the gap may be gone, the gap
+/// itself is still stated.
 fn shed(c: &mut PlanningContext) -> bool {
     let g = &mut c.graph;
     let test_excerpt = c.excerpts.iter().rposition(|x| {
@@ -297,34 +338,43 @@ fn shed(c: &mut PlanningContext) -> bool {
             .as_ref()
             .is_some_and(|id| g.tests.iter().any(|t| &t.id == id))
     });
-    let dropped =
-        if c.impact.take().is_some() || g.unresolved.pop().is_some() || g.relations.pop().is_some()
-        {
-            true
-        } else if let Some(i) = test_excerpt {
-            c.excerpts.remove(i);
-            true
-        } else if g.neighbors.pop().is_some() {
-            true
-        } else if g.tests.len() > 1 {
-            g.tests.pop();
-            true
-        } else if c.memory.items.pop().is_some() {
-            c.memory.truncated = true;
-            true
-        } else if c.excerpts.len() > 1 {
-            c.excerpts.pop();
-            true
-        } else if g.tests.pop().is_some() {
-            true
-        } else if g.primary.len() > 1 {
-            g.primary.pop();
-            true
-        } else if c.excerpts.pop().is_some() {
-            true
-        } else {
-            g.primary.pop().is_some()
-        };
+    // Test material and unresolved summaries are the cheapest to lose; the
+    // impact outlook and relations (knowledge a planner cannot recover by
+    // reading files) outlive them; neighbors go last among graph material,
+    // taking their relations with them.
+    let dropped = if let Some(i) = test_excerpt {
+        c.excerpts.remove(i);
+        true
+    } else if g.tests.len() > 1 {
+        g.tests.pop();
+        true
+    } else if g.unresolved.pop().is_some()
+        || c.impact.take().is_some()
+        || g.relations.pop().is_some()
+    {
+        // Each of these carried relation knowledge or its qualification, so
+        // the surviving picture is now partial in a way the counts alone no
+        // longer explain.
+        g.coverage.detail_shed = true;
+        true
+    } else if g.neighbors.pop().is_some() {
+        true
+    } else if c.memory.items.pop().is_some() {
+        c.memory.truncated = true;
+        true
+    } else if c.excerpts.len() > 1 {
+        c.excerpts.pop();
+        true
+    } else if g.tests.pop().is_some() {
+        true
+    } else if g.primary.len() > 1 {
+        g.primary.pop();
+        true
+    } else if c.excerpts.pop().is_some() {
+        true
+    } else {
+        g.primary.pop().is_some()
+    };
     if dropped {
         g.prune();
         let ids = g.entity_ids();

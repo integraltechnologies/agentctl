@@ -1,4 +1,4 @@
-//! Stage 3 dogfood over agentctl's own source tree.
+//! Ontology-lifecycle dogfood over agentctl's own source tree.
 //!
 //! A scripted executor performs a realistic refactor of agentctl's file
 //! discovery (extracting the protected-path test into a helper). The runtime
@@ -233,7 +233,7 @@ fn plan_for(prepared: &PlannerPacket, entity: GraphEntityId) -> ExecutionPlan {
     };
     let packet = PlanPacket {
         version: ProtocolVersion::V1,
-        plan_id: PlanId::new("plan:stage3-dogfood").unwrap(),
+        plan_id: PlanId::new("plan:ontology-dogfood").unwrap(),
         objective: prepared.request.intent.objective.clone(),
         tasks: vec![task],
         integration_verification: requirements("integration"),
@@ -277,7 +277,7 @@ fn plan_for(prepared: &PlannerPacket, entity: GraphEntityId) -> ExecutionPlan {
 }
 
 #[test]
-fn stage_three_dogfood_over_agentctls_own_source() {
+fn ontology_dogfood_over_agentctls_own_source() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if RepositoryInfo::discover(&manifest_dir).is_err() {
         eprintln!("skipping: {} is not a Git checkout", manifest_dir.display());

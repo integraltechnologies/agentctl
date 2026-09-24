@@ -9,7 +9,7 @@ use super::{
     store::{RegisteredRepository, RegisteredWorkspace},
 };
 
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 pub const APPLICATION_ID: i64 = 0x41475443; // AGTC
 
 const INITIAL: &str = r#"
@@ -125,6 +125,7 @@ fn check_version(connection: &Connection, version: i64) -> Result<()> {
         (11, "experiment_decision_cursors"),
         (12, "graph_resolution"),
         (13, "ontology_lifecycle"),
+        (14, "graph_semantic_provider"),
     ]
     .into_iter()
     .filter(|(v, _)| *v <= version)
@@ -485,6 +486,20 @@ fn migrate_transaction(connection: &mut Connection) -> Result<()> {
             transaction.execute_batch("ALTER TABLE graph_entities ADD COLUMN text_hash TEXT;")?;
         }
         transaction.execute_batch(include_str!("graph/lifecycle_schema.sql"))?;
+    }
+    if header(&transaction)? == 13 {
+        check_version(&transaction, 13)?;
+        // Additive: records which semantic provider proved a resolution, so a
+        // semantic claim is attributable. Existing rows are fast-path
+        // resolutions and keep a NULL provider. Nothing is rewritten: semantic
+        // rows only appear once an enrichment pass runs.
+        let attributed = transaction
+            .prepare("SELECT 1 FROM pragma_table_info('graph_resolutions') WHERE name='provider'")?
+            .exists([])?;
+        if !attributed {
+            transaction.execute_batch("ALTER TABLE graph_resolutions ADD COLUMN provider TEXT;")?;
+        }
+        transaction.execute_batch("INSERT INTO schema_migrations VALUES (14, 'graph_semantic_provider'); PRAGMA user_version=14;")?;
     }
     check(&transaction)?;
     require(

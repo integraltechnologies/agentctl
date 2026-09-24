@@ -1,9 +1,9 @@
-//! Stage 9A: durable long-running job/experiment process execution.
+//! Durable long-running job/experiment process execution.
 //!
 //! An experiment is a plain OS process (no provider, no model call) launched under
-//! the same sandboxed, argv-only process boundary as Stage 5 checks. It is not an
+//! the same sandboxed, argv-only process boundary as verification checks. It is not an
 //! AgentInstance and has no EngineeringSession ownership: there is no AI conversation
-//! to own. Liveness follows the unchanged Stage 6 philosophy: persisted RUNNING is a
+//! to own. Liveness follows the runtime-job liveness rule: persisted RUNNING is a
 //! historical fact, never proof that a process is still alive; only the exact
 //! controller process that is currently polling a child handle may report LIVE.
 use super::experiment_decisions as decisions;
@@ -17,15 +17,15 @@ use process::{
 use serde_json::json;
 use std::time::Duration;
 
-/// Hard sanity bound distinct from AI-role timeouts (Stage 7 caps those at one hour).
+/// Hard sanity bound distinct from AI-role timeouts (routing caps those at one hour).
 /// Experiments are not an AI role and may legitimately run far longer.
 pub const MAX_TIMEOUT_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
-/// Stage 9D bounded-autonomy defaults. Zero boundaries declared makes the budget
+/// Bounded-autonomy (wakeup) defaults. Zero boundaries declared makes the budget
 /// inert; a nonzero budget still hard-caps distinct planner wakeups per experiment.
 pub const DEFAULT_MAX_PLANNER_WAKEUPS: u32 = 3;
 pub const MAX_PLANNER_WAKEUPS: u32 = 20;
-/// Boundaries per experiment. Small and fixed: Stage 9C is a deterministic
+/// Boundaries per experiment. Small and fixed: boundary evaluation is a deterministic
 /// scalar-comparison policy, not a place to declare hundreds of rules.
 pub const MAX_DECISION_BOUNDARIES: usize = 32;
 
@@ -62,7 +62,7 @@ pub struct ExperimentAttempt {
     /// and is separate from the process `failure` outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ingestion_error: Option<String>,
-    /// A factual controller-side Stage 9C/9D evaluation failure (e.g. a transient I/O
+    /// A factual controller-side boundary/wakeup evaluation failure (e.g. a transient I/O
     /// error persisting a decision or minting a wakeup). Never changes process state;
     /// the next poll retries evaluation from currently-persisted facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,14 +70,14 @@ pub struct ExperimentAttempt {
     pub state: ExperimentState,
 }
 
-/// Durable record. Reuses the Stage 0 `CommandSpec` (structured argv, never a shell
+/// Durable record. Reuses the protocol `CommandSpec` (structured argv, never a shell
 /// string) and canonical `EvidenceRef`/`EvidenceRecord` conventions for captured output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExperimentRun {
     pub experiment_id: ExperimentId,
     pub workspace_id: WorkspaceId,
-    /// Reserved for future association with an EngineeringSession; Stage 9A never
+    /// Reserved for future association with an EngineeringSession; experiment execution never
     /// populates it; no AgentInstance/session ownership is created for a plain process.
     #[serde(default)]
     pub engineering_session_id: Option<String>,
@@ -98,7 +98,7 @@ pub struct ExperimentRun {
     pub created_at_ms: u64,
     pub state: ExperimentState,
     pub attempts: Vec<ExperimentAttempt>,
-    /// Stage 9C decision boundaries, frozen at creation. Never mutated afterward;
+    /// Decision boundaries, frozen at creation. Never mutated afterward;
     /// `boundaries_hash` lets a decision prove which declaration produced it even
     /// if this experiment is inspected long after boundaries could (in principle)
     /// have looked different in a newer client.
@@ -106,7 +106,7 @@ pub struct ExperimentRun {
     pub decision_boundaries: Vec<BoundaryDefinition>,
     #[serde(default)]
     pub boundaries_hash: String,
-    /// Stage 9D bound on distinct planner wakeups this experiment may ever create.
+    /// Bound on distinct planner wakeups this experiment may ever create.
     /// Immutable; nothing (including planner output) may raise it later.
     #[serde(default)]
     pub max_planner_wakeups: u32,
@@ -117,10 +117,10 @@ pub struct ExperimentObservation {
     pub run: ExperimentRun,
     /// Freshly computed at read time, never persisted. LIVE requires this exact
     /// process to hold the owned child handle; a separate CLI invocation always
-    /// observes UNKNOWN, identically to Stage 6 runtime-job liveness.
+    /// observes UNKNOWN, identically to runtime-job liveness.
     pub liveness: crate::local::observe::Liveness,
     pub events: ExperimentEventSummary,
-    /// Stage 9C/9D: decision/wakeup counts and whether operator attention is required.
+    /// Decision/wakeup counts and whether operator attention is required.
     pub control: wakeups::ExperimentControlSummary,
 }
 
@@ -323,7 +323,7 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-    /// Explicit, standalone Stage 9C/9D reconciliation: evaluates any not-yet-scanned
+    /// Explicit, standalone boundary/wakeup reconciliation: evaluates any not-yet-scanned
     /// persisted facts and creates any missing wakeups, without waiting for (or
     /// requiring) a live `drive()` poll loop. Safe to call at any time, including
     /// concurrently from a second connection/controller racing the same experiment -
@@ -406,7 +406,7 @@ fn build_spec(
     })
 }
 
-/// Stage 9C then Stage 9D, in that order: a decision must exist durably before any
+/// Boundary evaluation, then wakeups, in that order: a decision must exist durably before any
 /// wakeup can reference it. Both stages are pure, idempotent, and operate only on
 /// already-committed facts; neither ever kills, restarts, or launches a process.
 fn evaluate_decisions_and_wakeups(
@@ -458,7 +458,7 @@ fn drive(
         state: ExperimentState::Running,
     });
     save_experiment(store, info, run, "EXPERIMENT_ATTEMPT_STARTED")?;
-    // Heals any Stage 9C/9D crash window left by a prior attempt (a decision
+    // Heals any boundary/wakeup crash window left by a prior attempt (a decision
     // persisted but not yet woken, say) before this attempt contributes anything
     // new. Idempotent: every persisted fact is checked, nothing is ever re-fired.
     let mut decision_evaluation_error = evaluate_decisions_and_wakeups(store, info, run)

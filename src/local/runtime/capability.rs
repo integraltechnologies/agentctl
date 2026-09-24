@@ -1,4 +1,4 @@
-//! Derived Stage 6 control-plane capabilities.
+//! Derived control-plane capabilities.
 //!
 //! This is an inspection projection, not another lifecycle or a capability
 //! ledger. Findings are reconstructed from canonical plan/task state, the

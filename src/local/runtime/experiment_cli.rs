@@ -327,6 +327,29 @@ pub(crate) fn run(
                 "Cancellation requested; effective only if a live controller is currently polling this experiment. A crashed controller cannot observe this and nothing is falsely reported as killed.",
             )
         }
+        // A controller that dies mid-experiment leaves boundaries that fired but
+        // were never turned into planner wakeups. Reconciliation is idempotent,
+        // so this is how an operator closes that gap without a live poll.
+        "reconcile" => {
+            require(
+                args.len() == 1,
+                "experiment reconcile requires exactly one ID",
+            )?;
+            let id = ExperimentId::new(args[0]).map_err(Error::Invalid)?;
+            store.experiment_reconcile(&root, &id)?;
+            let control = store.experiment_control_summary(&root, &id)?;
+            output(
+                json_mode,
+                &control,
+                &format!(
+                    "Reconciled {}: {} decision(s), {} of {} planner wakeup(s) created.",
+                    id.as_str(),
+                    control.decision_count,
+                    control.wakeups_created,
+                    control.wakeups_budget
+                ),
+            )
+        }
         "status" => {
             require(args.len() == 1, "experiment status requires exactly one ID")?;
             let id = ExperimentId::new(args[0]).map_err(Error::Invalid)?;

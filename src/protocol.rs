@@ -370,7 +370,12 @@ pub struct VerificationPacket {
     pub decision: VerificationDecision,
     pub findings: Vec<VerificationFinding>,
     pub evidence: Vec<EvidenceRef>,
+    /// Stable check IDs this decision covers, copied verbatim from the issued
+    /// requirements (for example `test`); never prose. A PASS must include
+    /// every required ID.
     pub requirement_refs: Vec<String>,
+    /// Stable invariant IDs this decision covers, copied verbatim; a PASS must
+    /// include every required critical invariant.
     pub invariant_refs: Vec<String>,
     pub notes: Option<String>,
     /// A verifier's own, independent context request: decision `BLOCKED`, no
@@ -623,7 +628,7 @@ pub enum ExperimentBoundary {
     EpochComplete,
     MetricThreshold {
         metric: String,
-        /// Exact-match selector against a Stage 9B metric event's own `tags`. Absent
+        /// Exact-match selector against a structured metric event's own `tags`. Absent
         /// in an old document deserializes as empty, which is NOT a wildcard: an
         /// empty selector matches only an untagged event of that metric name (see
         /// `local::runtime::experiment_decisions` for the full fail-closed matching
@@ -636,9 +641,9 @@ pub enum ExperimentBoundary {
     },
 }
 
-/// Stage 9C deterministic outcome of a satisfied boundary. Deliberately small: a
+/// Deterministic outcome of a satisfied boundary. Deliberately small: a
 /// boundary either just records a fact, or names the single existing verification
-/// profile Stage 9D must attach when it wakes the normal planner. Neither variant
+/// profile a planner wakeup must attach when it wakes the normal planner. Neither variant
 /// grants any process-control or model-invocation authority by itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]

@@ -30,6 +30,7 @@
       }
     },
     "invariant_refs": {
+      "description": "Stable invariant IDs this decision covers, copied verbatim; a PASS must\ninclude every required critical invariant.",
       "type": "array",
       "items": {
         "type": "string"
@@ -42,6 +43,7 @@
       ]
     },
     "requirement_refs": {
+      "description": "Stable check IDs this decision covers, copied verbatim from the issued\nrequirements (for example `test`); never prose. A PASS must include\nevery required ID.",
       "type": "array",
       "items": {
         "type": "string"

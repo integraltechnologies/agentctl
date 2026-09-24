@@ -1,7 +1,10 @@
 //! Deterministic, local policy. No model catalog, provider calls or storage access.
 use super::*;
 
-pub const BUILTINS: [&str; 5] = ["planner", "executor", "verifier", "recon", "reviewer"];
+/// The roles agentctl can actually launch. A role with no production launch
+/// path is not a role: it would be advertised by `agentctl roles` and routable
+/// in configuration while never being able to run.
+pub const BUILTINS: [&str; 3] = ["planner", "executor", "verifier"];
 pub fn role_name(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Planner => "planner",
@@ -134,7 +137,11 @@ pub fn builtin(role: &str, runtime: &RuntimeConfig) -> RoleProfile {
         "planner" => (
             "Decompose the bounded objective into meaningful TaskPackets, dependencies, invariants and checks. Request roles, not providers; do not implement or rediscover the repository.",
             "bounded PlannerPacket with canonical graph and trusted memory",
-            "ExecutionPlan",
+            // The planner authors a PlanDecision; agentctl derives the
+            // ExecutionPlan envelope around it. Naming the envelope here put a
+            // second, contradictory output contract in every compiled planner
+            // prompt and in its recorded provenance.
+            "PlanDecision",
         ),
         "executor" => (
             "Implement the assigned TaskPacket completely within scope. Use necessary context, run required local checks, return compact evidence, and never self-verify or redesign unrelated code.",
@@ -146,15 +153,10 @@ pub fn builtin(role: &str, runtime: &RuntimeConfig) -> RoleProfile {
             "TaskPacket or integration PlanPacket, invariants, diff and captured evidence only",
             "VerificationPacket",
         ),
-        "recon" => (
-            "Locate symbols and relationships using graph queries first, then bounded relevant source. Return compact findings; do not modify source.",
-            "locator objective and bounded graph-first findings",
-            "helper findings JSON (noncanonical)",
-        ),
         _ => (
-            "Review explicitly requested architecture/code using bounded canonical context. Do not substitute for mandatory verification.",
-            "explicit objective and bounded relevant canonical context",
-            "helper findings JSON (noncanonical)",
+            "Independently evaluate objective, invariants, diff and captured evidence. Return PASS or REJECT; do not repair or use executor reasoning.",
+            "TaskPacket or integration PlanPacket, invariants, diff and captured evidence only",
+            "VerificationPacket",
         ),
     };
     RoleProfile {

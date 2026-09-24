@@ -70,12 +70,14 @@ pub fn strip_experiment_decisions(c: &rusqlite::Connection) {
     )
     .unwrap();
 }
-/// Removes the additive v13 ontology-lifecycle schema so a test can restore an
-/// older accepted schema. Every older downgrade path strips it first.
+/// Removes the additive v13 ontology-lifecycle schema, and every migration
+/// layered above it, so a test can restore an older accepted schema. Every
+/// older downgrade path strips it first.
 #[allow(dead_code)]
 pub fn strip_ontology_lifecycle(c: &rusqlite::Connection) {
     c.execute_batch(
-        "DROP TABLE IF EXISTS ontology_generations; DROP TABLE IF EXISTS ontology_blobs; DELETE FROM schema_migrations WHERE version=13;",
+        // Simulating a v12 database: every later migration goes too.
+        "DROP TABLE IF EXISTS ontology_generations; DROP TABLE IF EXISTS ontology_blobs; DELETE FROM schema_migrations WHERE version>=13;",
     )
     .unwrap();
     let hashed = c
@@ -93,7 +95,9 @@ pub fn strip_ontology_lifecycle(c: &rusqlite::Connection) {
 pub fn strip_graph_resolutions(c: &rusqlite::Connection) {
     strip_ontology_lifecycle(c);
     c.execute_batch(
-        "DROP TABLE IF EXISTS graph_resolutions; DROP INDEX IF EXISTS graph_edges_hinted; DELETE FROM schema_migrations WHERE version=12;",
+        // Simulating a v11 database means removing every migration layered on
+        // top of it, not just the one that created this table.
+        "DROP TABLE IF EXISTS graph_resolutions; DROP INDEX IF EXISTS graph_edges_hinted; DELETE FROM schema_migrations WHERE version>=12;",
     )
     .unwrap();
     let hinted = c
@@ -143,7 +147,7 @@ pub fn strip_runtime(c: &rusqlite::Connection) {
     c.execute_batch("DROP TABLE IF EXISTS runtime_jobs; DROP TABLE IF EXISTS runtime_runs; DELETE FROM schema_migrations WHERE version=7;").unwrap();
 }
 
-/// A human's deliberate Stage-3 decision: accept the workspace's open ontology
+/// A human's deliberate ontology decision: accept the workspace's open ontology
 /// candidate (an observed change that indexing alone never makes canonical).
 #[allow(dead_code)]
 pub fn accept_observation(
@@ -280,6 +284,69 @@ pub fn samples() -> BTreeMap<&'static str, Value> {
             json!({"version": "1", "task_id": "a", "job_id": "job:executor-a", "reason": "The parser caller is not in the issued context", "items": [{"kind": "SYMBOL_RELATIONS", "entity_id": "entity:parser", "relation": "CALLERS"}, {"kind": "FILE_RANGE", "path": "src/parser.rs", "start_line": 1, "end_line": 40}], "max_bytes": 4096}),
         ),
     ])
+}
+
+/// Seeds the canonical plan/task rows directly.
+///
+/// Production creates plans only through `Store::import_execution_plan`, which
+/// also requires a prepared planning request, a fresh index and project policy.
+/// Storage-layer tests need the rows, not that whole stack, so the privileged
+/// setup lives here rather than as a second plan-creation API on `Store`.
+#[allow(dead_code)]
+pub fn seed_plan(database: &std::path::Path, repo: &str, packet: &PlanPacket) {
+    let c = sql(database);
+    c.execute(
+        "INSERT INTO plans(repo_id,plan_id,packet_json) VALUES (?1,?2,?3)",
+        rusqlite::params![
+            repo,
+            packet.plan_id.as_str(),
+            serde_json::to_string(packet).unwrap()
+        ],
+    )
+    .unwrap();
+    for task in &packet.tasks {
+        c.execute(
+            "INSERT INTO tasks(repo_id,task_id,plan_id,state_json) VALUES (?1,?2,?3,'\"PLANNED\"')",
+            rusqlite::params![repo, task.task_id.as_str(), packet.plan_id.as_str()],
+        )
+        .unwrap();
+    }
+}
+
+/// Reads a job's workspace binding straight from the table. Production reads it
+/// through the internal `associated_workspace` helper on paths that need it;
+/// this exists so a migration test can assert the binding without the crate
+/// shipping a public accessor nothing else uses.
+#[allow(dead_code)]
+pub fn job_workspace(database: &std::path::Path, repo: &str, job: &str) -> Option<String> {
+    sql(database)
+        .query_row(
+            "SELECT workspace_id FROM jobs WHERE repo_id=?1 AND job_id=?2",
+            rusqlite::params![repo, job],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+}
+
+/// The planner wire contract: a provider returns a decision, and agentctl
+/// derives the execution-plan envelope (hashes, frozen source, identities, timestamps)
+/// itself. Tests keep building whole `ExecutionPlan`s for `import_execution_plan`,
+/// so this projects one back down to what a provider is actually asked for.
+#[allow(dead_code)]
+pub fn plan_decision(plan: &Value) -> Value {
+    let metadata = &plan["metadata"];
+    json!({
+        "version": "1",
+        "packet": plan["packet"],
+        "task_contracts": metadata["contracts"].as_array().unwrap_or(&vec![]).iter().map(|c| json!({
+            "task_id": c["task_id"],
+            "memory_refs": c["memory_refs"],
+            "exclusions": c["exclusions"],
+            "non_goals": c["non_goals"],
+        })).collect::<Vec<_>>(),
+        "integration_expectations": metadata["integration"]["expectations"],
+        "replan": metadata["replan"],
+    })
 }
 
 pub struct TempDir(pub PathBuf);
