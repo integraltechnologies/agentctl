@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use anyhow::{Result, bail, ensure};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 use super::{Store, event};
 use crate::graph::{
@@ -26,49 +26,7 @@ impl Store {
     /// from is still accepted.
     pub(crate) fn replace_graph(&mut self, c: &Contribution) -> Result<()> {
         self.write(|tx| {
-            expect_accepted(tx, &c.path, &c.hash)?;
-            for (path, hash) in &c.resolved_against {
-                expect_accepted(tx, path, hash)?;
-            }
-            tx.execute("DELETE FROM graph_sources WHERE path = ?1", [&c.path])?;
-            tx.execute(
-                "INSERT INTO graph_sources (path, hash, language) VALUES (?1, ?2, ?3)",
-                params![c.path, c.hash, c.language],
-            )?;
-            let source = tx.last_insert_rowid();
-            let mut entity = tx.prepare(
-                "INSERT INTO graph_entities (source_id, kind, symbol, span_start, span_end)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            for e in &c.entities {
-                let (start, end) = offsets(e.span)?;
-                entity.execute(params![source, e.kind, e.symbol, start, end])?;
-            }
-            let mut relation = tx.prepare(
-                "INSERT INTO graph_relations (source_id, kind, evidence,
-                   from_path, from_kind, from_symbol, from_namespace, from_ecosystem,
-                   to_path, to_kind, to_symbol, to_namespace, to_ecosystem, foreign_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            )?;
-            let mut site = tx.prepare(
-                "INSERT INTO graph_sites (relation_id, span_start, span_end) VALUES (?1, ?2, ?3)",
-            )?;
-            for r in &c.relations {
-                let foreign = [&r.from, &r.to].into_iter().find_map(|node| match node {
-                    Node::Entity(id) if id.path != c.path => Some(&c.resolved_against[&id.path]),
-                    _ => None,
-                });
-                let (fp, fk, fs, fn_, fe) = columns(&r.from);
-                let (tp, tk, ts, tn, te) = columns(&r.to);
-                relation.execute(params![
-                    source, r.kind, r.evidence, fp, fk, fs, fn_, fe, tp, tk, ts, tn, te, foreign
-                ])?;
-                let id = tx.last_insert_rowid();
-                for &span in &r.sites {
-                    let (start, end) = offsets(span)?;
-                    site.execute(params![id, start, end])?;
-                }
-            }
+            replace(tx, c)?;
             event(tx, "graph.indexed", None, None, None, &c.path)
         })
     }
@@ -189,6 +147,56 @@ impl Store {
         walk.stale = stale.into_iter().collect();
         Ok(walk)
     }
+}
+
+/// Replaces the graph of a validated contribution's source within `tx`,
+/// provided the content it and every source it was resolved against were
+/// derived from is still accepted there.
+pub(super) fn replace(tx: &Transaction, c: &Contribution) -> Result<()> {
+    expect_accepted(tx, &c.path, &c.hash)?;
+    for (path, hash) in &c.resolved_against {
+        expect_accepted(tx, path, hash)?;
+    }
+    tx.execute("DELETE FROM graph_sources WHERE path = ?1", [&c.path])?;
+    tx.execute(
+        "INSERT INTO graph_sources (path, hash, language) VALUES (?1, ?2, ?3)",
+        params![c.path, c.hash, c.language],
+    )?;
+    let source = tx.last_insert_rowid();
+    let mut entity = tx.prepare(
+        "INSERT INTO graph_entities (source_id, kind, symbol, span_start, span_end)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for e in &c.entities {
+        let (start, end) = offsets(e.span)?;
+        entity.execute(params![source, e.kind, e.symbol, start, end])?;
+    }
+    let mut relation = tx.prepare(
+        "INSERT INTO graph_relations (source_id, kind, evidence,
+           from_path, from_kind, from_symbol, from_namespace, from_ecosystem,
+           to_path, to_kind, to_symbol, to_namespace, to_ecosystem, foreign_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+    )?;
+    let mut site = tx.prepare(
+        "INSERT INTO graph_sites (relation_id, span_start, span_end) VALUES (?1, ?2, ?3)",
+    )?;
+    for r in &c.relations {
+        let foreign = [&r.from, &r.to].into_iter().find_map(|node| match node {
+            Node::Entity(id) if id.path != c.path => Some(&c.resolved_against[&id.path]),
+            _ => None,
+        });
+        let (fp, fk, fs, fn_, fe) = columns(&r.from);
+        let (tp, tk, ts, tn, te) = columns(&r.to);
+        relation.execute(params![
+            source, r.kind, r.evidence, fp, fk, fs, fn_, fe, tp, tk, ts, tn, te, foreign
+        ])?;
+        let id = tx.last_insert_rowid();
+        for &span in &r.sites {
+            let (start, end) = offsets(span)?;
+            site.execute(params![id, start, end])?;
+        }
+    }
+    Ok(())
 }
 
 /// The accepted state of a tracked path: `Some(None)` for accepted absence.

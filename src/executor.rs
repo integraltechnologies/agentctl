@@ -401,7 +401,7 @@ fn capture(store: &Store, generation: GenerationId) -> Result<Capture> {
 /// candidate or its baseline content. Once attempted, installing reads
 /// nothing from the workspace. Returns why nothing was installed, if
 /// preparing failed, or installing was declined or failed.
-fn install(
+pub(crate) fn install(
     project: &Project,
     store: &mut Store,
     execution: ExecutionId,

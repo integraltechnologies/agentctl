@@ -217,6 +217,45 @@ pub fn replace(project: &Project, store: &mut Store, contribution: &Contribution
     store.replace_graph(c)
 }
 
+/// What a language frontend made of a source's accepted content.
+#[derive(Debug)]
+pub(crate) enum Derivation {
+    /// Its graph, validated against the content.
+    Indexed(Contribution),
+    /// No frontend derives graphs of such a path: its content is not read.
+    Unsupported,
+    /// Its frontend found the content not valid in its language, so it has
+    /// no graph.
+    Declined,
+}
+
+/// Derives the graph of the tracked source `path` from its accepted
+/// content, read from its recovery object and verified, never from the
+/// working tree, with the frontend of its language: Rust for `.rs`. Fails
+/// only when that content cannot be read or the frontend's graph is
+/// invalid.
+pub(crate) fn derive(project: &Project, store: &Store, path: &str) -> Result<Derivation> {
+    if !path.ends_with(".rs") {
+        return Ok(Derivation::Unsupported);
+    }
+    let content = source::read_accepted(project, store, path)?;
+    let c = match rust::contribution(path, &content) {
+        Ok(c) => c,
+        Err(_) => return Ok(Derivation::Declined),
+    };
+    let check = || {
+        check_path(&c.path)?;
+        check_hash(&c.hash)?;
+        ensure!(
+            c.path == path && c.hash == content.hash(),
+            "derived from other content"
+        );
+        validate(&c, content.bytes().len() as u64)
+    };
+    check().with_context(|| format!("invalid graph contribution for `{path}`"))?;
+    Ok(Derivation::Indexed(c))
+}
+
 /// Checks everything about a contribution that does not depend on canonical
 /// state, given the length of its content.
 fn validate(c: &Contribution, len: u64) -> Result<()> {

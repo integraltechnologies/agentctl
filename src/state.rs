@@ -16,14 +16,19 @@
 //! Executor attempts, the changes they are found to have made in their
 //! workspaces and installing those into the working tree are recorded only
 //! through `crate::executor`, which observes both itself (see
-//! [`Execution`]).
+//! [`Execution`]). Verifications of installed candidates are recorded only
+//! through `crate::verifier`, and a verified candidate is accepted only
+//! through `crate::acceptance` (see [`Acceptance`]).
 
+mod acceptance;
 mod execution;
 mod graph;
 mod ownership;
 mod planning;
 mod verification;
 
+pub(crate) use acceptance::Publication;
+pub use acceptance::{Acceptance, AcceptedChange};
 pub use execution::{Capture, Change, ChangeKind, Content, Execution, ExecutionStatus, Install};
 pub(crate) use execution::{ExecutorResult, Observed};
 pub use ownership::{Acquisition, Conflict, Owner};
@@ -51,7 +56,7 @@ use serde_json::{Map, Value};
 /// Stamped into the SQLite header (`application_id`) so an agentctl store is
 /// recognized by what it is, not merely by its schema version number.
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"agct");
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const SCHEMA: &str = include_str!("state/schema.sql");
 const MIGRATE_V1: &str = include_str!("state/migrate_v1.sql");
 const MIGRATE_V2: &str = include_str!("state/migrate_v2.sql");
@@ -63,6 +68,7 @@ const MIGRATE_V7: &str = include_str!("state/migrate_v7.sql");
 const MIGRATE_V8: &str = include_str!("state/migrate_v8.sql");
 const MIGRATE_V9: &str = include_str!("state/migrate_v9.sql");
 const MIGRATE_V10: &str = include_str!("state/migrate_v10.sql");
+const MIGRATE_V11: &str = include_str!("state/migrate_v11.sql");
 /// The version 1 `accepted_sources` definition, exactly as SQLite keeps it.
 const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
     path          TEXT    PRIMARY KEY,
@@ -370,6 +376,29 @@ text_enum!(
 );
 
 text_enum!(
+    /// How far accepting a generation's verified candidate got. Each phase
+    /// holds only once every earlier one does.
+    AcceptancePhase {
+        /// Bound to its candidate and verification, with nothing published:
+        /// agentctl records an acceptance only together with publishing its
+        /// source, so this is never left behind by an interruption.
+        Intended = "intended",
+        /// Every changed path of the candidate is accepted source, exactly
+        /// as captured: the candidate's content, or accepted absence. Their
+        /// graphs are stale until synchronized; ownership is still held and
+        /// the generation still active.
+        Published = "published",
+        /// CodeGraph holds no graph of a changed path derived from anything
+        /// but its published identity: each is current, has none because no
+        /// frontend derives one, or, when absent, is gone.
+        Synchronized = "synchronized",
+        /// The generation is accepted, completing its task, and owns
+        /// nothing any more.
+        Completed = "completed",
+    }
+);
+
+text_enum!(
     /// What an executor reported of its own work: a claim, never proof.
     Reported {
         Succeeded = "succeeded",
@@ -439,7 +468,8 @@ pub enum AgentScope {
 }
 
 /// How a generation ends without being accepted. Acceptance establishes
-/// accepted source, so it goes through `source::accept_generation`.
+/// accepted source, so it goes through `crate::acceptance` for a generation
+/// that executed, or `source::accept_generation` for one that never did.
 #[derive(Debug, Clone, Copy)]
 pub enum GenerationEnd {
     Rejected,
@@ -860,7 +890,9 @@ impl Store {
     /// Accepts an active generation, atomically recording the source it
     /// establishes: `(path, Some(hash))` as accepted content, `(path, None)`
     /// as accepted absence. The generation keeps the paths it owns until they
-    /// are explicitly released.
+    /// are explicitly released. Only for a generation that never executed: an
+    /// executor's candidate is accepted only through `crate::acceptance`,
+    /// once verified.
     ///
     /// Canonical state may name only content the recovery object store
     /// durably holds, which this store cannot check: the caller must have
@@ -881,6 +913,21 @@ impl Store {
     ) -> Result<()> {
         self.write(|tx| {
             let (plan, task, number) = active_generation(tx, generation)?;
+            let (executed, accepting): (bool, bool) = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM executions WHERE generation_id = ?1),
+                        EXISTS (SELECT 1 FROM acceptances WHERE generation_id = ?1)",
+                [generation],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            ensure!(
+                !accepting,
+                "generation {generation} is being accepted; only its acceptance ends it"
+            );
+            ensure!(
+                to != GenerationState::Accepted || !executed,
+                "generation {generation} executed, so only accepting its verified candidate \
+                 accepts it"
+            );
             tx.execute(
                 "UPDATE generations SET state = ?2, ended_at = ?3 WHERE id = ?1",
                 params![generation, to, now()],
@@ -1495,6 +1542,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if version <= 10 {
         tx.execute_batch(MIGRATE_V10).with_context(mismatch)?;
     }
+    if version <= 11 {
+        tx.execute_batch(MIGRATE_V11).with_context(mismatch)?;
+    }
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SCHEMA)?;
     // A failed check rolls back any migration, leaving the file as found.
@@ -2022,7 +2072,7 @@ pub(crate) mod tests {
         format!("{n:064x}")
     }
 
-    pub(super) fn err(result: Result<impl fmt::Debug>) -> String {
+    pub(crate) fn err(result: Result<impl fmt::Debug>) -> String {
         format!("{:#}", result.unwrap_err())
     }
 
@@ -2037,7 +2087,7 @@ pub(crate) mod tests {
         AgentId(id)
     }
 
-    pub(super) fn ended(state: InvocationState) -> InvocationEnd {
+    pub(crate) fn ended(state: InvocationState) -> InvocationEnd {
         InvocationEnd {
             state,
             failure: None,
@@ -2162,9 +2212,27 @@ pub(crate) mod tests {
         }
     }
 
+    /// Rewrites the store at `path` as schema version 11, which records no
+    /// acceptance.
+    pub(crate) fn downgrade_to_v11(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER ownership_held_through_acceptance;
+             DROP TRIGGER generations_accepted_by_acceptance;
+             DROP TRIGGER accepted_sources_held_by_acceptance;
+             DROP TABLE acceptance_completions;
+             DROP TABLE acceptance_phases;
+             DROP TABLE acceptance_sources;
+             DROP TABLE acceptances;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 11).unwrap();
+    }
+
     /// Rewrites the store at `path` as schema version 10, which records no
     /// verification.
     pub(crate) fn downgrade_to_v10(path: &Path) {
+        downgrade_to_v11(path);
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
             "DROP TRIGGER journal_reconciles_verification;
@@ -2388,9 +2456,9 @@ pub(crate) mod tests {
     /// The tables version 6 reshapes; see its migration.
     const RESHAPED_IN_V6: [&str; 3] = ["plans", "tasks", "task_scope"];
 
-    /// The tables versions 8 to 11 add, which no migration from before
-    /// version 8 fills, nor any migration installs or verifies.
-    const ADDED_SINCE_V8: [&str; 8] = [
+    /// The tables versions 8 to 12 add, which no migration from before
+    /// version 8 fills, nor any migration installs, verifies or accepts.
+    const ADDED_SINCE_V8: [&str; 12] = [
         "executions",
         "execution_baseline",
         "execution_changes",
@@ -2399,10 +2467,14 @@ pub(crate) mod tests {
         "execution_install_results",
         "verifications",
         "verification_results",
+        "acceptances",
+        "acceptance_sources",
+        "acceptance_phases",
+        "acceptance_completions",
     ];
 
     /// Every row of every table except those `excluded` and those versions
-    /// 8 to 11 add, by table.
+    /// 8 to 12 add, by table.
     pub(crate) fn rows_besides(path: &Path, excluded: &[&str]) -> Vec<(String, Vec<Vec<Value>>)> {
         let conn = Connection::open(path).unwrap();
         let tables: Vec<String> = conn
@@ -4229,3 +4301,44 @@ pub struct ExecutionIsRestricted;
 /// ```
 #[cfg(doctest)]
 pub struct VerificationIsRestricted;
+
+/// Only `crate::acceptance`, which checks recovery objects, observes the
+/// working tree and derives CodeGraph from accepted content itself,
+/// records acceptances. Other crates can neither publish one's source:
+///
+/// ```compile_fail,E0624
+/// # use agentctl::state::{GenerationId, Store, TaskId};
+/// # fn f(store: &mut Store, task: TaskId, g: GenerationId) {
+/// store.publish_acceptance(task, g, |_| Ok(Vec::new())).unwrap();
+/// # }
+/// ```
+///
+/// nor synchronize CodeGraph with it from contributions of their own:
+///
+/// ```compile_fail,E0624
+/// # use agentctl::state::{GenerationId, Store};
+/// # fn f(store: &mut Store, g: GenerationId) {
+/// store.synchronize_acceptance(g, &[]).unwrap();
+/// # }
+/// ```
+///
+/// nor complete one:
+///
+/// ```compile_fail,E0624
+/// # use agentctl::state::{GenerationId, Store};
+/// # fn f(store: &mut Store, g: GenerationId) {
+/// store.complete_acceptance(g).unwrap();
+/// # }
+/// ```
+///
+/// but can accept a verified candidate, or read what is recorded:
+///
+/// ```no_run
+/// # fn f(p: &agentctl::project::Project, store: &mut agentctl::state::Store,
+/// #      t: agentctl::state::TaskId, g: agentctl::state::GenerationId) {
+/// agentctl::acceptance::accept(p, store, t, g).unwrap();
+/// store.acceptance(g).unwrap();
+/// # }
+/// ```
+#[cfg(doctest)]
+pub struct AcceptanceIsRestricted;

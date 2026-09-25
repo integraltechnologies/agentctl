@@ -61,7 +61,9 @@ pub fn index(project: &Project, store: &mut Store, path: &str) -> Result<()> {
     super::replace(project, store, &contribution)
 }
 
-fn contribution(path: &str, content: &AcceptedContent) -> Result<Contribution> {
+/// The graph of the Rust source `path` with accepted content `content`, or
+/// why that content is not valid Rust.
+pub(crate) fn contribution(path: &str, content: &AcceptedContent) -> Result<Contribution> {
     let text = std::str::from_utf8(content.bytes()).context("content is not UTF-8")?;
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;

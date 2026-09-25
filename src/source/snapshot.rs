@@ -73,6 +73,18 @@ pub(crate) fn snapshot_paths(project: &Project, paths: &[String]) -> Result<Snap
     observe(project, &project.root, paths.to_vec())
 }
 
+/// The entry at each of `paths` in the project's working tree, in the
+/// order given, without consulting Git.
+pub(crate) fn observe_paths(project: &Project, paths: &[String]) -> Result<Vec<(String, Content)>> {
+    paths
+        .iter()
+        .map(|path| {
+            check_path(path)?;
+            Ok((path.clone(), identify(&project.root, path)?))
+        })
+        .collect()
+}
+
 /// Observes `tree`, a copy of the repository outside the project, including
 /// every path in `also`: every entry beneath it, reached through real
 /// directories only, that the project's Git takes for repository content

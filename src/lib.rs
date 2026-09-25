@@ -1,3 +1,4 @@
+pub mod acceptance;
 pub mod config;
 pub mod executor;
 pub mod graph;

@@ -570,7 +570,10 @@ fn candidate(conn: &Connection, execution: ExecutionId) -> Result<Vec<(String, C
 
 /// The paths of `candidate` at which `observed`, which must be the entries
 /// at exactly its paths in order, differs from it.
-fn drifted(candidate: &[(String, Content)], observed: &[(String, Content)]) -> Result<Vec<String>> {
+pub(super) fn drifted(
+    candidate: &[(String, Content)],
+    observed: &[(String, Content)],
+) -> Result<Vec<String>> {
     ensure!(
         candidate.len() == observed.len()
             && candidate.iter().zip(observed).all(|(c, o)| c.0 == o.0),

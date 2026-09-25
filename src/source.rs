@@ -37,7 +37,7 @@ use crate::platform;
 use crate::project::{Project, STATE_DIR};
 use crate::state::{GenerationId, Store, check_path};
 use objects::Objects;
-pub(crate) use snapshot::{Snapshot, snapshot, snapshot_paths};
+pub(crate) use snapshot::{Snapshot, observe_paths, snapshot, snapshot_paths};
 pub(crate) use workspace::{Installation, Preparation, Workspace};
 
 /// How a path's working state compares with its accepted state.
@@ -102,9 +102,11 @@ pub fn accept_absent(project: &Project, store: &mut Store, paths: &[&str]) -> Re
     store.record_baseline(&sources)
 }
 
-/// Accepts an active generation, establishing the current working state of
-/// each eligible path in `paths` as its accepted state: a regular file's
-/// bytes, or absence.
+/// Accepts an active generation that never executed, establishing the
+/// current working state of each eligible path in `paths` as its accepted
+/// state: a regular file's bytes, or absence. An executor's candidate is
+/// accepted only once verified, through `crate::acceptance`, which never
+/// reads accepted identities from the working tree.
 pub fn accept_generation(
     project: &Project,
     store: &mut Store,
@@ -224,6 +226,18 @@ pub(crate) fn read_object(project: &Project, hash: &str, limit: u64) -> Result<O
     let mut bytes = Vec::new();
     objects.copy_to(hash, &mut bytes)?;
     Ok(Some(bytes))
+}
+
+/// Fails unless recovery object `hash` is available and its bytes hash to
+/// `hash`.
+pub(crate) fn check_object(project: &Project, hash: &str) -> Result<()> {
+    Objects::open(&project.root.join(STATE_DIR))?.copy_to(hash, &mut io::sink())
+}
+
+/// Makes every recovery object published so far durable, as far as the
+/// platform allows.
+pub(crate) fn sync_objects(project: &Project) -> Result<()> {
+    Objects::open(&project.root.join(STATE_DIR))?.sync()
 }
 
 /// The accepted content hash of a tracked source path, `None` for accepted
