@@ -1,4 +1,4 @@
--- agentctl canonical project state, schema version 6.
+-- agentctl canonical project state, schema version 7.
 --
 -- The schema enforces structure: references, value domains and uniqueness.
 -- Lifecycle transitions are enforced by `Store`, the only writer.
@@ -219,12 +219,32 @@ BEGIN SELECT RAISE(ABORT, 'human decisions are immutable'); END;
 CREATE TRIGGER decisions_no_delete BEFORE DELETE ON decisions
 BEGIN SELECT RAISE(ABORT, 'human decisions are immutable'); END;
 
--- Paths owned for mutation by the generation that claimed them. Ownership
--- outlives the generation's end and is only released explicitly.
+-- Paths owned for mutation by the generation that acquired them: exclusive
+-- authority to mutate that exact literal path, never any other path it
+-- contains or matches. Ownership is not task scope: scope only authorizes a
+-- generation of the task to acquire. Ownership outlives the generation's end,
+-- and any change of the scope that authorized it, until released explicitly.
 CREATE TABLE ownership (
     path          TEXT    PRIMARY KEY,
     generation_id INTEGER NOT NULL REFERENCES generations (id)
 ) STRICT, WITHOUT ROWID;
+
+CREATE INDEX ownership_by_generation ON ownership (generation_id);
+
+-- Only an active generation acquires, only paths its task's scope requests
+-- once its plan is no longer being planned, and never a path another
+-- generation owns: not even by replacing its row.
+CREATE TRIGGER ownership_acquired BEFORE INSERT ON ownership
+WHEN EXISTS (SELECT 1 FROM ownership WHERE path = NEW.path)
+    OR NOT EXISTS (SELECT 1 FROM generations g
+        JOIN tasks t ON t.id = g.task_id
+        JOIN plans p ON p.id = t.plan_id
+        JOIN task_scope s ON s.task_id = t.id
+        WHERE g.id = NEW.generation_id AND g.state = 'active'
+            AND p.state <> 'planning' AND s.path = NEW.path)
+BEGIN SELECT RAISE(ABORT, 'ownership is not acquirable'); END;
+CREATE TRIGGER ownership_not_transferred BEFORE UPDATE ON ownership
+BEGIN SELECT RAISE(ABORT, 'ownership is never transferred'); END;
 
 -- The accepted state of each tracked project path: the content hash of its
 -- accepted bytes, or NULL (which the CHECK passes) when the path is accepted

@@ -11,10 +11,14 @@
 //! the recovery object of any content before recording it here. CodeGraph
 //! facts are written only through `crate::graph`, which validates them first.
 //! A plan's tasks are written only through `crate::planner`, which validates
-//! what planners propose against the project.
+//! what planners propose against the project. Mutation ownership is
+//! acquired only within the scope planning authorized (see [`Acquisition`]).
 
 mod graph;
+mod ownership;
 mod planning;
+
+pub use ownership::{Acquisition, Conflict, Owner};
 
 use std::fmt;
 use std::path::Path;
@@ -34,13 +38,14 @@ use serde_json::{Map, Value};
 /// Stamped into the SQLite header (`application_id`) so an agentctl store is
 /// recognized by what it is, not merely by its schema version number.
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"agct");
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const SCHEMA: &str = include_str!("state/schema.sql");
 const MIGRATE_V1: &str = include_str!("state/migrate_v1.sql");
 const MIGRATE_V2: &str = include_str!("state/migrate_v2.sql");
 const MIGRATE_V3: &str = include_str!("state/migrate_v3.sql");
 const MIGRATE_V4: &str = include_str!("state/migrate_v4.sql");
 const MIGRATE_V5: &str = include_str!("state/migrate_v5.sql");
+const MIGRATE_V6: &str = include_str!("state/migrate_v6.sql");
 /// The version 1 `accepted_sources` definition, exactly as SQLite keeps it.
 const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
     path          TEXT    PRIMARY KEY,
@@ -796,60 +801,6 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Claims canonical project-relative paths for an active generation:
-    /// all of them, or none if any is already owned.
-    pub fn claim_paths(&mut self, generation: GenerationId, paths: &[&str]) -> Result<()> {
-        self.write(|tx| {
-            let (plan, task, number) = active_generation(tx, generation)?;
-            for path in paths {
-                check_path(path)?;
-                if let Some(owner) = owner(tx, path)? {
-                    bail!("`{path}` is already owned by generation {owner}");
-                }
-                tx.execute(
-                    "INSERT INTO ownership (path, generation_id) VALUES (?1, ?2)",
-                    params![path, generation],
-                )?;
-            }
-            event(
-                tx,
-                "ownership.claimed",
-                Some(plan),
-                Some(task),
-                None,
-                &format!("generation {number}: {}", paths.join(", ")),
-            )
-        })
-    }
-
-    /// Releases every path an ended generation owns. When that is safe is
-    /// for the caller's acceptance or recovery lifecycle to decide.
-    pub fn release_ownership(&mut self, generation: GenerationId) -> Result<()> {
-        self.write(|tx| {
-            let (plan, task, number, state) = generation_info(tx, generation)?;
-            ensure!(
-                state != GenerationState::Active,
-                "generation {generation} is still active"
-            );
-            let paths = tx
-                .prepare("DELETE FROM ownership WHERE generation_id = ?1 RETURNING path")?
-                .query_map([generation], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            event(
-                tx,
-                "ownership.released",
-                Some(plan),
-                Some(task),
-                None,
-                &format!("generation {number}: {}", paths.join(", ")),
-            )
-        })
-    }
-
-    pub fn owner(&self, path: &str) -> Result<Option<GenerationId>> {
-        owner(&self.conn, path)
-    }
-
     /// Records the baseline accepted identity of paths that have none yet:
     /// repository content (`Some(hash)`) or absence (`None`) accepted without
     /// any producing generation. As for [`Store::accept_generation`], the
@@ -1531,6 +1482,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         )?;
         ensure!(!dangling, mismatch());
     }
+    if version <= 6 {
+        tx.execute_batch(MIGRATE_V6).with_context(mismatch)?;
+    }
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SCHEMA)?;
     // A failed check rolls back any migration, leaving the file as found.
@@ -1687,16 +1641,6 @@ fn journal_agent(tx: &Transaction, entry: JournalId, state: &str, doing: &str) -
         "journal entry {entry} is {actual}; only an {state} entry can be {doing}"
     );
     Ok(agent)
-}
-
-fn owner(conn: &Connection, path: &str) -> Result<Option<GenerationId>> {
-    conn.query_row(
-        "SELECT generation_id FROM ownership WHERE path = ?1",
-        [path],
-        |r| r.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
 }
 
 /// Accepts only canonical `/`-separated project-relative paths (`src/lib.rs`),
@@ -1877,10 +1821,40 @@ pub(crate) mod tests {
         }
     }
 
-    fn store() -> (tempfile::TempDir, Store) {
+    pub(super) fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
         (dir, store)
+    }
+
+    /// A finalized plan of tasks `(key, scope, depends_on)`, as a planner
+    /// would make it, and their ids in order.
+    pub(super) fn ready_plan(
+        store: &mut Store,
+        tasks: &[(&str, &[&str], &[&str])],
+    ) -> (PlanId, Vec<TaskId>) {
+        let plan = store.create_plan(&objective("intent")).unwrap();
+        let strings = |items: &[&str]| items.iter().map(|&s| s.into()).collect();
+        let mut commands: Vec<_> = tasks
+            .iter()
+            .map(|&(key, paths, depends_on)| Command::AddTask {
+                task: key.into(),
+                objective: key.into(),
+                context: String::new(),
+                paths: strings(paths),
+                depends_on: strings(depends_on),
+            })
+            .collect();
+        commands.push(Command::Finalize {});
+        assert!(store.revise_plan(plan, &commands, &|_| Ok(())).unwrap());
+        let ids = store.tasks(plan).unwrap().iter().map(|t| t.id).collect();
+        (plan, ids)
+    }
+
+    /// Acquires `paths` for `generation`, which must succeed.
+    pub(super) fn acquire(store: &mut Store, generation: GenerationId, paths: &[&str]) {
+        let acquired = store.acquire_ownership(generation, paths).unwrap();
+        assert_eq!(acquired, Acquisition::Acquired, "{paths:?}");
     }
 
     /// A structurally valid content hash.
@@ -1888,7 +1862,7 @@ pub(crate) mod tests {
         format!("{n:064x}")
     }
 
-    fn err(result: Result<impl fmt::Debug>) -> String {
+    pub(super) fn err(result: Result<impl fmt::Debug>) -> String {
         format!("{:#}", result.unwrap_err())
     }
 
@@ -2028,10 +2002,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// Rewrites the store at `path` as schema version 6, whose database
+    /// accepts any ownership row a path's uniqueness allows.
+    pub(crate) fn downgrade_to_v6(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER ownership_acquired;
+             DROP TRIGGER ownership_not_transferred;
+             DROP INDEX ownership_by_generation;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+    }
+
     /// Rewrites the store at `path` as schema version 5, whose plans state
     /// intent as one statement and whose tasks have only a description. It
     /// keeps each objective, and nothing else of intent or tasks.
     pub(crate) fn downgrade_to_v5(path: &Path) {
+        downgrade_to_v6(path);
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
             "PRAGMA foreign_keys = OFF;
@@ -2191,7 +2179,12 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v1.db");
         let mut store = Store::open(&path).unwrap();
-        let (plan, first, accepted) = running_generation(&mut store);
+        let tasks: [(&str, &[&str], &[&str]); 2] = [
+            ("task", &["src/a.rs"], &[]),
+            ("next", &["src/b.rs"], &["task"]),
+        ];
+        let (plan, tasks) = ready_plan(&mut store, &tasks);
+        let accepted = store.start_generation(tasks[0]).unwrap();
         let agent = store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap();
@@ -2200,13 +2193,12 @@ pub(crate) mod tests {
         let intent = store.intend(agent, &legacy_intent("write a.rs")).unwrap();
         store.act(intent, None).unwrap();
         store.record_decision(plan, "concern", "decision").unwrap();
-        store.claim_paths(accepted, &["src/a.rs"]).unwrap();
+        acquire(&mut store, accepted, &["src/a.rs"]);
         store
             .accept_generation(accepted, &[("src/a.rs", Some(&hash(1)))])
             .unwrap();
-        let second = store.add_task(plan, "next", &[first]).unwrap();
-        let active = store.start_generation(second).unwrap();
-        store.claim_paths(active, &["src/b.rs"]).unwrap();
+        let active = store.start_generation(tasks[1]).unwrap();
+        acquire(&mut store, active, &["src/b.rs"]);
         drop(store);
         let reshaped = [&["accepted_sources"][..], &RESHAPED_IN_V6].concat();
         let before = rows_besides(&path, &reshaped);
@@ -2285,7 +2277,12 @@ pub(crate) mod tests {
     /// has, including accepted content and accepted absence.
     fn populated_v2(path: &Path) {
         let mut store = Store::open(path).unwrap();
-        let (plan, first, accepted) = running_generation(&mut store);
+        let tasks: [(&str, &[&str], &[&str]); 2] = [
+            ("task", &["src/a.rs"], &[]),
+            ("next", &["src/b.rs"], &["task"]),
+        ];
+        let (plan, tasks) = ready_plan(&mut store, &tasks);
+        let accepted = store.start_generation(tasks[0]).unwrap();
         let agent = store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap();
@@ -2293,7 +2290,7 @@ pub(crate) mod tests {
         store.invocation_running(invocation).unwrap();
         store.intend(agent, &legacy_intent("write a.rs")).unwrap();
         store.record_decision(plan, "concern", "decision").unwrap();
-        store.claim_paths(accepted, &["src/a.rs"]).unwrap();
+        acquire(&mut store, accepted, &["src/a.rs"]);
         store
             .record_baseline(&[("src/base.rs", Some(&hash(4))), ("src/none.rs", None)])
             .unwrap();
@@ -2303,9 +2300,8 @@ pub(crate) mod tests {
                 &[("src/a.rs", Some(&hash(1))), ("src/gone.rs", None)],
             )
             .unwrap();
-        let second = store.add_task(plan, "next", &[first]).unwrap();
-        let active = store.start_generation(second).unwrap();
-        store.claim_paths(active, &["src/b.rs"]).unwrap();
+        let active = store.start_generation(tasks[1]).unwrap();
+        acquire(&mut store, active, &["src/b.rs"]);
         drop(store);
         downgrade_to_v2(path);
     }
@@ -3345,9 +3341,12 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v5.db");
         let mut store = Store::open(&path).unwrap();
-        let (plan, first, generation) = running_generation(&mut store);
-        let second = store.add_task(plan, "second", &[first]).unwrap();
-        store.claim_paths(generation, &["src/a.rs"]).unwrap();
+        let tasks: [(&str, &[&str], &[&str]); 2] =
+            [("task", &["src/a.rs"], &[]), ("second", &[], &["task"])];
+        let (plan, tasks) = ready_plan(&mut store, &tasks);
+        let [first, second] = tasks[..] else { panic!() };
+        let generation = store.start_generation(first).unwrap();
+        acquire(&mut store, generation, &["src/a.rs"]);
         drop(store);
         downgrade_to_v5(&path);
         let before = rows_besides(&path, &RESHAPED_IN_V6);
@@ -3360,6 +3359,8 @@ pub(crate) mod tests {
         // the DAG, keyed afresh, with nothing requested.
         let mut store = Store::open(&path).unwrap();
         assert_eq!(store.plan(plan).unwrap().intent, objective("intent"));
+        let owner = store.owner("src/a.rs").unwrap().unwrap();
+        assert_eq!(owner.generation, generation, "ownership outlives its scope");
         let tasks: Vec<_> = store
             .tasks(plan)
             .unwrap()
@@ -3386,7 +3387,75 @@ pub(crate) mod tests {
         assert!(raw(&store, &delete).contains("FOREIGN KEY"));
         let rewrite = "UPDATE plans SET constraints = '[\"none\"]'";
         assert!(raw(&store, rewrite).contains("human intent is immutable"));
+        store.set_plan_state(plan, PlanState::Running).unwrap();
+        store.set_plan_state(plan, PlanState::Planning).unwrap();
         store.add_task(plan, "third", &[second]).unwrap();
+    }
+
+    #[test]
+    fn migrating_version_6_keeps_ownership_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v6.db");
+        let mut store = Store::open(&path).unwrap();
+        let tasks: [(&str, &[&str], &[&str]); 2] =
+            [("a", &["src/a.rs"], &[]), ("b", &["src/legacy.rs"], &[])];
+        let (_, tasks) = ready_plan(&mut store, &tasks);
+        let (a, b) = (tasks[0], tasks[1]);
+        let owner = store.start_generation(a).unwrap();
+        acquire(&mut store, owner, &["src/a.rs"]);
+        drop(store);
+        // Version 6 let ownership be claimed outside any scope.
+        downgrade_to_v6(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO ownership (path, generation_id) VALUES ('src/legacy.rs', ?1)",
+                [owner],
+            )
+            .unwrap();
+        let before = rows_besides(&path, &[]);
+
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        assert_eq!(
+            rows_besides(&path, &[]),
+            before,
+            "nothing invented or dropped"
+        );
+        let other = store.start_generation(b).unwrap();
+        let conflicted = store.acquire_ownership(other, &["src/legacy.rs"]).unwrap();
+        let Acquisition::Conflicted(conflicts) = conflicted else {
+            panic!("{conflicted:?}")
+        };
+        assert_eq!(conflicts[0].owner.generation, owner);
+        assert!(store.owned_paths(other).unwrap().is_empty());
+
+        // The migrated protections are the current schema's, so a draft
+        // scope authorizes no ownership there either.
+        let fresh = dir.path().join("fresh.db");
+        drop(Store::open(&fresh).unwrap());
+        assert_eq!(ownership_schema(&path), ownership_schema(&fresh));
+        let draft = store.create_plan(&objective("draft")).unwrap();
+        let task = store.add_task(draft, "draft", &[]).unwrap();
+        let generation = store.start_generation(task).unwrap();
+        let scope = format!("INSERT INTO task_scope VALUES ({task}, 'src/draft.rs')");
+        store.conn.execute(&scope, []).unwrap();
+        let claim = format!("INSERT INTO ownership VALUES ('src/draft.rs', {generation})");
+        let message = store.conn.execute(&claim, []).unwrap_err().to_string();
+        assert!(message.contains("not acquirable"), "{message}");
+    }
+
+    /// The definitions of the ownership table's index and triggers.
+    fn ownership_schema(path: &Path) -> Vec<String> {
+        let conn = Connection::open(path).unwrap();
+        let mut query = conn
+            .prepare(
+                "SELECT sql FROM sqlite_schema
+                 WHERE tbl_name = 'ownership' AND type IN ('index', 'trigger') ORDER BY name",
+            )
+            .unwrap();
+        let rows = query.query_map([], |r| r.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
     }
 
     /// The foreign key enforcement switches `Store::open` has made on this
@@ -3538,24 +3607,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ownership_and_accepted_sources() {
+    fn ending_generations_keeps_their_ownership() {
         let (_dir, mut store) = store();
-        let (plan, _, first) = running_generation(&mut store);
-        let other_task = store.add_task(plan, "other", &[]).unwrap();
-        let second = store.start_generation(other_task).unwrap();
-
-        store.claim_paths(first, &["src/a.rs", "src/b.rs"]).unwrap();
-        assert_eq!(store.owner("src/a.rs").unwrap(), Some(first));
-        let message = err(store.claim_paths(second, &["src/c.rs", "src/b.rs"]));
-        assert!(message.contains("already owned by generation"), "{message}");
-        assert_eq!(
-            store.owner("src/c.rs").unwrap(),
-            None,
-            "claims are all-or-nothing"
-        );
-        for bad in ["", "/abs", "a//b", "./a", "a/../b", "a/", "a\0b"] {
-            assert!(store.claim_paths(second, &[bad]).is_err(), "{bad:?}");
-        }
+        let scope = ["src/a.rs", "src/b.rs"];
+        let tasks: [(&str, &[&str], &[&str]); 3] = [
+            ("first", &scope, &[]),
+            ("failed", &scope, &[]),
+            ("rejected", &scope, &[]),
+        ];
+        let (_, tasks) = ready_plan(&mut store, &tasks);
+        let generations: Vec<_> = tasks
+            .iter()
+            .map(|&t| store.start_generation(t).unwrap())
+            .collect();
+        let [first, failed, rejected] = generations[..] else {
+            panic!()
+        };
+        acquire(&mut store, first, &scope);
 
         let message = err(store.release_ownership(first));
         assert!(message.contains("still active"), "{message}");
@@ -3564,58 +3632,46 @@ pub(crate) mod tests {
             .accept_generation(first, &[("src/a.rs", Some(&h1)), ("src/b.rs", Some(&h2))])
             .unwrap();
         assert_eq!(
-            store.owner("src/a.rs").unwrap(),
-            Some(first),
+            store.owned_paths(first).unwrap(),
+            scope,
             "acceptance alone does not release ownership"
         );
         store.release_ownership(first).unwrap();
         assert_eq!(store.owner("src/a.rs").unwrap(), None);
-        store.claim_paths(second, &["src/b.rs"]).unwrap();
-        store
-            .accept_generation(second, &[("src/a.rs", Some(&h3)), ("src/b.rs", None)])
-            .unwrap();
-        assert_eq!(
-            store.accepted_source("src/a.rs").unwrap(),
-            Some(AcceptedSource {
-                hash: Some(h3),
-                generation: Some(second)
-            })
-        );
-        assert_eq!(
-            store.accepted_source("src/b.rs").unwrap(),
-            Some(AcceptedSource {
-                hash: None,
-                generation: Some(second)
-            }),
-            "an accepted deletion is recorded as accepted absence"
-        );
-        assert_eq!(store.owner("src/b.rs").unwrap(), Some(second));
-    }
 
-    #[test]
-    fn failed_and_rejected_generations_keep_ownership() {
-        let (_dir, mut store) = store();
-        let (plan, task, failed) = running_generation(&mut store);
-        let other = store.add_task(plan, "other", &[]).unwrap();
-        let rejected = store.start_generation(other).unwrap();
-        store.claim_paths(failed, &["src/a.rs"]).unwrap();
-        store.claim_paths(rejected, &["src/b.rs"]).unwrap();
-
+        acquire(&mut store, failed, &["src/a.rs"]);
+        acquire(&mut store, rejected, &["src/b.rs"]);
         store
             .finish_generation(failed, GenerationEnd::Failed)
             .unwrap();
         store
             .finish_generation(rejected, GenerationEnd::Rejected)
             .unwrap();
-        assert_eq!(store.owner("src/a.rs").unwrap(), Some(failed));
-        assert_eq!(store.owner("src/b.rs").unwrap(), Some(rejected));
+        assert_eq!(store.owned_paths(failed).unwrap(), ["src/a.rs"]);
+        assert_eq!(store.owned_paths(rejected).unwrap(), ["src/b.rs"]);
 
-        // Not even the task's own next generation may take them implicitly.
+        // Not even the task's own next generation takes them implicitly.
+        let task = tasks[1];
         let retry = store.start_generation(task).unwrap();
-        assert!(err(store.claim_paths(retry, &["src/a.rs"])).contains("already owned"));
+        let conflicted = store.acquire_ownership(retry, &["src/a.rs"]).unwrap();
+        let Acquisition::Conflicted(conflicts) = conflicted else {
+            panic!("{conflicted:?}")
+        };
+        assert_eq!(conflicts[0].owner.generation, failed);
         store.release_ownership(failed).unwrap();
-        store.claim_paths(retry, &["src/a.rs"]).unwrap();
-        assert_eq!(store.owner("src/b.rs").unwrap(), Some(rejected));
+        acquire(&mut store, retry, &["src/a.rs"]);
+        store
+            .accept_generation(retry, &[("src/a.rs", Some(&h3)), ("src/b.rs", None)])
+            .unwrap();
+        assert_eq!(
+            store.accepted_source("src/b.rs").unwrap(),
+            Some(AcceptedSource {
+                hash: None,
+                generation: Some(retry)
+            }),
+            "an accepted deletion is recorded as accepted absence"
+        );
+        assert_eq!(store.owned_paths(rejected).unwrap(), ["src/b.rs"]);
     }
 
     #[test]
@@ -3699,8 +3755,10 @@ pub(crate) mod tests {
     #[test]
     fn failed_operation_rolls_back_entirely() {
         let (_dir, mut store) = store();
-        let (_, task, generation) = running_generation(&mut store);
-        store.claim_paths(generation, &["src/a.rs"]).unwrap();
+        let (_, tasks) = ready_plan(&mut store, &[("task", &["src/a.rs"], &[])]);
+        let task = tasks[0];
+        let generation = store.start_generation(task).unwrap();
+        acquire(&mut store, generation, &["src/a.rs"]);
         let events = store.events_after(0, 100).unwrap();
 
         // The invalid second path fails after the state update and first
@@ -3710,7 +3768,7 @@ pub(crate) mod tests {
         assert!(store.accept_generation(generation, &sources).is_err());
 
         assert_eq!(store.task(task).unwrap().state, TaskState::Running);
-        assert_eq!(store.owner("src/a.rs").unwrap(), Some(generation));
+        assert_eq!(store.owned_paths(generation).unwrap(), ["src/a.rs"]);
         assert_eq!(store.accepted_source("src/a.rs").unwrap(), None);
         assert_eq!(store.events_after(0, 100).unwrap(), events);
     }
