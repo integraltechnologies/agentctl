@@ -8,7 +8,8 @@
 //! Nothing is persisted for resumption, and nobody answers permission
 //! prompts, so any tool use that would ask is denied. An editable workspace
 //! runs in Claude's own `acceptEdits` mode, which accepts file edits in the
-//! working directory without asking.
+//! working directory without asking; a disposable one also allows running
+//! commands, and nothing else that would ask.
 
 use std::ffi::OsString;
 
@@ -24,6 +25,10 @@ pub(super) const ENV: Passthrough = Passthrough {
     prefixes: &["ANTHROPIC_", "CLAUDE_CODE_USE_"],
 };
 
+/// The tools running commands, on any platform, that a disposable
+/// workspace allows.
+const COMMAND_TOOLS: &str = "Bash,PowerShell";
+
 pub(super) fn prepare(launch: &Launch) -> Result<Prepared> {
     // Values are attached with `=` so none can be read as an option.
     let mut args: Vec<String> = [
@@ -33,12 +38,15 @@ pub(super) fn prepare(launch: &Launch) -> Result<Prepared> {
         "--no-session-persistence",
         match launch.workspace {
             Workspace::ReadOnly => "--permission-mode=default",
-            Workspace::Editable => "--permission-mode=acceptEdits",
+            Workspace::Editable | Workspace::Disposable => "--permission-mode=acceptEdits",
         },
         "--permission-prompts=none",
     ]
     .map(String::from)
     .into();
+    if launch.workspace == Workspace::Disposable {
+        args.push(format!("--allowedTools={COMMAND_TOOLS}"));
+    }
     args.push(format!("--model={}", launch.model));
     if let Some(effort) = launch.effort {
         ensure!(
@@ -280,8 +288,9 @@ mod tests {
         assert!(prepare(&launch(Some(ReasoningEffort::Minimal))).is_err());
     }
 
-    /// An editable workspace uses Claude's own edit-accepting mode; nothing
-    /// skips its permission checks.
+    /// An editable workspace uses Claude's own edit-accepting mode, and only
+    /// a disposable one allows commands besides; nothing skips its
+    /// permission checks.
     #[test]
     fn workspaces_use_claude_permission_modes() {
         let launch = |workspace| Launch {
@@ -299,6 +308,7 @@ mod tests {
         for (workspace, mode) in [
             (Workspace::ReadOnly, "--permission-mode=default"),
             (Workspace::Editable, "--permission-mode=acceptEdits"),
+            (Workspace::Disposable, "--permission-mode=acceptEdits"),
         ] {
             let args: Vec<String> = prepare(&launch(workspace))
                 .unwrap()
@@ -311,6 +321,14 @@ mod tests {
                 .filter(|a| a.starts_with("--permission-mode"))
                 .collect();
             assert_eq!(modes, [mode]);
+            let allowed: Vec<&String> = args
+                .iter()
+                .filter(|a| a.to_lowercase().contains("allowed"))
+                .collect();
+            match workspace {
+                Workspace::Disposable => assert_eq!(allowed, ["--allowedTools=Bash,PowerShell"]),
+                _ => assert!(allowed.is_empty(), "{allowed:?}"),
+            }
             assert!(args.contains(&"--permission-prompts=none".to_owned()));
             assert!(
                 !args

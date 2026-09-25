@@ -37,7 +37,7 @@ use crate::platform;
 use crate::project::{Project, STATE_DIR};
 use crate::state::{GenerationId, Store, check_path};
 use objects::Objects;
-pub(crate) use snapshot::{Snapshot, snapshot};
+pub(crate) use snapshot::{Snapshot, snapshot, snapshot_paths};
 pub(crate) use workspace::{Installation, Preparation, Workspace};
 
 /// How a path's working state compares with its accepted state.
@@ -212,6 +212,18 @@ pub fn read_accepted(project: &Project, store: &Store, path: &str) -> Result<Acc
 /// The length of the accepted content named `hash`.
 pub(crate) fn content_len(project: &Project, hash: &str) -> Result<u64> {
     Objects::open(&project.root.join(STATE_DIR))?.len(hash)
+}
+
+/// The bytes of recovery object `hash`, verified, unless there are more
+/// than `limit` of them.
+pub(crate) fn read_object(project: &Project, hash: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+    let objects = Objects::open(&project.root.join(STATE_DIR))?;
+    if objects.len(hash)? > limit {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    objects.copy_to(hash, &mut bytes)?;
+    Ok(Some(bytes))
 }
 
 /// The accepted content hash of a tracked source path, `None` for accepted

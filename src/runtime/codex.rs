@@ -8,7 +8,8 @@
 //! ephemeral. Model-generated commands run in Codex's own sandbox: read-only,
 //! or in an editable workspace `workspace-write`, whose only writable root is
 //! then the working directory, not the temporary directories Codex would
-//! otherwise add. That is Codex's confinement, not agentctl's.
+//! otherwise add. A disposable workspace keeps those, for the artifacts of
+//! builds and tests. That is Codex's confinement, not agentctl's.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -41,7 +42,7 @@ pub(super) fn prepare(launch: &Launch) -> Result<Prepared> {
         "--skip-git-repo-check",
         match launch.workspace {
             Workspace::ReadOnly => "--sandbox=read-only",
-            Workspace::Editable => "--sandbox=workspace-write",
+            Workspace::Editable | Workspace::Disposable => "--sandbox=workspace-write",
         },
     ]
     .map(OsString::from)
@@ -426,6 +427,14 @@ mod tests {
             let arg = format!("--config=sandbox_workspace_write.{key}=true");
             assert!(editable.contains(&arg), "{editable:?}");
         }
+        let disposable = args(Workspace::Disposable);
+        assert!(disposable.contains(&"--sandbox=workspace-write".to_owned()));
+        assert!(
+            !disposable
+                .iter()
+                .any(|a| a.contains("sandbox_workspace_write")),
+            "{disposable:?}"
+        );
         let read_only = args(Workspace::ReadOnly);
         assert!(read_only.contains(&"--sandbox=read-only".to_owned()));
         assert!(
@@ -433,7 +442,7 @@ mod tests {
                 .iter()
                 .any(|a| a.contains("sandbox_workspace_write"))
         );
-        for args in [editable, read_only] {
+        for args in [editable, disposable, read_only] {
             assert!(!args.iter().any(|a| a.contains("danger")), "{args:?}");
         }
     }

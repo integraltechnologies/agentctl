@@ -452,7 +452,7 @@ fn verdict_of(installation: Installation) -> (InstallOutcome, Vec<String>, Optio
 /// Observes twice, `SETTLE` apart: the later observation, and whether the
 /// two found the same entries. Agreement only says that nothing observed
 /// changed meanwhile, nothing of who wrote it.
-fn observe(snapshot: impl Fn() -> Result<Snapshot>) -> Result<(Snapshot, bool)> {
+pub(crate) fn observe(snapshot: impl Fn() -> Result<Snapshot>) -> Result<(Snapshot, bool)> {
     let first = snapshot()?;
     thread::sleep(SETTLE);
     let second = snapshot()?;

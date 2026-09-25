@@ -74,7 +74,7 @@ impl Content {
 
     /// Reads the kind and hash columns at `i` and `i + 1`, which the
     /// schema keeps consistent.
-    fn read(r: &Row, i: usize) -> rusqlite::Result<Self> {
+    pub(super) fn read(r: &Row, i: usize) -> rusqlite::Result<Self> {
         let hash = || -> rusqlite::Result<String> { r.get(i + 1) };
         match r.get::<_, String>(i)?.as_str() {
             "absent" => Ok(Self::Absent),

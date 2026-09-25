@@ -67,6 +67,12 @@ pub(crate) fn snapshot(project: &Project, also: &[String]) -> Result<Snapshot> {
     observe(project, &project.root, paths)
 }
 
+/// Observes exactly `paths` in the project's working tree, whatever Git
+/// makes of them.
+pub(crate) fn snapshot_paths(project: &Project, paths: &[String]) -> Result<Snapshot> {
+    observe(project, &project.root, paths.to_vec())
+}
+
 /// Observes `tree`, a copy of the repository outside the project, including
 /// every path in `also`: every entry beneath it, reached through real
 /// directories only, that the project's Git takes for repository content

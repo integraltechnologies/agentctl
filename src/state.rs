@@ -22,10 +22,16 @@ mod execution;
 mod graph;
 mod ownership;
 mod planning;
+mod verification;
 
 pub use execution::{Capture, Change, ChangeKind, Content, Execution, ExecutionStatus, Install};
 pub(crate) use execution::{ExecutorResult, Observed};
 pub use ownership::{Acquisition, Conflict, Owner};
+pub use verification::{
+    Blocker, Check, CheckOutcome, Note, Verdict, Verification, VerificationResult,
+    VerificationStatus, VerifierReport,
+};
+pub(crate) use verification::{VerifierObserved, VerifierResult};
 
 use std::fmt;
 use std::path::Path;
@@ -45,7 +51,7 @@ use serde_json::{Map, Value};
 /// Stamped into the SQLite header (`application_id`) so an agentctl store is
 /// recognized by what it is, not merely by its schema version number.
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"agct");
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const SCHEMA: &str = include_str!("state/schema.sql");
 const MIGRATE_V1: &str = include_str!("state/migrate_v1.sql");
 const MIGRATE_V2: &str = include_str!("state/migrate_v2.sql");
@@ -56,6 +62,7 @@ const MIGRATE_V6: &str = include_str!("state/migrate_v6.sql");
 const MIGRATE_V7: &str = include_str!("state/migrate_v7.sql");
 const MIGRATE_V8: &str = include_str!("state/migrate_v8.sql");
 const MIGRATE_V9: &str = include_str!("state/migrate_v9.sql");
+const MIGRATE_V10: &str = include_str!("state/migrate_v10.sql");
 /// The version 1 `accepted_sources` definition, exactly as SQLite keeps it.
 const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
     path          TEXT    PRIMARY KEY,
@@ -111,7 +118,8 @@ ids!(
     AgentId,
     InvocationId,
     JournalId,
-    ExecutionId
+    ExecutionId,
+    VerificationId
 );
 
 macro_rules! text_enum {
@@ -325,6 +333,39 @@ text_enum!(
         Refused = "refused",
         /// Writing failed, and every path written was restored.
         Failed = "failed",
+    }
+);
+
+text_enum!(
+    /// How one independent verification of an installed candidate ended.
+    /// Only `Passed` and `Failed` are judgments, and neither is acceptance:
+    /// a verification never accepts source, refreshes CodeGraph, releases
+    /// ownership, ends the generation or completes the task. It is evidence
+    /// that acceptance may weigh, about the exact candidate verified.
+    VerificationOutcome {
+        /// The verifier reported no blocking defect in this exact candidate,
+        /// with at least one check that passed, while the working tree held
+        /// the candidate throughout and the verifier left repository source
+        /// in its workspace untouched, as agentctl observed. Nothing more.
+        Passed = "passed",
+        /// The verifier reported the candidate blocked, with every blocker
+        /// it found, under the same observations as a pass.
+        Failed = "failed",
+        /// Before any verifier ran, the working tree no longer held the
+        /// installed candidate at some changed path: nothing was verified.
+        CandidateDrifted = "candidate_drifted",
+        /// The working tree stopped holding the candidate while it was
+        /// verified: whatever the verifier reported is about other bytes.
+        CandidateChanged = "candidate_changed",
+        /// The verifier changed repository source in its workspace, which a
+        /// verifier never does, so whatever it reported cannot pass.
+        BoundaryViolated = "boundary_violated",
+        /// The verifier's invocation failed, was cancelled or was
+        /// interrupted: no judgment, and nothing about the candidate.
+        InvocationFailed = "invocation_failed",
+        /// The invocation succeeded with a result breaking the verifier
+        /// protocol: no judgment either.
+        MalformedResult = "malformed_result",
     }
 );
 
@@ -1451,6 +1492,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if version <= 9 {
         tx.execute_batch(MIGRATE_V9).with_context(mismatch)?;
     }
+    if version <= 10 {
+        tx.execute_batch(MIGRATE_V10).with_context(mismatch)?;
+    }
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SCHEMA)?;
     // A failed check rolls back any migration, leaving the file as found.
@@ -2118,10 +2162,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// Rewrites the store at `path` as schema version 10, which records no
+    /// verification.
+    pub(crate) fn downgrade_to_v10(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER journal_reconciles_verification;
+             DROP TABLE verification_results;
+             DROP TABLE verifications;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 10).unwrap();
+    }
+
     /// Rewrites the store at `path` as schema version 9, whose executors
     /// worked in the working tree itself and whose candidates were never
     /// installed. The store must hold no install.
     pub(crate) fn downgrade_to_v9(path: &Path) {
+        downgrade_to_v10(path);
         let conn = Connection::open(path).unwrap();
         let start = MIGRATE_V8
             .find("CREATE TRIGGER execution_captures_derived")
@@ -2330,19 +2388,21 @@ pub(crate) mod tests {
     /// The tables version 6 reshapes; see its migration.
     const RESHAPED_IN_V6: [&str; 3] = ["plans", "tasks", "task_scope"];
 
-    /// The tables versions 8 to 10 add, which no migration from before
-    /// version 8 fills, nor any migration installs.
-    const ADDED_SINCE_V8: [&str; 6] = [
+    /// The tables versions 8 to 11 add, which no migration from before
+    /// version 8 fills, nor any migration installs or verifies.
+    const ADDED_SINCE_V8: [&str; 8] = [
         "executions",
         "execution_baseline",
         "execution_changes",
         "execution_captures",
         "execution_installs",
         "execution_install_results",
+        "verifications",
+        "verification_results",
     ];
 
     /// Every row of every table except those `excluded` and those versions
-    /// 8 to 10 add, by table.
+    /// 8 to 11 add, by table.
     pub(crate) fn rows_besides(path: &Path, excluded: &[&str]) -> Vec<(String, Vec<Vec<Value>>)> {
         let conn = Connection::open(path).unwrap();
         let tables: Vec<String> = conn
@@ -4147,3 +4207,25 @@ pub struct PlanningIsRestricted;
 /// ```
 #[cfg(doctest)]
 pub struct ExecutionIsRestricted;
+
+/// Only `crate::verifier`, which observes the working tree and the
+/// verifier's workspace itself, records verifications. Other crates can
+/// neither intend one directly:
+///
+/// ```compile_fail,E0624
+/// # use agentctl::state::{GenerationId, Store, TaskId};
+/// # fn f(store: &mut Store, task: TaskId, generation: GenerationId) {
+/// store.begin_verification(task, generation, &[], 0).unwrap();
+/// # }
+/// ```
+///
+/// nor record how one ended from observations of their own:
+///
+/// ```compile_fail,E0624
+/// # use agentctl::state::{Store, VerificationId};
+/// # fn f(store: &mut Store, verification: VerificationId) {
+/// store.finish_verification(verification, todo!()).unwrap();
+/// # }
+/// ```
+#[cfg(doctest)]
+pub struct VerificationIsRestricted;

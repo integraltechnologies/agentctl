@@ -98,6 +98,12 @@ pub enum Workspace {
     /// neither relies on it nor adds a sandbox of its own, so an editable
     /// working directory must hold nothing agentctl needs protected.
     Editable,
+    /// It may also run commands there, such as builds and tests, which may
+    /// write where the provider lets them: within its working directory and
+    /// the temporary directory. For a working directory that is a
+    /// disposable copy, whose outcome agentctl observes itself; like an
+    /// editable one, it must hold nothing agentctl needs protected.
+    Disposable,
 }
 
 /// Everything needed to launch one invocation.
