@@ -156,7 +156,7 @@ impl Store {
     }
 }
 
-fn owner(conn: &Connection, path: &str) -> Result<Option<Owner>> {
+pub(super) fn owner(conn: &Connection, path: &str) -> Result<Option<Owner>> {
     conn.query_row(
         "SELECT o.generation_id, g.task_id, t.plan_id FROM ownership o
          JOIN generations g ON g.id = o.generation_id JOIN tasks t ON t.id = g.task_id

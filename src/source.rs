@@ -22,6 +22,8 @@
 //! handle-relative resolution, hence `ConfinedResolution` is only best effort.
 
 mod objects;
+mod snapshot;
+mod workspace;
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -35,6 +37,8 @@ use crate::platform;
 use crate::project::{Project, STATE_DIR};
 use crate::state::{GenerationId, Store, check_path};
 use objects::Objects;
+pub(crate) use snapshot::{Snapshot, snapshot};
+pub(crate) use workspace::{Installation, Preparation, Workspace};
 
 /// How a path's working state compares with its accepted state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +171,7 @@ pub fn restore(project: &Project, store: &Store, paths: &[&str]) -> Result<()> {
     let objects = Objects::open(&project.root.join(STATE_DIR))?;
     for (path, hash) in paths.iter().zip(accepted) {
         match hash {
-            Some(hash) => write_accepted(&project.root, &objects, path, &hash),
+            Some(hash) => write_object(&project.root, &objects, path, &hash),
             None => remove(&project.root, path),
         }
         .with_context(|| format!("restoring `{path}`"))?;
@@ -220,7 +224,7 @@ fn accepted(project: &Project, store: &Store, path: &str) -> Result<Option<Strin
     Ok(source.hash)
 }
 
-fn write_accepted(root: &Path, objects: &Objects, path: &str, hash: &str) -> Result<()> {
+fn write_object(root: &Path, objects: &Objects, path: &str, hash: &str) -> Result<()> {
     let mut permissions = None;
     if let Some(dir) = parent(root, path, false)?
         && let Entry::File(file) = open(&dir.join(name(path)))?
@@ -320,8 +324,14 @@ fn discover(project: &Project) -> Result<Vec<String>> {
 
 /// The first of `paths` that Git ignores, if any.
 fn ignored(project: &Project, paths: &[&str]) -> Result<Option<String>> {
+    Ok(ignored_among(project, paths)?.into_iter().next())
+}
+
+/// Those of `paths` that Git ignores, in the order given. A tracked path is
+/// never ignored.
+fn ignored_among(project: &Project, paths: &[&str]) -> Result<Vec<String>> {
     if paths.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     // `check-ignore` matches each path as a name, but refuses the literal
     // pathspec flag. A `./` prefix keeps a leading `:` from being read as
@@ -333,12 +343,16 @@ fn ignored(project: &Project, paths: &[&str]) -> Result<Option<String>> {
         input.as_bytes(),
     )?;
     match output.status.code() {
-        Some(0) => {
-            let first = output.stdout.split(|&b| b == 0).next().unwrap_or_default();
-            let first = String::from_utf8_lossy(first);
-            Ok(Some(first.strip_prefix("./").unwrap_or(&first).to_owned()))
-        }
-        Some(1) => Ok(None),
+        Some(0) => Ok(output
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|path| {
+                let path = String::from_utf8_lossy(path);
+                path.strip_prefix("./").unwrap_or(&path).to_owned()
+            })
+            .collect()),
+        Some(1) => Ok(Vec::new()),
         _ => bail!("{}", stderr(&output)),
     }
 }
@@ -1117,6 +1131,321 @@ mod tests {
         restore(&project, &store, &["src/a.rs", "src/new.rs"]).unwrap();
         assert_eq!(fs::read(project.root.join("src/a.rs")).unwrap(), b"a");
         assert!(!project.root.join("src/new.rs").exists());
+    }
+
+    #[test]
+    fn snapshots_observe_repository_content_literally() {
+        use crate::state::Content;
+        let fx = Fixture::new("src");
+        fx.write(".gitignore", b"/.agentctl/\ntarget/\n");
+        fx.write("README.md", b"outside the roots, still project content");
+        fx.write("src/a.rs", b"a");
+        fx.write("src/[id].rs", b"id");
+        fx.write("src/target/out.o", b"ignored");
+        fx.write("src/vendor/lib.rs", b"nested");
+        run_git(&fx.root().join("src/vendor"), &["init", "-q"]);
+        fx.write("src/gone.rs", b"tracked, then deleted");
+        run_git(fx.root(), &["add", "src/gone.rs"]);
+        fs::remove_file(fx.root().join("src/gone.rs")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.rs", fx.root().join("src/link.rs")).unwrap();
+
+        let observed = snapshot(&fx.project, &["src/asked.rs".into()]).unwrap();
+        let mut expected = vec![
+            (
+                ".gitignore",
+                Content::File(sha256(b"/.agentctl/\ntarget/\n")),
+            ),
+            (
+                "README.md",
+                Content::File(sha256(b"outside the roots, still project content")),
+            ),
+            (
+                "agentctl.toml",
+                Content::File(sha256(&fx.read("agentctl.toml"))),
+            ),
+            ("src/[id].rs", Content::File(sha256(b"id"))),
+            ("src/a.rs", Content::File(sha256(b"a"))),
+            ("src/asked.rs", Content::Absent),
+            ("src/gone.rs", Content::Absent),
+        ];
+        if cfg!(unix) {
+            expected.push(("src/link.rs", Content::Symlink(sha256(b"a.rs"))));
+        }
+        let entries: Vec<(&str, Content)> = observed
+            .entries
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.clone()))
+            .collect();
+        assert_eq!(entries, expected);
+        assert!(
+            observed.head.starts_with("refs/heads/"),
+            "{}",
+            observed.head
+        );
+        assert!(observed.head.ends_with(" unborn"), "{}", observed.head);
+
+        // A file replaced by a directory is no file content; behind a
+        // symlinked directory there is no entry of the repository.
+        fs::remove_file(fx.root().join("src/a.rs")).unwrap();
+        fx.write("src/a.rs/inner.rs", b"inner");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("vendor", fx.root().join("src/linked")).unwrap();
+        let asked = ["src/a.rs".to_string(), "src/linked/lib.rs".to_string()];
+        let observed = snapshot(&fx.project, &asked).unwrap();
+        let content = |path: &str| {
+            let found = observed.entries.iter().find(|(p, _)| p == path);
+            found.map(|(_, content)| content.clone())
+        };
+        assert_eq!(content("src/a.rs"), Some(Content::Other));
+        assert_eq!(
+            content("src/a.rs/inner.rs"),
+            Some(Content::File(sha256(b"inner")))
+        );
+        #[cfg(unix)]
+        assert_eq!(content("src/linked/lib.rs"), Some(Content::Absent));
+
+        // Commits move HEAD.
+        run_git(
+            fx.root(),
+            &[
+                "-c",
+                "user.name=x",
+                "-c",
+                "user.email=x@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "c",
+            ],
+        );
+        let committed = snapshot(&fx.project, &[]).unwrap().head;
+        assert_ne!(committed, observed.head);
+        assert!(!committed.ends_with(" unborn"));
+    }
+
+    #[test]
+    fn workspaces_copy_the_repository_and_nothing_else() {
+        let fx = Fixture::new("src");
+        fx.write(".gitignore", b"/.agentctl/\ntarget/\n");
+        fx.write("src/a.rs", b"a");
+        fx.write("src/[id].rs", b"id");
+        fx.write("src/target/out.o", b"ignored");
+        fx.write("src/vendor/lib.rs", b"nested");
+        run_git(&fx.root().join("src/vendor"), &["init", "-q"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::os::unix::fs::symlink("a.rs", fx.root().join("src/link.rs")).unwrap();
+            fx.write("src/run.sh", b"#!/bin/sh\n");
+            let script = fx.root().join("src/run.sh");
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let asked = ["src/new.rs".to_string()];
+        let observed = snapshot(&fx.project, &asked).unwrap();
+        let workspace = Workspace::stage(&fx.project, &observed).unwrap();
+        let root = workspace.root().to_path_buf();
+        assert!(!root.starts_with(fx.root()) && !fx.root().starts_with(&root));
+
+        let mut listed = Vec::new();
+        let mut dirs = vec![(root.clone(), String::new())];
+        while let Some((dir, prefix)) = dirs.pop() {
+            for entry in fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = format!("{prefix}{}", entry.file_name().to_str().unwrap());
+                match entry.file_type().unwrap().is_dir() {
+                    true => dirs.push((entry.path(), format!("{path}/"))),
+                    false => listed.push(path),
+                }
+            }
+        }
+        listed.sort();
+        // Neither agentctl's state nor Git's, nothing ignored, and nothing
+        // of a nested repository.
+        let mut expected = vec![".gitignore", "agentctl.toml", "src/[id].rs", "src/a.rs"];
+        if cfg!(unix) {
+            expected.extend(["src/link.rs", "src/run.sh"]);
+        }
+        assert_eq!(listed, expected);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let link = fs::read_link(root.join("src/link.rs")).unwrap();
+            assert_eq!(link, Path::new("a.rs"));
+            let mode = fs::metadata(root.join("src/run.sh")).unwrap().permissions();
+            assert_eq!(mode.mode() & 0o777, 0o755);
+        }
+        // Observed by the project's rules, the copy holds what was observed.
+        let paths: Vec<String> = observed.entries.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(
+            workspace.observe(&fx.project, &paths).unwrap().entries,
+            observed.entries
+        );
+        drop(workspace);
+        assert!(!root.exists());
+
+        // A symlink leading out of the repository is never reproduced.
+        #[cfg(unix)]
+        for target in ["/etc", "../../outside", "../.agentctl/state.db"] {
+            let link = fx.root().join("src/out");
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let observed = snapshot(&fx.project, &[]).unwrap();
+            let refused = Workspace::stage(&fx.project, &observed);
+            fails(refused, "leading out of the repository");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installing_writes_only_where_the_baseline_still_holds() {
+        use crate::state::{Change, Content};
+        let fx = Fixture::new("src");
+        fx.write("src/a.rs", b"a");
+        let observed = snapshot(&fx.project, &[]).unwrap();
+        let workspace = Workspace::stage(&fx.project, &observed).unwrap();
+        fs::write(workspace.root().join("src/a.rs"), b"b").unwrap();
+        let change = Change {
+            path: "src/a.rs".into(),
+            before: Content::File(sha256(b"a")),
+            after: Content::File(sha256(b"b")),
+            authorized: true,
+        };
+        let install = |change: &Change| match workspace
+            .prepare(&fx.project, std::slice::from_ref(change))
+            .unwrap()
+        {
+            Preparation::Ready(prepared) => prepared.apply(&fx.project).unwrap(),
+            Preparation::Declined(verdict) => verdict,
+        };
+
+        // The project's `src` swapped for a symlink to identical bytes
+        // elsewhere: never followed, so drifted.
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::write(elsewhere.path().join("a.rs"), b"a").unwrap();
+        fs::rename(fx.root().join("src"), fx.root().join("src.moved")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), fx.root().join("src")).unwrap();
+        let Installation::Drifted(paths) = install(&change) else {
+            panic!()
+        };
+        assert_eq!(paths, ["src/a.rs"]);
+        assert_eq!(fs::read(elsewhere.path().join("a.rs")).unwrap(), b"a");
+        fs::remove_file(fx.root().join("src")).unwrap();
+        fs::rename(fx.root().join("src.moved"), fx.root().join("src")).unwrap();
+
+        // Symlinks and directories are neither installed nor replaced, and
+        // only authorized changes are installed.
+        for refused in [
+            Change {
+                after: Content::Symlink(sha256(b"elsewhere")),
+                ..change.clone()
+            },
+            Change {
+                before: Content::Other,
+                ..change.clone()
+            },
+            Change {
+                authorized: false,
+                ..change.clone()
+            },
+        ] {
+            assert!(matches!(install(&refused), Installation::Refused(_)));
+        }
+        // Nor what the workspace no longer holds.
+        let stale = Change {
+            after: Content::File(sha256(b"c")),
+            ..change.clone()
+        };
+        assert!(matches!(install(&stale), Installation::Refused(_)));
+        assert_eq!(fx.read("src/a.rs"), b"a");
+
+        // Prepared: both sides kept as recovery objects, nothing written.
+        let changes = std::slice::from_ref(&change);
+        let Preparation::Ready(prepared) = workspace.prepare(&fx.project, changes).unwrap() else {
+            panic!("prepared");
+        };
+        assert_eq!(fx.read("src/a.rs"), b"a");
+        let objects = fx.objects();
+        for bytes in [&b"a"[..], b"b"] {
+            assert!(
+                objects
+                    .iter()
+                    .any(|(name, kept)| *name == sha256(bytes) && kept == bytes)
+            );
+        }
+        // Installed from those objects alone, the workspace gone.
+        let root = workspace.root().to_path_buf();
+        drop(workspace);
+        assert!(!root.exists());
+        assert!(matches!(
+            prepared.apply(&fx.project).unwrap(),
+            Installation::Installed
+        ));
+        assert_eq!(fx.read("src/a.rs"), b"b");
+    }
+
+    #[test]
+    fn captured_deletions_are_installed_only_while_still_absent() {
+        use crate::state::{Change, Content};
+        let fx = Fixture::new("src");
+        fx.write("src/a.rs", b"a");
+        let observed = snapshot(&fx.project, &[]).unwrap();
+        let workspace = Workspace::stage(&fx.project, &observed).unwrap();
+        let staged = workspace.root().join("src/a.rs");
+        fs::remove_file(&staged).unwrap();
+        let change = Change {
+            path: "src/a.rs".into(),
+            before: Content::File(sha256(b"a")),
+            after: Content::Absent,
+            authorized: true,
+        };
+        let changes = std::slice::from_ref(&change);
+
+        // Still absent: ready, having written nothing.
+        assert!(matches!(
+            workspace.prepare(&fx.project, changes).unwrap(),
+            Preparation::Ready(_)
+        ));
+        assert_eq!(fx.read("src/a.rs"), b"a");
+
+        // Recreated in any form since capture: refused, nothing written,
+        // and the recreated entry left alone.
+        let refused = |recreated: &str| {
+            let Preparation::Declined(Installation::Refused(why)) =
+                workspace.prepare(&fx.project, changes).unwrap()
+            else {
+                panic!("a deletion recreated as {recreated} was prepared");
+            };
+            assert!(why.contains("no longer holds what was captured"), "{why}");
+            assert_eq!(fx.read("src/a.rs"), b"a");
+        };
+        fs::write(&staged, b"a").unwrap();
+        refused("a regular file");
+        assert_eq!(fs::read(&staged).unwrap(), b"a");
+        fs::remove_file(&staged).unwrap();
+
+        fs::create_dir(&staged).unwrap();
+        refused("a directory");
+        assert!(staged.is_dir());
+        fs::remove_dir(&staged).unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("b.rs", &staged).unwrap();
+            refused("a symlink");
+            assert!(fs::symlink_metadata(&staged).unwrap().is_symlink());
+            fs::remove_file(&staged).unwrap();
+        }
+
+        // Absent again: ready, and installing deletes.
+        let Preparation::Ready(prepared) = workspace.prepare(&fx.project, changes).unwrap() else {
+            panic!("prepared");
+        };
+        assert!(matches!(
+            prepared.apply(&fx.project).unwrap(),
+            Installation::Installed
+        ));
+        assert!(!fx.root().join("src/a.rs").exists());
     }
 
     #[test]

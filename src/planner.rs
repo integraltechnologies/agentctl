@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 
 use crate::graph::Freshness;
 use crate::project::Project;
-use crate::runtime::{self, Control, Launch, Outcome, Provider};
+use crate::runtime::{self, Control, Launch, Outcome, Provider, Workspace};
 use crate::source;
 use crate::state::{AgentId, InvocationId, PlanId, PlanState, Store};
 
@@ -342,6 +342,7 @@ pub fn start(
         input,
         output_schema: response_schema(),
         cwd: project.root.clone(),
+        workspace: Workspace::ReadOnly,
     };
     let invocation = runtime::spawn(store, &launch)?;
     Ok(Planner {

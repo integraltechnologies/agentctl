@@ -60,6 +60,16 @@ pub(crate) fn runs_directly(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("bat") || e.eq_ignore_ascii_case("cmd"))
 }
 
+/// Windows distinguishes file from directory symlinks and lets only
+/// privileged or developer-mode users create either, so agentctl creates
+/// none rather than guess.
+pub(crate) fn symlink(_target: &Path, _link: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "agentctl does not create symlinks on Windows",
+    ))
+}
+
 /// Windows cannot ask a process without a console of its own to stop
 /// gracefully, so no request is sent; the caller terminates it outright.
 pub(crate) fn request_termination(_child: &Child) -> io::Result<bool> {

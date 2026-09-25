@@ -1,4 +1,5 @@
 pub mod config;
+pub mod executor;
 pub mod graph;
 pub mod init;
 pub mod planner;

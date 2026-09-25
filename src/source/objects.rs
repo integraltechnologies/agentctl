@@ -101,7 +101,7 @@ pub(super) fn hash(source: impl Read) -> Result<String> {
 }
 
 /// Copies `from` to `to`, returning the content hash of the bytes copied.
-fn copy(mut from: impl Read, to: &mut impl Write) -> Result<String> {
+pub(super) fn copy(mut from: impl Read, to: &mut impl Write) -> Result<String> {
     let mut hashing = Hashing(Sha256::new(), to);
     io::copy(&mut from, &mut hashing)?;
     Ok(hashing

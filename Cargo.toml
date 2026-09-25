@@ -31,3 +31,7 @@ harness = false
 [[test]]
 name = "planner"
 harness = false
+
+[[test]]
+name = "executor"
+harness = false

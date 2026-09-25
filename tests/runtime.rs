@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use agentctl::config::ReasoningEffort;
 use agentctl::runtime::{
-    self, FailureKind, InvocationState, Launch, Outcome, Provider, TokenUsage, Usage,
+    self, FailureKind, InvocationState, Launch, Outcome, Provider, TokenUsage, Usage, Workspace,
 };
 use agentctl::state::{
     ActionStatus, AgentId, AgentScope, Attempt, HumanIntent, Intent, Role, Store,
@@ -334,6 +334,7 @@ impl Fixture {
             input: "the task".into(),
             output_schema: json!({"type": "object"}),
             cwd: self.dir.path().to_owned(),
+            workspace: Workspace::ReadOnly,
         }
     }
 

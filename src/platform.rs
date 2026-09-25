@@ -23,7 +23,7 @@ use windows as backend;
 
 pub(crate) use backend::{
     literal_name, open_regular, publish_new, replace, request_termination, runs_directly, stage,
-    sync_dir, write_back,
+    symlink, sync_dir, write_back,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

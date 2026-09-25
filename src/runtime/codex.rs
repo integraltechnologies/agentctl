@@ -5,7 +5,10 @@
 //! the turn's final agent message must be JSON, which agentctl checks against
 //! the schema again; earlier messages are progress prose. A failed turn is
 //! fatal and final: nothing Codex reports afterwards can undo it. Sessions are
-//! ephemeral, and model-generated commands run in Codex's read-only sandbox.
+//! ephemeral. Model-generated commands run in Codex's own sandbox: read-only,
+//! or in an editable workspace `workspace-write`, whose only writable root is
+//! then the working directory, not the temporary directories Codex would
+//! otherwise add. That is Codex's confinement, not agentctl's.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -14,7 +17,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Launch, Passthrough, Prepared, Stream, TokenUsage};
+use super::{Launch, Passthrough, Prepared, Stream, TokenUsage, Workspace};
 
 pub(super) const ENV: Passthrough = Passthrough {
     names: &["CODEX_HOME"],
@@ -36,10 +39,18 @@ pub(super) fn prepare(launch: &Launch) -> Result<Prepared> {
         "--ephemeral",
         // agentctl, not Codex, decides where an agent works.
         "--skip-git-repo-check",
-        "--sandbox=read-only",
+        match launch.workspace {
+            Workspace::ReadOnly => "--sandbox=read-only",
+            Workspace::Editable => "--sandbox=workspace-write",
+        },
     ]
     .map(OsString::from)
     .into();
+    if launch.workspace == Workspace::Editable {
+        for key in ["exclude_tmpdir_env_var", "exclude_slash_tmp"] {
+            args.push(format!("--config=sandbox_workspace_write.{key}=true").into());
+        }
+    }
     args.push(joined("--cd=", launch.cwd.as_os_str()));
     args.push(format!("--model={}", launch.model).into());
     // `--config` values are TOML; a quoted string is taken literally.
@@ -354,6 +365,7 @@ mod tests {
             input: "task".into(),
             output_schema: json!({"type": "object"}),
             cwd: "/work dir".into(),
+            workspace: Workspace::ReadOnly,
         };
         let prepared = prepare(&launch).unwrap();
         let args: Vec<String> = prepared
@@ -378,5 +390,51 @@ mod tests {
             serde_json::from_str::<Value>(&schema).unwrap(),
             launch.output_schema
         );
+    }
+
+    /// An editable workspace keeps Codex's own sandbox, writable only in the
+    /// working directory; nothing ever runs outside it.
+    #[test]
+    fn workspaces_keep_codex_sandboxed() {
+        let launch = |workspace| Launch {
+            agent: crate::state::tests::agent_id(1),
+            provider: super::super::Provider::Codex,
+            executable: None,
+            model: "m".into(),
+            effort: None,
+            bootstrap: String::new(),
+            input: "task".into(),
+            output_schema: json!({"type": "object"}),
+            cwd: "/work".into(),
+            workspace,
+        };
+        let args = |workspace| -> Vec<String> {
+            let prepared = prepare(&launch(workspace)).unwrap();
+            prepared
+                .args
+                .iter()
+                .map(|a| a.to_str().unwrap().to_owned())
+                .collect()
+        };
+        let editable = args(Workspace::Editable);
+        let sandboxes: Vec<&String> = editable
+            .iter()
+            .filter(|a| a.starts_with("--sandbox"))
+            .collect();
+        assert_eq!(sandboxes, ["--sandbox=workspace-write"]);
+        for key in ["exclude_tmpdir_env_var", "exclude_slash_tmp"] {
+            let arg = format!("--config=sandbox_workspace_write.{key}=true");
+            assert!(editable.contains(&arg), "{editable:?}");
+        }
+        let read_only = args(Workspace::ReadOnly);
+        assert!(read_only.contains(&"--sandbox=read-only".to_owned()));
+        assert!(
+            !read_only
+                .iter()
+                .any(|a| a.contains("sandbox_workspace_write"))
+        );
+        for args in [editable, read_only] {
+            assert!(!args.iter().any(|a| a.contains("danger")), "{args:?}");
+        }
     }
 }

@@ -6,7 +6,9 @@
 //! event's `structured_output`, which agentctl checks again; its prose
 //! `result` is never the result.
 //! Nothing is persisted for resumption, and nobody answers permission
-//! prompts, so any tool use that would ask is denied.
+//! prompts, so any tool use that would ask is denied. An editable workspace
+//! runs in Claude's own `acceptEdits` mode, which accepts file edits in the
+//! working directory without asking.
 
 use std::ffi::OsString;
 
@@ -14,7 +16,7 @@ use anyhow::{Result, ensure};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Launch, Passthrough, Prepared, Stream, TokenUsage};
+use super::{Launch, Passthrough, Prepared, Stream, TokenUsage, Workspace};
 use crate::config::ReasoningEffort;
 
 pub(super) const ENV: Passthrough = Passthrough {
@@ -29,7 +31,10 @@ pub(super) fn prepare(launch: &Launch) -> Result<Prepared> {
         "--output-format=stream-json",
         "--verbose",
         "--no-session-persistence",
-        "--permission-mode=default",
+        match launch.workspace {
+            Workspace::ReadOnly => "--permission-mode=default",
+            Workspace::Editable => "--permission-mode=acceptEdits",
+        },
         "--permission-prompts=none",
     ]
     .map(String::from)
@@ -265,6 +270,7 @@ mod tests {
             input: "task".into(),
             output_schema: json!({"type": "object"}),
             cwd: "/".into(),
+            workspace: super::super::Workspace::ReadOnly,
         };
         let args = prepare(&launch(Some(ReasoningEffort::High))).unwrap().args;
         assert!(args.contains(&"--model=--dangerously-skip-permissions".into()));
@@ -272,5 +278,45 @@ mod tests {
         assert!(args.contains(&"--effort=high".into()));
         assert!(!args.iter().any(|a| a == "task"), "input goes to stdin");
         assert!(prepare(&launch(Some(ReasoningEffort::Minimal))).is_err());
+    }
+
+    /// An editable workspace uses Claude's own edit-accepting mode; nothing
+    /// skips its permission checks.
+    #[test]
+    fn workspaces_use_claude_permission_modes() {
+        let launch = |workspace| Launch {
+            agent: crate::state::tests::agent_id(1),
+            provider: super::super::Provider::Claude,
+            executable: None,
+            model: "m".into(),
+            effort: None,
+            bootstrap: String::new(),
+            input: "task".into(),
+            output_schema: json!({"type": "object"}),
+            cwd: "/work".into(),
+            workspace,
+        };
+        for (workspace, mode) in [
+            (Workspace::ReadOnly, "--permission-mode=default"),
+            (Workspace::Editable, "--permission-mode=acceptEdits"),
+        ] {
+            let args: Vec<String> = prepare(&launch(workspace))
+                .unwrap()
+                .args
+                .iter()
+                .map(|a| a.to_str().unwrap().to_owned())
+                .collect();
+            let modes: Vec<&String> = args
+                .iter()
+                .filter(|a| a.starts_with("--permission-mode"))
+                .collect();
+            assert_eq!(modes, [mode]);
+            assert!(args.contains(&"--permission-prompts=none".to_owned()));
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a.contains("dangerously") || a.contains("bypass"))
+            );
+        }
     }
 }

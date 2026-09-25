@@ -94,6 +94,12 @@ pub(crate) fn runs_directly(_path: &Path) -> bool {
     true
 }
 
+/// Creates a symlink at `link` whose target is exactly `target`, never
+/// following or replacing anything already at `link`.
+pub(crate) fn symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
 /// Asks `child`, which must not have been reaped, to terminate: `SIGTERM`,
 /// which lets it stop what it started. Returns whether a request was sent.
 pub(crate) fn request_termination(child: &Child) -> io::Result<bool> {

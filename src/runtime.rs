@@ -89,6 +89,17 @@ impl fmt::Display for Provider {
     }
 }
 
+/// What an invocation may do to files in its working directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Workspace {
+    ReadOnly,
+    /// It may edit files within its working directory, in the provider's
+    /// own editing mode. The provider decides what that confines; agentctl
+    /// neither relies on it nor adds a sandbox of its own, so an editable
+    /// working directory must hold nothing agentctl needs protected.
+    Editable,
+}
+
 /// Everything needed to launch one invocation.
 #[derive(Debug, Clone)]
 pub struct Launch {
@@ -107,6 +118,7 @@ pub struct Launch {
     pub output_schema: Value,
     /// The absolute working directory.
     pub cwd: PathBuf,
+    pub workspace: Workspace,
 }
 
 /// How an invocation ended, with what agentctl received from the provider.
@@ -201,6 +213,18 @@ enum Stage {
 /// is recorded; a provider that cannot be started is recorded as failed, and
 /// [`Invocation::wait`] then returns that outcome.
 pub fn spawn(store: &mut Store, launch: &Launch) -> Result<Invocation> {
+    spawn_after(store, launch, |_, _| Ok(()))
+}
+
+/// [`spawn`], running `prepare` once the invocation is recorded and before
+/// any provider process exists, so that whatever it records durably
+/// precedes anything the provider does. Should `prepare` fail, nothing is
+/// launched and the invocation is recorded as failed to spawn, if it can be.
+pub fn spawn_after(
+    store: &mut Store,
+    launch: &Launch,
+    prepare: impl FnOnce(&mut Store, InvocationId) -> Result<()>,
+) -> Result<Invocation> {
     ensure!(
         launch.cwd.is_absolute(),
         "working directory {} is not absolute",
@@ -225,6 +249,19 @@ pub fn spawn(store: &mut Store, launch: &Launch) -> Result<Invocation> {
         &launch.model,
         effort.as_deref(),
     )?;
+    if let Err(e) = prepare(store, id) {
+        let end = InvocationEnd {
+            state: InvocationState::Failed,
+            failure: Some(FailureKind::SpawnFailed),
+            diagnostic: Some("agentctl abandoned the launch before starting the provider".into()),
+            exit_code: None,
+            provider_session: None,
+            usage: Usage::Unavailable,
+        };
+        // The original error matters more than any failure to record this.
+        let _ = store.finish_invocation(id, &end);
+        return Err(e);
+    }
     let shared = Arc::new(Shared {
         cancel: AtomicBool::new(false),
         progress: Mutex::new(Progress::new(prepared.decoder)),

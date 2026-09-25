@@ -13,11 +13,18 @@
 //! A plan's tasks are written only through `crate::planner`, which validates
 //! what planners propose against the project. Mutation ownership is
 //! acquired only within the scope planning authorized (see [`Acquisition`]).
+//! Executor attempts, the changes they are found to have made in their
+//! workspaces and installing those into the working tree are recorded only
+//! through `crate::executor`, which observes both itself (see
+//! [`Execution`]).
 
+mod execution;
 mod graph;
 mod ownership;
 mod planning;
 
+pub use execution::{Capture, Change, ChangeKind, Content, Execution, ExecutionStatus, Install};
+pub(crate) use execution::{ExecutorResult, Observed};
 pub use ownership::{Acquisition, Conflict, Owner};
 
 use std::fmt;
@@ -38,7 +45,7 @@ use serde_json::{Map, Value};
 /// Stamped into the SQLite header (`application_id`) so an agentctl store is
 /// recognized by what it is, not merely by its schema version number.
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"agct");
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 10;
 const SCHEMA: &str = include_str!("state/schema.sql");
 const MIGRATE_V1: &str = include_str!("state/migrate_v1.sql");
 const MIGRATE_V2: &str = include_str!("state/migrate_v2.sql");
@@ -46,6 +53,9 @@ const MIGRATE_V3: &str = include_str!("state/migrate_v3.sql");
 const MIGRATE_V4: &str = include_str!("state/migrate_v4.sql");
 const MIGRATE_V5: &str = include_str!("state/migrate_v5.sql");
 const MIGRATE_V6: &str = include_str!("state/migrate_v6.sql");
+const MIGRATE_V7: &str = include_str!("state/migrate_v7.sql");
+const MIGRATE_V8: &str = include_str!("state/migrate_v8.sql");
+const MIGRATE_V9: &str = include_str!("state/migrate_v9.sql");
 /// The version 1 `accepted_sources` definition, exactly as SQLite keeps it.
 const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
     path          TEXT    PRIMARY KEY,
@@ -100,7 +110,8 @@ ids!(
     GenerationId,
     AgentId,
     InvocationId,
-    JournalId
+    JournalId,
+    ExecutionId
 );
 
 macro_rules! text_enum {
@@ -256,6 +267,74 @@ impl InvocationEnd {
         }
     }
 }
+
+text_enum!(
+    /// What capturing an execution's repository changes established. Only a
+    /// candidate may become accepted work, and only once verified.
+    ExecutionOutcome {
+        /// Structurally valid: the invocation succeeded, its well-formed
+        /// result reported success, and every change observed in the
+        /// executor's workspace, staged against the observed repository
+        /// baseline, was authorized. Nothing more: agentctl observes the
+        /// workspace, not who writes to it, so this is no proof that the
+        /// executor process wrote every byte.
+        Candidate = "candidate",
+        /// The executor reported that it failed.
+        ReportedFailed = "reported_failed",
+        /// The invocation succeeded, but its result broke the executor
+        /// protocol.
+        MalformedResult = "malformed_result",
+        /// The invocation failed, was cancelled or was interrupted.
+        InvocationFailed = "invocation_failed",
+        /// The executor's workspace was mutated beyond the execution's
+        /// authority.
+        ScopeViolated = "scope_violated",
+        /// The workspace changed in a way that cannot safely be attributed
+        /// to the executor (see [`Attribution`]).
+        Unattributable = "unattributable",
+    }
+);
+
+text_enum!(
+    /// Why observed changes could not be attributed to an executor.
+    Attribution {
+        /// The workspace kept changing after the invocation ended.
+        Unsettled = "unsettled",
+        /// It changed although no executor process was ever launched.
+        NeverLaunched = "never_launched",
+        /// Schema versions 8 and 9 only, whose executors worked in the project's
+        /// working tree: a path another generation owns changed.
+        Contested = "contested",
+        /// Schema versions 8 and 9 only: the working tree changed while another
+        /// journaled action was in flight too.
+        Concurrent = "concurrent",
+    }
+);
+
+text_enum!(
+    /// How installing a candidate into the project's working tree ended.
+    InstallOutcome {
+        /// Every change was written: the working tree holds the candidate,
+        /// provisionally, until verified.
+        Installed = "installed",
+        /// The working tree no longer held what the baseline observed at
+        /// some changed path, so nothing was written.
+        Drifted = "drifted",
+        /// The candidate held a change agentctl does not install, or the
+        /// workspace no longer held what was captured: nothing was written.
+        Refused = "refused",
+        /// Writing failed, and every path written was restored.
+        Failed = "failed",
+    }
+);
+
+text_enum!(
+    /// What an executor reported of its own work: a claim, never proof.
+    Reported {
+        Succeeded = "succeeded",
+        Failed = "failed",
+    }
+);
 
 text_enum!(
     /// Why an invocation failed.
@@ -854,30 +933,7 @@ impl Store {
     /// Creates a logical agent. Planners serve a plan; executors and
     /// verifiers serve an active generation, which has one executor.
     pub fn create_agent(&mut self, role: Role, scope: AgentScope) -> Result<AgentId> {
-        self.write(|tx| {
-            let (plan, task, generation) = match scope {
-                AgentScope::Plan(plan) => {
-                    plan_state(tx, plan)?;
-                    (plan, None, None)
-                }
-                AgentScope::Generation(generation) => {
-                    let (plan, task, _) = active_generation(tx, generation)?;
-                    (plan, Some(task), Some(generation))
-                }
-            };
-            ensure!(
-                (role == Role::Planner) == generation.is_none(),
-                "a {role} cannot serve {scope:?}"
-            );
-            tx.execute(
-                "INSERT INTO agents (role, plan_id, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![role, generation.is_none().then_some(plan), generation, now()],
-            )
-            .with_context(|| format!("creating {role} for {scope:?}"))?;
-            let agent = AgentId(tx.last_insert_rowid());
-            event(tx, "agent.created", Some(plan), task, Some(agent), &role.to_string())?;
-            Ok(agent)
-        })
+        self.write(|tx| insert_agent(tx, role, scope))
     }
 
     /// Records a physical provider invocation embodying `agent`, before its
@@ -1057,26 +1113,7 @@ impl Store {
     /// INTEND: journals an action `agent` intends, before anything attempts
     /// it. That an action was intended is never evidence that it happened.
     pub fn intend(&mut self, agent: AgentId, intent: &Intent) -> Result<JournalId> {
-        let parameters = intent.check()?;
-        self.write(|tx| {
-            let (plan, task) = agent_subject(tx, agent)?;
-            tx.execute(
-                "INSERT INTO journal (agent_id, action, parameters, state, intended_at)
-                 VALUES (?1, ?2, ?3, 'intended', ?4)",
-                params![agent, intent.action, parameters, now()],
-            )?;
-            let entry = JournalId(tx.last_insert_rowid());
-            let detail = format!("entry {entry}: {}", intent.action);
-            event(
-                tx,
-                "journal.intended",
-                Some(plan),
-                task,
-                Some(agent),
-                &detail,
-            )?;
-            Ok(entry)
-        })
+        self.write(|tx| insert_intent(tx, agent, intent))
     }
 
     /// Revises what an entry intends, until it is attempted. From then on
@@ -1107,42 +1144,7 @@ impl Store {
     /// of the entry's agent that performs or requested it, if any. From then
     /// on the outcome is unknown until the entry is reconciled.
     pub fn act(&mut self, entry: JournalId, invocation: Option<InvocationId>) -> Result<()> {
-        self.write(|tx| {
-            let agent = journal_agent(tx, entry, "intended", "attempted")?;
-            if let Some(invocation) = invocation {
-                let embodies: AgentId = tx
-                    .query_row(
-                        "SELECT agent_id FROM invocations WHERE id = ?1",
-                        [invocation],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                    .with_context(|| format!("invocation {invocation} does not exist"))?;
-                ensure!(
-                    embodies == agent,
-                    "invocation {invocation} embodies agent {embodies}, \
-                     not agent {agent} whose entry {entry} it would attempt"
-                );
-            }
-            tx.execute(
-                "UPDATE journal SET state = 'attempted', invocation_id = ?2, attempted_at = ?3
-                 WHERE id = ?1",
-                params![entry, invocation, now()],
-            )?;
-            let (plan, task) = agent_subject(tx, agent)?;
-            let detail = match invocation {
-                Some(invocation) => format!("entry {entry} by invocation {invocation}"),
-                None => format!("entry {entry}"),
-            };
-            event(
-                tx,
-                "journal.attempted",
-                Some(plan),
-                task,
-                Some(agent),
-                &detail,
-            )
-        })
+        self.write(|tx| act_entry(tx, entry, invocation))
     }
 
     /// RECONCILE: records, once, what was established about an attempted
@@ -1154,52 +1156,7 @@ impl Store {
         outcome: ActionOutcome,
         evidence: &[Evidence],
     ) -> Result<()> {
-        ensure!(
-            (1..=EVIDENCE_LIMIT).contains(&evidence.len()),
-            "a reconciliation needs from 1 to {EVIDENCE_LIMIT} items of evidence"
-        );
-        evidence.iter().try_for_each(Evidence::check)?;
-        let recorded = serde_json::to_string(evidence)?;
-        self.write(|tx| {
-            let agent = journal_agent(tx, entry, "attempted", "reconciled")?;
-            for item in evidence {
-                if let Evidence::Invocation { invocation } = item {
-                    let (embodies, state): (AgentId, InvocationState) = tx
-                        .query_row(
-                            "SELECT agent_id, state FROM invocations WHERE id = ?1",
-                            [invocation],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
-                        )
-                        .optional()?
-                        .with_context(|| format!("invocation {invocation} does not exist"))?;
-                    ensure!(
-                        embodies == agent,
-                        "invocation {invocation} embodies agent {embodies}, \
-                         not agent {agent} whose entry {entry} it would evidence"
-                    );
-                    ensure!(
-                        state.is_terminal(),
-                        "invocation {invocation} has not ended, so it is no evidence yet"
-                    );
-                }
-            }
-            tx.execute(
-                "UPDATE journal SET state = 'reconciled', outcome = ?2, evidence = ?3,
-                   reconciled_at = ?4
-                 WHERE id = ?1",
-                params![entry, outcome, recorded, now()],
-            )?;
-            let (plan, task) = agent_subject(tx, agent)?;
-            let detail = format!("entry {entry}: {outcome}");
-            event(
-                tx,
-                "journal.reconciled",
-                Some(plan),
-                task,
-                Some(agent),
-                &detail,
-            )
-        })
+        self.write(|tx| reconcile_entry(tx, entry, outcome, evidence))
     }
 
     pub fn journal_entry(&self, entry: JournalId) -> Result<JournalEntry> {
@@ -1485,6 +1442,15 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if version <= 6 {
         tx.execute_batch(MIGRATE_V6).with_context(mismatch)?;
     }
+    if version <= 7 {
+        tx.execute_batch(MIGRATE_V7).with_context(mismatch)?;
+    }
+    if version <= 8 {
+        tx.execute_batch(MIGRATE_V8).with_context(mismatch)?;
+    }
+    if version <= 9 {
+        tx.execute_batch(MIGRATE_V9).with_context(mismatch)?;
+    }
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SCHEMA)?;
     // A failed check rolls back any migration, leaving the file as found.
@@ -1533,7 +1499,7 @@ fn enable_wal(conn: &Connection) -> Result<()> {
     }
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after 1970");
@@ -1579,7 +1545,7 @@ fn depend(tx: &Transaction, plan: PlanId, task: TaskId, dep: TaskId) -> Result<(
     Ok(())
 }
 
-fn plan_state(tx: &Transaction, plan: PlanId) -> Result<PlanState> {
+fn plan_state(tx: &Connection, plan: PlanId) -> Result<PlanState> {
     tx.query_row("SELECT state FROM plans WHERE id = ?1", [plan], |r| {
         r.get(0)
     })
@@ -1589,7 +1555,7 @@ fn plan_state(tx: &Transaction, plan: PlanId) -> Result<PlanState> {
 
 /// The plan, task, number and state of a generation.
 fn generation_info(
-    tx: &Transaction,
+    tx: &Connection,
     generation: GenerationId,
 ) -> Result<(PlanId, TaskId, i64, GenerationState)> {
     tx.query_row(
@@ -1610,6 +1576,156 @@ fn active_generation(tx: &Transaction, generation: GenerationId) -> Result<(Plan
         "generation {generation} has already ended ({state})"
     );
     Ok((plan, task, number))
+}
+
+/// Creates a logical agent; see [`Store::create_agent`].
+fn insert_agent(tx: &Transaction, role: Role, scope: AgentScope) -> Result<AgentId> {
+    let (plan, task, generation) = match scope {
+        AgentScope::Plan(plan) => {
+            plan_state(tx, plan)?;
+            (plan, None, None)
+        }
+        AgentScope::Generation(generation) => {
+            let (plan, task, _) = active_generation(tx, generation)?;
+            (plan, Some(task), Some(generation))
+        }
+    };
+    ensure!(
+        (role == Role::Planner) == generation.is_none(),
+        "a {role} cannot serve {scope:?}"
+    );
+    tx.execute(
+        "INSERT INTO agents (role, plan_id, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            role,
+            generation.is_none().then_some(plan),
+            generation,
+            now()
+        ],
+    )
+    .with_context(|| format!("creating {role} for {scope:?}"))?;
+    let agent = AgentId(tx.last_insert_rowid());
+    event(
+        tx,
+        "agent.created",
+        Some(plan),
+        task,
+        Some(agent),
+        &role.to_string(),
+    )?;
+    Ok(agent)
+}
+
+/// Journals an intended action; see [`Store::intend`].
+fn insert_intent(tx: &Transaction, agent: AgentId, intent: &Intent) -> Result<JournalId> {
+    let parameters = intent.check()?;
+    let (plan, task) = agent_subject(tx, agent)?;
+    tx.execute(
+        "INSERT INTO journal (agent_id, action, parameters, state, intended_at)
+         VALUES (?1, ?2, ?3, 'intended', ?4)",
+        params![agent, intent.action, parameters, now()],
+    )?;
+    let entry = JournalId(tx.last_insert_rowid());
+    let detail = format!("entry {entry}: {}", intent.action);
+    event(
+        tx,
+        "journal.intended",
+        Some(plan),
+        task,
+        Some(agent),
+        &detail,
+    )?;
+    Ok(entry)
+}
+
+/// Reconciles an attempted entry; see [`Store::reconcile`].
+fn act_entry(tx: &Transaction, entry: JournalId, invocation: Option<InvocationId>) -> Result<()> {
+    let agent = journal_agent(tx, entry, "intended", "attempted")?;
+    if let Some(invocation) = invocation {
+        let embodies: AgentId = tx
+            .query_row(
+                "SELECT agent_id FROM invocations WHERE id = ?1",
+                [invocation],
+                |r| r.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("invocation {invocation} does not exist"))?;
+        ensure!(
+            embodies == agent,
+            "invocation {invocation} embodies agent {embodies}, \
+             not agent {agent} whose entry {entry} it would attempt"
+        );
+    }
+    tx.execute(
+        "UPDATE journal SET state = 'attempted', invocation_id = ?2, attempted_at = ?3
+         WHERE id = ?1",
+        params![entry, invocation, now()],
+    )?;
+    let (plan, task) = agent_subject(tx, agent)?;
+    let detail = match invocation {
+        Some(invocation) => format!("entry {entry} by invocation {invocation}"),
+        None => format!("entry {entry}"),
+    };
+    event(
+        tx,
+        "journal.attempted",
+        Some(plan),
+        task,
+        Some(agent),
+        &detail,
+    )
+}
+
+fn reconcile_entry(
+    tx: &Transaction,
+    entry: JournalId,
+    outcome: ActionOutcome,
+    evidence: &[Evidence],
+) -> Result<()> {
+    ensure!(
+        (1..=EVIDENCE_LIMIT).contains(&evidence.len()),
+        "a reconciliation needs from 1 to {EVIDENCE_LIMIT} items of evidence"
+    );
+    evidence.iter().try_for_each(Evidence::check)?;
+    let recorded = serde_json::to_string(evidence)?;
+    let agent = journal_agent(tx, entry, "attempted", "reconciled")?;
+    for item in evidence {
+        if let Evidence::Invocation { invocation } = item {
+            let (embodies, state): (AgentId, InvocationState) = tx
+                .query_row(
+                    "SELECT agent_id, state FROM invocations WHERE id = ?1",
+                    [invocation],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+                .with_context(|| format!("invocation {invocation} does not exist"))?;
+            ensure!(
+                embodies == agent,
+                "invocation {invocation} embodies agent {embodies}, \
+                 not agent {agent} whose entry {entry} it would evidence"
+            );
+            ensure!(
+                state.is_terminal(),
+                "invocation {invocation} has not ended, so it is no evidence yet"
+            );
+        }
+    }
+    tx.execute(
+        "UPDATE journal SET state = 'reconciled', outcome = ?2, evidence = ?3,
+           reconciled_at = ?4
+         WHERE id = ?1",
+        params![entry, outcome, recorded, now()],
+    )?;
+    let (plan, task) = agent_subject(tx, agent)?;
+    let detail = format!("entry {entry}: {outcome}");
+    event(
+        tx,
+        "journal.reconciled",
+        Some(plan),
+        task,
+        Some(agent),
+        &detail,
+    )
 }
 
 /// The plan and, for generation-scoped agents, the task `agent` serves.
@@ -1829,7 +1945,7 @@ pub(crate) mod tests {
 
     /// A finalized plan of tasks `(key, scope, depends_on)`, as a planner
     /// would make it, and their ids in order.
-    pub(super) fn ready_plan(
+    pub(crate) fn ready_plan(
         store: &mut Store,
         tasks: &[(&str, &[&str], &[&str])],
     ) -> (PlanId, Vec<TaskId>) {
@@ -1852,7 +1968,7 @@ pub(crate) mod tests {
     }
 
     /// Acquires `paths` for `generation`, which must succeed.
-    pub(super) fn acquire(store: &mut Store, generation: GenerationId, paths: &[&str]) {
+    pub(crate) fn acquire(store: &mut Store, generation: GenerationId, paths: &[&str]) {
         let acquired = store.acquire_ownership(generation, paths).unwrap();
         assert_eq!(acquired, Acquisition::Acquired, "{paths:?}");
     }
@@ -1866,7 +1982,7 @@ pub(crate) mod tests {
         format!("{:#}", result.unwrap_err())
     }
 
-    fn version(path: &Path) -> i64 {
+    pub(crate) fn version(path: &Path) -> i64 {
         Connection::open(path)
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -1877,7 +1993,7 @@ pub(crate) mod tests {
         AgentId(id)
     }
 
-    fn ended(state: InvocationState) -> InvocationEnd {
+    pub(super) fn ended(state: InvocationState) -> InvocationEnd {
         InvocationEnd {
             state,
             failure: None,
@@ -1888,7 +2004,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn succeeded() -> InvocationEnd {
+    pub(crate) fn succeeded() -> InvocationEnd {
         InvocationEnd {
             exit_code: Some(0),
             ..ended(InvocationState::Succeeded)
@@ -2002,9 +2118,75 @@ pub(crate) mod tests {
         }
     }
 
+    /// Rewrites the store at `path` as schema version 9, whose executors
+    /// worked in the working tree itself and whose candidates were never
+    /// installed. The store must hold no install.
+    pub(crate) fn downgrade_to_v9(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        let start = MIGRATE_V8
+            .find("CREATE TRIGGER execution_captures_derived")
+            .unwrap();
+        let end = start + MIGRATE_V8[start..].find("END;").unwrap() + "END;".len();
+        conn.execute_batch(&format!(
+            "DROP TRIGGER journal_reconciles_install;
+             DROP TABLE execution_install_results;
+             DROP TABLE execution_installs;
+             DROP TRIGGER execution_captures_derived;
+             {}",
+            &MIGRATE_V8[start..end]
+        ))
+        .unwrap();
+        conn.pragma_update(None, "user_version", 9).unwrap();
+    }
+
+    /// Rewrites the store at `path` as schema version 8, which records an
+    /// execution's capture on its row, guarded only against rewriting.
+    pub(crate) fn downgrade_to_v8(path: &Path) {
+        downgrade_to_v9(path);
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER journal_reconciles_execution;
+             CREATE TEMP TABLE v9_executions AS
+                 SELECT e.*, c.outcome, c.attribution, c.reported, c.claimed, c.head_after,
+                        c.captured_at
+                 FROM executions e LEFT JOIN execution_captures c ON c.execution_id = e.id;
+             CREATE TEMP TABLE v9_baseline AS SELECT * FROM execution_baseline;
+             CREATE TEMP TABLE v9_changes AS SELECT * FROM execution_changes;
+             DROP TABLE execution_captures;
+             DROP TABLE execution_changes;
+             DROP TABLE execution_baseline;
+             DROP TABLE executions;",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATE_V7).unwrap();
+        conn.execute_batch(
+            "INSERT INTO executions SELECT * FROM v9_executions;
+             INSERT INTO execution_baseline SELECT * FROM v9_baseline;
+             INSERT INTO execution_changes SELECT * FROM v9_changes;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 8).unwrap();
+    }
+
+    /// Rewrites the store at `path` as schema version 7, which records no
+    /// executor attempts.
+    pub(crate) fn downgrade_to_v7(path: &Path) {
+        downgrade_to_v8(path);
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE execution_changes;
+             DROP TABLE execution_baseline;
+             DROP TABLE executions;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+    }
+
     /// Rewrites the store at `path` as schema version 6, whose database
     /// accepts any ownership row a path's uniqueness allows.
     pub(crate) fn downgrade_to_v6(path: &Path) {
+        downgrade_to_v7(path);
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
             "DROP TRIGGER ownership_acquired;
@@ -2148,8 +2330,20 @@ pub(crate) mod tests {
     /// The tables version 6 reshapes; see its migration.
     const RESHAPED_IN_V6: [&str; 3] = ["plans", "tasks", "task_scope"];
 
-    /// Every row of every table except those `excluded`, by table.
-    fn rows_besides(path: &Path, excluded: &[&str]) -> Vec<(String, Vec<Vec<Value>>)> {
+    /// The tables versions 8 to 10 add, which no migration from before
+    /// version 8 fills, nor any migration installs.
+    const ADDED_SINCE_V8: [&str; 6] = [
+        "executions",
+        "execution_baseline",
+        "execution_changes",
+        "execution_captures",
+        "execution_installs",
+        "execution_install_results",
+    ];
+
+    /// Every row of every table except those `excluded` and those versions
+    /// 8 to 10 add, by table.
+    pub(crate) fn rows_besides(path: &Path, excluded: &[&str]) -> Vec<(String, Vec<Vec<Value>>)> {
         let conn = Connection::open(path).unwrap();
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
@@ -2160,7 +2354,9 @@ pub(crate) mod tests {
             .unwrap();
         tables
             .into_iter()
-            .filter(|table| !excluded.contains(&table.as_str()))
+            .filter(|table| {
+                !excluded.contains(&table.as_str()) && !ADDED_SINCE_V8.contains(&table.as_str())
+            })
             .map(|table| {
                 let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
                 let columns = stmt.column_count();
@@ -2886,7 +3082,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn intent(action: &str, parameters: serde_json::Value) -> Intent {
+    pub(super) fn intent(action: &str, parameters: serde_json::Value) -> Intent {
         Intent {
             action: action.into(),
             parameters: parameters.as_object().unwrap().clone(),
@@ -3445,6 +3641,29 @@ pub(crate) mod tests {
         assert!(message.contains("not acquirable"), "{message}");
     }
 
+    #[test]
+    fn migrating_version_7_records_no_executions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v7.db");
+        let mut store = Store::open(&path).unwrap();
+        let (_, tasks) = ready_plan(&mut store, &[("a", &["src/a.rs"], &[])]);
+        let generation = store.start_generation(tasks[0]).unwrap();
+        acquire(&mut store, generation, &["src/a.rs"]);
+        drop(store);
+        downgrade_to_v7(&path);
+        let before = rows_besides(&path, &[]);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        assert_eq!(rows_besides(&path, &[]), before, "nothing changed");
+        for table in ADDED_SINCE_V8 {
+            let sql = format!("SELECT count(*) FROM {table}");
+            let rows: i64 = store.conn.query_row(&sql, [], |r| r.get(0)).unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+        assert_eq!(store.execution(generation).unwrap(), None);
+    }
+
     /// The definitions of the ownership table's index and triggers.
     fn ownership_schema(path: &Path) -> Vec<String> {
         let conn = Connection::open(path).unwrap();
@@ -3897,3 +4116,34 @@ pub struct AcceptedSourceIsRestricted;
 /// ```
 #[cfg(doctest)]
 pub struct PlanningIsRestricted;
+
+/// Only `crate::executor`, which observes the repository and its workspaces
+/// itself, records executor attempts, what they changed, and installing it.
+/// Other crates can neither intend one directly:
+///
+/// ```compile_fail,E0624
+/// # use agentctl::state::{GenerationId, Store, TaskId};
+/// # fn f(store: &mut Store, task: TaskId, generation: GenerationId) {
+/// store.begin_execution(task, generation, &[], &[], "HEAD").unwrap();
+/// # }
+/// ```
+///
+/// nor capture one from observations of their own:
+///
+/// ```compile_fail,E0624
+/// # use agentctl::state::{ExecutionId, Store};
+/// # fn f(store: &mut Store, execution: ExecutionId) {
+/// store.finish_execution(execution, todo!()).unwrap();
+/// # }
+/// ```
+///
+/// nor record installing a candidate without writing it:
+///
+/// ```compile_fail,E0624
+/// # use agentctl::state::{ExecutionId, InstallOutcome, Store};
+/// # fn f(store: &mut Store, execution: ExecutionId) {
+/// store.finish_install(execution, InstallOutcome::Installed, &[]).unwrap();
+/// # }
+/// ```
+#[cfg(doctest)]
+pub struct ExecutionIsRestricted;
