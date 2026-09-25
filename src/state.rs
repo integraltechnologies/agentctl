@@ -19,19 +19,24 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, Type, ValueRef};
 use rusqlite::{
-    Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior,
+    params,
 };
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 /// Stamped into the SQLite header (`application_id`) so an agentctl store is
 /// recognized by what it is, not merely by its schema version number.
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"agct");
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SCHEMA: &str = include_str!("state/schema.sql");
 const MIGRATE_V1: &str = include_str!("state/migrate_v1.sql");
 const MIGRATE_V2: &str = include_str!("state/migrate_v2.sql");
 const MIGRATE_V3: &str = include_str!("state/migrate_v3.sql");
+const MIGRATE_V4: &str = include_str!("state/migrate_v4.sql");
 /// The version 1 `accepted_sources` definition, exactly as SQLite keeps it.
 const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
     path          TEXT    PRIMARY KEY,
@@ -40,11 +45,20 @@ const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
 ) STRICT, WITHOUT ROWID";
 /// How long a transaction waits for another process's writer to finish.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds on what the journal records, so that it holds structure rather
+/// than opaque blobs or prose.
+const IDENTIFIER_LIMIT: usize = 64;
+const PARAMETERS_LIMIT: usize = 8 * 1024;
+const PARAMETER_TEXT_LIMIT: usize = 1024;
+const PARAMETER_DEPTH: usize = 8;
+const EVIDENCE_LIMIT: usize = 32;
+const EVIDENCE_PATH_LIMIT: usize = 4096;
 
 macro_rules! ids {
     ($($(#[$doc:meta])* $name:ident),+ $(,)?) => {$(
         $(#[$doc])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(transparent)]
         pub struct $name(i64);
 
         impl fmt::Display for $name {
@@ -158,26 +172,14 @@ text_enum!(Role {
     Verifier = "verifier",
 });
 
-text_enum!(JournalState {
-    /// Intended, not known to have been attempted.
-    Intended = "intended",
-    /// Attempted, outcome unknown.
-    Attempted = "attempted",
-    Completed = "completed",
-    Deviated = "deviated",
-    Failed = "failed",
-});
-
-impl JournalState {
-    fn can_become(self, to: Self) -> bool {
-        use JournalState::*;
-        match self {
-            Intended => to != Intended,
-            Attempted => matches!(to, Completed | Deviated | Failed),
-            Completed | Deviated | Failed => false,
-        }
+text_enum!(
+    /// What reconciliation established that an attempted action did.
+    ActionOutcome {
+        CompletedAsIntended = "completed_as_intended",
+        CompletedWithDeviation = "completed_with_deviation",
+        Failed = "failed",
     }
-}
+);
 
 text_enum!(
     /// Where a provider invocation is in its lifecycle, as agentctl knows it.
@@ -350,12 +352,71 @@ pub struct Invocation {
     pub end: Option<InvocationEnd>,
 }
 
+/// An engineering-control action a logical agent intends: an
+/// agentctl-defined `action` kind such as `source.write`, with parameters
+/// identifying what it acts on. What an action means belongs to the layer
+/// that defines it.
+///
+/// An intent is agentctl's structured description, never provider prose.
+/// The kind and every parameter name are identifiers (`[a-z][a-z0-9_.]*`),
+/// and parameter values are bounded JSON whose strings are literal data (a
+/// path names a path, never a pattern) of one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Intent {
+    pub action: String,
+    pub parameters: Map<String, Value>,
+}
+
+/// A structured fact supporting a reconciliation: a reference to canonical
+/// state or an agentctl-defined fact, never prose. Evidence says what was
+/// established, not whether the work is acceptable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Evidence {
+    /// How an ended invocation ended, as recorded.
+    Invocation { invocation: InvocationId },
+    /// The content a canonical project path was observed to hold: its
+    /// content hash, or `None` when it did not exist.
+    Content { path: String, hash: Option<String> },
+    /// An agentctl-defined fact, named by an identifier.
+    Fact { name: String },
+}
+
+/// Everything established about one journaled action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalEntry {
     pub id: JournalId,
-    pub intent: String,
-    pub state: JournalState,
-    pub outcome: Option<String>,
+    pub agent: AgentId,
+    /// Exactly what was intended when the attempt began, or, before then,
+    /// as last revised.
+    pub intent: Intent,
+    pub intended_at: i64,
+    pub status: ActionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionStatus {
+    /// Intended, and never attempted.
+    NotAttempted,
+    /// Attempted: it may have been acted on, and its outcome is unknown.
+    /// Nothing, including how the invocation ended, stands in for
+    /// reconciliation.
+    OutcomeUnknown(Attempt),
+    Reconciled(Attempt, Reconciliation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attempt {
+    /// The invocation of the entry's agent that performed or requested it.
+    pub invocation: Option<InvocationId>,
+    pub at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reconciliation {
+    pub outcome: ActionOutcome,
+    pub evidence: Vec<Evidence>,
+    pub at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -997,18 +1058,19 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Journals what `agent` intends to do, before it acts.
-    pub fn record_intent(&mut self, agent: AgentId, intent: &str) -> Result<JournalId> {
+    /// INTEND: journals an action `agent` intends, before anything attempts
+    /// it. That an action was intended is never evidence that it happened.
+    pub fn intend(&mut self, agent: AgentId, intent: &Intent) -> Result<JournalId> {
+        let parameters = intent.check()?;
         self.write(|tx| {
             let (plan, task) = agent_subject(tx, agent)?;
-            let at = now();
             tx.execute(
-                "INSERT INTO journal (agent_id, intent, state, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?4)",
-                params![agent, intent, JournalState::Intended, at],
+                "INSERT INTO journal (agent_id, action, parameters, state, intended_at)
+                 VALUES (?1, ?2, ?3, 'intended', ?4)",
+                params![agent, intent.action, parameters, now()],
             )?;
             let entry = JournalId(tx.last_insert_rowid());
-            let detail = format!("entry {entry}: {intent}");
+            let detail = format!("entry {entry}: {}", intent.action);
             event(
                 tx,
                 "journal.intended",
@@ -1021,37 +1083,21 @@ impl Store {
         })
     }
 
-    /// Marks a journal entry attempted, or reconciles it with what actually
-    /// happened. Deviations and failures require an `outcome`.
-    pub fn update_journal(
-        &mut self,
-        entry: JournalId,
-        to: JournalState,
-        outcome: Option<&str>,
-    ) -> Result<()> {
+    /// Revises what an entry intends, until it is attempted. From then on
+    /// its intent is history.
+    pub fn revise_intent(&mut self, entry: JournalId, intent: &Intent) -> Result<()> {
+        let parameters = intent.check()?;
         self.write(|tx| {
-            let (agent, from): (AgentId, JournalState) = tx
-                .query_row(
-                    "SELECT agent_id, state FROM journal WHERE id = ?1",
-                    [entry],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?
-                .with_context(|| format!("journal entry {entry} does not exist"))?;
-            ensure!(
-                from.can_become(to),
-                "journal entry {entry} cannot go from {from} to {to}"
-            );
+            let agent = journal_agent(tx, entry, "intended", "revised")?;
             tx.execute(
-                "UPDATE journal SET state = ?2, outcome = ?3, updated_at = ?4 WHERE id = ?1",
-                params![entry, to, outcome, now()],
-            )
-            .with_context(|| format!("recording journal entry {entry} as {to}"))?;
+                "UPDATE journal SET action = ?2, parameters = ?3 WHERE id = ?1",
+                params![entry, intent.action, parameters],
+            )?;
             let (plan, task) = agent_subject(tx, agent)?;
-            let detail = format!("entry {entry}: {from} -> {to}");
+            let detail = format!("entry {entry}: {}", intent.action);
             event(
                 tx,
-                "journal.updated",
+                "journal.revised",
                 Some(plan),
                 task,
                 Some(agent),
@@ -1060,19 +1106,129 @@ impl Store {
         })
     }
 
-    pub fn journal(&self, agent: AgentId) -> Result<Vec<JournalEntry>> {
+    /// ACT: records that an intended entry is being attempted, which must
+    /// be durable before anything acts on it. `invocation` is the invocation
+    /// of the entry's agent that performs or requested it, if any. From then
+    /// on the outcome is unknown until the entry is reconciled.
+    pub fn act(&mut self, entry: JournalId, invocation: Option<InvocationId>) -> Result<()> {
+        self.write(|tx| {
+            let agent = journal_agent(tx, entry, "intended", "attempted")?;
+            if let Some(invocation) = invocation {
+                let embodies: AgentId = tx
+                    .query_row(
+                        "SELECT agent_id FROM invocations WHERE id = ?1",
+                        [invocation],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .with_context(|| format!("invocation {invocation} does not exist"))?;
+                ensure!(
+                    embodies == agent,
+                    "invocation {invocation} embodies agent {embodies}, \
+                     not agent {agent} whose entry {entry} it would attempt"
+                );
+            }
+            tx.execute(
+                "UPDATE journal SET state = 'attempted', invocation_id = ?2, attempted_at = ?3
+                 WHERE id = ?1",
+                params![entry, invocation, now()],
+            )?;
+            let (plan, task) = agent_subject(tx, agent)?;
+            let detail = match invocation {
+                Some(invocation) => format!("entry {entry} by invocation {invocation}"),
+                None => format!("entry {entry}"),
+            };
+            event(
+                tx,
+                "journal.attempted",
+                Some(plan),
+                task,
+                Some(agent),
+                &detail,
+            )
+        })
+    }
+
+    /// RECONCILE: records, once, what was established about an attempted
+    /// entry's outcome and the evidence establishing it. This says what
+    /// happened, not whether the work is acceptable.
+    pub fn reconcile(
+        &mut self,
+        entry: JournalId,
+        outcome: ActionOutcome,
+        evidence: &[Evidence],
+    ) -> Result<()> {
+        ensure!(
+            (1..=EVIDENCE_LIMIT).contains(&evidence.len()),
+            "a reconciliation needs from 1 to {EVIDENCE_LIMIT} items of evidence"
+        );
+        evidence.iter().try_for_each(Evidence::check)?;
+        let recorded = serde_json::to_string(evidence)?;
+        self.write(|tx| {
+            let agent = journal_agent(tx, entry, "attempted", "reconciled")?;
+            for item in evidence {
+                if let Evidence::Invocation { invocation } = item {
+                    let (embodies, state): (AgentId, InvocationState) = tx
+                        .query_row(
+                            "SELECT agent_id, state FROM invocations WHERE id = ?1",
+                            [invocation],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?
+                        .with_context(|| format!("invocation {invocation} does not exist"))?;
+                    ensure!(
+                        embodies == agent,
+                        "invocation {invocation} embodies agent {embodies}, \
+                         not agent {agent} whose entry {entry} it would evidence"
+                    );
+                    ensure!(
+                        state.is_terminal(),
+                        "invocation {invocation} has not ended, so it is no evidence yet"
+                    );
+                }
+            }
+            tx.execute(
+                "UPDATE journal SET state = 'reconciled', outcome = ?2, evidence = ?3,
+                   reconciled_at = ?4
+                 WHERE id = ?1",
+                params![entry, outcome, recorded, now()],
+            )?;
+            let (plan, task) = agent_subject(tx, agent)?;
+            let detail = format!("entry {entry}: {outcome}");
+            event(
+                tx,
+                "journal.reconciled",
+                Some(plan),
+                task,
+                Some(agent),
+                &detail,
+            )
+        })
+    }
+
+    pub fn journal_entry(&self, entry: JournalId) -> Result<JournalEntry> {
         self.conn
-            .prepare(
-                "SELECT id, intent, state, outcome FROM journal WHERE agent_id = ?1 ORDER BY id",
-            )?
-            .query_map([agent], |r| {
-                Ok(JournalEntry {
-                    id: r.get(0)?,
-                    intent: r.get(1)?,
-                    state: r.get(2)?,
-                    outcome: r.get(3)?,
-                })
-            })?
+            .query_row(
+                &format!("{JOURNAL_COLUMNS} WHERE id = ?1"),
+                [entry],
+                journal_row,
+            )
+            .optional()?
+            .with_context(|| format!("journal entry {entry} does not exist"))
+    }
+
+    /// The canonical continuation state of `agent`'s work, for whatever
+    /// embodies it next: every action it journaled, in order, with exactly
+    /// what is established about each. It is reconstructed from this store
+    /// alone, never from a provider session or transcript, and leaves what
+    /// to do about an unknown outcome to its caller.
+    pub fn continuation(&self, agent: AgentId) -> Result<Vec<JournalEntry>> {
+        agent_subject(&self.conn, agent)?;
+        self.conn
+            .prepare(&format!(
+                "{JOURNAL_COLUMNS} WHERE agent_id = ?1 ORDER BY id"
+            ))?
+            .query_map([agent], journal_row)?
             .collect::<rusqlite::Result<_>>()
             .map_err(Into::into)
     }
@@ -1176,6 +1332,47 @@ fn invocation_row(r: &rusqlite::Row) -> rusqlite::Result<Invocation> {
     })
 }
 
+const JOURNAL_COLUMNS: &str = "SELECT id, agent_id, action, parameters, intended_at,
+    attempted_at, invocation_id, outcome, evidence, reconciled_at FROM journal";
+
+fn journal_row(r: &Row) -> rusqlite::Result<JournalEntry> {
+    let attempt = |at| -> rusqlite::Result<Attempt> {
+        Ok(Attempt {
+            invocation: r.get(6)?,
+            at,
+        })
+    };
+    // The schema guarantees which columns are set in each state.
+    let status = match (r.get(5)?, r.get(7)?) {
+        (None, _) => ActionStatus::NotAttempted,
+        (Some(at), None) => ActionStatus::OutcomeUnknown(attempt(at)?),
+        (Some(at), Some(outcome)) => ActionStatus::Reconciled(
+            attempt(at)?,
+            Reconciliation {
+                outcome,
+                evidence: json_column(r, 8)?,
+                at: r.get(9)?,
+            },
+        ),
+    };
+    Ok(JournalEntry {
+        id: r.get(0)?,
+        agent: r.get(1)?,
+        intent: Intent {
+            action: r.get(2)?,
+            parameters: json_column(r, 3)?,
+        },
+        intended_at: r.get(4)?,
+        status,
+    })
+}
+
+fn json_column<T: DeserializeOwned>(r: &Row, i: usize) -> rusqlite::Result<T> {
+    let text: String = r.get(i)?;
+    serde_json::from_str(&text)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(i, Type::Text, Box::new(e)))
+}
+
 /// Builds a complete store in a private file beside `path`, then links it
 /// into place only if `path` is still absent. A file agentctl did not create
 /// is never claimed, however empty, and racing creators cannot observe a
@@ -1237,6 +1434,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     }
     if version <= 3 {
         tx.execute_batch(MIGRATE_V3).with_context(mismatch)?;
+    }
+    if version <= 4 {
+        tx.execute_batch(MIGRATE_V4).with_context(mismatch)?;
     }
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SCHEMA)?;
@@ -1366,8 +1566,8 @@ fn active_generation(tx: &Transaction, generation: GenerationId) -> Result<(Plan
 }
 
 /// The plan and, for generation-scoped agents, the task `agent` serves.
-fn agent_subject(tx: &Transaction, agent: AgentId) -> Result<(PlanId, Option<TaskId>)> {
-    tx.query_row(
+fn agent_subject(conn: &Connection, agent: AgentId) -> Result<(PlanId, Option<TaskId>)> {
+    conn.query_row(
         "SELECT coalesce(a.plan_id, t.plan_id), g.task_id FROM agents a
          LEFT JOIN generations g ON g.id = a.generation_id
          LEFT JOIN tasks t ON t.id = g.task_id WHERE a.id = ?1",
@@ -1376,6 +1576,24 @@ fn agent_subject(tx: &Transaction, agent: AgentId) -> Result<(PlanId, Option<Tas
     )
     .optional()?
     .with_context(|| format!("agent {agent} does not exist"))
+}
+
+/// The agent of journal entry `entry`, which must be in `state` to be
+/// `doing` what the caller does.
+fn journal_agent(tx: &Transaction, entry: JournalId, state: &str, doing: &str) -> Result<AgentId> {
+    let (agent, actual): (AgentId, String) = tx
+        .query_row(
+            "SELECT agent_id, state FROM journal WHERE id = ?1",
+            [entry],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .with_context(|| format!("journal entry {entry} does not exist"))?;
+    ensure!(
+        actual == state,
+        "journal entry {entry} is {actual}; only an {state} entry can be {doing}"
+    );
+    Ok(agent)
 }
 
 fn owner(conn: &Connection, path: &str) -> Result<Option<GenerationId>> {
@@ -1416,10 +1634,77 @@ fn check_identity(path: &str, hash: Option<&str>) -> Result<()> {
     hash.map_or(Ok(()), check_hash)
 }
 
+/// Accepts only the identifiers naming journal actions, parameters and facts.
+fn check_identifier(what: &str, name: &str) -> Result<()> {
+    let valid = name.len() <= IDENTIFIER_LIMIT
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.'));
+    ensure!(valid, "{what} `{name:.64}` is not an identifier");
+    Ok(())
+}
+
+impl Intent {
+    /// Checks the intent is within the journal's bounds, returning its
+    /// parameters as recorded.
+    fn check(&self) -> Result<String> {
+        check_identifier("action", &self.action)?;
+        self.parameters
+            .iter()
+            .try_for_each(|(name, value)| check_parameter(name, value, 1))?;
+        let recorded = serde_json::to_string(&self.parameters)?;
+        ensure!(
+            recorded.len() <= PARAMETERS_LIMIT,
+            "intent parameters exceed {PARAMETERS_LIMIT} bytes"
+        );
+        Ok(recorded)
+    }
+}
+
+fn check_parameter(name: &str, value: &Value, depth: usize) -> Result<()> {
+    check_identifier("parameter", name)?;
+    ensure!(
+        depth <= PARAMETER_DEPTH,
+        "intent parameters nest deeper than {PARAMETER_DEPTH} levels"
+    );
+    match value {
+        Value::String(text) => ensure!(
+            text.len() <= PARAMETER_TEXT_LIMIT && !text.chars().any(char::is_control),
+            "parameter `{name}` is not one line of at most {PARAMETER_TEXT_LIMIT} bytes"
+        ),
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| check_parameter(name, item, depth + 1))?,
+        Value::Object(fields) => fields
+            .iter()
+            .try_for_each(|(name, value)| check_parameter(name, value, depth + 1))?,
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+impl Evidence {
+    fn check(&self) -> Result<()> {
+        match self {
+            Self::Invocation { .. } => Ok(()),
+            Self::Content { path, hash } => {
+                ensure!(
+                    path.len() <= EVIDENCE_PATH_LIMIT,
+                    "evidence paths are at most {EVIDENCE_PATH_LIMIT} bytes"
+                );
+                check_identity(path, hash.as_deref())
+            }
+            Self::Fact { name } => check_identifier("fact", name),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use rusqlite::types::Value;
+    use serde_json::json;
     use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
 
@@ -1561,11 +1846,53 @@ pub(crate) mod tests {
         }
     }
 
-    /// Rewrites the store at `path` as schema version 2, which lacks only
-    /// the CodeGraph tables.
+    /// The journal entry version 4 migrates to `legacy.v4` with the prose
+    /// intent `description`, so it survives a round trip through version 4.
+    fn legacy_intent(description: &str) -> Intent {
+        let parameters = json!({ "description": description });
+        Intent {
+            action: "legacy.v4".into(),
+            parameters: parameters.as_object().unwrap().clone(),
+        }
+    }
+
+    /// Rewrites the store at `path` as schema version 4, whose journal
+    /// records intents and outcomes as prose. Entries must not be
+    /// reconciled; those of `legacy_intent` keep their intent's prose.
+    pub(crate) fn downgrade_to_v4(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER journal_forward_only;
+             DROP TRIGGER journal_no_delete;
+             DROP INDEX journal_by_agent;
+             ALTER TABLE journal RENAME TO journal_v5;
+             CREATE TABLE journal (
+                 id         INTEGER PRIMARY KEY,
+                 agent_id   INTEGER NOT NULL REFERENCES agents (id),
+                 intent     TEXT    NOT NULL CHECK (intent <> ''),
+                 state      TEXT    NOT NULL CHECK (state IN
+                     ('intended', 'attempted', 'completed', 'deviated', 'failed')),
+                 outcome    TEXT,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 CHECK (state IN ('completed', 'deviated', 'failed') OR outcome IS NULL),
+                 CHECK (state NOT IN ('deviated', 'failed') OR coalesce(outcome, '') <> '')
+             ) STRICT;
+             INSERT INTO journal
+                 SELECT id, agent_id, coalesce(parameters ->> 'description', action), state,
+                        NULL, intended_at, coalesce(attempted_at, intended_at)
+                 FROM journal_v5;
+             DROP TABLE journal_v5;
+             CREATE INDEX journal_by_agent ON journal (agent_id);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+    }
+
     /// Rewrites the store at `path` as schema version 3, whose invocations
     /// record only when they started and ended.
     pub(crate) fn downgrade_to_v3(path: &Path) {
+        downgrade_to_v4(path);
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
             "DROP INDEX invocations_live;
@@ -1588,6 +1915,8 @@ pub(crate) mod tests {
         conn.pragma_update(None, "user_version", 3).unwrap();
     }
 
+    /// Rewrites the store at `path` as schema version 2, which lacks only
+    /// the CodeGraph tables.
     pub(crate) fn downgrade_to_v2(path: &Path) {
         downgrade_to_v3(path);
         let conn = Connection::open(path).unwrap();
@@ -1658,10 +1987,8 @@ pub(crate) mod tests {
             .unwrap();
         let invocation = store.start_invocation(agent, "codex", "gpt", None).unwrap();
         store.invocation_running(invocation).unwrap();
-        let intent = store.record_intent(agent, "write a.rs").unwrap();
-        store
-            .update_journal(intent, JournalState::Attempted, None)
-            .unwrap();
+        let intent = store.intend(agent, &legacy_intent("write a.rs")).unwrap();
+        store.act(intent, None).unwrap();
         store.record_decision(plan, "concern", "decision").unwrap();
         store.claim_paths(accepted, &["src/a.rs"]).unwrap();
         store
@@ -1753,7 +2080,7 @@ pub(crate) mod tests {
             .unwrap();
         let invocation = store.start_invocation(agent, "codex", "gpt", None).unwrap();
         store.invocation_running(invocation).unwrap();
-        store.record_intent(agent, "write a.rs").unwrap();
+        store.intend(agent, &legacy_intent("write a.rs")).unwrap();
         store.record_decision(plan, "concern", "decision").unwrap();
         store.claim_paths(accepted, &["src/a.rs"]).unwrap();
         store
@@ -1789,10 +2116,11 @@ pub(crate) mod tests {
         let (graph, rest): (Vec<_>, Vec<_>) = after
             .into_iter()
             .partition(|(table, _)| table.starts_with("graph_"));
-        // Invocations change shape in version 4; see the version 3 migration.
+        // Invocations and the journal change shape in versions 4 and 5; see
+        // their migrations.
         let reshaped = |rows: &[(String, Vec<Vec<Value>>)]| {
             rows.iter()
-                .filter(|(table, _)| table != "invocations")
+                .filter(|(table, _)| !matches!(table.as_str(), "invocations" | "journal"))
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -2336,56 +2664,453 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn journal_distinguishes_intend_act_reconcile_states() {
-        use JournalState::*;
-        let (_dir, mut store) = store();
+    fn intent(action: &str, parameters: serde_json::Value) -> Intent {
+        Intent {
+            action: action.into(),
+            parameters: parameters.as_object().unwrap().clone(),
+        }
+    }
+
+    /// An agent with an ended invocation, which can evidence a
+    /// reconciliation.
+    fn agent_with_ended_invocation(store: &mut Store) -> (AgentId, InvocationId) {
         let plan = store.create_plan("intent").unwrap();
         let agent = store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap();
+        let invocation = store.start_invocation(agent, "claude", "m", None).unwrap();
+        store.invocation_running(invocation).unwrap();
+        store.finish_invocation(invocation, &succeeded()).unwrap();
+        (agent, invocation)
+    }
 
-        let done = store.record_intent(agent, "write a.rs").unwrap();
-        store.update_journal(done, Attempted, None).unwrap();
-        assert!(store.update_journal(done, Intended, None).is_err());
-        store.update_journal(done, Completed, None).unwrap();
-        assert!(store.update_journal(done, Failed, Some("late")).is_err());
+    #[test]
+    fn journal_lifecycle_is_intend_act_reconcile() {
+        use ActionOutcome::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut store = Store::open(&path).unwrap();
+        let (agent, invocation) = agent_with_ended_invocation(&mut store);
+        let write = intent("source.write", json!({"path": "src/[slug]/*.rs"}));
+        let content = Evidence::Content {
+            path: "src/[slug]/*.rs".into(),
+            hash: Some(hash(1)),
+        };
 
-        let deviated = store.record_intent(agent, "edit b.rs").unwrap();
-        store.update_journal(deviated, Attempted, None).unwrap();
-        assert!(err(store.update_journal(deviated, Deviated, None)).contains("CHECK"));
+        let entries: Vec<_> = [
+            None,
+            Some(CompletedAsIntended),
+            Some(CompletedWithDeviation),
+        ]
+        .into_iter()
+        .chain([Some(Failed)])
+        .map(|outcome| {
+            let entry = store.intend(agent, &write).unwrap();
+            if let Some(outcome) = outcome {
+                store.act(entry, Some(invocation)).unwrap();
+                let evidence = [Evidence::Invocation { invocation }, content.clone()];
+                store.reconcile(entry, outcome, &evidence).unwrap();
+            }
+            entry
+        })
+        .collect();
+        let pending = store.intend(agent, &write).unwrap();
         store
-            .update_journal(deviated, Deviated, Some("edited c.rs too"))
+            .revise_intent(
+                pending,
+                &intent("source.delete", json!({"path": "src/a.rs"})),
+            )
             .unwrap();
+        let unknown = store.intend(agent, &write).unwrap();
+        store.act(unknown, None).unwrap();
 
-        // Reconciliation may find an intent was never attempted.
-        let failed = store.record_intent(agent, "run tests").unwrap();
-        store
-            .update_journal(failed, Failed, Some("never started"))
-            .unwrap();
-
-        let open = store.record_intent(agent, "push").unwrap();
-        let unknown = store.record_intent(agent, "migrate").unwrap();
-        store.update_journal(unknown, Attempted, None).unwrap();
-        assert!(store.update_journal(open, Intended, None).is_err());
-        assert!(store.update_journal(open, Attempted, Some("note")).is_err());
-
-        let states: Vec<_> = store
-            .journal(agent)
-            .unwrap()
-            .into_iter()
-            .map(|e| (e.id, e.state, e.outcome))
+        let continuation = store.continuation(agent).unwrap();
+        let statuses: Vec<_> = continuation
+            .iter()
+            .map(|e| match &e.status {
+                ActionStatus::NotAttempted => ("not attempted", None, None),
+                ActionStatus::OutcomeUnknown(a) => ("unknown", a.invocation, None),
+                ActionStatus::Reconciled(a, r) => ("reconciled", a.invocation, Some(r.outcome)),
+            })
             .collect();
         assert_eq!(
-            states,
+            statuses,
             [
-                (done, Completed, None),
-                (deviated, Deviated, Some("edited c.rs too".into())),
-                (failed, Failed, Some("never started".into())),
-                (open, Intended, None),
-                (unknown, Attempted, None),
+                ("not attempted", None, None),
+                ("reconciled", Some(invocation), Some(CompletedAsIntended)),
+                ("reconciled", Some(invocation), Some(CompletedWithDeviation)),
+                ("reconciled", Some(invocation), Some(Failed)),
+                ("not attempted", None, None),
+                ("unknown", None, None),
             ]
         );
+        assert_eq!(continuation[0].id, entries[0]);
+        assert_eq!(continuation[1].intent, write, "paths are kept literally");
+        assert_eq!(continuation[4].intent.action, "source.delete");
+        let ActionStatus::Reconciled(_, reconciliation) = &continuation[2].status else {
+            unreachable!()
+        };
+        assert_eq!(
+            reconciliation.evidence,
+            [Evidence::Invocation { invocation }, content]
+        );
+        assert_eq!(store.journal_entry(unknown).unwrap(), continuation[5]);
+
+        let kinds: Vec<_> = store
+            .events_after(0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind.starts_with("journal."))
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds.len(), 1 + 3 * 3 + 2 + 2);
+        assert!(kinds.contains(&"journal.revised".to_owned()));
+
+        drop(store);
+        let fresh = Store::open(&path).unwrap();
+        assert_eq!(fresh.continuation(agent).unwrap(), continuation);
+        assert!(err(fresh.continuation(AgentId(99))).contains("does not exist"));
+    }
+
+    #[test]
+    fn journal_transitions_are_enforced_by_the_store() {
+        use ActionOutcome::*;
+        let (_dir, mut store) = store();
+        let (agent, invocation) = agent_with_ended_invocation(&mut store);
+        let (other, foreign) = agent_with_ended_invocation(&mut store);
+        let live = store.start_invocation(agent, "claude", "m", None).unwrap();
+        let write = intent("source.write", json!({"path": "src/a.rs"}));
+        let evidence = [Evidence::Invocation { invocation }];
+        let entry = store.intend(agent, &write).unwrap();
+
+        // A refused call changes neither the entry nor history.
+        let refused =
+            |store: &mut Store, call: &dyn Fn(&mut Store) -> Result<()>, expected: &str| {
+                let before = (
+                    store.journal_entry(entry).unwrap(),
+                    store.events_after(0, 1000).unwrap(),
+                );
+                let message = err(call(store));
+                assert!(message.contains(expected), "{message}");
+                let after = (
+                    store.journal_entry(entry).unwrap(),
+                    store.events_after(0, 1000).unwrap(),
+                );
+                assert_eq!(after, before);
+            };
+        let reconcile = |outcome, evidence: Vec<Evidence>| {
+            move |store: &mut Store| store.reconcile(entry, outcome, &evidence)
+        };
+        let attempted_only = "only an attempted entry can be reconciled";
+        let intended_only = "only an intended entry can be attempted";
+
+        refused(
+            &mut store,
+            &reconcile(Failed, evidence.to_vec()),
+            attempted_only,
+        );
+        let embodied = format!("embodies agent {other}");
+        refused(&mut store, &|s| s.act(entry, Some(foreign)), &embodied);
+        refused(
+            &mut store,
+            &|s| s.act(entry, Some(InvocationId(99))),
+            "does not exist",
+        );
+        assert!(err(store.act(JournalId(99), None)).contains("does not exist"));
+
+        store.act(entry, Some(live)).unwrap();
+        refused(&mut store, &|s| s.act(entry, Some(live)), intended_only);
+        refused(&mut store, &|s| s.act(entry, None), intended_only);
+        let revised = intent("source.write", json!({}));
+        let revise = |s: &mut Store| s.revise_intent(entry, &revised);
+        refused(&mut store, &revise, "only an intended entry can be revised");
+        refused(
+            &mut store,
+            &reconcile(CompletedAsIntended, vec![]),
+            "from 1 to 32 items",
+        );
+        let unended = vec![Evidence::Invocation { invocation: live }];
+        refused(
+            &mut store,
+            &reconcile(CompletedAsIntended, unended),
+            "has not ended",
+        );
+        let missing = vec![Evidence::Invocation {
+            invocation: InvocationId(99),
+        }];
+        refused(
+            &mut store,
+            &reconcile(CompletedAsIntended, missing),
+            "does not exist",
+        );
+        // Evidence of another agent's invocation says nothing about this
+        // agent's action, even alongside evidence of its own.
+        for foreign in [
+            vec![Evidence::Invocation {
+                invocation: foreign,
+            }],
+            vec![
+                evidence[0].clone(),
+                Evidence::Invocation {
+                    invocation: foreign,
+                },
+            ],
+        ] {
+            refused(
+                &mut store,
+                &reconcile(CompletedAsIntended, foreign),
+                &embodied,
+            );
+        }
+
+        store
+            .reconcile(entry, CompletedAsIntended, &evidence)
+            .unwrap();
+        let fact = vec![Evidence::Fact {
+            name: "late".into(),
+        }];
+        // Neither a repeated nor a contradictory reconciliation is accepted.
+        for (outcome, evidence) in [
+            (CompletedAsIntended, evidence.to_vec()),
+            (Failed, evidence.to_vec()),
+            (CompletedWithDeviation, fact),
+        ] {
+            refused(&mut store, &reconcile(outcome, evidence), attempted_only);
+        }
+        refused(&mut store, &|s| s.act(entry, None), intended_only);
+        refused(&mut store, &revise, "only an intended entry can be revised");
+    }
+
+    #[test]
+    fn journal_schema_refuses_rewriting_history() {
+        let (_dir, mut store) = store();
+        let (agent, invocation) = agent_with_ended_invocation(&mut store);
+        let write = intent("source.write", json!({"path": "src/a.rs"}));
+        let evidence = [Evidence::Invocation { invocation }];
+        let intended = store.intend(agent, &write).unwrap();
+        let attempted = store.intend(agent, &write).unwrap();
+        store.act(attempted, Some(invocation)).unwrap();
+        let reconciled = store.intend(agent, &write).unwrap();
+        store.act(reconciled, None).unwrap();
+        store
+            .reconcile(reconciled, ActionOutcome::Failed, &evidence)
+            .unwrap();
+        let recorded = store.continuation(agent).unwrap();
+
+        let refused = |sql: &str, entry: JournalId| {
+            let message = err(store.conn.execute(sql, [entry]).map_err(Into::into));
+            assert!(
+                message.contains("immutable") || message.contains("CHECK"),
+                "{sql}: {message}"
+            );
+        };
+        refused(
+            "UPDATE journal SET state = 'reconciled', outcome = 'failed', evidence = '[1]', reconciled_at = 1 WHERE id = ?1",
+            intended,
+        );
+        // Skipping ACT is refused even when the update supplies everything a
+        // reconciled entry has.
+        let message = err(store
+            .conn
+            .execute(
+                "UPDATE journal SET state = 'reconciled', attempted_at = 1, outcome = 'failed',
+                   evidence = '[1]', reconciled_at = 1 WHERE id = ?1",
+                [intended],
+            )
+            .map_err(Into::into));
+        assert!(message.contains("immutable"), "{message}");
+        refused(
+            "UPDATE journal SET invocation_id = 1 WHERE id = ?1",
+            intended,
+        );
+        refused("UPDATE journal SET agent_id = 2 WHERE id = ?1", intended);
+        refused(
+            "UPDATE journal SET parameters = '{}' WHERE id = ?1",
+            attempted,
+        );
+        refused(
+            "UPDATE journal SET action = 'other' WHERE id = ?1",
+            attempted,
+        );
+        refused(
+            "UPDATE journal SET invocation_id = NULL WHERE id = ?1",
+            attempted,
+        );
+        refused(
+            "UPDATE journal SET state = 'intended', attempted_at = NULL WHERE id = ?1",
+            attempted,
+        );
+        refused(
+            "UPDATE journal SET attempted_at = attempted_at + 1 WHERE id = ?1",
+            attempted,
+        );
+        refused(
+            "UPDATE journal SET state = 'reconciled', outcome = 'failed', reconciled_at = 1 WHERE id = ?1",
+            attempted,
+        );
+        refused(
+            "UPDATE journal SET state = 'reconciled', outcome = 'failed', evidence = '[]', reconciled_at = 1 WHERE id = ?1",
+            attempted,
+        );
+        refused(
+            "UPDATE journal SET outcome = 'completed_as_intended' WHERE id = ?1",
+            reconciled,
+        );
+        refused(
+            "UPDATE journal SET evidence = '[2]' WHERE id = ?1",
+            reconciled,
+        );
+        for entry in [intended, attempted, reconciled] {
+            refused("DELETE FROM journal WHERE id = ?1", entry);
+        }
+        assert_eq!(store.continuation(agent).unwrap(), recorded);
+    }
+
+    #[test]
+    fn journal_records_only_bounded_structure() {
+        let (_dir, mut store) = store();
+        let (agent, invocation) = agent_with_ended_invocation(&mut store);
+        let deep = (0..PARAMETER_DEPTH).fold(json!(1), |v, _| json!([v]));
+        let cases = [
+            ("", json!({}), "not an identifier"),
+            ("Source.Write", json!({}), "not an identifier"),
+            ("source write", json!({}), "not an identifier"),
+            (
+                &"a".repeat(IDENTIFIER_LIMIT + 1),
+                json!({}),
+                "not an identifier",
+            ),
+            ("act", json!({"Bad Key": 1}), "not an identifier"),
+            (
+                "act",
+                json!({"nested": {"bad-key": 1}}),
+                "not an identifier",
+            ),
+            ("act", json!({"note": "line one\nline two"}), "not one line"),
+            (
+                "act",
+                json!({"note": "x".repeat(PARAMETER_TEXT_LIMIT + 1)}),
+                "not one line",
+            ),
+            ("act", json!({"deep": deep}), "nest deeper"),
+            ("act", json!({"items": vec!["x".repeat(1000); 9]}), "exceed"),
+        ];
+        for (action, parameters, expected) in cases {
+            let bad = intent(action, parameters);
+            let message = err(store.intend(agent, &bad));
+            assert!(message.contains(expected), "{action}: {message}");
+        }
+        let entry = store.intend(agent, &intent("act", json!({}))).unwrap();
+        let shallow = (1..PARAMETER_DEPTH).fold(json!(1), |v, _| json!([v]));
+        store
+            .revise_intent(entry, &intent("act", json!({"deep": shallow})))
+            .unwrap();
+        let message = err(store.revise_intent(entry, &intent("act", json!({"x": "a\tb"}))));
+        assert!(message.contains("not one line"), "{message}");
+        assert_eq!(store.continuation(agent).unwrap().len(), 1);
+        assert_eq!(
+            store.events_after(0, 100).unwrap().last().unwrap().kind,
+            "journal.revised"
+        );
+
+        store.act(entry, None).unwrap();
+        let content = |path: &str, hash: Option<String>| Evidence::Content {
+            path: path.into(),
+            hash,
+        };
+        let cases = [
+            (vec![content("../escape", None)], "not a canonical"),
+            (vec![content("src//a.rs", None)], "not a canonical"),
+            (
+                vec![content(&"a".repeat(EVIDENCE_PATH_LIMIT + 1), None)],
+                "at most",
+            ),
+            (vec![content("src/a.rs", Some("h".into()))], "not a SHA-256"),
+            (
+                vec![Evidence::Fact {
+                    name: "tests passed".into(),
+                }],
+                "not an identifier",
+            ),
+            (
+                vec![Evidence::Invocation { invocation }; EVIDENCE_LIMIT + 1],
+                "from 1 to",
+            ),
+        ];
+        for (evidence, expected) in cases {
+            let message = err(store.reconcile(entry, ActionOutcome::Failed, &evidence));
+            assert!(message.contains(expected), "{message}");
+        }
+        store
+            .reconcile(
+                entry,
+                ActionOutcome::Failed,
+                &[
+                    content("src/a.rs", None),
+                    Evidence::Fact {
+                        name: "precondition_unmet".into(),
+                    },
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn migrating_version_4_never_claims_an_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v4.db");
+        let mut store = Store::open(&path).unwrap();
+        let plan = store.create_plan("intent").unwrap();
+        let agent = store
+            .create_agent(Role::Planner, AgentScope::Plan(plan))
+            .unwrap();
+        drop(store);
+        downgrade_to_v4(&path);
+        let conn = Connection::open(&path).unwrap();
+        // Every state version 4 allows.
+        let states = [
+            ("intended", None),
+            ("attempted", None),
+            ("completed", None),
+            ("completed", Some("done")),
+            ("deviated", Some("edited c.rs too")),
+            ("failed", Some("never started")),
+            ("failed", Some("tests failed")),
+        ];
+        for (id, (state, outcome)) in (1..).zip(states) {
+            conn.execute(
+                "INSERT INTO journal (id, agent_id, intent, state, outcome, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 10, 20)",
+                params![id, agent, format!("step {id}"), state, outcome],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let before = rows_besides(&path, "journal");
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        let continuation = store.continuation(agent).unwrap();
+        let attempted = Attempt {
+            invocation: None,
+            at: 20,
+        };
+        for (i, entry) in continuation.iter().enumerate() {
+            assert_eq!(entry.intent, legacy_intent(&format!("step {}", i + 1)));
+            assert_eq!(entry.intended_at, 10);
+            // Only an attempt is carried over, never an outcome, and a
+            // failure does not establish an attempt.
+            let expected = match states[i].0 {
+                "attempted" | "completed" | "deviated" => {
+                    ActionStatus::OutcomeUnknown(attempted.clone())
+                }
+                _ => ActionStatus::NotAttempted,
+            };
+            assert_eq!(entry.status, expected, "entry {}", i + 1);
+        }
+        assert_eq!(continuation.len(), states.len());
+        drop(store);
+        assert_eq!(rows_besides(&path, "journal"), before);
     }
 
     #[test]
@@ -2420,7 +3145,7 @@ pub(crate) mod tests {
         let agent = store
             .create_agent(Role::Executor, AgentScope::Generation(generation))
             .unwrap();
-        store.record_intent(agent, "work").unwrap();
+        store.intend(agent, &intent("work", json!({}))).unwrap();
 
         let events = store.events_after(0, 100).unwrap();
         let kinds: Vec<_> = events.iter().map(|e| e.kind.as_str()).collect();

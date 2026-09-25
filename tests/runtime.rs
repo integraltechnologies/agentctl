@@ -19,7 +19,7 @@ use agentctl::config::ReasoningEffort;
 use agentctl::runtime::{
     self, FailureKind, InvocationState, Launch, Outcome, Provider, TokenUsage, Usage,
 };
-use agentctl::state::{AgentId, AgentScope, Role, Store};
+use agentctl::state::{ActionStatus, AgentId, AgentScope, Attempt, Intent, Role, Store};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -90,6 +90,10 @@ fn main() -> ExitCode {
         (
             "abandoned_invocations_stay_unresolved",
             abandoned_invocations_stay_unresolved,
+        ),
+        (
+            "journaled_attempts_outlive_abandoned_invocations",
+            journaled_attempts_outlive_abandoned_invocations,
         ),
         (
             "independent_invocations_run_concurrently",
@@ -795,6 +799,42 @@ fn abandoned_invocations_stay_unresolved() {
     f.store.finish_invocation(id, &resolved).unwrap();
     let outcome = f.run(&f.launch(Provider::Claude, "ok"));
     assert_eq!(outcome.end.state, InvocationState::Succeeded);
+}
+
+fn journaled_attempts_outlive_abandoned_invocations() {
+    let mut f = Fixture::new();
+    let intent = Intent {
+        action: "source.write".into(),
+        parameters: json!({"path": "src/a.rs"}).as_object().unwrap().clone(),
+    };
+    let entry = f.store.intend(f.agent, &intent).unwrap();
+    let invocation = f.spawn("hang").unwrap();
+    let pid = wait_for_first_event(&invocation);
+    let id = invocation.id();
+    f.store.act(entry, Some(id)).unwrap();
+    drop(invocation);
+    assert_reaped(pid);
+
+    // Neither the invocation's end nor a later invocation of the agent
+    // stands in for reconciling the attempt.
+    let interrupted = runtime::InvocationEnd {
+        state: InvocationState::Interrupted,
+        failure: None,
+        diagnostic: Some("agentctl lost the invocation".into()),
+        exit_code: None,
+        provider_session: None,
+        usage: Usage::Unavailable,
+    };
+    f.store.finish_invocation(id, &interrupted).unwrap();
+    let later = f.run(&f.launch(Provider::Claude, "ok"));
+    assert_eq!(later.end.state, InvocationState::Succeeded);
+    let continuation = f.reopen().continuation(f.agent).unwrap();
+    assert_eq!(continuation.len(), 1);
+    assert_eq!(continuation[0].intent, intent);
+    assert!(matches!(
+        continuation[0].status,
+        ActionStatus::OutcomeUnknown(Attempt { invocation: Some(i), .. }) if i == id
+    ));
 }
 
 fn independent_invocations_run_concurrently() {
