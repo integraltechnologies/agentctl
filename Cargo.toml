@@ -27,3 +27,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 [[test]]
 name = "runtime"
 harness = false
+
+[[test]]
+name = "planner"
+harness = false

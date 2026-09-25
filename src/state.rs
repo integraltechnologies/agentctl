@@ -10,8 +10,11 @@
 //! Accepted source is written only through `crate::source`, which publishes
 //! the recovery object of any content before recording it here. CodeGraph
 //! facts are written only through `crate::graph`, which validates them first.
+//! A plan's tasks are written only through `crate::planner`, which validates
+//! what planners propose against the project.
 
 mod graph;
+mod planning;
 
 use std::fmt;
 use std::path::Path;
@@ -31,12 +34,13 @@ use serde_json::{Map, Value};
 /// Stamped into the SQLite header (`application_id`) so an agentctl store is
 /// recognized by what it is, not merely by its schema version number.
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"agct");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SCHEMA: &str = include_str!("state/schema.sql");
 const MIGRATE_V1: &str = include_str!("state/migrate_v1.sql");
 const MIGRATE_V2: &str = include_str!("state/migrate_v2.sql");
 const MIGRATE_V3: &str = include_str!("state/migrate_v3.sql");
 const MIGRATE_V4: &str = include_str!("state/migrate_v4.sql");
+const MIGRATE_V5: &str = include_str!("state/migrate_v5.sql");
 /// The version 1 `accepted_sources` definition, exactly as SQLite keeps it.
 const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
     path          TEXT    PRIMARY KEY,
@@ -53,6 +57,10 @@ const PARAMETER_TEXT_LIMIT: usize = 1024;
 const PARAMETER_DEPTH: usize = 8;
 const EVIDENCE_LIMIT: usize = 32;
 const EVIDENCE_PATH_LIMIT: usize = 4096;
+/// Bounds on a plan's human intent.
+const OBJECTIVE_LIMIT: usize = 4096;
+const STATEMENT_LIMIT: usize = 1024;
+const STATEMENTS_LIMIT: usize = 32;
 
 macro_rules! ids {
     ($($(#[$doc:meta])* $name:ident),+ $(,)?) => {$(
@@ -313,10 +321,21 @@ pub enum GenerationEnd {
     Failed,
 }
 
+/// What a human wants of a plan: the objective, the constraints and
+/// invariants the work must respect, and the criteria by which it is
+/// complete, each as the human stated it. It is fixed when the plan is
+/// created: planning decides how to meet it, never what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanIntent {
+    pub objective: String,
+    pub constraints: Vec<String>,
+    pub completion_criteria: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub id: PlanId,
-    pub intent: String,
+    pub intent: HumanIntent,
     pub state: PlanState,
     pub created_at: i64,
     pub updated_at: i64,
@@ -326,7 +345,13 @@ pub struct Plan {
 pub struct Task {
     pub id: TaskId,
     pub plan: PlanId,
-    pub description: String,
+    /// The planner-chosen name identifying it within its plan.
+    pub key: String,
+    pub objective: String,
+    /// What a worker is told beyond the objective.
+    pub context: String,
+    /// The literal project paths it requests to mutate, in order.
+    pub scope: Vec<String>,
     pub state: TaskState,
     pub depends_on: Vec<TaskId>,
 }
@@ -464,10 +489,27 @@ impl Store {
             let flags = OpenFlags::default().difference(OpenFlags::SQLITE_OPEN_CREATE);
             let mut conn = Connection::open_with_flags(path, flags)?;
             conn.busy_timeout(BUSY_TIMEOUT)?;
-            conn.pragma_update(None, "foreign_keys", true)?;
             // Identify the file before switching it to WAL, which rewrites
-            // its header, so a refused file is left untouched.
-            migrate(&mut conn)?;
+            // its header, so a refused file is left untouched. Only the
+            // migration to version 6 rebuilds referenced tables, which
+            // needs references unenforced until `migrate` has checked them;
+            // a current store is never opened without enforcement.
+            let rebuild = rebuilds_referenced_tables(&conn)?;
+            if rebuild {
+                set_foreign_keys(&conn, false)?;
+            }
+            let migrated = migrate(&mut conn);
+            let restored = if rebuild {
+                set_foreign_keys(&conn, true)
+            } else {
+                Ok(())
+            };
+            migrated?;
+            restored?;
+            ensure!(
+                conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))?,
+                "foreign key enforcement is off"
+            );
             enable_wal(&conn)?;
             Ok(Self { conn })
         };
@@ -483,14 +525,32 @@ impl Store {
         Ok(value)
     }
 
-    pub fn create_plan(&mut self, intent: &str) -> Result<PlanId> {
+    /// Creates a plan in planning, establishing its human intent before
+    /// anything can plan it.
+    pub fn create_plan(&mut self, intent: &HumanIntent) -> Result<PlanId> {
+        let (constraints, criteria) = intent.check()?;
         self.write(|tx| {
             tx.execute(
-                "INSERT INTO plans (intent, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
-                params![intent, PlanState::Planning, now()],
+                "INSERT INTO plans
+                   (objective, constraints, completion_criteria, state, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    intent.objective,
+                    constraints,
+                    criteria,
+                    PlanState::Planning,
+                    now()
+                ],
             )?;
             let plan = PlanId(tx.last_insert_rowid());
-            event(tx, "plan.created", Some(plan), None, None, intent)?;
+            event(
+                tx,
+                "plan.created",
+                Some(plan),
+                None,
+                None,
+                &intent.objective,
+            )?;
             Ok(plan)
         })
     }
@@ -498,15 +558,20 @@ impl Store {
     pub fn plan(&self, id: PlanId) -> Result<Plan> {
         self.conn
             .query_row(
-                "SELECT intent, state, created_at, updated_at FROM plans WHERE id = ?1",
+                "SELECT objective, constraints, completion_criteria, state, created_at, updated_at
+                 FROM plans WHERE id = ?1",
                 [id],
                 |r| {
                     Ok(Plan {
                         id,
-                        intent: r.get(0)?,
-                        state: r.get(1)?,
-                        created_at: r.get(2)?,
-                        updated_at: r.get(3)?,
+                        intent: HumanIntent {
+                            objective: r.get(0)?,
+                            constraints: json_column(r, 1)?,
+                            completion_criteria: json_column(r, 2)?,
+                        },
+                        state: r.get(3)?,
+                        created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
                     })
                 },
             )
@@ -514,13 +579,19 @@ impl Store {
             .with_context(|| format!("plan {id} does not exist"))
     }
 
-    /// A plan completes only once every task in it is completed.
+    /// A plan becomes ready only by finalizing its planning (see
+    /// `crate::planner`), and completes only once every task in it is
+    /// completed.
     pub fn set_plan_state(&mut self, plan: PlanId, to: PlanState) -> Result<()> {
         self.write(|tx| {
             let from = plan_state(tx, plan)?;
             ensure!(
                 from.can_become(to),
                 "plan {plan} cannot go from {from} to {to}"
+            );
+            ensure!(
+                to != PlanState::Ready,
+                "plan {plan} becomes ready only by finalizing its planning"
             );
             if to == PlanState::Completed {
                 let open: i64 = tx.query_row(
@@ -546,65 +617,11 @@ impl Store {
         })
     }
 
-    /// Adds a task depending on existing tasks of the same plan.
-    pub fn add_task(
-        &mut self,
-        plan: PlanId,
-        description: &str,
-        depends_on: &[TaskId],
-    ) -> Result<TaskId> {
-        self.write(|tx| {
-            let state = plan_state(tx, plan)?;
-            ensure!(state != PlanState::Completed, "plan {plan} is completed");
-            tx.execute(
-                "INSERT INTO tasks (plan_id, description, created_at) VALUES (?1, ?2, ?3)",
-                params![plan, description, now()],
-            )?;
-            let task = TaskId(tx.last_insert_rowid());
-            for &dep in depends_on {
-                depend(tx, plan, task, dep)?;
-            }
-            event(
-                tx,
-                "task.created",
-                Some(plan),
-                Some(task),
-                None,
-                description,
-            )?;
-            Ok(task)
-        })
-    }
-
-    /// Makes `task` depend on another task of its plan, whichever was created
-    /// first, unless that would close a cycle.
-    pub fn add_dependency(&mut self, task: TaskId, depends_on: TaskId) -> Result<()> {
-        self.write(|tx| {
-            let plan: PlanId = tx
-                .query_row("SELECT plan_id FROM tasks WHERE id = ?1", [task], |r| {
-                    r.get(0)
-                })
-                .optional()?
-                .with_context(|| format!("task {task} does not exist"))?;
-            let state = plan_state(tx, plan)?;
-            ensure!(state != PlanState::Completed, "plan {plan} is completed");
-            depend(tx, plan, task, depends_on)?;
-            event(
-                tx,
-                "task.dependency",
-                Some(plan),
-                Some(task),
-                None,
-                &format!("depends on task {depends_on}"),
-            )
-        })
-    }
-
     pub fn task(&self, id: TaskId) -> Result<Task> {
-        let (plan, description, state) = self
+        let (plan, key, objective, context, state) = self
             .conn
             .query_row(
-                "SELECT plan_id, description, CASE
+                "SELECT plan_id, key, objective, context, CASE
                    WHEN EXISTS (SELECT 1 FROM generations WHERE task_id = ?1 AND state = 'accepted')
                      THEN 'completed'
                    WHEN EXISTS (SELECT 1 FROM generations WHERE task_id = ?1 AND state = 'active')
@@ -612,10 +629,15 @@ impl Store {
                    ELSE 'pending' END
                  FROM tasks WHERE id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?
             .with_context(|| format!("task {id} does not exist"))?;
+        let scope = self
+            .conn
+            .prepare("SELECT path FROM task_scope WHERE task_id = ?1 ORDER BY 1")?
+            .query_map([id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         let depends_on = self
             .conn
             .prepare("SELECT depends_on FROM task_dependencies WHERE task_id = ?1 ORDER BY 1")?
@@ -624,10 +646,24 @@ impl Store {
         Ok(Task {
             id,
             plan,
-            description,
+            key,
+            objective,
+            context,
+            scope,
             state,
             depends_on,
         })
+    }
+
+    /// Every task of a plan, in the order they were added.
+    pub fn tasks(&self, plan: PlanId) -> Result<Vec<Task>> {
+        self.plan(plan)?;
+        let ids: Vec<TaskId> = self
+            .conn
+            .prepare("SELECT id FROM tasks WHERE plan_id = ?1 ORDER BY id")?
+            .query_map([plan], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        ids.into_iter().map(|id| self.task(id)).collect()
     }
 
     /// Whether every task `task` depends on is completed.
@@ -837,6 +873,15 @@ impl Store {
                 &format!("{} paths", sources.len()),
             )
         })
+    }
+
+    /// Every tracked path with accepted content, in order.
+    pub fn accepted_paths(&self) -> Result<Vec<String>> {
+        self.conn
+            .prepare("SELECT path FROM accepted_sources WHERE hash IS NOT NULL ORDER BY path")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Into::into)
     }
 
     pub fn accepted_source(&self, path: &str) -> Result<Option<AcceptedSource>> {
@@ -1396,6 +1441,40 @@ fn create(path: &Path) -> Result<()> {
     }
 }
 
+/// The last schema version whose migration rebuilds tables other tables
+/// reference, which SQLite allows only with foreign keys unenforced.
+const LAST_REBUILT_VERSION: i64 = 5;
+
+/// Whether migrating the store `conn` opens would rebuild referenced
+/// tables. Versions only rise, so a store found current stays current.
+fn rebuilds_referenced_tables(conn: &Connection) -> Result<bool> {
+    let (id, version): (i32, i64) = conn.query_row(
+        "SELECT (SELECT application_id FROM pragma_application_id),
+                (SELECT user_version FROM pragma_user_version)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(id == APPLICATION_ID && (1..=LAST_REBUILT_VERSION).contains(&version))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every foreign key enforcement switch `Store::open` made on this
+    /// thread, in order.
+    static FOREIGN_KEY_SWITCHES: std::cell::RefCell<Vec<bool>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// Switches foreign key enforcement; outside any transaction, where SQLite
+/// ignores the switch.
+fn set_foreign_keys(conn: &Connection, on: bool) -> Result<()> {
+    #[cfg(test)]
+    FOREIGN_KEY_SWITCHES.with(|s| s.borrow_mut().push(on));
+    conn.pragma_update(None, "foreign_keys", on)?;
+    Ok(())
+}
+
 /// Brings an existing store's schema to `SCHEMA_VERSION`, refusing files it
 /// does not own or understand. Each version migrates to the next in turn,
 /// all in one transaction.
@@ -1437,6 +1516,20 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     }
     if version <= 4 {
         tx.execute_batch(MIGRATE_V4).with_context(mismatch)?;
+    }
+    if version <= LAST_REBUILT_VERSION {
+        let enforced: bool = tx.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+        ensure!(
+            !enforced,
+            "state schema version {version} changed while opening"
+        );
+        tx.execute_batch(MIGRATE_V5).with_context(mismatch)?;
+        let dangling: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_foreign_key_check)",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(!dangling, mismatch());
     }
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SCHEMA)?;
@@ -1645,6 +1738,47 @@ fn check_identifier(what: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+impl HumanIntent {
+    /// Checks the intent is within its bounds, returning its constraints and
+    /// completion criteria as recorded.
+    fn check(&self) -> Result<(String, String)> {
+        check_text("the objective", &self.objective, OBJECTIVE_LIMIT, true)?;
+        for (what, statements) in [
+            ("constraints", &self.constraints),
+            ("completion criteria", &self.completion_criteria),
+        ] {
+            ensure!(
+                statements.len() <= STATEMENTS_LIMIT,
+                "at most {STATEMENTS_LIMIT} {what} can be stated"
+            );
+            for statement in statements {
+                check_text(what, statement, STATEMENT_LIMIT, true)?;
+            }
+        }
+        Ok((
+            serde_json::to_string(&self.constraints)?,
+            serde_json::to_string(&self.completion_criteria)?,
+        ))
+    }
+}
+
+/// Accepts text of at most `limit` bytes whose only control characters are
+/// line breaks and tabs, and, when `required`, that says something.
+fn check_text(what: &str, text: &str, limit: usize, required: bool) -> Result<()> {
+    ensure!(
+        !required || !text.trim().is_empty(),
+        "{what} must not be blank"
+    );
+    ensure!(text.len() <= limit, "{what} must be at most {limit} bytes");
+    ensure!(
+        !text
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t'),
+        "{what} must not contain control characters"
+    );
+    Ok(())
+}
+
 impl Intent {
     /// Checks the intent is within the journal's bounds, returning its
     /// parameters as recorded.
@@ -1703,10 +1837,45 @@ impl Evidence {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::planner::Command;
     use rusqlite::types::Value;
     use serde_json::json;
     use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
+
+    /// Human intent stating only an objective.
+    pub(crate) fn objective(text: &str) -> HumanIntent {
+        HumanIntent {
+            objective: text.into(),
+            constraints: Vec::new(),
+            completion_criteria: Vec::new(),
+        }
+    }
+
+    impl Store {
+        /// Adds the task `key` to a planning plan, as a planner would.
+        pub(crate) fn add_task(
+            &mut self,
+            plan: PlanId,
+            key: &str,
+            depends_on: &[TaskId],
+        ) -> Result<TaskId> {
+            let depends_on = depends_on
+                .iter()
+                .map(|&task| Ok(self.task(task)?.key))
+                .collect::<Result<_>>()?;
+            let add = Command::AddTask {
+                task: key.into(),
+                objective: key.into(),
+                context: String::new(),
+                paths: Vec::new(),
+                depends_on,
+            };
+            self.revise_plan(plan, &[add], &|_| Ok(()))?;
+            let tasks = self.tasks(plan)?;
+            Ok(tasks.into_iter().find(|t| t.key == key).unwrap().id)
+        }
+    }
 
     fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -1754,7 +1923,7 @@ pub(crate) mod tests {
 
     /// A plan with one task running its first generation.
     fn running_generation(store: &mut Store) -> (PlanId, TaskId, GenerationId) {
-        let plan = store.create_plan("intent").unwrap();
+        let plan = store.create_plan(&objective("intent")).unwrap();
         let task = store.add_task(plan, "task", &[]).unwrap();
         let generation = store.start_generation(task).unwrap();
         (plan, task, generation)
@@ -1764,11 +1933,14 @@ pub(crate) mod tests {
     fn creates_schema_and_reopens_without_reset() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let plan = Store::open(&path).unwrap().create_plan("ship it").unwrap();
+        let plan = Store::open(&path)
+            .unwrap()
+            .create_plan(&objective("ship it"))
+            .unwrap();
         assert_eq!(version(&path), SCHEMA_VERSION);
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.plan(plan).unwrap().intent, "ship it");
+        assert_eq!(store.plan(plan).unwrap().intent, objective("ship it"));
         assert_eq!(store.events_after(0, 10).unwrap().len(), 1);
         let mode: String = store
             .conn
@@ -1856,10 +2028,47 @@ pub(crate) mod tests {
         }
     }
 
+    /// Rewrites the store at `path` as schema version 5, whose plans state
+    /// intent as one statement and whose tasks have only a description. It
+    /// keeps each objective, and nothing else of intent or tasks.
+    pub(crate) fn downgrade_to_v5(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             PRAGMA legacy_alter_table = ON;
+             DROP TRIGGER plans_intent_immutable;
+             DROP TABLE task_scope;
+             ALTER TABLE plans RENAME TO plans_v6;
+             CREATE TABLE plans (
+                 id         INTEGER PRIMARY KEY,
+                 intent     TEXT    NOT NULL CHECK (intent <> ''),
+                 state      TEXT    NOT NULL CHECK (state IN
+                     ('planning', 'ready', 'running', 'paused', 'needs_attention', 'completed')),
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             ) STRICT;
+             INSERT INTO plans SELECT id, objective, state, created_at, updated_at FROM plans_v6;
+             DROP TABLE plans_v6;
+             ALTER TABLE tasks RENAME TO tasks_v6;
+             CREATE TABLE tasks (
+                 id          INTEGER PRIMARY KEY,
+                 plan_id     INTEGER NOT NULL REFERENCES plans (id),
+                 description TEXT    NOT NULL CHECK (description <> ''),
+                 created_at  INTEGER NOT NULL,
+                 UNIQUE (id, plan_id)
+             ) STRICT;
+             INSERT INTO tasks SELECT id, plan_id, objective, created_at FROM tasks_v6;
+             DROP TABLE tasks_v6;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+    }
+
     /// Rewrites the store at `path` as schema version 4, whose journal
     /// records intents and outcomes as prose. Entries must not be
     /// reconciled; those of `legacy_intent` keep their intent's prose.
     pub(crate) fn downgrade_to_v4(path: &Path) {
+        downgrade_to_v5(path);
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
             "DROP TRIGGER journal_forward_only;
@@ -1948,21 +2157,22 @@ pub(crate) mod tests {
         conn.pragma_update(None, "user_version", 1).unwrap();
     }
 
-    /// Every row of every table except `excluded`, by table.
-    fn rows_besides(path: &Path, excluded: &str) -> Vec<(String, Vec<Vec<Value>>)> {
+    /// The tables version 6 reshapes; see its migration.
+    const RESHAPED_IN_V6: [&str; 3] = ["plans", "tasks", "task_scope"];
+
+    /// Every row of every table except those `excluded`, by table.
+    fn rows_besides(path: &Path, excluded: &[&str]) -> Vec<(String, Vec<Vec<Value>>)> {
         let conn = Connection::open(path).unwrap();
         let tables: Vec<String> = conn
-            .prepare(
-                "SELECT name FROM sqlite_schema
-                 WHERE type = 'table' AND name <> ?1 ORDER BY name",
-            )
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
             .unwrap()
-            .query_map([excluded], |r| r.get(0))
+            .query_map([], |r| r.get(0))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         tables
             .into_iter()
+            .filter(|table| !excluded.contains(&table.as_str()))
             .map(|table| {
                 let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
                 let columns = stmt.column_count();
@@ -1998,10 +2208,11 @@ pub(crate) mod tests {
         let active = store.start_generation(second).unwrap();
         store.claim_paths(active, &["src/b.rs"]).unwrap();
         drop(store);
-        let before = rows_besides(&path, "accepted_sources");
+        let reshaped = [&["accepted_sources"][..], &RESHAPED_IN_V6].concat();
+        let before = rows_besides(&path, &reshaped);
         for (table, rows) in &before {
             assert!(
-                !rows.is_empty() || table.starts_with("graph_"),
+                !rows.is_empty() || table.starts_with("graph_") || table == "task_scope",
                 "{table} is exercised"
             );
         }
@@ -2025,7 +2236,7 @@ pub(crate) mod tests {
             .query_row("SELECT count(*) FROM accepted_sources", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
-        assert_eq!(rows_besides(&path, "accepted_sources"), before);
+        assert_eq!(rows_besides(&path, &reshaped), before);
 
         // The migrated store accepts source state established afresh.
         store
@@ -2104,7 +2315,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v2.db");
         populated_v2(&path);
-        let before = rows_besides(&path, "");
+        let before = rows_besides(&path, &[]);
         for (table, rows) in &before {
             assert!(!rows.is_empty(), "{table} is exercised");
         }
@@ -2112,15 +2323,18 @@ pub(crate) mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(version(&path), SCHEMA_VERSION);
         drop(store);
-        let after = rows_besides(&path, "");
+        let after = rows_besides(&path, &[]);
         let (graph, rest): (Vec<_>, Vec<_>) = after
             .into_iter()
             .partition(|(table, _)| table.starts_with("graph_"));
-        // Invocations and the journal change shape in versions 4 and 5; see
-        // their migrations.
+        // Invocations, the journal, plans and tasks change shape in versions
+        // 4 to 6; see their migrations.
         let reshaped = |rows: &[(String, Vec<Vec<Value>>)]| {
             rows.iter()
-                .filter(|(table, _)| !matches!(table.as_str(), "invocations" | "journal"))
+                .filter(|(table, _)| {
+                    !["invocations", "journal"].contains(&table.as_str())
+                        && !RESHAPED_IN_V6.contains(&table.as_str())
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -2213,25 +2427,24 @@ pub(crate) mod tests {
     fn plan_lifecycle_rejects_invalid_transitions() {
         use PlanState::*;
         let (_dir, mut store) = store();
-        let plan = store.create_plan("intent").unwrap();
+        let plan = store.create_plan(&objective("intent")).unwrap();
 
         for to in [Running, Paused, Completed, Planning] {
             assert!(err(store.set_plan_state(plan, to)).contains("cannot go from planning"));
         }
-        for to in [
-            NeedsAttention,
-            Ready,
-            Running,
-            Paused,
-            Running,
-            Planning,
-            Ready,
-            Running,
-        ] {
+        // Only finalized planning makes a plan ready.
+        let finalizing = "becomes ready only by finalizing";
+        assert!(err(store.set_plan_state(plan, Ready)).contains(finalizing));
+        let task = store.add_task(plan, "task", &[]).unwrap();
+        store
+            .revise_plan(plan, &[Command::Finalize {}], &|_| Ok(()))
+            .unwrap();
+        for to in [Running, Paused, Running, Planning, NeedsAttention] {
             store.set_plan_state(plan, to).unwrap();
         }
+        assert!(err(store.set_plan_state(plan, Ready)).contains(finalizing));
+        store.set_plan_state(plan, Running).unwrap();
 
-        let task = store.add_task(plan, "task", &[]).unwrap();
         let message = err(store.set_plan_state(plan, Completed));
         assert!(message.contains("1 uncompleted tasks"), "{message}");
         let generation = store.start_generation(task).unwrap();
@@ -2242,14 +2455,14 @@ pub(crate) mod tests {
         for to in [Planning, Ready, Running, Paused, NeedsAttention, Completed] {
             assert!(store.set_plan_state(plan, to).is_err());
         }
-        assert!(err(store.add_task(plan, "late", &[])).contains("is completed"));
+        assert!(err(store.add_task(plan, "late", &[])).contains("only a planning plan"));
     }
 
     #[test]
     fn references_are_enforced() {
         let (_dir, mut store) = store();
-        let a = store.create_plan("a").unwrap();
-        let b = store.create_plan("b").unwrap();
+        let a = store.create_plan(&objective("a")).unwrap();
+        let b = store.create_plan(&objective("b")).unwrap();
         let in_b = store.add_task(b, "b1", &[]).unwrap();
 
         assert!(store.add_task(PlanId(99), "orphan", &[]).is_err());
@@ -2267,8 +2480,11 @@ pub(crate) mod tests {
         // The database itself refuses dangling references and self-cycles.
         let raw = |sql: &str| store.conn.execute(sql, []).unwrap_err().to_string();
         assert!(
-            raw("INSERT INTO tasks (plan_id, description, created_at) VALUES (99, 'x', 0)")
-                .contains("FOREIGN KEY")
+            raw(
+                "INSERT INTO tasks (plan_id, key, objective, context, created_at)
+                 VALUES (99, 'x', 'x', '', 0)"
+            )
+            .contains("FOREIGN KEY")
         );
         let cycle = format!("INSERT INTO task_dependencies VALUES ({b}, {in_b}, {in_b})");
         assert!(raw(&cycle).contains("CHECK"));
@@ -2282,7 +2498,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let mut store = Store::open(&path).unwrap();
-        let plan = store.create_plan("intent").unwrap();
+        let plan = store.create_plan(&objective("intent")).unwrap();
         let a = store.add_task(plan, "a", &[]).unwrap();
         let b = store.add_task(plan, "b", &[a]).unwrap();
         let c = store.add_task(plan, "c", &[a, b]).unwrap();
@@ -2328,15 +2544,17 @@ pub(crate) mod tests {
     #[test]
     fn dependencies_form_any_acyclic_graph() {
         let (_dir, mut store) = store();
-        let plan = store.create_plan("intent").unwrap();
+        let plan = store.create_plan(&objective("intent")).unwrap();
         let [a, b, c, d] = ["a", "b", "c", "d"].map(|t| store.add_task(plan, t, &[]).unwrap());
+        let on = |task: &str, deps: &[&str]| Command::SetDependencies {
+            task: task.into(),
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+        };
 
         // Edges run against creation order as freely as with it: a diamond
         // where the earliest task depends on later ones.
-        store.add_dependency(a, b).unwrap();
-        store.add_dependency(a, c).unwrap();
-        store.add_dependency(b, d).unwrap();
-        store.add_dependency(c, d).unwrap();
+        let diamond = [on("a", &["b", "c"]), on("b", &["d"]), on("c", &["d"])];
+        store.revise_plan(plan, &diamond, &|_| Ok(())).unwrap();
         let e = store.add_task(plan, "e", &[a, d]).unwrap();
         assert_eq!(store.task(a).unwrap().depends_on, vec![b, c]);
         assert_eq!(store.task(e).unwrap().depends_on, vec![a, d]);
@@ -2344,11 +2562,18 @@ pub(crate) mod tests {
         assert!(store.dependencies_satisfied(d).unwrap());
 
         let events = store.events_after(0, 100).unwrap();
-        for (task, dep) in [(d, d), (b, a), (d, a), (d, e)] {
-            let message = err(store.add_dependency(task, dep));
-            assert!(message.contains("would form a cycle"), "{message}");
+        for (task, dep, refusal) in [
+            ("d", "d", "cannot depend on itself"),
+            ("b", "a", "would form a cycle"),
+            ("d", "a", "would form a cycle"),
+            ("d", "e", "would form a cycle"),
+            ("a", "b", "more than once"),
+        ] {
+            let deps = on(task, &[dep, dep]);
+            let message = err(store.revise_plan(plan, &[deps], &|_| Ok(())));
+            assert!(message.contains(refusal), "{message}");
         }
-        assert!(store.add_dependency(a, b).is_err(), "duplicate edge");
+        assert_eq!(store.task(a).unwrap().depends_on, vec![b, c]);
         assert_eq!(store.task(d).unwrap().depends_on, vec![]);
         assert_eq!(store.events_after(0, 100).unwrap(), events);
     }
@@ -2356,7 +2581,7 @@ pub(crate) mod tests {
     #[test]
     fn invocation_lifecycle_is_explicit_and_final() {
         let (_dir, mut store) = store();
-        let plan = store.create_plan("intent").unwrap();
+        let plan = store.create_plan(&objective("intent")).unwrap();
         let agent = store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap();
@@ -2424,7 +2649,7 @@ pub(crate) mod tests {
     #[test]
     fn invocation_ends_must_be_consistent() {
         let (_dir, mut store) = store();
-        let plan = store.create_plan("intent").unwrap();
+        let plan = store.create_plan(&objective("intent")).unwrap();
         let agent = store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap();
@@ -2471,7 +2696,7 @@ pub(crate) mod tests {
     fn invocation_transitions_are_enforced_by_the_store() {
         use FailureKind::*;
         let (_dir, mut store) = store();
-        let plan = store.create_plan("intent").unwrap();
+        let plan = store.create_plan(&objective("intent")).unwrap();
         let failed = |kind, exit_code| InvocationEnd {
             failure: Some(kind),
             diagnostic: Some("why".into()),
@@ -2565,7 +2790,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v3.db");
         let mut store = Store::open(&path).unwrap();
-        let plan = store.create_plan("intent").unwrap();
+        let plan = store.create_plan(&objective("intent")).unwrap();
         let agent = |store: &mut Store| {
             store
                 .create_agent(Role::Planner, AgentScope::Plan(plan))
@@ -2578,7 +2803,8 @@ pub(crate) mod tests {
         let live = store.start_invocation(b, "codex", "m2", None).unwrap();
         drop(store);
         downgrade_to_v3(&path);
-        let before = rows_besides(&path, "invocations");
+        let reshaped = [&["invocations"][..], &RESHAPED_IN_V6].concat();
+        let before = rows_besides(&path, &reshaped);
 
         let mut store = Store::open(&path).unwrap();
         assert_eq!(version(&path), SCHEMA_VERSION);
@@ -2596,7 +2822,7 @@ pub(crate) mod tests {
         // Still live: the agent cannot be embodied twice.
         assert!(store.start_invocation(b, "codex", "m2", None).is_err());
         drop(store);
-        assert_eq!(rows_besides(&path, "invocations"), before);
+        assert_eq!(rows_besides(&path, &reshaped), before);
     }
 
     #[test]
@@ -2674,7 +2900,7 @@ pub(crate) mod tests {
     /// An agent with an ended invocation, which can evidence a
     /// reconciliation.
     fn agent_with_ended_invocation(store: &mut Store) -> (AgentId, InvocationId) {
-        let plan = store.create_plan("intent").unwrap();
+        let plan = store.create_plan(&objective("intent")).unwrap();
         let agent = store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap();
@@ -3060,7 +3286,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v4.db");
         let mut store = Store::open(&path).unwrap();
-        let plan = store.create_plan("intent").unwrap();
+        let plan = store.create_plan(&objective("intent")).unwrap();
         let agent = store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap();
@@ -3086,7 +3312,8 @@ pub(crate) mod tests {
             .unwrap();
         }
         drop(conn);
-        let before = rows_besides(&path, "journal");
+        let reshaped = [&["journal"][..], &RESHAPED_IN_V6].concat();
+        let before = rows_besides(&path, &reshaped);
 
         let store = Store::open(&path).unwrap();
         assert_eq!(version(&path), SCHEMA_VERSION);
@@ -3110,13 +3337,145 @@ pub(crate) mod tests {
         }
         assert_eq!(continuation.len(), states.len());
         drop(store);
-        assert_eq!(rows_besides(&path, "journal"), before);
+        assert_eq!(rows_besides(&path, &reshaped), before);
+    }
+
+    #[test]
+    fn migrating_version_5_keeps_objectives_and_the_task_dag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        let mut store = Store::open(&path).unwrap();
+        let (plan, first, generation) = running_generation(&mut store);
+        let second = store.add_task(plan, "second", &[first]).unwrap();
+        store.claim_paths(generation, &["src/a.rs"]).unwrap();
+        drop(store);
+        downgrade_to_v5(&path);
+        let before = rows_besides(&path, &RESHAPED_IN_V6);
+        drop(Store::open(&path).unwrap());
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        assert_eq!(rows_besides(&path, &RESHAPED_IN_V6), before);
+
+        // Version 5's one statement of intent is the objective; no
+        // constraint or criterion is invented. Tasks keep their place in
+        // the DAG, keyed afresh, with nothing requested.
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.plan(plan).unwrap().intent, objective("intent"));
+        let tasks: Vec<_> = store
+            .tasks(plan)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.id, t.key, t.objective, t.context, t.scope, t.depends_on))
+            .collect();
+        let migrated = |id: TaskId, objective: &str, depends_on| {
+            let key = format!("task-{id}");
+            (id, key, objective.into(), String::new(), vec![], depends_on)
+        };
+        assert_eq!(
+            tasks,
+            [
+                migrated(first, "task", vec![]),
+                migrated(second, "second", vec![first])
+            ]
+        );
+        assert_eq!(store.task(first).unwrap().state, TaskState::Running);
+
+        // References into the rebuilt tables hold and are enforced, and
+        // the intent is immutable.
+        let raw = |store: &Store, sql: &str| store.conn.execute(sql, []).unwrap_err().to_string();
+        let delete = format!("DELETE FROM tasks WHERE id = {first}");
+        assert!(raw(&store, &delete).contains("FOREIGN KEY"));
+        let rewrite = "UPDATE plans SET constraints = '[\"none\"]'";
+        assert!(raw(&store, rewrite).contains("human intent is immutable"));
+        store.add_task(plan, "third", &[second]).unwrap();
+    }
+
+    /// The foreign key enforcement switches `Store::open` has made on this
+    /// thread since last asked.
+    fn foreign_key_switches() -> Vec<bool> {
+        FOREIGN_KEY_SWITCHES.with(|s| s.take())
+    }
+
+    fn enforces_foreign_keys(store: &Store) -> bool {
+        store
+            .conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn opening_a_current_store_never_disables_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        drop(Store::open(&path).unwrap());
+        assert!(foreign_key_switches().is_empty());
+        let store = Store::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        assert!(foreign_key_switches().is_empty());
+        assert!(enforces_foreign_keys(&store));
+    }
+
+    #[test]
+    fn migrating_version_5_disables_foreign_keys_only_while_rebuilding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        let mut store = Store::open(&path).unwrap();
+        running_generation(&mut store);
+        drop(store);
+        downgrade_to_v5(&path);
+        foreign_key_switches();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(foreign_key_switches(), [false, true]);
+        assert!(enforces_foreign_keys(&store));
+        drop(store);
+        drop(Store::open(&path).unwrap());
+        assert!(foreign_key_switches().is_empty());
+    }
+
+    #[test]
+    fn migrating_version_4_through_the_rebuild_restores_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v4.db");
+        let mut store = Store::open(&path).unwrap();
+        running_generation(&mut store);
+        drop(store);
+        downgrade_to_v4(&path);
+        foreign_key_switches();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(version(&path), SCHEMA_VERSION);
+        assert_eq!(foreign_key_switches(), [false, true]);
+        assert!(enforces_foreign_keys(&store));
+    }
+
+    #[test]
+    fn refuses_version_5_files_with_dangling_references_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dangling.db");
+        let mut store = Store::open(&path).unwrap();
+        running_generation(&mut store);
+        drop(store);
+        downgrade_to_v5(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM tasks;")
+            .unwrap();
+        drop(conn);
+
+        let before = std::fs::read(&path).unwrap();
+        foreign_key_switches();
+        let message = err(Store::open(&path));
+        assert!(
+            message.contains("does not match agentctl schema version 5"),
+            "{message}"
+        );
+        // No store is returned, and enforcement was restored regardless.
+        assert_eq!(foreign_key_switches(), [false, true]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(version(&path), 5);
     }
 
     #[test]
     fn decisions_persist_immutably() {
         let (_dir, mut store) = store();
-        let plan = store.create_plan("intent").unwrap();
+        let plan = store.create_plan(&objective("intent")).unwrap();
         store
             .record_decision(plan, "tests are flaky on CI", "quarantine them")
             .unwrap();
@@ -3153,7 +3512,7 @@ pub(crate) mod tests {
             kinds,
             [
                 "plan.created",
-                "task.created",
+                "plan.revised",
                 "generation.started",
                 "agent.created",
                 "journal.intended"
@@ -3371,7 +3730,9 @@ pub(crate) mod tests {
                     barrier.wait();
                     let mut store = Store::open(&path).unwrap();
                     for j in 0..10 {
-                        let plan = store.create_plan(&format!("plan {i}.{j}")).unwrap();
+                        let plan = store
+                            .create_plan(&objective(&format!("plan {i}.{j}")))
+                            .unwrap();
                         store.add_task(plan, "task", &[]).unwrap();
                     }
                 })
@@ -3456,3 +3817,25 @@ pub(crate) mod tests {
 /// ```
 #[cfg(doctest)]
 pub struct AcceptedSourceIsRestricted;
+
+/// Only `crate::planner`, which checks requested paths against the project,
+/// revises a plan's tasks or makes it ready. Other crates can neither revise
+/// a plan directly:
+///
+/// ```compile_fail,E0624
+/// # use agentctl::{planner::Command, state::{PlanId, Store}};
+/// # fn f(store: &mut Store, plan: PlanId) {
+/// store.revise_plan(plan, &[Command::Finalize {}], &|_| Ok(())).unwrap();
+/// # }
+/// ```
+///
+/// nor make it ready through its lifecycle:
+///
+/// ```no_run
+/// # use agentctl::state::{PlanId, PlanState, Store};
+/// # fn f(store: &mut Store, plan: PlanId) {
+/// assert!(store.set_plan_state(plan, PlanState::Ready).is_err());
+/// # }
+/// ```
+#[cfg(doctest)]
+pub struct PlanningIsRestricted;

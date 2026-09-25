@@ -226,6 +226,7 @@ mod tests {
     use super::*;
     use crate::config::tests::sample;
     use crate::project::{STATE_DB, STATE_DIR};
+    use crate::state::tests::objective;
     use std::fs;
 
     fn init(cwd: &Path, input: &str, available: bool) -> (Result<()>, String) {
@@ -308,7 +309,11 @@ mod tests {
         fs::write(dir.path().join(CONFIG_FILE), &original).unwrap();
         init(dir.path(), "n\n", true).0.unwrap();
         let project = Project::load(dir.path()).unwrap();
-        let plan = project.hydrate().unwrap().create_plan("old").unwrap();
+        let plan = project
+            .hydrate()
+            .unwrap()
+            .create_plan(&objective("old"))
+            .unwrap();
 
         fs::remove_dir_all(dir.path().join(STATE_DIR)).unwrap();
         init(dir.path(), "n\n", true).0.unwrap();
@@ -320,7 +325,7 @@ mod tests {
         );
         let mut store = project.hydrate().unwrap();
         assert!(store.plan(plan).is_err(), "local state starts fresh");
-        store.create_plan("new").unwrap();
+        store.create_plan(&objective("new")).unwrap();
     }
 
     #[test]

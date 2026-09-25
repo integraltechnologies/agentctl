@@ -1,26 +1,55 @@
--- agentctl canonical project state, schema version 5.
+-- agentctl canonical project state, schema version 6.
 --
 -- The schema enforces structure: references, value domains and uniqueness.
 -- Lifecycle transitions are enforced by `Store`, the only writer.
 -- Timestamps are Unix epoch milliseconds.
 
+-- A plan pursues a human's intent: an objective, the constraints and
+-- invariants the work must respect, and the criteria by which it is
+-- complete, each a JSON array of statements as given. Intent is established
+-- with the plan and never changes: planning decides how, never what.
 CREATE TABLE plans (
-    id         INTEGER PRIMARY KEY,
-    intent     TEXT    NOT NULL CHECK (intent <> ''),
-    state      TEXT    NOT NULL CHECK (state IN
+    id                  INTEGER PRIMARY KEY,
+    objective           TEXT    NOT NULL CHECK (objective <> ''),
+    constraints         TEXT    NOT NULL
+        CHECK (json_valid(constraints) AND json_type(constraints) = 'array'),
+    completion_criteria TEXT    NOT NULL
+        CHECK (json_valid(completion_criteria) AND json_type(completion_criteria) = 'array'),
+    state               TEXT    NOT NULL CHECK (state IN
         ('planning', 'ready', 'running', 'paused', 'needs_attention', 'completed')),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
 ) STRICT;
 
--- A task's lifecycle is derived from its generations (see `Store::task`).
+CREATE TRIGGER plans_intent_immutable BEFORE UPDATE ON plans
+WHEN NEW.id IS NOT OLD.id OR NEW.objective IS NOT OLD.objective
+    OR NEW.constraints IS NOT OLD.constraints
+    OR NEW.completion_criteria IS NOT OLD.completion_criteria
+BEGIN SELECT RAISE(ABORT, 'human intent is immutable'); END;
+
+-- Planned work, named within its plan by a planner-chosen `key` so that
+-- planning never depends on storage rows. `context` is what a worker is
+-- told beyond the objective. A task's lifecycle is derived from its
+-- generations (see `Store::task`).
 CREATE TABLE tasks (
-    id          INTEGER PRIMARY KEY,
-    plan_id     INTEGER NOT NULL REFERENCES plans (id),
-    description TEXT    NOT NULL CHECK (description <> ''),
-    created_at  INTEGER NOT NULL,
-    UNIQUE (id, plan_id)
+    id         INTEGER PRIMARY KEY,
+    plan_id    INTEGER NOT NULL REFERENCES plans (id),
+    key        TEXT    NOT NULL CHECK (length(key) <= 64
+        AND key GLOB '[a-z]*' AND key NOT GLOB '*[^a-z0-9_-]*'),
+    objective  TEXT    NOT NULL CHECK (objective <> ''),
+    context    TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (id, plan_id),
+    UNIQUE (plan_id, key)
 ) STRICT;
+
+-- The exact project paths a task requests to mutate: literal names, never
+-- patterns.
+CREATE TABLE task_scope (
+    task_id INTEGER NOT NULL REFERENCES tasks (id) ON DELETE CASCADE,
+    path    TEXT    NOT NULL CHECK (path <> ''),
+    PRIMARY KEY (task_id, path)
+) STRICT, WITHOUT ROWID;
 
 -- Dependencies stay within one plan. Task ids carry no ordering: an edge may
 -- point to any task, and `Store` refuses edges that would close a cycle.

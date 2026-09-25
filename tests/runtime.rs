@@ -19,7 +19,9 @@ use agentctl::config::ReasoningEffort;
 use agentctl::runtime::{
     self, FailureKind, InvocationState, Launch, Outcome, Provider, TokenUsage, Usage,
 };
-use agentctl::state::{ActionStatus, AgentId, AgentScope, Attempt, Intent, Role, Store};
+use agentctl::state::{
+    ActionStatus, AgentId, AgentScope, Attempt, HumanIntent, Intent, Role, Store,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -284,6 +286,14 @@ fn fake_provider() -> &'static Path {
         .1
 }
 
+fn intent(objective: &str) -> HumanIntent {
+    HumanIntent {
+        objective: objective.into(),
+        constraints: Vec::new(),
+        completion_criteria: Vec::new(),
+    }
+}
+
 struct Fixture {
     dir: TempDir,
     store: Store,
@@ -294,7 +304,7 @@ impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("state.db")).unwrap();
-        let plan = store.create_plan("exercise the runtime").unwrap();
+        let plan = store.create_plan(&intent("exercise the runtime")).unwrap();
         let agent = store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap();
@@ -302,7 +312,7 @@ impl Fixture {
     }
 
     fn agent(&mut self) -> AgentId {
-        let plan = self.store.create_plan("another").unwrap();
+        let plan = self.store.create_plan(&intent("another")).unwrap();
         self.store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap()

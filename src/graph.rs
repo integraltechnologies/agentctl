@@ -377,6 +377,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::config::tests::sample;
     use crate::source::accept_generation;
+    use crate::state::tests::objective;
     use Freshness::{Absent, Current, Stale, Unindexed};
     use std::fs;
     use std::process::Command;
@@ -423,7 +424,7 @@ pub(crate) mod tests {
                 }
                 None => fs::remove_file(&file).unwrap(),
             }
-            let plan = self.store.create_plan("change").unwrap();
+            let plan = self.store.create_plan(&objective("change")).unwrap();
             let task = self.store.add_task(plan, "change", &[]).unwrap();
             let generation = self.store.start_generation(task).unwrap();
             accept_generation(&self.project, &mut self.store, generation, &[path]).unwrap();

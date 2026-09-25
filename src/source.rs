@@ -263,7 +263,7 @@ fn remove(root: &Path, path: &str) -> Result<()> {
 /// root, inside agentctl's or Git's own state, or not addressable as literal
 /// names on this platform. ASCII case is ignored for state, as
 /// case-insensitive filesystems do.
-fn check_source(project: &Project, path: &str) -> Result<()> {
+pub(crate) fn check_source(project: &Project, path: &str) -> Result<()> {
     check_path(path)?;
     ensure!(
         project
@@ -457,7 +457,7 @@ mod tests {
     use super::*;
     use crate::config::tests::sample;
     use crate::project::STATE_DB;
-    use crate::state::tests::downgrade_to_v1;
+    use crate::state::tests::{downgrade_to_v1, objective};
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
@@ -519,7 +519,7 @@ mod tests {
 
         /// Starts a generation of a new task, to be accepted.
         fn generation(&mut self) -> GenerationId {
-            let plan = self.store.create_plan("change").unwrap();
+            let plan = self.store.create_plan(&objective("change")).unwrap();
             let task = self.store.add_task(plan, "change", &[]).unwrap();
             self.store.start_generation(task).unwrap()
         }

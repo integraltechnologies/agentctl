@@ -8,8 +8,8 @@ use std::path::Path;
 use std::process::{self, Command};
 
 use agentctl::state::{
-    ActionOutcome, ActionStatus, AgentId, AgentScope, Evidence, FailureKind, Intent, InvocationEnd,
-    InvocationId, InvocationState, JournalEntry, Role, Store, Usage,
+    ActionOutcome, ActionStatus, AgentId, AgentScope, Evidence, FailureKind, HumanIntent, Intent,
+    InvocationEnd, InvocationId, InvocationState, JournalEntry, Role, Store, Usage,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -87,7 +87,13 @@ fn interrupted_child() {
         return;
     };
     let mut store = Store::open(Path::new(&path)).unwrap();
-    let plan = store.create_plan("continue after interruption").unwrap();
+    let plan = store
+        .create_plan(&HumanIntent {
+            objective: "continue after interruption".into(),
+            constraints: Vec::new(),
+            completion_criteria: Vec::new(),
+        })
+        .unwrap();
     let agent = store
         .create_agent(Role::Planner, AgentScope::Plan(plan))
         .unwrap();

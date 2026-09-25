@@ -621,6 +621,7 @@ mod tests {
     use crate::graph::tests::{Fixture, current, fails};
     use crate::graph::{Direction, Freshness};
     use crate::project::STATE_DIR;
+    use crate::state::tests::objective;
     use std::fs;
 
     const LIB: &str = "src/lib.rs";
@@ -1204,7 +1205,7 @@ fn platform() {}
         }
         let file = fx.project.root.join(LIB);
         fs::write(&file, b"fn f() {}\xff").unwrap();
-        let plan = fx.store.create_plan("bytes").unwrap();
+        let plan = fx.store.create_plan(&objective("bytes")).unwrap();
         let task = fx.store.add_task(plan, "bytes", &[]).unwrap();
         let generation = fx.store.start_generation(task).unwrap();
         source::accept_generation(&fx.project, &mut fx.store, generation, &[LIB]).unwrap();

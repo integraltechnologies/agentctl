@@ -1,6 +1,7 @@
 pub mod config;
 pub mod graph;
 pub mod init;
+pub mod planner;
 pub mod platform;
 pub mod project;
 pub mod runtime;
