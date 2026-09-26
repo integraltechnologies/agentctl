@@ -154,7 +154,7 @@ pub fn result_schema() -> Value {
 }
 
 /// Reads a verifier's result, which must keep to the protocol.
-fn read(payload: &Value) -> Result<VerifierReport> {
+pub(crate) fn read(payload: &Value) -> Result<VerifierReport> {
     let report = VerifierReport::deserialize(payload)?;
     report.check()?;
     Ok(report)
@@ -377,7 +377,7 @@ pub fn start(
         });
     }
     // Staging writes nothing in the project, so it may precede the intent.
-    let (view, workspace) = stage(project, store, generation, &snapshot, &candidate)?;
+    let (view, workspace, _) = stage(project, store, Some(generation), &snapshot, &candidate)?;
     let (verification, agent, entry) =
         store.begin_verification(task, generation, &observed, since)?;
     let launch = Launch {
@@ -469,23 +469,47 @@ impl Verifier {
 }
 
 /// Stages the view of the repository for verifying the candidate of
-/// `generation` (see [`view`]) from the working tree as `tree` observed it
-/// and from recovery objects, and returns it with its workspace. The basis
-/// is read again once staged: should an install of another generation have
-/// been attempted meanwhile at a path copied from the working tree, or such
-/// a path have gained accepted state, the copy may hold provisional bytes,
-/// so it is staged again, a bounded number of times.
-fn stage(
+/// `generation` (see [`view`]), or with no generation and no candidate the
+/// accepted repository alone, from the working tree as `tree` observed it
+/// and from recovery objects, and returns it with its workspace and the
+/// basis it was staged on. The basis is read again once staged: should an
+/// install of another generation have been attempted meanwhile at a path
+/// copied from the working tree, or such a path have gained accepted state,
+/// the copy may hold provisional bytes, so it is staged again, a bounded
+/// number of times.
+pub(crate) fn stage(
     project: &Project,
     store: &Store,
-    generation: GenerationId,
+    generation: Option<GenerationId>,
     tree: &Snapshot,
     candidate: &[(String, Content)],
-) -> Result<(Snapshot, Workspace)> {
+) -> Result<(Snapshot, Workspace, ViewBasis)> {
+    settle(store, generation, tree, candidate, |view, recovered| {
+        Workspace::compose(project, view, recovered)
+    })
+}
+
+/// The view of the accepted repository alone that [`stage`] would stage
+/// from `tree`, and the basis it holds on, without staging it.
+pub(crate) fn accepted_view(store: &Store, tree: &Snapshot) -> Result<(Snapshot, ViewBasis)> {
+    let (view, (), basis) = settle(store, None, tree, &[], |_, _| Ok(()))?;
+    Ok((view, basis))
+}
+
+/// Builds the view (see [`view`]) and what `make` makes of it, until the
+/// basis it was built on is found not to have moved meanwhile, a bounded
+/// number of times.
+fn settle<T>(
+    store: &Store,
+    generation: Option<GenerationId>,
+    tree: &Snapshot,
+    candidate: &[(String, Content)],
+    make: impl Fn(&Snapshot, &BTreeSet<String>) -> Result<T>,
+) -> Result<(Snapshot, T, ViewBasis)> {
     let mut basis = store.view_basis(generation)?;
     for _ in 0..STAGE_ATTEMPTS {
         let (view, recovered) = view(tree, &basis, candidate);
-        let staged = Workspace::compose(project, &view, &recovered);
+        let made = make(&view, &recovered);
         let later = store.view_basis(generation)?;
         let taken: BTreeSet<&str> = view
             .entries
@@ -494,7 +518,7 @@ fn stage(
             .filter(|path| !recovered.contains(*path))
             .collect();
         if !basis.moved(&later, &taken) {
-            return Ok((view, staged?));
+            return Ok((view, made?, basis));
         }
         basis = later;
     }
@@ -553,7 +577,10 @@ fn entries_at(snapshot: &Snapshot, paths: &[String]) -> Vec<(String, Content)> {
 /// Every path whose entry any of `observations` of a workspace found
 /// different from what was `staged` there, where a path not staged counts
 /// as absent: repository source changed, created or deleted.
-fn mutated(staged: &[(String, Content)], observations: &[&[(String, Content)]]) -> Vec<String> {
+pub(crate) fn mutated(
+    staged: &[(String, Content)],
+    observations: &[&[(String, Content)]],
+) -> Vec<String> {
     let staged: BTreeMap<&str, &Content> = staged.iter().map(|(p, c)| (p.as_str(), c)).collect();
     let mut mutated: Vec<String> = observations
         .iter()

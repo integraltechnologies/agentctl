@@ -63,7 +63,7 @@ pub enum Content {
 }
 
 impl Content {
-    fn columns(&self) -> (&'static str, Option<&str>) {
+    pub(super) fn columns(&self) -> (&'static str, Option<&str>) {
         match self {
             Self::Absent => ("absent", None),
             Self::File(hash) => ("file", Some(hash)),
@@ -799,7 +799,7 @@ fn record_install(
     Ok(())
 }
 
-fn check_content(path: &str, content: &Content) -> Result<()> {
+pub(super) fn check_content(path: &str, content: &Content) -> Result<()> {
     check_path(path)?;
     match content {
         Content::File(hash) | Content::Symlink(hash) => check_hash(hash),

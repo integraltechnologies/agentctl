@@ -2,8 +2,11 @@ use std::io;
 
 use agentctl::planner::{self, Planned};
 use agentctl::project::Project;
-use agentctl::state::{ConcernId, Decided, HumanDecision, PlanId, PlanState, Store};
-use agentctl::{init, scheduler};
+use agentctl::state::{
+    ConcernId, Decided, HumanDecision, IntegrationOutcome, IntegrationStatus, PlanId, PlanState,
+    Store,
+};
+use agentctl::{init, integration, scheduler};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -39,9 +42,19 @@ enum PlanCommand {
     /// planner awaits your decisions: its planner is given canonical
     /// feedback on how the plan's work went, and what it proposes is
     /// applied as one change, or not at all. Nothing runs: `agentctl run`
-    /// runs whatever the replan made eligible.
+    /// runs whatever the replan made eligible. When the planner proposes
+    /// that the plan's objective is met, its final integration verification
+    /// runs at once.
     Update {
         /// The plan to replan.
+        plan: PlanId,
+    },
+    /// Verify a settled plan whose planner proposed its completion: a fresh,
+    /// independent verifier judges its accepted result as a whole, and only
+    /// its pass completes the plan. A failure's blockers go to the planner
+    /// (`plan update`); nothing is retried.
+    Verify {
+        /// The plan to verify.
         plan: PlanId,
     },
     /// Show a plan's state and every concern its planner raised for your
@@ -141,6 +154,14 @@ fn main() -> Result<()> {
             show_attention(&store, plan)
         }
         Command::Plan {
+            command: PlanCommand::Verify { plan },
+        } => {
+            let cwd = std::env::current_dir()?;
+            let project = Project::discover(&cwd)?.context("no agentctl project here")?;
+            let mut store = project.hydrate()?;
+            verify(&project, &mut store, plan)
+        }
+        Command::Plan {
             command: PlanCommand::Update { plan },
         } => {
             let cwd = std::env::current_dir()?;
@@ -169,6 +190,10 @@ fn main() -> Result<()> {
                     if state == PlanState::NeedsAttention {
                         show_attention(&store, plan)?;
                     }
+                    if store.completion_proposal(plan)? == Some(replan) {
+                        println!("plan {plan}: its planner proposed completion");
+                        verify(&project, &mut store, plan)?;
+                    }
                     Ok(())
                 }
                 Planned::Stale { invocation } => bail!(
@@ -188,6 +213,34 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Runs `plan`'s final integration verification and prints how it ended.
+fn verify(project: &Project, store: &mut Store, plan: PlanId) -> Result<()> {
+    let integrated = integration::verify(project, store, plan, None)?;
+    let v = &integrated.integration;
+    let IntegrationStatus::Finished(result) = &v.status else {
+        bail!("integration verification {} did not finish", v.id);
+    };
+    println!(
+        "integration verification {} of replan {}: {}",
+        v.id, v.proposal, result.outcome
+    );
+    for blocker in result.report.iter().flat_map(|r| &r.blockers) {
+        println!("  blocker {}: {}", blocker.id, blocker.summary);
+    }
+    if let Some(why) = &integrated.malformed {
+        println!("  malformed result: {why}");
+    }
+    println!("plan {plan}: {}", store.plan(plan)?.state);
+    match result.outcome {
+        IntegrationOutcome::Passed => {}
+        IntegrationOutcome::Failed => {
+            println!("its planner decides what follows: `agentctl plan update {plan}`")
+        }
+        _ => println!("nothing was judged: `agentctl plan verify {plan}` verifies again"),
+    }
+    Ok(())
 }
 
 /// Prints `plan`'s state, its concerns and what continues it.

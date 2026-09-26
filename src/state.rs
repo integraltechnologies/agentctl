@@ -18,12 +18,15 @@
 //! through `crate::executor`, which observes both itself (see
 //! [`Execution`]). Verifications of installed candidates are recorded only
 //! through `crate::verifier`, and a verified candidate is accepted only
-//! through `crate::acceptance` (see [`Acceptance`]).
+//! through `crate::acceptance` (see [`Acceptance`]). A plan is completed
+//! only by the pass of a final integration verification of its accepted
+//! result, recorded only through `crate::integration` (see [`Integration`]).
 
 mod acceptance;
 mod attention;
 mod execution;
 mod graph;
+mod integration;
 mod ownership;
 mod planning;
 mod replanning;
@@ -35,6 +38,8 @@ pub use acceptance::{Acceptance, AcceptedChange};
 pub use attention::{Concern, Decided, HumanDecision};
 pub use execution::{Capture, Change, ChangeKind, Content, Execution, ExecutionStatus, Install};
 pub(crate) use execution::{ExecutorResult, Observed};
+pub(crate) use integration::IntegrationObserved;
+pub use integration::{Integration, IntegrationResult, IntegrationStatus};
 pub use ownership::{Acquisition, Conflict, Owner};
 pub(crate) use replanning::Restoration;
 pub use replanning::{Basis, Replan, ReplanRecord, RetryAuthorization, Revision, Standing};
@@ -134,7 +139,8 @@ ids!(
     ExecutionId,
     VerificationId,
     ReplanId,
-    ConcernId
+    ConcernId,
+    IntegrationId
 );
 
 macro_rules! text_enum {
@@ -183,6 +189,9 @@ text_enum!(PlanState {
     /// awaits its planner: nothing of it is claimed. Entered and left only
     /// through attention (see `Store::decide`).
     NeedsAttention = "needs_attention",
+    /// A final integration verification passed its accepted result as a
+    /// whole, as it stood then: entered only by that pass (see
+    /// `crate::integration`), and never left.
     Completed = "completed",
 });
 
@@ -193,7 +202,7 @@ impl PlanState {
             (self, to),
             (Planning, Ready)
                 | (Ready, Running | Planning)
-                | (Running, Paused | Planning | Completed)
+                | (Running, Paused | Planning)
                 | (Paused, Running)
         )
     }
@@ -379,6 +388,34 @@ text_enum!(
         BoundaryViolated = "boundary_violated",
         /// The verifier's invocation failed, was cancelled or was
         /// interrupted: no judgment, and nothing about the candidate.
+        InvocationFailed = "invocation_failed",
+        /// The invocation succeeded with a result breaking the verifier
+        /// protocol: no judgment either.
+        MalformedResult = "malformed_result",
+    }
+);
+
+text_enum!(
+    /// How a final integration verification of a plan ended. Only `Passed`
+    /// and `Failed` are judgments, each of the plan's accepted result and
+    /// work exactly as they stood when intended and still stand: a pass
+    /// completes the plan, and a failure's blockers are feedback for its
+    /// planner, never a retry.
+    IntegrationOutcome {
+        /// The verifier reported no blocker, with at least one check that
+        /// passed, and left repository source in its workspace untouched.
+        Passed = "passed",
+        /// The verifier reported the accepted result blocked, with every
+        /// blocker it found.
+        Failed = "failed",
+        /// The plan's completion proposal, its work or accepted source no
+        /// longer stood as verified once the verifier ended: whatever it
+        /// reported is about another state.
+        BasisChanged = "basis_changed",
+        /// The verifier changed repository source in its workspace.
+        BoundaryViolated = "boundary_violated",
+        /// The verifier's invocation failed, was cancelled or was
+        /// interrupted: no judgment.
         InvocationFailed = "invocation_failed",
         /// The invocation succeeded with a result breaking the verifier
         /// protocol: no judgment either.
@@ -749,11 +786,15 @@ impl Store {
     }
 
     /// A plan becomes ready only by finalizing its planning (see
-    /// `crate::planner`), and completes only once every task in it is
-    /// completed.
+    /// `crate::planner`), and completed only by the pass of its final
+    /// integration verification (see `crate::integration`).
     pub fn set_plan_state(&mut self, plan: PlanId, to: PlanState) -> Result<()> {
         self.write(|tx| {
             let from = plan_state(tx, plan)?;
+            ensure!(
+                to != PlanState::Completed,
+                "plan {plan} is completed only by the pass of its final integration verification"
+            );
             ensure!(
                 from.can_become(to),
                 "plan {plan} cannot go from {from} to {to}"
@@ -762,15 +803,6 @@ impl Store {
                 to != PlanState::Ready,
                 "plan {plan} becomes ready only by finalizing its planning"
             );
-            if to == PlanState::Completed {
-                let open: i64 = tx.query_row(
-                    "SELECT count(*) FROM tasks t WHERE t.plan_id = ?1 AND NOT EXISTS
-                     (SELECT 1 FROM generations g WHERE g.task_id = t.id AND g.state = 'accepted')",
-                    [plan],
-                    |r| r.get(0),
-                )?;
-                ensure!(open == 0, "plan {plan} still has {open} uncompleted tasks");
-            }
             tx.execute(
                 "UPDATE plans SET state = ?2, updated_at = ?3 WHERE id = ?1",
                 params![plan, to, now()],
@@ -1612,8 +1644,13 @@ fn insert_agent(tx: &Transaction, role: Role, scope: AgentScope) -> Result<Agent
             (plan, Some(task), Some(generation))
         }
     };
+    // A verifier of a plan judges its accepted result as a whole.
     ensure!(
-        (role == Role::Planner) == generation.is_none(),
+        match role {
+            Role::Planner => generation.is_none(),
+            Role::Executor => generation.is_some(),
+            Role::Verifier => true,
+        },
         "a {role} cannot serve {scope:?}"
     );
     tx.execute(
@@ -2063,7 +2100,7 @@ pub(crate) mod tests {
     /// Every object of the canonical schema, as `(type, name)`, in
     /// `schema_objects` order: what a fresh store must hold, whatever
     /// `SCHEMA` itself says.
-    const CANONICAL_OBJECTS: [(&str, &str); 138] = [
+    const CANONICAL_OBJECTS: [(&str, &str); 169] = [
         ("index", "agents_one_executor"),
         ("index", "generations_live"),
         ("index", "generations_state"),
@@ -2073,6 +2110,7 @@ pub(crate) mod tests {
         ("index", "invocations_live"),
         ("index", "journal_by_agent"),
         ("index", "ownership_by_generation"),
+        ("index", "plans_state"),
         ("table", "acceptance_completions"),
         ("table", "acceptance_phases"),
         ("table", "acceptance_sources"),
@@ -2081,6 +2119,7 @@ pub(crate) mod tests {
         ("table", "agents"),
         ("table", "attention_concerns"),
         ("table", "attention_decisions"),
+        ("table", "completion_proposals"),
         ("table", "events"),
         ("table", "execution_baseline"),
         ("table", "execution_captures"),
@@ -2095,9 +2134,14 @@ pub(crate) mod tests {
         ("table", "graph_relations"),
         ("table", "graph_sites"),
         ("table", "graph_sources"),
+        ("table", "integration_inputs"),
+        ("table", "integration_results"),
+        ("table", "integration_sources"),
+        ("table", "integration_verifications"),
         ("table", "invocations"),
         ("table", "journal"),
         ("table", "ownership"),
+        ("table", "plan_completions"),
         ("table", "plans"),
         ("table", "replans"),
         ("table", "retry_authorizations"),
@@ -2132,6 +2176,9 @@ pub(crate) mod tests {
         ("trigger", "attention_decisions_immutable"),
         ("trigger", "attention_decisions_made"),
         ("trigger", "attention_decisions_no_delete"),
+        ("trigger", "completion_proposals_immutable"),
+        ("trigger", "completion_proposals_made"),
+        ("trigger", "completion_proposals_no_delete"),
         ("trigger", "events_no_delete"),
         ("trigger", "events_no_update"),
         ("trigger", "execution_baseline_immutable"),
@@ -2160,16 +2207,35 @@ pub(crate) mod tests {
         ("trigger", "generation_revisions_no_delete"),
         ("trigger", "generations_abandoned_by_replan"),
         ("trigger", "generations_accepted_by_acceptance"),
+        ("trigger", "integration_inputs_immutable"),
+        ("trigger", "integration_inputs_no_delete"),
+        ("trigger", "integration_inputs_recorded"),
+        ("trigger", "integration_results_derived"),
+        ("trigger", "integration_results_immutable"),
+        ("trigger", "integration_results_no_delete"),
+        ("trigger", "integration_sources_immutable"),
+        ("trigger", "integration_sources_no_delete"),
+        ("trigger", "integration_sources_recorded"),
+        ("trigger", "integration_verifications_immutable"),
+        ("trigger", "integration_verifications_intended"),
+        ("trigger", "integration_verifications_no_delete"),
+        ("trigger", "integration_verifications_sealed"),
         ("trigger", "journal_forward_only"),
         ("trigger", "journal_no_delete"),
         ("trigger", "journal_reconciles_execution"),
         ("trigger", "journal_reconciles_install"),
+        ("trigger", "journal_reconciles_integration"),
         ("trigger", "journal_reconciles_verification"),
         ("trigger", "ownership_acquired"),
         ("trigger", "ownership_held_through_acceptance"),
         ("trigger", "ownership_held_until_abandoned"),
         ("trigger", "ownership_not_transferred"),
+        ("trigger", "plan_completions_granted"),
+        ("trigger", "plan_completions_immutable"),
+        ("trigger", "plan_completions_no_delete"),
         ("trigger", "plans_attended"),
+        ("trigger", "plans_completed"),
+        ("trigger", "plans_created_uncompleted"),
         ("trigger", "plans_intent_immutable"),
         ("trigger", "plans_not_replaced"),
         ("trigger", "replans_applied"),
@@ -2200,7 +2266,9 @@ pub(crate) mod tests {
         ("trigger", "verifications_intended"),
         ("trigger", "verifications_no_delete"),
         ("view", "completed_tasks"),
+        ("view", "current_integrations"),
         ("view", "scheduler_outcomes"),
+        ("view", "settled_plans"),
         ("view", "task_definitions"),
     ];
 
@@ -2355,7 +2423,7 @@ pub(crate) mod tests {
         let (_dir, mut store) = store();
         let plan = store.create_plan(&objective("intent")).unwrap();
 
-        for to in [Running, Paused, Completed, Planning] {
+        for to in [Running, Paused, Planning] {
             assert!(err(store.set_plan_state(plan, to)).contains("cannot go from planning"));
         }
         // Only finalized planning makes a plan ready.
@@ -2376,16 +2444,16 @@ pub(crate) mod tests {
         // Only a concern its planner raises makes a plan need attention.
         assert!(err(store.set_plan_state(plan, NeedsAttention)).contains("cannot go from"));
 
-        let message = err(store.set_plan_state(plan, Completed));
-        assert!(message.contains("1 uncompleted tasks"), "{message}");
+        // Every task completing never completes a plan: only the pass of
+        // its final integration verification does (see `integration`).
         let generation = store.start_generation(task).unwrap();
         store.accept_generation(generation, &[]).unwrap();
-        store.set_plan_state(plan, Completed).unwrap();
-        assert_eq!(store.plan(plan).unwrap().state, Completed);
-
-        for to in [Planning, Ready, Running, Paused, NeedsAttention, Completed] {
-            assert!(store.set_plan_state(plan, to).is_err());
-        }
+        let message = err(store.set_plan_state(plan, Completed));
+        assert!(
+            message.contains("final integration verification"),
+            "{message}"
+        );
+        assert_eq!(store.plan(plan).unwrap().state, Running);
         assert!(err(store.add_task(plan, "late", &[])).contains("only a planning plan"));
     }
 

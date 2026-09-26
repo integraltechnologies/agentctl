@@ -3,6 +3,7 @@ pub mod config;
 pub mod executor;
 pub mod graph;
 pub mod init;
+pub mod integration;
 pub mod planner;
 pub mod platform;
 pub mod project;

@@ -109,15 +109,17 @@ CREATE TABLE generations (
 CREATE UNIQUE INDEX generations_live ON generations (task_id)
     WHERE state IN ('active', 'accepted');
 
--- Logical agents. Planners serve a plan; executors and verifiers serve one
--- generation.
+-- Logical agents. Planners serve a plan and executors one generation.
+-- Verifiers serve one generation, judging its candidate, or a plan,
+-- judging its accepted result as a whole (see `integration_verifications`).
 CREATE TABLE agents (
     id            INTEGER PRIMARY KEY,
     role          TEXT    NOT NULL CHECK (role IN ('planner', 'executor', 'verifier')),
     plan_id       INTEGER REFERENCES plans (id),
     generation_id INTEGER REFERENCES generations (id),
     created_at    INTEGER NOT NULL,
-    CHECK ((role = 'planner') = (plan_id IS NOT NULL)),
+    CHECK (role <> 'planner' OR plan_id IS NOT NULL),
+    CHECK (role <> 'executor' OR generation_id IS NOT NULL),
     CHECK ((plan_id IS NULL) <> (generation_id IS NULL))
 ) STRICT;
 
@@ -250,8 +252,8 @@ CREATE TABLE ownership (
 CREATE INDEX ownership_by_generation ON ownership (generation_id);
 
 -- Only an active generation acquires, only paths its task's scope requests
--- once its plan is no longer being planned, and never a path another
--- generation owns: not even by replacing its row.
+-- once its plan is no longer being planned, nor completed, and never a
+-- path another generation owns: not even by replacing its row.
 CREATE TRIGGER ownership_acquired BEFORE INSERT ON ownership
 WHEN EXISTS (SELECT 1 FROM ownership WHERE path = NEW.path)
     OR NOT EXISTS (SELECT 1 FROM generations g
@@ -259,7 +261,7 @@ WHEN EXISTS (SELECT 1 FROM ownership WHERE path = NEW.path)
         JOIN plans p ON p.id = t.plan_id
         JOIN task_scope s ON s.task_id = t.id
         WHERE g.id = NEW.generation_id AND g.state = 'active'
-            AND p.state <> 'planning' AND s.path = NEW.path)
+            AND p.state NOT IN ('planning', 'completed') AND s.path = NEW.path)
 BEGIN SELECT RAISE(ABORT, 'ownership is not acquirable'); END;
 CREATE TRIGGER ownership_not_transferred BEFORE UPDATE ON ownership
 BEGIN SELECT RAISE(ABORT, 'ownership is never transferred'); END;
@@ -1458,3 +1460,353 @@ WHEN NEW.state IS NOT OLD.state AND (
 BEGIN
     SELECT RAISE(ABORT, 'a plan needs attention exactly while a concern blocks it or an instruction awaits its planner');
 END;
+
+-- Final integration verification. Every task of a plan completing is not
+-- evidence that its human's intent is met: a plan is completed only once a
+-- fresh, independent verifier judged the accepted result as a whole and
+-- passed it, while that result, and the plan's work, stood exactly as
+-- verified.
+
+-- A plan is settled while its work stands still and is wholly accepted:
+-- it runs, every task of it completed or was cancelled, no generation of it
+-- is active, owns a path, holds a claim or has an action or invocation
+-- whose end is unknown, no concern blocks it and no instruction awaits its
+-- planner, no planner of it acts, no acceptance of its work is unfinished,
+-- and no source its accepted work changed has a stale graph. Other plans'
+-- unfinished acceptances and stale graphs elsewhere do not block it: what
+-- its verification relies on of them is bound by its basis instead (see
+-- `current_integrations`), and stale graph facts are never given as current.
+CREATE VIEW settled_plans (plan_id) AS
+SELECT p.id FROM plans p
+WHERE p.state = 'running'
+    AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.plan_id = p.id
+        AND NOT EXISTS (SELECT 1 FROM completed_tasks c WHERE c.task_id = t.id)
+        AND NOT EXISTS (SELECT 1 FROM task_cancellations x WHERE x.task_id = t.id))
+    AND NOT EXISTS (SELECT 1 FROM generations g JOIN tasks t ON t.id = g.task_id
+        WHERE t.plan_id = p.id AND (g.state = 'active'
+            OR EXISTS (SELECT 1 FROM ownership o WHERE o.generation_id = g.id)
+            OR EXISTS (SELECT 1 FROM scheduler_claims c WHERE c.generation_id = g.id
+                AND NOT EXISTS (SELECT 1 FROM scheduler_releases r
+                    WHERE r.generation_id = c.generation_id))
+            OR EXISTS (SELECT 1 FROM agents a JOIN journal j ON j.agent_id = a.id
+                WHERE a.generation_id = g.id AND j.state = 'attempted')
+            OR EXISTS (SELECT 1 FROM agents a JOIN invocations i ON i.agent_id = a.id
+                WHERE a.generation_id = g.id AND i.ended_at IS NULL)))
+    AND NOT EXISTS (SELECT 1 FROM attention_concerns c
+        LEFT JOIN attention_decisions d ON d.concern_id = c.id
+        WHERE c.plan_id = p.id AND coalesce(d.kind, 'stop') = 'stop')
+    AND NOT EXISTS (SELECT 1 FROM attention_decisions d WHERE d.plan_id = p.id
+        AND d.kind = 'instruct'
+        AND d.replan_id = (SELECT max(id) FROM replans WHERE plan_id = p.id))
+    AND NOT EXISTS (SELECT 1 FROM agents a JOIN journal j ON j.agent_id = a.id
+        WHERE a.role = 'planner' AND a.plan_id = p.id AND j.state = 'attempted')
+    AND NOT EXISTS (SELECT 1 FROM agents a JOIN invocations i ON i.agent_id = a.id
+        WHERE a.role = 'planner' AND a.plan_id = p.id AND i.ended_at IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM acceptances a JOIN generations g ON g.id = a.generation_id
+        JOIN tasks t ON t.id = g.task_id
+        WHERE t.plan_id = p.id AND NOT EXISTS (SELECT 1 FROM acceptance_phases x
+            WHERE x.generation_id = a.generation_id AND x.phase = 'completed'))
+    AND NOT EXISTS (SELECT 1 FROM acceptance_sources x JOIN generations g ON g.id = x.generation_id
+        JOIN tasks t ON t.id = g.task_id
+        JOIN graph_sources gs ON gs.path = x.path
+        JOIN accepted_sources s ON s.path = gs.path
+        WHERE t.plan_id = p.id AND gs.hash IS NOT s.hash);
+
+-- A planner's proposal, as the whole of a replan, that its settled plan's
+-- objective is met: engineering judgment, never completion. It only makes
+-- final integration verification of the plan possible, while that replan
+-- is the plan's latest. Recorded last in the replan's transaction. Never
+-- changed after.
+CREATE TABLE completion_proposals (
+    replan_id   INTEGER PRIMARY KEY REFERENCES replans (id),
+    plan_id     INTEGER NOT NULL REFERENCES plans (id),
+    proposed_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TRIGGER completion_proposals_made BEFORE INSERT ON completion_proposals
+WHEN EXISTS (SELECT 1 FROM completion_proposals WHERE replan_id = NEW.replan_id)
+    OR NEW.replan_id IS NOT (SELECT max(id) FROM replans WHERE plan_id = NEW.plan_id)
+    OR NOT EXISTS (SELECT 1 FROM settled_plans WHERE plan_id = NEW.plan_id)
+BEGIN SELECT RAISE(ABORT, 'only the latest replan of a settled plan proposes its completion'); END;
+CREATE TRIGGER completion_proposals_immutable BEFORE UPDATE ON completion_proposals
+BEGIN SELECT RAISE(ABORT, 'completion proposals are immutable'); END;
+CREATE TRIGGER completion_proposals_no_delete BEFORE DELETE ON completion_proposals
+BEGIN SELECT RAISE(ABORT, 'completion proposals are immutable'); END;
+
+-- One final integration verification of a settled plan, acting on its
+-- current completion proposal: a fresh verifier agent of the plan,
+-- embodied by one fresh invocation, judging the plan's accepted result as
+-- a whole in a disposable copy of the accepted repository. Intended with
+-- the verifier's journal entry, its first and only action, and with the
+-- exact accepted source it verifies (`integration_sources`); `basis`
+-- identifies the plan's replanning state then (see `Store::replan_basis`).
+-- Numbered per proposal: another attempt, by another fresh verifier, only
+-- once every earlier one of the plan is reconciled, and none of the
+-- proposal with a judgment. Never changed after.
+CREATE TABLE integration_verifications (
+    id         INTEGER PRIMARY KEY,
+    plan_id    INTEGER NOT NULL REFERENCES plans (id),
+    replan_id  INTEGER NOT NULL REFERENCES completion_proposals (replan_id),
+    number     INTEGER NOT NULL CHECK (number > 0),
+    basis      TEXT    NOT NULL CHECK (length(basis) = 64 AND basis NOT GLOB '*[^0-9a-f]*'),
+    agent_id   INTEGER NOT NULL UNIQUE REFERENCES agents (id),
+    journal_id INTEGER NOT NULL UNIQUE REFERENCES journal (id),
+    started_at INTEGER NOT NULL,
+    UNIQUE (replan_id, number)
+) STRICT;
+
+CREATE TRIGGER integration_verifications_intended BEFORE INSERT ON integration_verifications
+WHEN EXISTS (SELECT 1 FROM integration_verifications WHERE id = NEW.id
+        OR agent_id = NEW.agent_id OR journal_id = NEW.journal_id)
+    OR NEW.number <> 1 + (SELECT count(*) FROM integration_verifications
+        WHERE replan_id = NEW.replan_id)
+    OR EXISTS (SELECT 1 FROM integration_verifications v JOIN journal j ON j.id = v.journal_id
+        WHERE v.plan_id = NEW.plan_id AND j.state <> 'reconciled')
+    OR EXISTS (SELECT 1 FROM integration_verifications v
+        JOIN integration_results r ON r.verification_id = v.id
+        WHERE v.replan_id = NEW.replan_id AND r.outcome IN ('passed', 'failed'))
+    OR NOT EXISTS (SELECT 1 FROM completion_proposals c
+        WHERE c.replan_id = NEW.replan_id AND c.plan_id = NEW.plan_id
+            AND c.replan_id = (SELECT max(id) FROM replans WHERE plan_id = NEW.plan_id))
+    OR NOT EXISTS (SELECT 1 FROM settled_plans WHERE plan_id = NEW.plan_id)
+    OR NOT EXISTS (SELECT 1 FROM agents a JOIN journal j ON j.id = NEW.journal_id
+        WHERE a.id = NEW.agent_id AND a.role = 'verifier' AND a.plan_id = NEW.plan_id
+            AND j.agent_id = a.id AND j.state = 'intended'
+            AND NOT EXISTS (SELECT 1 FROM journal o WHERE o.agent_id = a.id AND o.id <> j.id)
+            AND NOT EXISTS (SELECT 1 FROM invocations i WHERE i.agent_id = a.id))
+BEGIN
+    SELECT RAISE(ABORT, 'only a settled plan''s current completion proposal is verified, once at a time, by a fresh verifier');
+END;
+-- Inserting a verification seals its snapshot, which the same transaction
+-- constructed just before under its next id (see `integration_sources`):
+-- only as that id, and only once the snapshot is complete, binding exactly
+-- what accepted source holds, and binding `agentctl.toml`, which is never
+-- accepted source, as a repository input.
+CREATE TRIGGER integration_verifications_sealed BEFORE INSERT ON integration_verifications
+WHEN NEW.id IS NOT (SELECT coalesce(max(id), 0) + 1 FROM integration_verifications)
+    OR EXISTS (SELECT 1 FROM accepted_sources a
+        LEFT JOIN integration_sources s ON s.verification_id = NEW.id AND s.path = a.path
+        WHERE s.path IS NULL OR s.hash IS NOT a.hash)
+    OR EXISTS (SELECT 1 FROM integration_sources s
+        LEFT JOIN accepted_sources a ON a.path = s.path
+        WHERE s.verification_id = NEW.id AND a.path IS NULL)
+    OR EXISTS (SELECT 1 FROM integration_inputs i JOIN accepted_sources a ON a.path = i.path
+        WHERE i.verification_id = NEW.id)
+    OR EXISTS (SELECT 1 FROM accepted_sources WHERE lower(path) = 'agentctl.toml')
+    OR NOT EXISTS (SELECT 1 FROM integration_inputs
+        WHERE verification_id = NEW.id AND path = 'agentctl.toml' AND kind = 'file')
+BEGIN
+    SELECT RAISE(ABORT, 'an integration verification seals its complete snapshot, as its next id');
+END;
+CREATE TRIGGER integration_verifications_immutable BEFORE UPDATE ON integration_verifications
+BEGIN SELECT RAISE(ABORT, 'integration history is immutable'); END;
+CREATE TRIGGER integration_verifications_no_delete BEFORE DELETE ON integration_verifications
+BEGIN SELECT RAISE(ABORT, 'integration history is immutable'); END;
+
+-- The accepted source an integration verification verifies: every tracked
+-- path's accepted identity, exactly as `accepted_sources` held it when the
+-- verification was intended. With `integration_inputs`, its snapshot:
+-- constructed only in the transaction intending it, before the
+-- verification itself, under the id it is about to take; the deferred
+-- reference lets no snapshot commit without its verification, and
+-- inserting the verification seals it (`integration_verifications_sealed`),
+-- whatever its journal entry's state. Never changed after.
+CREATE TABLE integration_sources (
+    verification_id INTEGER NOT NULL
+        REFERENCES integration_verifications (id) DEFERRABLE INITIALLY DEFERRED,
+    path            TEXT    NOT NULL CHECK (path <> ''),
+    hash            TEXT    CHECK (length(hash) = 64 AND hash NOT GLOB '*[^0-9a-f]*'),
+    PRIMARY KEY (verification_id, path)
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER integration_sources_recorded BEFORE INSERT ON integration_sources
+WHEN EXISTS (SELECT 1 FROM integration_sources
+        WHERE verification_id = NEW.verification_id AND path = NEW.path)
+    OR NEW.verification_id IS NOT (SELECT coalesce(max(id), 0) + 1
+        FROM integration_verifications)
+    OR NOT EXISTS (SELECT 1 FROM accepted_sources a
+        WHERE a.path = NEW.path AND a.hash IS NEW.hash)
+BEGIN SELECT RAISE(ABORT, 'an integration verification records accepted source before it is sealed'); END;
+CREATE TRIGGER integration_sources_immutable BEFORE UPDATE ON integration_sources
+BEGIN SELECT RAISE(ABORT, 'integration history is immutable'); END;
+CREATE TRIGGER integration_sources_no_delete BEFORE DELETE ON integration_sources
+BEGIN SELECT RAISE(ABORT, 'integration history is immutable'); END;
+
+-- The repository inputs an integration verification's verifier was given
+-- beside accepted source: every other entry its view of the repository
+-- held (see `crate::integration`), such as manifests, lock files, build
+-- scripts, fixtures and `agentctl.toml`, with its kind and content hash; a
+-- path with no row held nothing. Never accepted source, which
+-- `integration_sources` binds. Part of the verification's snapshot,
+-- constructed and sealed as `integration_sources` is; never changed after.
+CREATE TABLE integration_inputs (
+    verification_id INTEGER NOT NULL
+        REFERENCES integration_verifications (id) DEFERRABLE INITIALLY DEFERRED,
+    path            TEXT    NOT NULL CHECK (path <> ''),
+    kind            TEXT    NOT NULL CHECK (kind IN ('file', 'symlink', 'other')),
+    hash            TEXT    CHECK (length(hash) = 64 AND hash NOT GLOB '*[^0-9a-f]*'),
+    CHECK ((kind = 'other') = (hash IS NULL)),
+    PRIMARY KEY (verification_id, path)
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER integration_inputs_recorded BEFORE INSERT ON integration_inputs
+WHEN EXISTS (SELECT 1 FROM integration_inputs
+        WHERE verification_id = NEW.verification_id AND path = NEW.path)
+    OR EXISTS (SELECT 1 FROM accepted_sources WHERE path = NEW.path)
+    OR NEW.verification_id IS NOT (SELECT coalesce(max(id), 0) + 1
+        FROM integration_verifications)
+BEGIN SELECT RAISE(ABORT, 'an integration verification records repository inputs before it is sealed'); END;
+CREATE TRIGGER integration_inputs_immutable BEFORE UPDATE ON integration_inputs
+BEGIN SELECT RAISE(ABORT, 'integration history is immutable'); END;
+CREATE TRIGGER integration_inputs_no_delete BEFORE DELETE ON integration_inputs
+BEGIN SELECT RAISE(ABORT, 'integration history is immutable'); END;
+
+-- Each integration verification whose basis still holds: its proposal is
+-- its plan's latest replan, its plan is settled, and accepted source is
+-- exactly what it verified.
+CREATE VIEW current_integrations (verification_id) AS
+SELECT v.id FROM integration_verifications v
+WHERE v.replan_id = (SELECT max(id) FROM replans WHERE plan_id = v.plan_id)
+    AND EXISTS (SELECT 1 FROM settled_plans s WHERE s.plan_id = v.plan_id)
+    AND NOT EXISTS (SELECT 1 FROM accepted_sources a
+        LEFT JOIN integration_sources s ON s.verification_id = v.id AND s.path = a.path
+        WHERE s.path IS NULL OR s.hash IS NOT a.hash)
+    AND NOT EXISTS (SELECT 1 FROM integration_sources s
+        LEFT JOIN accepted_sources a ON a.path = s.path
+        WHERE s.verification_id = v.id AND a.path IS NULL);
+
+-- How an integration verification ended, recorded in the transaction that
+-- reconciles its journal entry, and never changed after. What agentctl
+-- observed: 'basis_changed' when the plan's work, its proposal or accepted
+-- source no longer stood as verified once the verifier ended, whatever it
+-- reported; otherwise 'boundary_violated' when it changed repository
+-- source in its workspace, as `mutated` lists (either way). `inputs` holds
+-- the repository inputs agentctl observed once the verifier ended, as
+-- `[{"path", "kind", "hash"}]`, or NULL when they could not be observed:
+-- SQL cannot read a filesystem, so that observation is agentctl's,
+-- recorded with the result it decides. What the verifier claimed, when its
+-- result was well formed: `verdict` with `checked`, `blockers` and
+-- `non_blocking`. Only a verdict about the current basis, its repository
+-- inputs observed exactly as recorded, whose workspace source stayed
+-- untouched is a judgment: 'passed' needs checked evidence and no blocker,
+-- 'failed' at least one blocker. Nothing else judges.
+CREATE TABLE integration_results (
+    verification_id INTEGER PRIMARY KEY REFERENCES integration_verifications (id),
+    outcome         TEXT    NOT NULL CHECK (outcome IN ('passed', 'failed', 'basis_changed',
+        'boundary_violated', 'invocation_failed', 'malformed_result')),
+    mutated         TEXT    CHECK (json_valid(mutated) AND json_type(mutated) = 'array'
+        AND json_array_length(mutated) > 0),
+    inputs          TEXT    CHECK (json_valid(inputs) AND json_type(inputs) = 'array'),
+    verdict         TEXT    CHECK (verdict IN ('pass', 'fail')),
+    checked         TEXT    CHECK (json_valid(checked) AND json_type(checked) = 'array'),
+    blockers        TEXT    CHECK (json_valid(blockers) AND json_type(blockers) = 'array'),
+    non_blocking    TEXT    CHECK (json_valid(non_blocking) AND json_type(non_blocking) = 'array'),
+    finished_at     INTEGER NOT NULL,
+    CHECK ((verdict IS NULL) = (checked IS NULL) AND (verdict IS NULL) = (blockers IS NULL)
+        AND (verdict IS NULL) = (non_blocking IS NULL)),
+    CHECK (verdict IS NOT 'pass'
+        OR (json_array_length(checked) > 0 AND json_array_length(blockers) = 0)),
+    CHECK (verdict IS NOT 'fail' OR json_array_length(blockers) > 0),
+    CHECK (outcome <> 'boundary_violated' OR mutated IS NOT NULL),
+    CHECK (mutated IS NULL OR outcome IN ('basis_changed', 'boundary_violated')),
+    CHECK (outcome <> 'passed' OR verdict IS 'pass'),
+    CHECK (outcome <> 'failed' OR verdict IS 'fail'),
+    CHECK (outcome NOT IN ('invocation_failed', 'malformed_result') OR verdict IS NULL)
+) STRICT;
+
+-- A result follows its attempt, once the verifier's invocation ended,
+-- which succeeded exactly when the result holds a verdict or was
+-- malformed. A judgment is only of a basis that still holds, with the
+-- repository inputs observed exactly as recorded when it was intended, and
+-- a pass needs a check that passed.
+CREATE TRIGGER integration_results_derived BEFORE INSERT ON integration_results
+WHEN EXISTS (SELECT 1 FROM integration_results WHERE verification_id = NEW.verification_id)
+    OR NOT EXISTS (SELECT 1 FROM integration_verifications v
+        JOIN journal j ON j.id = v.journal_id
+        JOIN invocations i ON i.id = j.invocation_id
+        WHERE v.id = NEW.verification_id AND j.state = 'attempted'
+            AND i.agent_id = v.agent_id AND i.state NOT IN ('starting', 'running')
+            AND (NEW.verdict IS NULL OR i.state = 'succeeded')
+            AND (NEW.outcome NOT IN ('passed', 'failed', 'malformed_result')
+                OR i.state = 'succeeded')
+            AND (NEW.outcome <> 'invocation_failed' OR i.state <> 'succeeded'))
+    OR (NEW.outcome IN ('passed', 'failed') AND NOT EXISTS (SELECT 1 FROM current_integrations
+        WHERE verification_id = NEW.verification_id))
+    OR (NEW.outcome IN ('passed', 'failed') AND (NEW.inputs IS NULL
+        OR json_array_length(NEW.inputs) <> (SELECT count(*) FROM integration_inputs
+            WHERE verification_id = NEW.verification_id)
+        OR json_array_length(NEW.inputs) <> (SELECT count(DISTINCT o.value ->> 'path')
+            FROM json_each(NEW.inputs) o)
+        OR EXISTS (SELECT 1 FROM json_each(NEW.inputs) o WHERE NOT EXISTS (SELECT 1
+            FROM integration_inputs i WHERE i.verification_id = NEW.verification_id
+                AND i.path IS o.value ->> 'path' AND i.kind IS o.value ->> 'kind'
+                AND i.hash IS o.value ->> 'hash'))))
+    OR (NEW.verdict = 'pass' AND NOT EXISTS (SELECT 1 FROM json_each(NEW.checked) c
+        WHERE c.value ->> 'outcome' = 'passed'))
+BEGIN SELECT RAISE(ABORT, 'an integration result follows its attempt, consistently'); END;
+CREATE TRIGGER integration_results_immutable BEFORE UPDATE ON integration_results
+BEGIN SELECT RAISE(ABORT, 'integration history is immutable'); END;
+CREATE TRIGGER integration_results_no_delete BEFORE DELETE ON integration_results
+BEGIN SELECT RAISE(ABORT, 'integration history is immutable'); END;
+
+-- An integration verification's journal entry is reconciled only together
+-- with its result, as that implies.
+CREATE TRIGGER journal_reconciles_integration BEFORE UPDATE ON journal
+WHEN NEW.state = 'reconciled'
+    AND EXISTS (SELECT 1 FROM integration_verifications WHERE journal_id = NEW.id)
+    AND NOT EXISTS (SELECT 1 FROM integration_verifications v
+        JOIN integration_results r ON r.verification_id = v.id
+        WHERE v.journal_id = NEW.id AND NEW.outcome IS CASE
+            WHEN r.outcome IN ('passed', 'failed') THEN 'completed_as_intended'
+            WHEN r.outcome IN ('basis_changed', 'boundary_violated')
+                THEN 'completed_with_deviation'
+            ELSE 'failed' END)
+BEGIN SELECT RAISE(ABORT, 'an integration verification is reconciled only by its result'); END;
+
+-- A plan's completion, by the pass of its latest integration verification
+-- while that verification's basis still holds, recorded in the
+-- transaction that completes the plan: nothing else completes one. It
+-- references the plan as completed, so it cannot commit unless the plan
+-- is, and no completed plan leaves that state (`plans_completed`). Never
+-- changed after.
+CREATE TABLE plan_completions (
+    plan_id         INTEGER PRIMARY KEY,
+    verification_id INTEGER NOT NULL UNIQUE REFERENCES integration_results (verification_id),
+    state           TEXT    NOT NULL DEFAULT 'completed' CHECK (state = 'completed'),
+    completed_at    INTEGER NOT NULL,
+    FOREIGN KEY (plan_id, state) REFERENCES plans (id, state) DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+-- What a completion's deferred reference to its plan needs.
+CREATE UNIQUE INDEX plans_state ON plans (id, state);
+
+CREATE TRIGGER plan_completions_granted BEFORE INSERT ON plan_completions
+WHEN EXISTS (SELECT 1 FROM plan_completions
+        WHERE plan_id = NEW.plan_id OR verification_id = NEW.verification_id)
+    OR NOT EXISTS (SELECT 1 FROM integration_verifications v
+        JOIN journal j ON j.id = v.journal_id
+        JOIN integration_results r ON r.verification_id = v.id
+        WHERE v.id = NEW.verification_id AND v.plan_id = NEW.plan_id
+            AND j.state = 'reconciled' AND r.outcome = 'passed'
+            AND v.id = (SELECT max(id) FROM integration_verifications
+                WHERE plan_id = NEW.plan_id))
+    OR NOT EXISTS (SELECT 1 FROM current_integrations
+        WHERE verification_id = NEW.verification_id)
+BEGIN
+    SELECT RAISE(ABORT, 'only the current pass of a plan''s latest integration verification completes it');
+END;
+CREATE TRIGGER plan_completions_immutable BEFORE UPDATE ON plan_completions
+BEGIN SELECT RAISE(ABORT, 'completions are immutable'); END;
+CREATE TRIGGER plan_completions_no_delete BEFORE DELETE ON plan_completions
+BEGIN SELECT RAISE(ABORT, 'completions are immutable'); END;
+
+-- A plan becomes completed only as its completion says, and never leaves
+-- that state; nor is one ever created completed.
+CREATE TRIGGER plans_completed BEFORE UPDATE OF state ON plans
+WHEN NEW.state IS NOT OLD.state AND (OLD.state = 'completed'
+    OR (NEW.state = 'completed'
+        AND NOT EXISTS (SELECT 1 FROM plan_completions WHERE plan_id = NEW.id)))
+BEGIN SELECT RAISE(ABORT, 'a plan is completed only by its final integration verification, for good'); END;
+CREATE TRIGGER plans_created_uncompleted BEFORE INSERT ON plans
+WHEN NEW.state = 'completed'
+BEGIN SELECT RAISE(ABORT, 'a plan is completed only by its final integration verification, for good'); END;

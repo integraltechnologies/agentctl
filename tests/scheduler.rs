@@ -17,14 +17,15 @@ use std::sync::{Barrier, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use agentctl::integration::{self, Integrated};
 use agentctl::planner::{self, Command as Plan, Planned};
 use agentctl::project::Project;
 use agentctl::scheduler::{self, Report};
 use agentctl::source;
 use agentctl::state::{
     AcceptancePhase, ActionOutcome, ActionStatus, Condition, Evidence, GenerationState,
-    HumanDecision, HumanIntent, PipelineOutcome, PlanId, PlanState, Release, Replan, Store, TaskId,
-    TaskStatus, VerificationOutcome, VerificationStatus,
+    HumanDecision, HumanIntent, IntegrationOutcome, IntegrationStatus, PipelineOutcome, PlanId,
+    PlanState, Release, Replan, Store, TaskId, TaskStatus, VerificationOutcome, VerificationStatus,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -95,6 +96,22 @@ fn main() -> ExitCode {
             "a_human_decision_continues_a_plan_through_its_planner",
             a_human_decision_continues_a_plan_through_its_planner,
         ),
+        (
+            "a_plan_completes_only_by_its_integration_pass",
+            a_plan_completes_only_by_its_integration_pass,
+        ),
+        (
+            "an_integration_failure_reaches_a_fresh_planner",
+            an_integration_failure_reaches_a_fresh_planner,
+        ),
+        (
+            "an_integration_verifier_sees_captured_inputs_and_live_ones_invalidate_it",
+            an_integration_verifier_sees_captured_inputs_and_live_ones_invalidate_it,
+        ),
+        (
+            "a_plan_verifies_while_another_process_works_on_another",
+            a_plan_verifies_while_another_process_works_on_another,
+        ),
     ];
     let filters: Vec<String> = env::args()
         .skip(1)
@@ -151,6 +168,9 @@ fn fake() -> ExitCode {
     let packet: Value = serde_json::from_str(&input).unwrap();
     if bootstrap.starts_with("You are the planning agent") {
         return replan(&args, &packet);
+    }
+    if bootstrap.starts_with("You are the integration verifier") {
+        return integrate(&args, &packet);
     }
     let key = packet["task"]["key"].as_str().unwrap().to_owned();
     let objective = packet["task"]["objective"].as_str().unwrap().to_owned();
@@ -276,6 +296,67 @@ fn replan(args: &[String], packet: &Value) -> ExitCode {
     println!("{init}\n{result}");
     std::io::stdout().flush().unwrap();
     ExitCode::SUCCESS
+}
+
+/// Acts as Claude Code verifying a plan's accepted result, as the
+/// `integration-script` marker says: `fail`, `malformed` (a pass that
+/// names a blocker), or a pass. Records its input and working directory,
+/// once let go should the `integration-hold` marker exist.
+fn integrate(args: &[String], packet: &Value) -> ExitCode {
+    // Nothing is resumed: the input is all an integration verifier knows.
+    assert!(args.iter().any(|a| a == "--no-session-persistence"));
+    assert!(!args.iter().any(|a| a.starts_with("--resume")));
+    let n = (0..).find(|n| !marker(&format!("integration-input-{n}")).exists());
+    let n = n.unwrap();
+    fs::write(
+        marker(&format!("integration-input-{n}")),
+        packet.to_string(),
+    )
+    .unwrap();
+    if marker("integration-hold").exists() {
+        fs::write(marker("integration-held"), "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !marker("integration-release").exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let mut view = serde_json::Map::new();
+    record_view(Path::new("."), "", &mut view);
+    let view = Value::from(view).to_string();
+    fs::write(marker(&format!("integration-view-{n}")), view).unwrap();
+    log("start integration");
+    let checked = json!([{"check": "cargo test", "command": "cargo test",
+                          "outcome": "passed", "evidence": "ok"}]);
+    let blocker = json!([{"id": "ib1", "summary": "the criterion is unmet",
+                          "paths": ["src/a.rs"], "evidence": "no test covers it",
+                          "location": null}]);
+    let result = match fs::read_to_string(marker("integration-script")).as_deref() {
+        Ok("fail") => json!({"verdict": "fail", "checked": checked, "blockers": blocker,
+                             "non_blocking": []}),
+        Ok("malformed") => json!({"verdict": "pass", "checked": checked, "blockers": blocker,
+                                  "non_blocking": []}),
+        _ => json!({"verdict": "pass", "checked": checked, "blockers": [], "non_blocking": []}),
+    };
+    log("end integration");
+    let init = json!({"type": "system", "subtype": "init", "session_id": "fake-session"});
+    let result = json!({"type": "result", "subtype": "success", "is_error": false,
+        "session_id": "fake-session", "result": "prose", "structured_output": result,
+        "usage": {"input_tokens": 3, "output_tokens": 2}});
+    println!("{init}\n{result}");
+    std::io::stdout().flush().unwrap();
+    ExitCode::SUCCESS
+}
+
+/// What the `n`th integration verifier was given, and the files of its
+/// working directory.
+fn integration_input(n: usize) -> (Value, Value) {
+    let read = |name: String| -> Value {
+        serde_json::from_str(&fs::read_to_string(marker(&name)).unwrap()).unwrap()
+    };
+    (
+        read(format!("integration-input-{n}")),
+        read(format!("integration-view-{n}")),
+    )
 }
 
 /// What the `n`th planner invocation was given.
@@ -528,6 +609,14 @@ impl Fixture {
             .unwrap()
             .finish(&project, &mut store)
             .unwrap()
+    }
+
+    /// Verifies the plan as `agentctl plan verify` would, from a store of
+    /// its own, with the fake as its integration verifier.
+    fn verify(&self) -> Integrated {
+        let project = Project::load(&self.project.root).unwrap();
+        let mut store = project.hydrate().unwrap();
+        integration::verify(&project, &mut store, self.plan, Some(fake_agent())).unwrap()
     }
 
     /// Everything replanning could change of the plan, or of how it runs.
@@ -1252,4 +1341,276 @@ fn a_human_decision_continues_a_plan_through_its_planner() {
     assert!(matches!(fx.replan(), Planned::Refused { .. }));
     assert_eq!(store.plan(fx.plan).unwrap().state, PlanState::Running);
     assert_eq!(store.attention(fx.plan).unwrap().len(), 1);
+}
+
+/// How an integration verification ended, as recorded.
+fn integrated(integrated: &Integrated) -> (IntegrationOutcome, Vec<String>) {
+    let IntegrationStatus::Finished(result) = &integrated.integration.status else {
+        panic!("not finished: {integrated:?}");
+    };
+    let blockers = result.report.iter().flat_map(|r| &r.blockers);
+    (result.outcome, blockers.map(|b| b.id.clone()).collect())
+}
+
+fn replanned(planned: Planned) -> agentctl::state::ReplanId {
+    match planned {
+        Planned::Replanned { replan, .. } => replan,
+        other => panic!("not replanned: {other:?}"),
+    }
+}
+
+fn a_plan_completes_only_by_its_integration_pass() {
+    let fx = Fixture::new(1, &[("only", "Change a", &["src/a.rs"], &[])]);
+    let report = fx.run();
+    // Every task completed, and the plan still runs: nothing completes it.
+    assert_eq!(report.snapshot.condition(), Condition::AllCompleted);
+    assert_eq!(fx.store().plan(fx.plan).unwrap().state, PlanState::Running);
+    assert_eq!(fx.store().completion_proposal(fx.plan).unwrap(), None);
+
+    fs::write(
+        marker("planner-script"),
+        r#"[{"op": "propose_completion"}]"#,
+    )
+    .unwrap();
+    let proposal = replanned(fx.replan());
+    assert_eq!(
+        fx.store().completion_proposal(fx.plan).unwrap(),
+        Some(proposal)
+    );
+    assert_eq!(fx.store().plan(fx.plan).unwrap().state, PlanState::Running);
+
+    let verified = fx.verify();
+    assert_eq!(
+        integrated(&verified),
+        (IntegrationOutcome::Passed, Vec::new())
+    );
+    assert_eq!(verified.integration.proposal, proposal);
+    assert_eq!(
+        fx.store().plan(fx.plan).unwrap().state,
+        PlanState::Completed
+    );
+    let tail: Vec<String> = logged().into_iter().rev().take(2).collect();
+    assert_eq!(tail, ["end integration", "start integration"]);
+
+    // A fresh verifier of the plan, given canonical facts alone, in a copy
+    // of the accepted repository.
+    let (input, view) = integration_input(0);
+    assert_eq!(input["intent"]["objective"], "Improve the demo");
+    assert_eq!(
+        input["intent"]["completion_criteria"],
+        json!(["cargo test passes"])
+    );
+    assert_eq!(input["plan"]["tasks"][0]["status"], "completed");
+    let text = input.to_string();
+    for claimed in [
+        "claimed",
+        "modified_paths",
+        "verdict",
+        "summary",
+        "explanation",
+    ] {
+        assert!(!text.contains(claimed), "{claimed}: {text}");
+    }
+    assert_eq!(view["src/a.rs"], "// only was here\n");
+    assert!(view.get("agentctl.toml").is_some());
+    assert!(
+        !view
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|p| p.starts_with(".agentctl/"))
+    );
+    let store = fx.store();
+    let agent = verified.integration.agent;
+    assert_ne!(agent, fx.store().planner(fx.plan).unwrap());
+    assert_eq!(store.invocations(agent).unwrap().len(), 1);
+
+    // Nothing continues a completed plan: not scheduling, not replanning.
+    assert!(scheduler::run(&fx.project, fx.plan, Some(fake_agent())).is_err());
+    let project = Project::load(&fx.project.root).unwrap();
+    let mut store = project.hydrate().unwrap();
+    assert!(planner::replan(&project, &mut store, fx.plan, Some(fake_agent())).is_err());
+    assert!(integration::verify(&project, &mut store, fx.plan, Some(fake_agent())).is_err());
+}
+
+fn an_integration_failure_reaches_a_fresh_planner() {
+    let fx = Fixture::new_with(
+        1,
+        &[("only", "Change a", &["src/a.rs"], &[])],
+        &["src/fix.rs"],
+    );
+    fx.run();
+    fs::write(
+        marker("planner-script"),
+        r#"[{"op": "propose_completion"}]"#,
+    )
+    .unwrap();
+    let first = replanned(fx.replan());
+
+    // A malformed verdict judges nothing; a failure is a judgment.
+    fs::write(marker("integration-script"), "malformed").unwrap();
+    let malformed = fx.verify();
+    assert_eq!(
+        integrated(&malformed).0,
+        IntegrationOutcome::MalformedResult
+    );
+    assert!(malformed.malformed.is_some());
+    fs::write(marker("integration-script"), "fail").unwrap();
+    let failed = fx.verify();
+    assert_eq!(
+        integrated(&failed),
+        (IntegrationOutcome::Failed, vec!["ib1".to_owned()])
+    );
+    assert_eq!(failed.integration.number, 2);
+    assert_eq!(fx.store().plan(fx.plan).unwrap().state, PlanState::Running);
+    // Nothing is retried: the same proposal is not verified again.
+    let project = Project::load(&fx.project.root).unwrap();
+    let mut store = project.hydrate().unwrap();
+    assert!(integration::verify(&project, &mut store, fx.plan, Some(fake_agent())).is_err());
+
+    // A fresh planner is given the blockers, and answers with new work.
+    let fix = r#"[{"op": "add_task", "task": "fix", "objective": "Cover the criterion",
+                   "context": "", "paths": ["src/fix.rs"], "depends_on": []}]"#;
+    fs::write(marker("planner-script"), fix).unwrap();
+    let corrective = replanned(fx.replan());
+    let feedback = planner_input(1);
+    let listed = feedback["integration"].as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[1]["outcome"], "failed");
+    assert_eq!(listed[1]["current"], true);
+    assert_eq!(listed[1]["proposed_by_replan"], json!(first));
+    let blockers = &listed[1]["claimed_by_integration_verifier"]["blockers"];
+    assert_eq!(blockers[0]["id"], "ib1");
+    assert_eq!(blockers[0]["summary"], "the criterion is unmet");
+    assert!(corrective > first);
+
+    let report = fx.run();
+    assert_eq!(launched(), ["only", "fix"]);
+    assert_eq!(report.snapshot.condition(), Condition::AllCompleted);
+    fs::write(
+        marker("planner-script"),
+        r#"[{"op": "propose_completion"}]"#,
+    )
+    .unwrap();
+    let second = replanned(fx.replan());
+    assert_eq!(planner_input(2)["integration"][1]["current"], false);
+    fs::write(marker("integration-script"), "pass").unwrap();
+    let passed = fx.verify();
+    assert_eq!(integrated(&passed).0, IntegrationOutcome::Passed);
+    assert_eq!(
+        (passed.integration.proposal, passed.integration.number),
+        (second, 1)
+    );
+    assert_eq!(
+        fx.store().plan(fx.plan).unwrap().state,
+        PlanState::Completed
+    );
+    let (_, view) = integration_input(2);
+    assert_eq!(view["src/fix.rs"], "// fix was here\n");
+}
+
+/// Proposes the plan's completion through a fresh planner.
+fn propose(fx: &Fixture) -> agentctl::state::ReplanId {
+    fs::write(
+        marker("planner-script"),
+        r#"[{"op": "propose_completion"}]"#,
+    )
+    .unwrap();
+    replanned(fx.replan())
+}
+
+fn an_integration_verifier_sees_captured_inputs_and_live_ones_invalidate_it() {
+    let _unblock = Unblock(&["integration-release"]);
+    let fx = Fixture::new(1, &[("only", "Change a", &["src/a.rs"], &[])]);
+    let write = |path: &str, text: &str| {
+        let path = fx.project.root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write("Cargo.toml", "[package]\nname = \"demo\"\n");
+    write(".gitignore", "/.agentctl/\ntarget/\n");
+    write("target/debug/out.o", "object");
+    fx.run();
+    propose(&fx);
+
+    // The verifier works while its manifest changes in the working tree.
+    fs::write(marker("integration-hold"), "").unwrap();
+    let project = Project::load(&fx.project.root).unwrap();
+    let mut store = project.hydrate().unwrap();
+    let integrator = integration::start(&project, &mut store, fx.plan, Some(fake_agent())).unwrap();
+    await_marker("integration-held");
+    write("Cargo.toml", "[package]\nname = \"changed\"\n");
+    fs::write(marker("integration-release"), "").unwrap();
+    let stale = integrator.finish(&project, &mut store).unwrap();
+    assert_eq!(integrated(&stale).0, IntegrationOutcome::BasisChanged);
+    assert_eq!(fx.store().plan(fx.plan).unwrap().state, PlanState::Running);
+    // It saw exactly the bytes captured, never the live ones, and nothing
+    // ignored.
+    let (input, view) = integration_input(0);
+    assert_eq!(view["Cargo.toml"], "[package]\nname = \"demo\"\n");
+    assert_eq!(view["src/a.rs"], "// only was here\n");
+    assert!(view.get("target/debug/out.o").is_none(), "{view}");
+    let knowledge = input["knowledge"].to_string();
+    assert!(knowledge.contains("exactly as it stood"), "{knowledge}");
+
+    // Verified again against what stands now, with ignored build output
+    // changing meanwhile: a pass, completing the plan.
+    fs::remove_file(marker("integration-held")).unwrap();
+    fs::remove_file(marker("integration-release")).unwrap();
+    let integrator = integration::start(&project, &mut store, fx.plan, Some(fake_agent())).unwrap();
+    await_marker("integration-held");
+    write("target/debug/out.o", "rebuilt");
+    write("target/debug/new.o", "new");
+    fs::write(marker("integration-release"), "").unwrap();
+    let passed = integrator.finish(&project, &mut store).unwrap();
+    assert_eq!(integrated(&passed).0, IntegrationOutcome::Passed);
+    assert_eq!(passed.integration.number, 2);
+    let (_, view) = integration_input(1);
+    assert_eq!(view["Cargo.toml"], "[package]\nname = \"changed\"\n");
+    assert_eq!(
+        fx.store().plan(fx.plan).unwrap().state,
+        PlanState::Completed
+    );
+}
+
+fn a_plan_verifies_while_another_process_works_on_another() {
+    let fx = Fixture::new_with(4, &[("a", "Change a", &["src/a.rs"], &[])], &["src/b.rs"]);
+    let (other, _) = fx.add_plan(&[(
+        "b",
+        "Change b hold-verify verify=fail",
+        &["src/b.rs", NEW],
+        &[],
+    )]);
+    let mut process = Scheduler {
+        child: Command::new(scheduler_child())
+            .arg(&fx.project.root)
+            .arg(other.to_string())
+            .arg(fake_agent())
+            .spawn()
+            .unwrap(),
+        unblock: &["release-verify-b"],
+    };
+    // Another process's pipeline installed `b`'s unaccepted candidate in
+    // the working tree, and verifies it, while this plan runs, is proposed
+    // complete and verified as a whole.
+    await_marker("verifying-b");
+    assert_eq!(fx.read(NEW), "// b was here\n");
+    fx.run();
+    propose(&fx);
+    let verified = fx.verify();
+    assert_eq!(integrated(&verified).0, IntegrationOutcome::Passed);
+    assert_eq!(
+        fx.store().plan(fx.plan).unwrap().state,
+        PlanState::Completed
+    );
+    assert!(!logged().contains(&"end verifier b".to_owned()));
+    // Its verifier saw accepted source and repository inputs alone.
+    let (_, view) = integration_input(0);
+    assert_eq!(view["src/a.rs"], "// a was here\n");
+    assert_eq!(view["src/b.rs"], "// accepted\n");
+    assert_eq!(view.get(NEW), None, "{view}");
+    assert_eq!(view["README.md"], "# demo\n");
+    fs::write(marker("release-verify-b"), "").unwrap();
+    assert!(process.wait(), "the other scheduler failed");
+    assert_eq!(fx.read("src/b.rs"), "// b was here\n");
 }

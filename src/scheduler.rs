@@ -282,7 +282,7 @@ fn pipe(state: &Path, work: Work, pipeline: &impl Pipeline) -> Finished {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -316,7 +316,7 @@ mod tests {
 
     /// How a simulated executor ends.
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Exec {
+    pub(crate) enum Exec {
         /// Writes every path of its authority, and reports success.
         Candidate,
         /// Deletes every path of its authority, and reports success.
@@ -329,7 +329,7 @@ mod tests {
 
     /// How a simulated verifier ends.
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Judge {
+    pub(crate) enum Judge {
         Pass,
         Fail,
         /// Never ends.
@@ -337,17 +337,17 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct Script {
-        exec: Exec,
-        judge: Judge,
+    pub(crate) struct Script {
+        pub(crate) exec: Exec,
+        pub(crate) judge: Judge,
         /// Whether synchronizing CodeGraph fails, leaving the acceptance
         /// published and unfinished.
-        unfinished: bool,
+        pub(crate) unfinished: bool,
         /// Whether its executor waits to be let go once running.
-        hold: bool,
+        pub(crate) hold: bool,
     }
 
-    const PASS: Script = Script {
+    pub(crate) const PASS: Script = Script {
         exec: Exec::Candidate,
         judge: Judge::Pass,
         unfinished: false,
@@ -357,7 +357,7 @@ mod tests {
     /// Deterministic fake providers: each pipeline goes through Blocks 11
     /// to 13 as recorded by the store, with providers that write, report
     /// and end as scripted by task key, recording each launch.
-    struct Simulated<'a> {
+    pub(crate) struct Simulated<'a> {
         project: &'a Project,
         scripts: HashMap<String, Script>,
         /// Every executor launched, by task key, in order.
@@ -377,7 +377,7 @@ mod tests {
     }
 
     impl<'a> Simulated<'a> {
-        fn new(project: &'a Project, scripts: &[(&str, Script)]) -> Self {
+        pub(crate) fn new(project: &'a Project, scripts: &[(&str, Script)]) -> Self {
             Self {
                 reruns: HashSet::new(),
                 seen: Mutex::default(),
@@ -414,7 +414,7 @@ mod tests {
             self.let_go.notify_all();
         }
 
-        fn launches(&self) -> Vec<String> {
+        pub(crate) fn launches(&self) -> Vec<String> {
             self.launches
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -656,7 +656,7 @@ mod tests {
 
     /// A project whose `src/` files for every task path are accepted, and
     /// a ready plan of tasks `(key, scope, depends_on)`.
-    fn project(tasks: &[(&str, &[&str], &[&str])]) -> (Fixture, PlanId, Vec<TaskId>) {
+    pub(crate) fn project(tasks: &[(&str, &[&str], &[&str])]) -> (Fixture, PlanId, Vec<TaskId>) {
         project_without(tasks, &[])
     }
 
@@ -666,7 +666,16 @@ mod tests {
         tasks: &[(&str, &[&str], &[&str])],
         absent: &[&str],
     ) -> (Fixture, PlanId, Vec<TaskId>) {
-        let mut fx = Fixture::new("src");
+        project_in("src", tasks, absent)
+    }
+
+    /// [`project_without`], with source roots `roots`.
+    pub(crate) fn project_in(
+        roots: &str,
+        tasks: &[(&str, &[&str], &[&str])],
+        absent: &[&str],
+    ) -> (Fixture, PlanId, Vec<TaskId>) {
+        let mut fx = Fixture::new(roots);
         let root = fx.project.root.clone();
         for (_, scope, _) in tasks {
             for path in scope.iter().filter(|p| !absent.contains(p)) {
@@ -680,7 +689,12 @@ mod tests {
         (fx, plan, ids)
     }
 
-    fn schedule_with(project: &Project, plan: PlanId, n: u32, pipeline: &impl Pipeline) -> Report {
+    pub(crate) fn schedule_with(
+        project: &Project,
+        plan: PlanId,
+        n: u32,
+        pipeline: &impl Pipeline,
+    ) -> Report {
         let report = schedule(&project.state_path(), plan, limit(n), pipeline).unwrap();
         assert_eq!(report.stopped, None);
         for end in &report.finished {

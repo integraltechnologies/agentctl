@@ -357,8 +357,9 @@ impl Store {
     }
 
     /// The basis of a view of the repository for verifying the candidate
-    /// of `generation`, read in one transaction; see [`ViewBasis`].
-    pub(crate) fn view_basis(&self, generation: GenerationId) -> Result<ViewBasis> {
+    /// of `generation`, or, for `None`, the accepted repository alone, read
+    /// in one transaction; see [`ViewBasis`].
+    pub(crate) fn view_basis(&self, generation: Option<GenerationId>) -> Result<ViewBasis> {
         let tx = self.conn.unchecked_transaction()?;
         let accepted: BTreeMap<String, Option<String>> = tx
             .prepare("SELECT path, hash FROM accepted_sources")?
@@ -375,7 +376,7 @@ impl Store {
              JOIN executions e ON e.id = i.execution_id
              JOIN execution_changes c ON c.execution_id = i.execution_id
              LEFT JOIN execution_install_results r ON r.execution_id = i.execution_id
-             WHERE ij.state <> 'intended' AND e.generation_id <> ?1
+             WHERE ij.state <> 'intended' AND e.generation_id IS NOT ?1
              ORDER BY c.execution_id, c.path",
         )?;
         let rows = stmt.query_map([generation], |r| {
@@ -1352,13 +1353,13 @@ mod tests {
         // Restored once installing failed, or never attempted.
         let c = candidate(&mut store, &["src/c.rs"], Some(InstallOutcome::Failed));
         let d = candidate(&mut store, &["src/d.rs"], None);
-        let basis = store.view_basis(a.generation).unwrap();
+        let basis = store.view_basis(Some(a.generation)).unwrap();
         let before_e = basis.clone();
         // Attempted with its outcome unknown: it may have written anything.
         let e = candidate(&mut store, &["src/e.rs"], None);
         let entry = store.begin_install(e.execution).unwrap();
         store.act(entry, None).unwrap();
-        let basis_e = store.view_basis(a.generation).unwrap();
+        let basis_e = store.view_basis(Some(a.generation)).unwrap();
 
         let content = |basis: &ViewBasis, path: &str| basis.content(path);
         assert_eq!(content(&basis, "src/b.rs"), Some(Content::File(accepted)));
@@ -1386,12 +1387,12 @@ mod tests {
         store
             .finish_install(e.execution, InstallOutcome::Failed, &[])
             .unwrap();
-        let restored = store.view_basis(a.generation).unwrap();
+        let restored = store.view_basis(Some(a.generation)).unwrap();
         assert_eq!(content(&restored, "src/e.rs"), None);
         assert!(before_e.moved(&restored, &taken(&["src/e.rs"])));
         // A path gaining accepted state moves too.
         store.record_baseline(&[("src/d.rs", None)]).unwrap();
-        let later = store.view_basis(a.generation).unwrap();
+        let later = store.view_basis(Some(a.generation)).unwrap();
         assert!(basis.moved(&later, &taken(&["src/d.rs"])));
     }
 

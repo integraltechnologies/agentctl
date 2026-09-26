@@ -195,6 +195,9 @@ pub(super) fn apply(
         Command::RaiseAttention { .. } => {
             bail!("only a finalized plan's replanning raises a concern")
         }
+        Command::ProposeCompletion {} => {
+            bail!("only a finalized plan's replanning proposes its completion")
+        }
     }
     Ok(false)
 }

@@ -60,6 +60,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use super::attention::{blocked, raise, resume};
+use super::integration::propose;
 use super::ownership::release;
 use super::planning::{self, lookup};
 use super::scheduling::{dag_defects, task_status};
@@ -72,8 +73,9 @@ use crate::planner::{Command, Rejection};
 
 /// Identifies a plan's replanning state: its state and tasks, their
 /// definitions and dependencies, everything recorded about their
-/// generations, claims, authorizations, cancellations and revisions, and
-/// its concerns and their human decisions.
+/// generations, claims, authorizations, cancellations and revisions, its
+/// concerns and their human decisions, and how its final integration
+/// verifications ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Basis(String);
 
@@ -223,6 +225,13 @@ impl Store {
                 let why = anyhow!("only acting on a human's decisions proposes no command");
                 return Err(Rejection::response(why).into());
             }
+            let proposing = commands
+                .iter()
+                .position(|c| matches!(c, Command::ProposeCompletion {}));
+            if let Some(i) = proposing.filter(|_| commands.len() > 1) {
+                let why = anyhow!("a completion proposal is the whole of its replan");
+                return Err(Rejection::command(i + 1, "propose_completion", why).into());
+            }
             tx.execute(
                 "INSERT INTO replans (plan_id, journal_id, basis, commands, applied_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -257,6 +266,11 @@ impl Store {
                     },
                 ];
                 reconcile_entry(tx, entry, ActionOutcome::CompletedAsIntended, &evidence)?;
+            }
+            // Once its planner's action is settled too.
+            if proposing.is_some() {
+                propose(tx, plan, replan)
+                    .map_err(|why| Rejection::command(1, "propose_completion", why))?;
             }
             // Last, once everything else applied: only committing remains.
             let mut restorations = Vec::new();
@@ -474,6 +488,8 @@ fn apply(
         Command::RemoveTask { .. } => {
             bail!("a finalized plan's tasks are never removed: cancel_task supersedes one")
         }
+        // Recorded once everything else in the replan is.
+        Command::ProposeCompletion {} => {}
         Command::Finalize {} => bail!("the plan was finalized already"),
     }
     Ok(())
@@ -705,7 +721,7 @@ pub(super) fn record_revision(
 
 /// Everything recorded about `plan` that replanning depends on, one query
 /// after another in order, each row and value delimited.
-const BASIS_QUERIES: [&str; 11] = [
+const BASIS_QUERIES: [&str; 12] = [
     "SELECT state FROM plans WHERE id = ?1",
     "SELECT id, key, objective, context FROM tasks WHERE plan_id = ?1 ORDER BY id",
     "SELECT s.task_id, s.path FROM task_scope s JOIN tasks t ON t.id = s.task_id
@@ -741,9 +757,12 @@ const BASIS_QUERIES: [&str; 11] = [
     "SELECT max(id) FROM replans WHERE plan_id = ?1",
     "SELECT c.id, c.key, d.kind, d.instruction FROM attention_concerns c
      LEFT JOIN attention_decisions d ON d.concern_id = c.id WHERE c.plan_id = ?1 ORDER BY 1",
+    "SELECT r.verification_id, r.outcome FROM integration_results r
+     JOIN integration_verifications v ON v.id = r.verification_id WHERE v.plan_id = ?1
+     ORDER BY 1",
 ];
 
-fn basis(conn: &Connection, plan: PlanId) -> Result<Basis> {
+pub(super) fn basis(conn: &Connection, plan: PlanId) -> Result<Basis> {
     let mut hash = Sha256::new();
     for sql in BASIS_QUERIES {
         let mut statement = conn.prepare(sql)?;

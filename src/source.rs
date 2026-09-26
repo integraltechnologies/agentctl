@@ -2,7 +2,11 @@
 //!
 //! Source is what Git considers repository content (tracked, or untracked
 //! and not ignored) within the configured source roots, excluding agentctl's
-//! `.agentctl/` and anything in a `.git` entry. Only regular files carry
+//! `.agentctl/`, its project-control file `agentctl.toml` and anything in a
+//! `.git` entry. `agentctl.toml` configures agentctl itself, so it is never
+//! accepted engineering source, whatever the roots: no task changes it and
+//! no graph indexes it, and an integration verification binds it as a
+//! repository input (see `crate::integration`). Only regular files carry
 //! source content; symlinks, submodules and other entries are never captured.
 //!
 //! Paths are opaque literal strings: canonical, `/`-separated and relative to
@@ -34,7 +38,7 @@ use std::thread;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::platform;
-use crate::project::{Project, STATE_DIR};
+use crate::project::{CONFIG_FILE, Project, STATE_DIR};
 use crate::state::{GenerationId, Store, check_path};
 use objects::Objects;
 pub(crate) use snapshot::{Snapshot, observe_paths, snapshot, snapshot_paths};
@@ -290,7 +294,8 @@ fn remove(root: &Path, path: &str) -> Result<()> {
 }
 
 /// Refuses paths that cannot be source: non-canonical, outside every source
-/// root, inside agentctl's or Git's own state, or not addressable as literal
+/// root, agentctl's own state or project-control file, inside Git's own
+/// state, or not addressable as literal
 /// names on this platform. ASCII case is ignored for state, as
 /// case-insensitive filesystems do.
 pub(crate) fn check_source(project: &Project, path: &str) -> Result<()> {
@@ -306,10 +311,21 @@ pub(crate) fn check_source(project: &Project, path: &str) -> Result<()> {
     );
     ensure!(!reserved(path), "`{path}` is agentctl or Git state");
     ensure!(
+        !control(path),
+        "`{path}` is agentctl's project-control file, never source"
+    );
+    ensure!(
         path.split('/').all(platform::literal_name),
         "`{path}` cannot be addressed literally on this platform"
     );
     Ok(())
+}
+
+/// Whether `path` is agentctl's project-control file, which is repository
+/// content but never source, whatever the configured roots. ASCII case is
+/// ignored, as for state.
+fn control(path: &str) -> bool {
+    path.eq_ignore_ascii_case(CONFIG_FILE)
 }
 
 fn reserved(path: &str) -> bool {
@@ -336,7 +352,7 @@ fn discover(project: &Project) -> Result<Vec<String>> {
         let path = std::str::from_utf8(raw)
             .map_err(|_| anyhow!("`{}` is not a UTF-8 path", String::from_utf8_lossy(raw)))?;
         // Untracked nested repositories are listed as directories.
-        if path.ends_with('/') || reserved(path) {
+        if path.ends_with('/') || reserved(path) || control(path) {
             continue;
         }
         check_source(project, path)?;
@@ -673,10 +689,16 @@ mod tests {
         fx.write("vendor/lib.rs", b"nested");
         run_git(&fx.root().join("vendor"), &["init", "-q"]);
 
-        assert_eq!(
-            fx.baseline(),
-            sorted(&[".gitignore", "agentctl.toml", "src/a.rs"])
-        );
+        // Even under root `.`, agentctl's project-control file is no source.
+        assert_eq!(fx.baseline(), sorted(&[".gitignore", "src/a.rs"]));
+        assert_eq!(fx.store.accepted_source("agentctl.toml").unwrap(), None);
+        for bad in ["agentctl.toml", "AgentCtl.TOML"] {
+            fails(drift(&fx.project, &fx.store, bad), "project-control file");
+            fails(fx.accept_absent(&[bad]), "project-control file");
+        }
+        // Only the project's own: one deeper is ordinary source.
+        fx.write("src/agentctl.toml", b"data");
+        assert_eq!(fx.baseline(), ["src/agentctl.toml"]);
         for bad in [
             ".agentctl/state.db",
             ".AgentCtl/x",
