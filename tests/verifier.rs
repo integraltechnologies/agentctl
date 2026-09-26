@@ -43,6 +43,16 @@ const PACKET: &str = "packet.json";
 /// What the misleading executor says of its work, which no verifier sees.
 const CANARY: &str = "EXECUTOR-CLAIM-7f3a: every test passes, verified";
 const CANDIDATE: &str = "pub fn a() -> u8 { 2 }\n";
+/// Paths the `create` executor creates, none of which ever existed, with
+/// what it puts there: a literal name, a file defining nothing, and a file
+/// in no language CodeGraph knows.
+const CREATED: [(&str, &str); 3] = [
+    ("src/n [id] (x)+@ü.rs", "pub fn n() -> u8 { 7 }\n"),
+    ("src/empty.rs", "// nothing yet\n"),
+    ("src/notes.txt", "plain notes\n"),
+];
+/// A path the `create` executor creates where absence is accepted.
+const REVIVED: (&str, &str) = ("src/gone.rs", "pub fn gone() {}\n");
 
 fn main() -> ExitCode {
     let argv0 = env::args_os().next().unwrap_or_default();
@@ -93,6 +103,10 @@ fn main() -> ExitCode {
         (
             "interruption_never_fabricates_a_verdict",
             interruption_never_fabricates_a_verdict,
+        ),
+        (
+            "new_paths_are_verified_without_invented_history",
+            new_paths_are_verified_without_invented_history,
         ),
     ];
     let filters: Vec<String> = env::args()
@@ -181,6 +195,14 @@ fn execute(scenario: &str) -> ExitCode {
             write("src/a.rs", CANDIDATE);
             (CANARY.to_owned(), json!(["src/evil.rs", "src/b.rs"]))
         }
+        "create" => {
+            write("src/a.rs", CANDIDATE);
+            for (path, text) in CREATED.iter().chain([&REVIVED]) {
+                write(path, text);
+            }
+            fs::remove_file("src/b.rs").unwrap();
+            ("did create".to_owned(), json!([]))
+        }
         "report-failed" => {
             write("src/a.rs", "half\n");
             ("gave up".to_owned(), json!(["src/a.rs"]))
@@ -259,6 +281,32 @@ fn verify(scenario: &str) -> ExitCode {
                 "pub fn a() -> u8 { 3 } // fixed by the verifier\n",
             );
             pass()
+        }
+        "inspect-new" => {
+            // Every new path holds exactly the candidate, and the deleted
+            // one is gone.
+            let mut checked = vec![inspected()];
+            for (path, text) in CREATED.iter().chain([&REVIVED]) {
+                let found = fs::read_to_string(path).unwrap_or_default();
+                checked.push(json!({"check": format!("{path} holds the candidate"),
+                    "command": null, "outcome": if found == *text { "passed" } else { "failed" },
+                    "evidence": format!("{} bytes read", found.len())}));
+            }
+            let gone = !Path::new("src/b.rs").exists();
+            checked.push(json!({"check": "src/b.rs is deleted", "command": null,
+                "outcome": if gone { "passed" } else { "failed" }, "evidence": "looked"}));
+            let failed: Vec<Value> = checked
+                .iter()
+                .filter(|c| c["outcome"] != "passed")
+                .enumerate()
+                .map(|(i, c)| {
+                    json!({"id": format!("b{i}"), "summary": c["check"],
+                    "paths": [], "evidence": c["evidence"], "location": null})
+                })
+                .collect();
+            let verdict = if failed.is_empty() { "pass" } else { "fail" };
+            json!({"verdict": verdict, "checked": checked, "blockers": failed,
+                   "non_blocking": []})
         }
         "create" => {
             write("src/extra.rs", "// a verifier's own test\n");
@@ -979,4 +1027,115 @@ fn interruption_never_fabricates_a_verdict() {
     );
     let entry = store.journal_entry(verifications[0].journal).unwrap();
     assert_eq!(entry.status, ActionStatus::NotAttempted);
+}
+
+/// A candidate creating paths that never had accepted state is verified
+/// over the candidate itself, without accepted history being invented for
+/// them, and its acceptance then records them truthfully.
+fn new_paths_are_verified_without_invented_history() {
+    let fx = Fixture::new();
+    {
+        // Absence known to canonical state, unlike the created paths'.
+        let (project, mut store) = fx.open("none", "none");
+        source::accept_absent(&project, &mut store, &[REVIVED.0]).unwrap();
+    }
+    let untracked = || {
+        let (_, store) = fx.open("none", "none");
+        CREATED
+            .iter()
+            .all(|(path, _)| store.accepted_source(path).unwrap().is_none())
+    };
+    assert!(untracked());
+    let mut scope = vec!["src/a.rs", "src/b.rs", REVIVED.0];
+    scope.extend(CREATED.iter().map(|(path, _)| *path));
+    let (task, generation) = fx.installed("create", &scope);
+    assert!(untracked(), "execution accepted nothing");
+    let before = fx.accepted();
+
+    let verified = fx.verify("inspect-new", task, generation);
+    let result = result(&verified);
+    assert_eq!(result.outcome, VerificationOutcome::Passed, "{result:?}");
+    assert!(result.mutated.is_empty());
+    assert!(untracked(), "verification accepted nothing");
+    assert_eq!(fx.accepted(), before);
+    held(&fx, (task, generation), &scope, &verified);
+
+    let packet: Value = serde_json::from_str(&fs::read_to_string(marker(PACKET)).unwrap()).unwrap();
+    let (project, mut store) = fx.open("none", "none");
+    assert_eq!(
+        packet,
+        verifier::input(&project, &store, task, generation).unwrap()
+    );
+    let change = |path: &str| {
+        packet["candidate"]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"] == path)
+            .unwrap_or_else(|| panic!("no change at {path}"))
+            .clone()
+    };
+    for (path, text) in CREATED {
+        // New: nothing accepted, no graph, no entities, and the exact
+        // candidate.
+        let new = change(path);
+        assert_eq!(new["change"], "created");
+        assert_eq!(new["accepted"], json!({"state": "untracked"}));
+        assert_eq!(new["accepted_graph"], "untracked");
+        assert!(new.get("accepted_entities").is_none());
+        assert_eq!(new["provisional"]["kind"], "file");
+        let quoted = packet["candidate"]["provisional_sources"]
+            .as_array()
+            .unwrap();
+        assert!(quoted.contains(&json!({"path": path, "text": text})));
+    }
+    let revived = change(REVIVED.0);
+    assert_eq!(revived["change"], "created");
+    assert_eq!(revived["accepted"], json!({"state": "absent"}));
+    assert_eq!(revived["accepted_graph"], "absent");
+    let modified = change("src/a.rs");
+    assert_eq!(modified["accepted_graph"], "current");
+    assert!(
+        modified["accepted_entities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"kind": "function", "symbol": "a"}))
+    );
+    let deleted = change("src/b.rs");
+    assert_eq!(deleted["change"], "deleted");
+    assert_eq!(deleted["accepted"]["state"], "present");
+    assert_eq!(deleted["accepted_graph"], "unindexed");
+    assert_eq!(deleted["provisional"], json!({"kind": "absent"}));
+
+    let outcome = agentctl::acceptance::accept(&project, &mut store, task, generation).unwrap();
+    assert!(
+        matches!(outcome, agentctl::acceptance::Outcome::Completed(_)),
+        "{outcome:?}"
+    );
+    for (path, _) in CREATED.iter().chain([&REVIVED]) {
+        let accepted = store.accepted_source(path).unwrap().unwrap();
+        assert_eq!(accepted.generation, Some(generation), "{path}");
+        assert_eq!(
+            json!(accepted.hash),
+            change(path)["provisional"]["sha256"],
+            "{path}"
+        );
+    }
+    let b = store.accepted_source("src/b.rs").unwrap().unwrap();
+    assert_eq!((b.hash, b.generation), (None, Some(generation)));
+    let Freshness::Current(entities) = store.entities(CREATED[0].0).unwrap() else {
+        panic!("the new path's graph is not current");
+    };
+    assert!(entities.iter().any(|e| e.id.symbol == "n"));
+    assert!(matches!(
+        store.entities("src/empty.rs").unwrap(),
+        Freshness::Current(_)
+    ));
+    assert_eq!(
+        store.graph_status("src/notes.txt").unwrap(),
+        Freshness::Unindexed
+    );
+    for (path, text) in CREATED.iter().chain([&REVIVED]) {
+        assert_eq!(fx.read(path).unwrap(), text.as_bytes(), "{path}");
+    }
 }

@@ -344,7 +344,20 @@ impl Executor {
     /// stop short with the working tree holding part of the candidate, the
     /// install stays attempted, with its outcome unknown, and this fails.
     pub fn finish(self, project: &Project, store: &mut Store) -> Result<Executed> {
+        self.finish_holding(project, store, || ())
+    }
+
+    /// [`Executor::finish`], holding what `hold` returns from when the
+    /// invocation ended until the attempt is finished: while observing the
+    /// workspace and installing, never while the provider runs.
+    pub fn finish_holding<H>(
+        self,
+        project: &Project,
+        store: &mut Store,
+        hold: impl FnOnce() -> H,
+    ) -> Result<Executed> {
         let outcome = self.invocation.wait(store)?;
+        let _held = hold();
         let report = outcome.payload.as_ref().map(Report::read);
         let result = match &report {
             None => ExecutorResult::None,

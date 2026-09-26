@@ -39,3 +39,7 @@ harness = false
 [[test]]
 name = "verifier"
 harness = false
+
+[[test]]
+name = "scheduler"
+harness = false

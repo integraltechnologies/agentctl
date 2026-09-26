@@ -23,7 +23,7 @@
 //! Nothing here accepts source, touches CodeGraph, ends the generation or
 //! releases ownership: a pass is evidence for acceptance, not acceptance.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::types::Type;
@@ -290,6 +290,52 @@ pub(crate) struct VerifierObserved<'a> {
     pub result: VerifierResult<'a>,
 }
 
+/// What canonical state says a verifier's view of the repository must hold
+/// besides the candidate, as of one moment: accepted state, and where
+/// installs of other generations may have left provisional bytes in the
+/// working tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewBasis {
+    /// The accepted content of every tracked path, `None` for accepted
+    /// absence.
+    pub accepted: BTreeMap<String, Option<String>>,
+    /// Each path without accepted state that an install of another
+    /// generation may have written and not restored, and what the earliest
+    /// such install found there before writing: the path as it was before
+    /// any provisional candidate reached it.
+    pub provisional: BTreeMap<String, Content>,
+    /// Each changed path of every install of another generation attempted
+    /// so far, whatever became of it, by execution. Only attempted installs
+    /// write, and an attempt is never undone, so this only grows.
+    pub attempted: BTreeSet<(ExecutionId, String)>,
+}
+
+impl ViewBasis {
+    /// What a view must hold at `path` according to canonical state, or
+    /// `None` when that is whatever the working tree holds: no candidate
+    /// ever wrote there and left it, and it has no accepted state.
+    pub(crate) fn content(&self, path: &str) -> Option<Content> {
+        match self.accepted.get(path) {
+            Some(Some(hash)) => Some(Content::File(hash.clone())),
+            Some(None) => Some(Content::Absent),
+            None => self.provisional.get(path).cloned(),
+        }
+    }
+
+    /// Whether `later`, read after this, may disagree with it about any of
+    /// `taken`, paths a view took from the working tree on this basis: had
+    /// one gained accepted state, or had an install of it been attempted
+    /// meanwhile, the working tree may have held provisional bytes there
+    /// while it was copied.
+    pub(crate) fn moved(&self, later: &ViewBasis, taken: &BTreeSet<&str>) -> bool {
+        taken.iter().any(|path| later.content(path).is_some())
+            || later
+                .attempted
+                .difference(&self.attempted)
+                .any(|(_, path)| taken.contains(path.as_str()))
+    }
+}
+
 /// An installed candidate that may be verified now.
 struct Verifiable {
     execution: ExecutionId,
@@ -308,6 +354,49 @@ impl Store {
         generation: GenerationId,
     ) -> Result<Vec<(String, Content)>> {
         Ok(verifiable(&self.conn, task, generation)?.candidate)
+    }
+
+    /// The basis of a view of the repository for verifying the candidate
+    /// of `generation`, read in one transaction; see [`ViewBasis`].
+    pub(crate) fn view_basis(&self, generation: GenerationId) -> Result<ViewBasis> {
+        let tx = self.conn.unchecked_transaction()?;
+        let accepted: BTreeMap<String, Option<String>> = tx
+            .prepare("SELECT path, hash FROM accepted_sources")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut provisional = BTreeMap::new();
+        let mut attempted = BTreeSet::new();
+        // An install attempted with no result may have written anything;
+        // one that ended any way but installed restored what it wrote.
+        let mut stmt = tx.prepare(
+            "SELECT c.execution_id, c.path, c.before_kind, c.before_hash,
+               ij.state = 'attempted' OR coalesce(r.outcome = 'installed', 0)
+             FROM execution_installs i JOIN journal ij ON ij.id = i.journal_id
+             JOIN executions e ON e.id = i.execution_id
+             JOIN execution_changes c ON c.execution_id = i.execution_id
+             LEFT JOIN execution_install_results r ON r.execution_id = i.execution_id
+             WHERE ij.state <> 'intended' AND e.generation_id <> ?1
+             ORDER BY c.execution_id, c.path",
+        )?;
+        let rows = stmt.query_map([generation], |r| {
+            Ok((r.get(0)?, r.get(1)?, Content::read(r, 2)?, r.get(4)?))
+        })?;
+        for row in rows {
+            let (execution, path, before, written): (ExecutionId, String, Content, bool) = row?;
+            if written && !accepted.contains_key(&path) {
+                // Earliest first, so the first found is what was there
+                // before any of them.
+                provisional.entry(path.clone()).or_insert(before);
+            }
+            attempted.insert((execution, path));
+        }
+        drop(stmt);
+        tx.finish()?;
+        Ok(ViewBasis {
+            accepted,
+            provisional,
+            attempted,
+        })
     }
 
     /// INTEND: records a verification of the installed candidate of an
@@ -1246,6 +1335,64 @@ mod tests {
         assert_eq!(outcome.unwrap(), VerificationOutcome::Passed);
         let refused = store.finish_verification(verification, &observed(&c.entries, &[], reported));
         assert!(err(refused).contains("already ended (passed)"));
+    }
+
+    #[test]
+    fn view_bases_hold_accepted_state_and_what_other_candidates_replaced() {
+        let (_dir, mut store) = store();
+        let new = "src/b [id] (new)+@ü.rs";
+        let accepted = format!("{:064x}", 7);
+        store
+            .record_baseline(&[("src/b.rs", Some(&accepted)), ("src/gone.rs", None)])
+            .unwrap();
+        let a = installed(&mut store, &["src/a.rs"]);
+        // Installed and never accepted: provisional where nothing is
+        // accepted, and accepted state wins where something is.
+        let b = installed(&mut store, &["src/b.rs", new]);
+        // Restored once installing failed, or never attempted.
+        let c = candidate(&mut store, &["src/c.rs"], Some(InstallOutcome::Failed));
+        let d = candidate(&mut store, &["src/d.rs"], None);
+        let basis = store.view_basis(a.generation).unwrap();
+        let before_e = basis.clone();
+        // Attempted with its outcome unknown: it may have written anything.
+        let e = candidate(&mut store, &["src/e.rs"], None);
+        let entry = store.begin_install(e.execution).unwrap();
+        store.act(entry, None).unwrap();
+        let basis_e = store.view_basis(a.generation).unwrap();
+
+        let content = |basis: &ViewBasis, path: &str| basis.content(path);
+        assert_eq!(content(&basis, "src/b.rs"), Some(Content::File(accepted)));
+        assert_eq!(content(&basis, "src/gone.rs"), Some(Content::Absent));
+        // What was there before B, never B's bytes, at its literal path.
+        assert_eq!(content(&basis, new), Some(file(1)));
+        assert_eq!(content(&basis, "src/b [id] (new)+@u.rs"), None);
+        // The generation verified is not another's candidate.
+        assert_eq!(content(&basis, "src/a.rs"), None);
+        for path in ["src/c.rs", "src/d.rs", "src/e.rs"] {
+            assert_eq!(content(&basis, path), None, "{path}");
+        }
+        assert_eq!(content(&basis_e, "src/e.rs"), Some(file(1)));
+        assert!(basis.attempted.contains(&(c.execution, "src/c.rs".into())));
+        assert!(!basis.attempted.iter().any(|(x, _)| *x == d.execution));
+        assert!(!basis.attempted.iter().any(|(x, _)| *x == a.execution));
+        assert!(basis.attempted.contains(&(b.execution, new.into())));
+
+        // A path copied from the working tree is staged again once an
+        // install there was attempted meanwhile, however it then ended.
+        let taken = |paths: &[&'static str]| paths.iter().copied().collect::<BTreeSet<_>>();
+        assert!(before_e.moved(&basis_e, &taken(&["src/e.rs"])));
+        assert!(!before_e.moved(&basis_e, &taken(&["src/d.rs", "README.md"])));
+        assert!(!basis.moved(&basis, &taken(&["src/c.rs", "src/d.rs"])));
+        store
+            .finish_install(e.execution, InstallOutcome::Failed, &[])
+            .unwrap();
+        let restored = store.view_basis(a.generation).unwrap();
+        assert_eq!(content(&restored, "src/e.rs"), None);
+        assert!(before_e.moved(&restored, &taken(&["src/e.rs"])));
+        // A path gaining accepted state moves too.
+        store.record_baseline(&[("src/d.rs", None)]).unwrap();
+        let later = store.view_basis(a.generation).unwrap();
+        assert!(basis.moved(&later, &taken(&["src/d.rs"])));
     }
 
     #[test]

@@ -42,7 +42,7 @@ use super::{
     FailureKind, GenerationId, GenerationState, InstallOutcome, Intent, InvocationId,
     InvocationState, JournalId, PlanState, Reported, Role, Store, TaskId, act_entry,
     active_generation, check_hash, check_path, event, generation_info, insert_agent, insert_intent,
-    json_column, now, plan_state, reconcile_entry,
+    json_column, now, plan_state, reconcile_entry, unsatisfied_dependencies,
 };
 
 /// The journal action of an execution.
@@ -708,13 +708,10 @@ fn authority(conn: &Connection, task: TaskId, generation: GenerationId) -> Resul
         matches!(plan_state, PlanState::Ready | PlanState::Running),
         "plan {plan} is {plan_state}; only a ready or running plan executes tasks"
     );
-    let ready: bool = conn.query_row(
-        "SELECT NOT EXISTS (SELECT 1 FROM task_dependencies d WHERE d.task_id = ?1 AND NOT EXISTS
-           (SELECT 1 FROM generations g WHERE g.task_id = d.depends_on AND g.state = 'accepted'))",
-        [task],
-        |r| r.get(0),
-    )?;
-    ensure!(ready, "task {task} depends on tasks not yet completed");
+    ensure!(
+        unsatisfied_dependencies(conn, task)?.is_empty(),
+        "task {task} depends on tasks not yet completed"
+    );
     let executed: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM executions WHERE generation_id = ?1)",
         [generation],

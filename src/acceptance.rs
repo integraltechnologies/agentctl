@@ -195,7 +195,7 @@ fn synchronize(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::thread;
@@ -234,7 +234,7 @@ mod tests {
 
     /// How a verification of the candidate ends.
     #[derive(Clone, Copy)]
-    enum Judged {
+    pub(crate) enum Judged {
         Pass,
         Fail,
         Malformed,
@@ -275,17 +275,17 @@ mod tests {
     /// `edits` in its workspace (`None` deletes): captured as a candidate
     /// and installed in the working tree, not yet verified. Task `next`
     /// depends on `t`.
-    struct Case {
-        fx: Fixture,
-        plan: PlanId,
-        task: TaskId,
-        next: TaskId,
-        generation: GenerationId,
+    pub(crate) struct Case {
+        pub(crate) fx: Fixture,
+        pub(crate) plan: PlanId,
+        pub(crate) task: TaskId,
+        pub(crate) next: TaskId,
+        pub(crate) generation: GenerationId,
         execution: ExecutionId,
     }
 
     impl Case {
-        fn installed(
+        pub(crate) fn installed(
             accepted: &[(&str, &str)],
             scope: &[&str],
             edits: &[(&str, Option<&str>)],
@@ -360,7 +360,7 @@ mod tests {
         }
 
         /// [`Case::installed`], verified as passed.
-        fn passed(
+        pub(crate) fn passed(
             accepted: &[(&str, &str)],
             scope: &[&str],
             edits: &[(&str, Option<&str>)],
@@ -370,7 +370,7 @@ mod tests {
             case
         }
 
-        fn verify(&mut self, judged: Judged) {
+        pub(crate) fn verify(&mut self, judged: Judged) {
             let store = &mut self.fx.store;
             let candidate = store
                 .verification_candidate(self.task, self.generation)
@@ -422,7 +422,7 @@ mod tests {
             store.finish_verification(verification, &observed).unwrap();
         }
 
-        fn accept(&mut self) -> Outcome {
+        pub(crate) fn accept(&mut self) -> Outcome {
             accept(
                 &self.fx.project,
                 &mut self.fx.store,
@@ -432,7 +432,7 @@ mod tests {
             .unwrap()
         }
 
-        fn accept_with(&mut self, deriving: impl FnMut(&str) -> Result<()>) -> Outcome {
+        pub(crate) fn accept_with(&mut self, deriving: impl FnMut(&str) -> Result<()>) -> Outcome {
             let (project, store) = (&self.fx.project, &mut self.fx.store);
             accept_with(project, store, self.task, self.generation, deriving).unwrap()
         }
@@ -445,7 +445,7 @@ mod tests {
             fs::read_to_string(self.root().join(path)).ok()
         }
 
-        fn phase(&self) -> Option<AcceptancePhase> {
+        pub(crate) fn phase(&self) -> Option<AcceptancePhase> {
             let acceptance = self.fx.store.acceptance(self.generation).unwrap();
             acceptance.map(|a| a.phase)
         }
@@ -526,7 +526,7 @@ mod tests {
         }
 
         /// A connection of its own, as another process would have.
-        fn connection(&self) -> rusqlite::Connection {
+        pub(crate) fn connection(&self) -> rusqlite::Connection {
             rusqlite::Connection::open(self.root().join(STATE_DIR).join(STATE_DB)).unwrap()
         }
 
@@ -1554,9 +1554,11 @@ mod tests {
         let before = tables(&path);
 
         let mut case = case.reopen();
-        assert_eq!(version(&path), 12);
+        assert!(version(&path) > 11);
         let mut after = tables(&path);
-        after.retain(|(table, _)| !table.starts_with("acceptance"));
+        after.retain(|(table, _)| {
+            !table.starts_with("acceptance") && !table.starts_with("scheduler")
+        });
         assert_eq!(after, before, "nothing changed");
         for table in ["acceptances", "acceptance_sources", "acceptance_phases"] {
             let count = rows(&case.fx.store, &format!("SELECT count(*) FROM {table}"));

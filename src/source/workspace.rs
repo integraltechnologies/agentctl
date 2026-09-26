@@ -20,7 +20,7 @@
 //! install may be recorded as attempted, and only then written, so that a
 //! crash part way leaves every path recoverable without the workspace.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -119,6 +119,23 @@ impl Workspace {
     /// nothing anyone else can find, unless the copy is then observed to
     /// hold exactly what the baseline observed.
     pub(crate) fn stage(project: &Project, baseline: &Snapshot) -> Result<Self> {
+        Self::compose(project, baseline, &BTreeSet::new())
+    }
+
+    /// [`Workspace::stage`], except that the regular file at each path in
+    /// `recovered` is copied from its recovery object instead of the
+    /// working tree, keeping the permissions of any regular file the
+    /// working tree holds there: a view of the repository that holds bytes
+    /// the working tree need not hold.
+    pub(crate) fn compose(
+        project: &Project,
+        baseline: &Snapshot,
+        recovered: &BTreeSet<String>,
+    ) -> Result<Self> {
+        let objects = match recovered.is_empty() {
+            true => None,
+            false => Some(Objects::open(&project.root.join(STATE_DIR))?),
+        };
         let dir = tempfile::Builder::new()
             .prefix("agentctl-workspace-")
             .tempdir()
@@ -142,6 +159,10 @@ impl Workspace {
             let copying = || format!("copying `{path}` into the workspace");
             match content {
                 Content::Absent => {}
+                Content::File(hash) if recovered.contains(path) => {
+                    let objects = objects.as_ref().context("recovering needs objects")?;
+                    recover_file(&project.root, objects, &root, path, hash).with_context(copying)?
+                }
                 Content::File(hash) => {
                     copy_file(&project.root, &root, path, hash).with_context(copying)?
                 }
@@ -281,6 +302,20 @@ fn copy_file(from: &Path, to: &Path, path: &str, hash: &str) -> Result<()> {
         "`{path}` changed while it was copied"
     );
     copy.set_permissions(permissions)?;
+    Ok(())
+}
+
+/// Writes recovery object `hash` at `path` in `to`, failing unless its
+/// bytes hash to `hash`, with the permissions of the regular file at `path`
+/// in `from`, if there is one.
+fn recover_file(from: &Path, objects: &Objects, to: &Path, path: &str, hash: &str) -> Result<()> {
+    let dest = within(to, path);
+    fs::create_dir_all(dest.parent().context("a path has a parent")?)?;
+    let mut copy = File::create_new(&dest)?;
+    objects.copy_to(hash, &mut copy)?;
+    if let Entry::File(file) = entry(from, path)? {
+        copy.set_permissions(file.metadata()?.permissions())?;
+    }
     Ok(())
 }
 

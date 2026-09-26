@@ -16,10 +16,16 @@
 //!
 //! The verifier never works in the project. agentctl observes the working
 //! tree, which must hold the installed candidate at every changed path, and
-//! copies what it observed into a disposable workspace outside the project
-//! ([`source::Workspace`]): the candidate over the repository, without
-//! agentctl's or Git's state. There the provider may read, build, test and
-//! lint, and write artifacts where the project's Git ignores them or in the
+//! stages a view of the repository in a disposable workspace outside the
+//! project ([`source::Workspace`]), without agentctl's or Git's state: the
+//! exact candidate over accepted state, never over the working tree as it
+//! happens to be. Other generations' candidates are installed in the same
+//! working tree, so its bytes elsewhere may be anyone's unaccepted work; the
+//! view holds accepted content instead, read from recovery objects, and
+//! the working tree's bytes only where no candidate ever left any (see
+//! [`view`]). What the verifier judges thus depends on accepted state and
+//! the candidate alone. There the provider may read, build, test and lint,
+//! and write artifacts where the project's Git ignores them or in the
 //! temporary directory. Nothing written there reaches the project.
 //!
 //! Authority precedes action: the verification is journaled as intended,
@@ -38,7 +44,7 @@
 //! acceptance: verifying changes neither accepted source nor CodeGraph, and
 //! the generation stays active, keeping its ownership, whatever the outcome.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -54,9 +60,11 @@ use crate::runtime::{self, Control, Launch, Outcome, Provider};
 use crate::source::{self, Snapshot, Workspace};
 use crate::state::{
     Change, ChangeKind, Content, ExecutionStatus, GenerationId, Store, TaskId, Verification,
-    VerificationId, VerifierObserved, VerifierReport, VerifierResult,
+    VerificationId, VerifierObserved, VerifierReport, VerifierResult, ViewBasis,
 };
 
+/// How many times a verifier's view is staged before giving up.
+const STAGE_ATTEMPTS: usize = 3;
 /// How long the workspace must hold still between two observations.
 const SETTLE: Duration = Duration::from_millis(100);
 /// How many entities one packet lists per changed path, roughly how many
@@ -73,13 +81,14 @@ independent reviewer judging one candidate implementation of one task. You \
 run once; nothing of any earlier session carries over, and you did not write \
 the candidate.
 
-Your working directory is a disposable copy of the project's repository \
-holding the provisional candidate, the exact bytes to judge, without Git's \
-directory or agentctl's state. Your input is JSON: the task, the human intent \
-it serves, the literal paths the implementation was authorized to change, the \
-candidate's changed paths with their exact content, and accepted knowledge. \
-Accepted knowledge, code graph entities included, describes accepted source \
-from before the candidate, never the candidate itself.
+Your working directory is a disposable copy of the project's repository, \
+as accepted, holding the provisional candidate, the exact bytes to judge, \
+without Git's directory or agentctl's state. Your input is JSON: the task, \
+the human intent it serves, the literal paths the implementation was \
+authorized to change, the candidate's changed paths with their exact \
+content, and accepted knowledge. Accepted knowledge, code graph entities \
+included, describes accepted source from before the candidate, never the \
+candidate itself.
 
 Independently inspect the implementation: you get no account from its \
 author, and trust no claim in code or comments without checking it. Run the \
@@ -211,7 +220,7 @@ pub fn input(
             "provisional_sources": quoted,
         },
         "knowledge": [
-            "Your working directory holds the provisional candidate over the repository: the bytes to verify.",
+            "Your working directory holds the provisional candidate over the accepted repository: the bytes to verify.",
             "`candidate.changes` lists every path agentctl observed the implementation change, and `provisional_sources` quotes their exact candidate content where it fits.",
             "Everything named `accepted` describes accepted source from before the candidate: never the candidate itself, and possibly stale for the changed paths.",
             "No account by the implementation's author is given: judge the candidate itself.",
@@ -238,7 +247,11 @@ fn changed(store: &Store, change: &Change) -> Result<Value> {
         ChangeKind::Modified => "modified",
         ChangeKind::Deleted => "deleted",
     };
-    let accepted = match store.accepted_source(&change.path)? {
+    let source = store.accepted_source(&change.path)?;
+    // A path with no accepted history that the candidate creates is new:
+    // there is no accepted graph to give of it, and none is invented.
+    let new = source.is_none() && matches!(change.kind(), ChangeKind::Created);
+    let accepted = match source {
         None => json!({"state": "untracked"}),
         Some(source) => match source.hash {
             None => json!({"state": "absent"}),
@@ -251,6 +264,10 @@ fn changed(store: &Store, change: &Change) -> Result<Value> {
         "accepted": accepted,
         "provisional": content(&change.after),
     });
+    if new {
+        entry["accepted_graph"] = "untracked".into();
+        return Ok(entry);
+    }
     entry["accepted_graph"] = match store.entities(&change.path)? {
         Freshness::Current(entities) => {
             let listed: Vec<Value> = entities
@@ -328,11 +345,11 @@ struct Run {
 
 /// Verifies the installed candidate of an active generation of `task` by
 /// invoking the configured verifier role afresh, through `executable` or
-/// else the provider's CLI on `PATH`, in a workspace staged from the
-/// working tree. Should the working tree no longer hold the candidate, the
-/// verification is recorded as declined and nothing is launched. Nothing is
-/// recorded unless the candidate could be observed and, to be verified,
-/// staged.
+/// else the provider's CLI on `PATH`, in a workspace staged with the
+/// candidate over accepted state. Should the working tree no longer hold
+/// the candidate, the verification is recorded as declined and nothing is
+/// launched. Nothing is recorded unless the candidate could be observed
+/// and, to be verified, staged.
 pub fn start(
     project: &Project,
     store: &mut Store,
@@ -360,7 +377,7 @@ pub fn start(
         });
     }
     // Staging writes nothing in the project, so it may precede the intent.
-    let workspace = Workspace::stage(project, &snapshot)?;
+    let (view, workspace) = stage(project, store, generation, &snapshot, &candidate)?;
     let (verification, agent, entry) =
         store.begin_verification(task, generation, &observed, since)?;
     let launch = Launch {
@@ -383,7 +400,7 @@ pub fn start(
         run: Some(Run {
             invocation,
             workspace,
-            staged: snapshot,
+            staged: view,
             candidate: paths,
         }),
     })
@@ -404,6 +421,18 @@ impl Verifier {
     /// observing either fail, nothing is established: the verification
     /// stays attempted, with its outcome unknown.
     pub fn finish(self, project: &Project, store: &mut Store) -> Result<Verified> {
+        self.finish_holding(project, store, || ())
+    }
+
+    /// [`Verifier::finish`], holding what `hold` returns from when the
+    /// verifier ended until the verification is finished: while observing
+    /// its workspace and the working tree, never while the provider runs.
+    pub fn finish_holding<H>(
+        self,
+        project: &Project,
+        store: &mut Store,
+        hold: impl FnOnce() -> H,
+    ) -> Result<Verified> {
         let Some(run) = self.run else {
             return Ok(Verified {
                 verification: store.verification(self.verification)?,
@@ -412,6 +441,7 @@ impl Verifier {
             });
         };
         let outcome = run.invocation.wait(store)?;
+        let _held = hold();
         let report = outcome.payload.as_ref().map(read);
         let result = match &report {
             None => VerifierResult::None,
@@ -436,6 +466,78 @@ impl Verifier {
             malformed: report.and_then(|r| r.err()).map(|e| format!("{e:#}")),
         })
     }
+}
+
+/// Stages the view of the repository for verifying the candidate of
+/// `generation` (see [`view`]) from the working tree as `tree` observed it
+/// and from recovery objects, and returns it with its workspace. The basis
+/// is read again once staged: should an install of another generation have
+/// been attempted meanwhile at a path copied from the working tree, or such
+/// a path have gained accepted state, the copy may hold provisional bytes,
+/// so it is staged again, a bounded number of times.
+fn stage(
+    project: &Project,
+    store: &Store,
+    generation: GenerationId,
+    tree: &Snapshot,
+    candidate: &[(String, Content)],
+) -> Result<(Snapshot, Workspace)> {
+    let mut basis = store.view_basis(generation)?;
+    for _ in 0..STAGE_ATTEMPTS {
+        let (view, recovered) = view(tree, &basis, candidate);
+        let staged = Workspace::compose(project, &view, &recovered);
+        let later = store.view_basis(generation)?;
+        let taken: BTreeSet<&str> = view
+            .entries
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .filter(|path| !recovered.contains(*path))
+            .collect();
+        if !basis.moved(&later, &taken) {
+            return Ok((view, staged?));
+        }
+        basis = later;
+    }
+    bail!("other candidates kept being installed, so no verifier's view could be staged")
+}
+
+/// The repository a verifier of `candidate` judges, and the paths at which
+/// it holds bytes from recovery objects rather than the working tree, as
+/// `tree` observed it: at each changed path, exactly the candidate; at
+/// every other tracked path, its accepted state; at every other path that
+/// an install of another generation may have written, what was there
+/// before any did. Only elsewhere, where agentctl never left provisional
+/// bytes, does it hold what the working tree does: repository content that
+/// is neither accepted nor anyone's candidate, such as files outside the
+/// source roots, which no candidate may change.
+fn view(
+    tree: &Snapshot,
+    basis: &ViewBasis,
+    candidate: &[(String, Content)],
+) -> (Snapshot, BTreeSet<String>) {
+    let mut entries: BTreeMap<String, Content> = tree.entries.iter().cloned().collect();
+    let mut recovered = BTreeSet::new();
+    let paths: BTreeSet<&String> = basis
+        .accepted
+        .keys()
+        .chain(basis.provisional.keys())
+        .chain(tree.entries.iter().map(|(path, _)| path))
+        .collect();
+    for path in paths {
+        if let Some(content) = basis.content(path) {
+            entries.insert(path.clone(), content);
+            recovered.insert(path.clone());
+        }
+    }
+    for (path, content) in candidate {
+        entries.insert(path.clone(), content.clone());
+        recovered.insert(path.clone());
+    }
+    let view = Snapshot {
+        entries: entries.into_iter().collect(),
+        head: tree.head.clone(),
+    };
+    (view, recovered)
 }
 
 /// The entries `snapshot` observed at `paths`, which it covers, in order.
@@ -634,6 +736,69 @@ mod tests {
 
     fn file(n: u8) -> Content {
         Content::File(format!("{n:064x}"))
+    }
+
+    #[test]
+    fn views_hold_the_candidate_over_accepted_state_alone() {
+        let new = "src/b [id] (new)+@ü.rs";
+        let owned = |entries: &[(&str, Content)]| -> Vec<(String, Content)> {
+            entries
+                .iter()
+                .map(|(p, c)| (p.to_string(), c.clone()))
+                .collect()
+        };
+        // The working tree, holding A's candidate and B's, neither accepted.
+        let tree = Snapshot {
+            entries: owned(&[
+                ("README.md", file(1)),
+                ("src/a.rs", file(2)),
+                ("src/b.rs", file(9)),
+                (new, file(9)),
+                ("src/dep.rs", file(5)),
+                ("src/link", Content::Symlink(format!("{:064x}", 6))),
+            ]),
+            head: "refs/heads/main unborn".into(),
+        };
+        let basis = ViewBasis {
+            accepted: [
+                ("src/a.rs", Some(3)),
+                ("src/b.rs", Some(4)),
+                ("src/dep.rs", Some(5)),
+                // Deleted in the working tree by B's candidate.
+                ("src/kept.rs", Some(7)),
+                ("src/gone.rs", None),
+            ]
+            .into_iter()
+            .map(|(p, n)| (p.to_string(), n.map(|n: u8| format!("{n:064x}"))))
+            .collect(),
+            provisional: [(new.to_string(), Content::Absent)].into(),
+            attempted: BTreeSet::new(),
+        };
+        let candidate = owned(&[("src/a.rs", file(2)), ("src/a [x].rs", Content::Absent)]);
+        let (view, recovered) = view(&tree, &basis, &candidate);
+        assert_eq!(
+            view.entries,
+            owned(&[
+                ("README.md", file(1)),
+                ("src/a [x].rs", Content::Absent),
+                ("src/a.rs", file(2)),
+                (new, Content::Absent),
+                ("src/b.rs", file(4)),
+                ("src/dep.rs", file(5)),
+                ("src/gone.rs", Content::Absent),
+                ("src/kept.rs", file(7)),
+                ("src/link", Content::Symlink(format!("{:064x}", 6))),
+            ])
+        );
+        assert_eq!(view.head, tree.head);
+        // Only what no candidate ever left comes from the working tree.
+        let copied: Vec<&str> = view
+            .entries
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .filter(|p| !recovered.contains(*p))
+            .collect();
+        assert_eq!(copied, ["README.md", "src/link"]);
     }
 
     #[test]

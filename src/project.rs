@@ -59,13 +59,18 @@ impl Project {
         })
     }
 
+    /// Where the canonical state store is.
+    pub fn state_path(&self) -> PathBuf {
+        self.root.join(STATE_DIR).join(STATE_DB)
+    }
+
     /// Ensures the local, Git-ignored `.agentctl/` state directory exists and
     /// opens its canonical state store, creating it if absent.
     pub fn hydrate(&self) -> Result<Store> {
         let state = self.root.join(STATE_DIR);
         fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
         ignore_state_dir(&self.root)?;
-        Store::open(&state.join(STATE_DB))
+        Store::open(&self.state_path())
     }
 }
 

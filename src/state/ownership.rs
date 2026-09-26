@@ -18,7 +18,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{
     GenerationId, GenerationState, PlanId, PlanState, Store, TaskId, active_generation, check_path,
@@ -64,52 +64,7 @@ impl Store {
         generation: GenerationId,
         paths: &[&str],
     ) -> Result<Acquisition> {
-        self.write(|tx| {
-            let (plan, task, number) = active_generation(tx, generation)?;
-            let state = plan_state(tx, plan)?;
-            ensure!(
-                state != PlanState::Planning,
-                "plan {plan} is being planned, so its scopes authorize no mutation"
-            );
-            let mut free = Vec::new();
-            let mut conflicts = Vec::new();
-            for path in paths.iter().copied().collect::<BTreeSet<_>>() {
-                check_path(path)?;
-                let authorized: bool = tx.query_row(
-                    "SELECT EXISTS (SELECT 1 FROM task_scope WHERE task_id = ?1 AND path = ?2)",
-                    params![task, path],
-                    |r| r.get(0),
-                )?;
-                ensure!(authorized, "`{path}` is not in the scope of task {task}");
-                match owner(tx, path)? {
-                    None => free.push(path),
-                    Some(owner) if owner.generation == generation => {}
-                    Some(owner) => conflicts.push(Conflict {
-                        path: path.into(),
-                        owner,
-                    }),
-                }
-            }
-            if !conflicts.is_empty() {
-                return Ok(Acquisition::Conflicted(conflicts));
-            }
-            if free.is_empty() {
-                return Ok(Acquisition::Acquired);
-            }
-            let kind = match owns_any(tx, generation)? {
-                true => "ownership.expanded",
-                false => "ownership.acquired",
-            };
-            for path in &free {
-                tx.execute(
-                    "INSERT INTO ownership (path, generation_id) VALUES (?1, ?2)",
-                    params![path, generation],
-                )?;
-            }
-            let detail = format!("generation {number}: {} paths", free.len());
-            event(tx, kind, Some(plan), Some(task), None, &detail)?;
-            Ok(Acquisition::Acquired)
-        })
+        self.write(|tx| acquire(tx, generation, paths))
     }
 
     /// Releases every path an ended generation owns, and only those. When
@@ -154,6 +109,60 @@ impl Store {
             .collect::<rusqlite::Result<_>>()
             .map_err(Into::into)
     }
+}
+
+/// Acquires `paths` for `generation` within `tx`; see
+/// [`Store::acquire_ownership`]. A conflicted or refused request writes
+/// nothing.
+pub(super) fn acquire(
+    tx: &Transaction,
+    generation: GenerationId,
+    paths: &[&str],
+) -> Result<Acquisition> {
+    let (plan, task, number) = active_generation(tx, generation)?;
+    let state = plan_state(tx, plan)?;
+    ensure!(
+        state != PlanState::Planning,
+        "plan {plan} is being planned, so its scopes authorize no mutation"
+    );
+    let mut free = Vec::new();
+    let mut conflicts = Vec::new();
+    for path in paths.iter().copied().collect::<BTreeSet<_>>() {
+        check_path(path)?;
+        let authorized: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM task_scope WHERE task_id = ?1 AND path = ?2)",
+            params![task, path],
+            |r| r.get(0),
+        )?;
+        ensure!(authorized, "`{path}` is not in the scope of task {task}");
+        match owner(tx, path)? {
+            None => free.push(path),
+            Some(owner) if owner.generation == generation => {}
+            Some(owner) => conflicts.push(Conflict {
+                path: path.into(),
+                owner,
+            }),
+        }
+    }
+    if !conflicts.is_empty() {
+        return Ok(Acquisition::Conflicted(conflicts));
+    }
+    if free.is_empty() {
+        return Ok(Acquisition::Acquired);
+    }
+    let kind = match owns_any(tx, generation)? {
+        true => "ownership.expanded",
+        false => "ownership.acquired",
+    };
+    for path in &free {
+        tx.execute(
+            "INSERT INTO ownership (path, generation_id) VALUES (?1, ?2)",
+            params![path, generation],
+        )?;
+    }
+    let detail = format!("generation {number}: {} paths", free.len());
+    event(tx, kind, Some(plan), Some(task), None, &detail)?;
+    Ok(Acquisition::Acquired)
 }
 
 pub(super) fn owner(conn: &Connection, path: &str) -> Result<Option<Owner>> {

@@ -7,6 +7,7 @@ pub mod planner;
 pub mod platform;
 pub mod project;
 pub mod runtime;
+pub mod scheduler;
 pub mod source;
 pub mod state;
 pub mod verifier;

@@ -25,6 +25,7 @@ mod execution;
 mod graph;
 mod ownership;
 mod planning;
+mod scheduling;
 mod verification;
 
 pub(crate) use acceptance::Publication;
@@ -32,11 +33,14 @@ pub use acceptance::{Acceptance, AcceptedChange};
 pub use execution::{Capture, Change, ChangeKind, Content, Execution, ExecutionStatus, Install};
 pub(crate) use execution::{ExecutorResult, Observed};
 pub use ownership::{Acquisition, Conflict, Owner};
+pub use scheduling::{
+    Capacity, Claim, ClaimRecord, Condition, DagDefect, Release, Snapshot, TaskStatus,
+};
 pub use verification::{
     Blocker, Check, CheckOutcome, Note, Verdict, Verification, VerificationResult,
     VerificationStatus, VerifierReport,
 };
-pub(crate) use verification::{VerifierObserved, VerifierResult};
+pub(crate) use verification::{VerifierObserved, VerifierResult, ViewBasis};
 
 use std::fmt;
 use std::path::Path;
@@ -56,7 +60,7 @@ use serde_json::{Map, Value};
 /// Stamped into the SQLite header (`application_id`) so an agentctl store is
 /// recognized by what it is, not merely by its schema version number.
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"agct");
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const SCHEMA: &str = include_str!("state/schema.sql");
 const MIGRATE_V1: &str = include_str!("state/migrate_v1.sql");
 const MIGRATE_V2: &str = include_str!("state/migrate_v2.sql");
@@ -69,6 +73,7 @@ const MIGRATE_V8: &str = include_str!("state/migrate_v8.sql");
 const MIGRATE_V9: &str = include_str!("state/migrate_v9.sql");
 const MIGRATE_V10: &str = include_str!("state/migrate_v10.sql");
 const MIGRATE_V11: &str = include_str!("state/migrate_v11.sql");
+const MIGRATE_V12: &str = include_str!("state/migrate_v12.sql");
 /// The version 1 `accepted_sources` definition, exactly as SQLite keeps it.
 const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
     path          TEXT    PRIMARY KEY,
@@ -93,7 +98,9 @@ const STATEMENTS_LIMIT: usize = 32;
 macro_rules! ids {
     ($($(#[$doc:meta])* $name:ident),+ $(,)?) => {$(
         $(#[$doc])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
         #[serde(transparent)]
         pub struct $name(i64);
 
@@ -112,6 +119,16 @@ macro_rules! ids {
         impl FromSql for $name {
             fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
                 i64::column_result(value).map(Self)
+            }
+        }
+
+        /// Parses an id as agentctl prints it; whether anything has that id
+        /// is for `Store` to say.
+        impl std::str::FromStr for $name {
+            type Err = std::num::ParseIntError;
+
+            fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+                s.parse().map(Self)
             }
         }
     )+};
@@ -395,6 +412,30 @@ text_enum!(
         /// The generation is accepted, completing its task, and owns
         /// nothing any more.
         Completed = "completed",
+    }
+);
+
+text_enum!(
+    /// How a scheduled pipeline ended, as canonical state establishes it
+    /// once its claim may be released. Only `Accepted` completes the task;
+    /// every other outcome leaves the task for planner action, and its
+    /// generation as the pipeline left it.
+    PipelineOutcome {
+        /// Its acceptance completed: the task is completed.
+        Accepted = "accepted",
+        /// No execution was ever attempted: no executor ran.
+        NotExecuted = "not_executed",
+        /// The execution's capture is not a candidate.
+        ExecutionFailed = "execution_failed",
+        /// The candidate was not installed into the working tree.
+        InstallFailed = "install_failed",
+        /// The latest verification of the candidate failed it.
+        VerificationFailed = "verification_failed",
+        /// The candidate was never judged: no verification finished, or
+        /// the latest one reconciled without a judgment.
+        VerificationInconclusive = "verification_inconclusive",
+        /// The latest verification passed, and no acceptance was recorded.
+        AcceptanceDeclined = "acceptance_declined",
     }
 );
 
@@ -821,56 +862,15 @@ impl Store {
         ids.into_iter().map(|id| self.task(id)).collect()
     }
 
-    /// Whether every task `task` depends on is completed.
+    /// Whether every task `task` depends on is completed: by a generation
+    /// whose acceptance completed, and by nothing short of that.
     pub fn dependencies_satisfied(&self, task: TaskId) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT NOT EXISTS (SELECT 1 FROM task_dependencies d WHERE d.task_id = ?1 AND NOT EXISTS
-               (SELECT 1 FROM generations g WHERE g.task_id = d.depends_on AND g.state = 'accepted'))",
-            [task],
-            |r| r.get(0),
-        )?)
+        Ok(unsatisfied_dependencies(&self.conn, task)?.is_empty())
     }
 
     /// Starts the next generation of a pending task.
     pub fn start_generation(&mut self, task: TaskId) -> Result<GenerationId> {
-        self.write(|tx| {
-            let plan: PlanId = tx
-                .query_row("SELECT plan_id FROM tasks WHERE id = ?1", [task], |r| {
-                    r.get(0)
-                })
-                .optional()?
-                .with_context(|| format!("task {task} does not exist"))?;
-            let live: Option<GenerationState> = tx
-                .query_row(
-                    "SELECT state FROM generations
-                     WHERE task_id = ?1 AND state IN ('active', 'accepted')",
-                    [task],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(state) = live {
-                bail!("task {task} already has an {state} generation");
-            }
-            let number: i64 = tx.query_row(
-                "SELECT coalesce(max(number), 0) + 1 FROM generations WHERE task_id = ?1",
-                [task],
-                |r| r.get(0),
-            )?;
-            tx.execute(
-                "INSERT INTO generations (task_id, number, state, started_at) VALUES (?1, ?2, ?3, ?4)",
-                params![task, number, GenerationState::Active, now()],
-            )?;
-            let generation = GenerationId(tx.last_insert_rowid());
-            event(
-                tx,
-                "generation.started",
-                Some(plan),
-                Some(task),
-                None,
-                &format!("generation {number}"),
-            )?;
-            Ok(generation)
-        })
+        self.write(|tx| insert_generation(tx, task).map(|(_, generation, _)| generation))
     }
 
     /// Ends an active generation without accepting it. The generation keeps
@@ -1545,6 +1545,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if version <= 11 {
         tx.execute_batch(MIGRATE_V11).with_context(mismatch)?;
     }
+    if version <= 12 {
+        tx.execute_batch(MIGRATE_V12).with_context(mismatch)?;
+    }
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SCHEMA)?;
     // A failed check rolls back any migration, leaving the file as found.
@@ -1614,6 +1617,62 @@ fn event(
         params![now(), kind, plan, task, agent, detail],
     )?;
     Ok(())
+}
+
+/// Starts the next generation of a pending task, returning its plan, id
+/// and number; see [`Store::start_generation`].
+fn insert_generation(tx: &Transaction, task: TaskId) -> Result<(PlanId, GenerationId, i64)> {
+    let plan: PlanId = tx
+        .query_row("SELECT plan_id FROM tasks WHERE id = ?1", [task], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .with_context(|| format!("task {task} does not exist"))?;
+    let live: Option<GenerationState> = tx
+        .query_row(
+            "SELECT state FROM generations
+             WHERE task_id = ?1 AND state IN ('active', 'accepted')",
+            [task],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(state) = live {
+        bail!("task {task} already has an {state} generation");
+    }
+    let number: i64 = tx.query_row(
+        "SELECT coalesce(max(number), 0) + 1 FROM generations WHERE task_id = ?1",
+        [task],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO generations (task_id, number, state, started_at) VALUES (?1, ?2, ?3, ?4)",
+        params![task, number, GenerationState::Active, now()],
+    )?;
+    let generation = GenerationId(tx.last_insert_rowid());
+    event(
+        tx,
+        "generation.started",
+        Some(plan),
+        Some(task),
+        None,
+        &format!("generation {number}"),
+    )?;
+    Ok((plan, generation, number))
+}
+
+/// The tasks `task` depends on that are not completed, in order: the one
+/// definition of dependency satisfaction, which the `completed_tasks` view
+/// holds. A dependency is satisfied only by a generation of the task whose
+/// acceptance completed, never by anything short of that.
+pub(crate) fn unsatisfied_dependencies(conn: &Connection, task: TaskId) -> Result<Vec<TaskId>> {
+    conn.prepare(
+        "SELECT d.depends_on FROM task_dependencies d WHERE d.task_id = ?1 AND NOT EXISTS
+           (SELECT 1 FROM completed_tasks c WHERE c.task_id = d.depends_on)
+         ORDER BY d.depends_on",
+    )?
+    .query_map([task], |r| r.get(0))?
+    .collect::<rusqlite::Result<_>>()
+    .map_err(Into::into)
 }
 
 /// Records that `task` depends on `dep`, refusing an edge from which `task`
@@ -2212,9 +2271,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// Rewrites the store at `path` as schema version 12, which records no
+    /// scheduler claim.
+    pub(crate) fn downgrade_to_v12(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP VIEW scheduler_outcomes;
+             DROP TABLE scheduler_releases;
+             DROP TABLE scheduler_claims;
+             DROP VIEW completed_tasks;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 12).unwrap();
+    }
+
     /// Rewrites the store at `path` as schema version 11, which records no
     /// acceptance.
     pub(crate) fn downgrade_to_v11(path: &Path) {
+        downgrade_to_v12(path);
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
             "DROP TRIGGER ownership_held_through_acceptance;
@@ -2456,9 +2530,10 @@ pub(crate) mod tests {
     /// The tables version 6 reshapes; see its migration.
     const RESHAPED_IN_V6: [&str; 3] = ["plans", "tasks", "task_scope"];
 
-    /// The tables versions 8 to 12 add, which no migration from before
-    /// version 8 fills, nor any migration installs, verifies or accepts.
-    const ADDED_SINCE_V8: [&str; 12] = [
+    /// The tables versions 8 to 13 add, which no migration from before
+    /// version 8 fills, nor any migration installs, verifies, accepts or
+    /// schedules.
+    const ADDED_SINCE_V8: [&str; 14] = [
         "executions",
         "execution_baseline",
         "execution_changes",
@@ -2471,10 +2546,12 @@ pub(crate) mod tests {
         "acceptance_sources",
         "acceptance_phases",
         "acceptance_completions",
+        "scheduler_claims",
+        "scheduler_releases",
     ];
 
     /// Every row of every table except those `excluded` and those versions
-    /// 8 to 12 add, by table.
+    /// 8 to 13 add, by table.
     pub(crate) fn rows_besides(path: &Path, excluded: &[&str]) -> Vec<(String, Vec<Vec<Value>>)> {
         let conn = Connection::open(path).unwrap();
         let tables: Vec<String> = conn
@@ -2848,7 +2925,9 @@ pub(crate) mod tests {
         let task = store.task(c).unwrap();
         assert_eq!((task.plan, task.depends_on), (plan, vec![a, b]));
         assert_eq!(store.task(a).unwrap().state, TaskState::Completed);
-        assert!(store.dependencies_satisfied(b).unwrap());
+        // Accepted without executing, so without a completed acceptance:
+        // that satisfies no dependency.
+        assert!(!store.dependencies_satisfied(b).unwrap());
         assert!(!store.dependencies_satisfied(c).unwrap());
         let history: Vec<_> = store
             .generations(a)
