@@ -290,12 +290,14 @@ mod tests {
 
     use super::*;
     use crate::graph::tests::Fixture;
+    use crate::planner;
     use crate::source::{self, Workspace};
     use crate::state::tests::{ended, ready_plan, succeeded};
     use crate::state::{
         AcceptancePhase, Check, CheckOutcome, Condition, ExecutionStatus, ExecutorResult,
-        FailureKind, InvocationEnd, InvocationState, Observed, PipelineOutcome, PlanState,
-        Reported, Verdict, VerifierObserved, VerifierReport, VerifierResult,
+        FailureKind, GenerationState, InvocationEnd, InvocationState, Observed, PipelineOutcome,
+        PlanState, Replan, ReplanId, Reported, Verdict, VerifierObserved, VerifierReport,
+        VerifierResult,
     };
 
     /// The next executor launched, which a test waits for only so long.
@@ -309,11 +311,16 @@ mod tests {
         NonZeroU32::new(n).unwrap()
     }
 
+    /// What each of some paths holds, in order: a file's text, or nothing.
+    type Tree = Vec<(String, Option<String>)>;
+
     /// How a simulated executor ends.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Exec {
         /// Writes every path of its authority, and reports success.
         Candidate,
+        /// Deletes every path of its authority, and reports success.
+        Delete,
         /// Its invocation fails.
         Fail,
         /// Never ends: attempted, with its outcome unknown.
@@ -362,11 +369,18 @@ mod tests {
         all_released: AtomicBool,
         let_go: Condvar,
         started: Mutex<Option<mpsc::Sender<String>>>,
+        /// Tasks that may run once more, as scripted by `PASS`.
+        reruns: HashSet<String>,
+        /// What each executor launched found at each path of its
+        /// authority, by task key, in order.
+        seen: Mutex<Vec<(String, Tree)>>,
     }
 
     impl<'a> Simulated<'a> {
         fn new(project: &'a Project, scripts: &[(&str, Script)]) -> Self {
             Self {
+                reruns: HashSet::new(),
+                seen: Mutex::default(),
                 project,
                 scripts: scripts.iter().map(|(k, s)| (k.to_string(), *s)).collect(),
                 launches: Mutex::default(),
@@ -407,19 +421,42 @@ mod tests {
                 .clone()
         }
 
+        /// What the latest executor of `key` found at each path.
+        fn seen(&self, key: &str) -> Tree {
+            let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+            let latest = seen.iter().rev().find(|(k, _)| k == key);
+            latest.expect("never launched").1.clone()
+        }
+
         fn peak(&self) -> usize {
             self.peak.load(Ordering::SeqCst)
         }
 
+        /// [`Simulated::new`], letting `reruns` run once more.
+        fn rerunning(mut self, reruns: &[&str]) -> Self {
+            self.reruns = reruns.iter().map(|k| k.to_string()).collect();
+            self
+        }
+
+        /// The script of `key`'s next launch.
+        fn script(&self, key: &str) -> Script {
+            match self.launches().iter().any(|k| k == key) {
+                true => PASS,
+                false => self.scripts.get(key).copied().unwrap_or(PASS),
+            }
+        }
+
         fn launched(&self, key: &str) {
-            let again = {
+            let before = {
                 let mut launches = self.launches.lock().unwrap_or_else(PoisonError::into_inner);
-                let again = launches.iter().any(|k| k == key);
+                let before = launches.iter().filter(|k| *k == key).count();
                 launches.push(key.into());
-                again
+                before
             };
-            // No test here runs any task twice.
-            assert!(!again, "{key} launched again");
+            // No test here runs any task twice, unless one retry of it is
+            // expected: a task run beyond that stops the test at once.
+            let allowed = usize::from(self.reruns.contains(key));
+            assert!(before <= allowed, "{key} launched again");
             let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
             if let Some(started) = &*self.started.lock().unwrap_or_else(PoisonError::into_inner) {
@@ -485,13 +522,21 @@ mod tests {
             let project = self.project;
             let (task, generation) = (work.task, work.generation);
             let key = store.task(task)?.key;
-            let script = self.scripts.get(&key).copied().unwrap_or(PASS);
+            let script = self.script(&key);
             let authority = store.execution_authority(task, generation)?;
             let (execution, agent, entry, workspace, baseline) = {
                 let _held = gate.hold();
                 let since = crate::state::now();
                 let baseline = source::snapshot(project, &authority)?;
                 let workspace = Workspace::stage(project, &baseline)?;
+                let seen = authority
+                    .iter()
+                    .map(|p| (p.clone(), fs::read_to_string(workspace.root().join(p)).ok()))
+                    .collect();
+                self.seen
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((key.clone(), seen));
                 let (execution, agent, entry) = store.begin_execution(
                     task,
                     generation,
@@ -528,11 +573,17 @@ mod tests {
                     }
                     succeeded()
                 }
+                Exec::Delete => {
+                    for path in &authority {
+                        fs::remove_file(workspace.root().join(path))?;
+                    }
+                    succeeded()
+                }
             };
             store.finish_invocation(invocation, &ran)?;
             self.running.fetch_sub(1, Ordering::SeqCst);
             let result = match script.exec {
-                Exec::Candidate => ExecutorResult::Reported {
+                Exec::Candidate | Exec::Delete => ExecutorResult::Reported {
                     status: Reported::Succeeded,
                     claimed: &authority,
                 },
@@ -606,10 +657,19 @@ mod tests {
     /// A project whose `src/` files for every task path are accepted, and
     /// a ready plan of tasks `(key, scope, depends_on)`.
     fn project(tasks: &[(&str, &[&str], &[&str])]) -> (Fixture, PlanId, Vec<TaskId>) {
+        project_without(tasks, &[])
+    }
+
+    /// [`project`], except that no file, and no accepted state, is at any
+    /// of the paths `absent`.
+    fn project_without(
+        tasks: &[(&str, &[&str], &[&str])],
+        absent: &[&str],
+    ) -> (Fixture, PlanId, Vec<TaskId>) {
         let mut fx = Fixture::new("src");
         let root = fx.project.root.clone();
         for (_, scope, _) in tasks {
-            for path in *scope {
+            for path in scope.iter().filter(|p| !absent.contains(p)) {
                 let file = root.join(path);
                 fs::create_dir_all(file.parent().unwrap()).unwrap();
                 fs::write(file, "// accepted\n").unwrap();
@@ -1089,5 +1149,656 @@ mod tests {
         assert!(report.finished.is_empty() && sim.launches().is_empty());
         assert_eq!(report.snapshot.condition(), Condition::InvalidDag);
         assert_eq!(fx.store.plan(plan).unwrap().state, PlanState::Running);
+    }
+
+    /// Replans `plan` as its planner proposed `commands`, against the state
+    /// its feedback showed.
+    fn replan(
+        project: &Project,
+        store: &mut Store,
+        plan: PlanId,
+        commands: &[planner::Command],
+    ) -> ReplanId {
+        let (_, basis) = planner::feedback(project, store, plan).unwrap();
+        let replan = planner::apply_replan(project, store, plan, &basis, commands);
+        match replan.unwrap() {
+            Replan::Applied(replan) => replan,
+            Replan::Stale => panic!("stale"),
+        }
+    }
+
+    fn retry(task: &str) -> planner::Command {
+        planner::Command::RetryTask { task: task.into() }
+    }
+
+    #[test]
+    fn a_planner_retry_reruns_a_stopped_task_once_through_fresh_agents() {
+        let tasks: [(&str, &[&str], &[&str]); 3] = [
+            ("exec-fails", &["src/a.rs"], &[]),
+            ("verify-fails", &["src/b.rs"], &[]),
+            ("after", &["src/c.rs"], &["exec-fails", "verify-fails"]),
+        ];
+        let (mut fx, plan, ids) = project(&tasks);
+        let [exec_fails, verify_fails, after] = ids[..] else {
+            panic!()
+        };
+        let scripts = [
+            (
+                "exec-fails",
+                Script {
+                    exec: Exec::Fail,
+                    ..PASS
+                },
+            ),
+            (
+                "verify-fails",
+                Script {
+                    judge: Judge::Fail,
+                    ..PASS
+                },
+            ),
+        ];
+        let sim = Simulated::new(&fx.project, &scripts).rerunning(&["exec-fails", "verify-fails"]);
+        schedule_with(&fx.project, plan, 2, &sim);
+        // Stopped pipelines are never retried on the scheduler's account.
+        let again = schedule_with(&fx.project, plan, 2, &sim);
+        assert!(again.finished.is_empty());
+        assert_eq!(sim.launches().len(), 2);
+
+        // What the planner is told: how each pipeline ended, as recorded,
+        // with the verifier's blockers as its claims.
+        let (input, _) = planner::feedback(&fx.project, &fx.store, plan).unwrap();
+        let listed = &input["plan"]["tasks"];
+        let failed = &listed[0]["generations"][0];
+        assert_eq!(failed["pipeline"], "execution_failed");
+        assert_eq!(failed["execution"]["outcome"], "invocation_failed");
+        assert_eq!(failed["execution"]["invocation"]["failure"], "exit_status");
+        assert_eq!(failed["retains_capacity"], false);
+        let rejected = &listed[1]["generations"][0];
+        assert_eq!(rejected["pipeline"], "verification_failed");
+        assert_eq!(rejected["execution"]["install"], "installed");
+        let verification = &rejected["verifications"][0];
+        assert_eq!(verification["outcome"], "failed");
+        assert_eq!(
+            verification["claimed_by_verifier"]["blockers"][0]["summary"],
+            "broken"
+        );
+        assert_eq!(listed[2]["status"], "waiting_for_dependencies");
+        for task in &listed.as_array().unwrap()[..2] {
+            assert_eq!(task["status"], "stopped");
+            assert!(
+                task["may"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&"retry_task".into())
+            );
+        }
+
+        // The planner revises one task to address the blocker, and retries
+        // both.
+        let fix = planner::Command::UpdateTask {
+            task: "verify-fails".into(),
+            objective: None,
+            context: Some("Blocker b1: it was broken.".into()),
+            paths: None,
+        };
+        replan(
+            &fx.project,
+            &mut fx.store,
+            plan,
+            &[fix, retry("exec-fails"), retry("verify-fails")],
+        );
+        let report = schedule_with(&fx.project, plan, 2, &sim);
+        assert_eq!(report.snapshot.condition(), Condition::AllCompleted);
+        let mut launched = sim.launches();
+        launched.sort();
+        assert_eq!(
+            launched,
+            [
+                "after",
+                "exec-fails",
+                "exec-fails",
+                "verify-fails",
+                "verify-fails"
+            ]
+        );
+        for (task, ended) in [
+            (exec_fails, GenerationState::Failed),
+            (verify_fails, GenerationState::Rejected),
+        ] {
+            let generations = fx.store.generations(task).unwrap();
+            let [first, second] = &generations[..] else {
+                panic!("{generations:?}")
+            };
+            assert_eq!(
+                (first.state, second.state),
+                (ended, GenerationState::Accepted)
+            );
+            // A fresh executor, and a fresh verifier, for the fresh
+            // generation; the first keeps its own.
+            let executor = |g| fx.store.execution(g).unwrap().unwrap().agent;
+            assert_ne!(executor(first.id), executor(second.id));
+            assert_eq!(fx.store.generation_revision(first.id).unwrap(), Some(1));
+        }
+        let verifier = |g| fx.store.verifications(g).unwrap()[0].agent;
+        let generations = fx.store.generations(verify_fails).unwrap();
+        assert_ne!(verifier(generations[0].id), verifier(generations[1].id));
+        // The revised task ran its revision; the other, its only one.
+        assert_eq!(
+            fx.store.generation_revision(generations[1].id).unwrap(),
+            Some(2)
+        );
+        let retried = fx.store.generations(exec_fails).unwrap()[1].id;
+        assert_eq!(fx.store.generation_revision(retried).unwrap(), Some(1));
+        assert_eq!(fx.store.generations(after).unwrap().len(), 1);
+        // Each authorization was used once, and nothing runs again.
+        let again = schedule_with(&fx.project, plan, 2, &sim);
+        assert!(again.finished.is_empty());
+    }
+
+    #[test]
+    fn a_replacement_task_runs_instead_of_a_retry() {
+        let tasks: [(&str, &[&str], &[&str]); 2] = [
+            ("old", &["src/a.rs"], &[]),
+            ("next", &["src/b.rs"], &["old"]),
+        ];
+        let (mut fx, plan, ids) = project(&tasks);
+        let fails = Script {
+            exec: Exec::Fail,
+            ..PASS
+        };
+        let sim = Simulated::new(&fx.project, &[("old", fails)]);
+        schedule_with(&fx.project, plan, 2, &sim);
+        let old = fx.store.generations(ids[0]).unwrap()[0].id;
+        replan(
+            &fx.project,
+            &mut fx.store,
+            plan,
+            &[
+                planner::Command::CancelTask { task: "old".into() },
+                planner::Command::AddTask {
+                    task: "replacement".into(),
+                    objective: "Change a another way".into(),
+                    context: String::new(),
+                    paths: vec!["src/a.rs".into()],
+                    depends_on: Vec::new(),
+                },
+                planner::Command::SetDependencies {
+                    task: "next".into(),
+                    depends_on: vec!["replacement".into()],
+                },
+            ],
+        );
+        let report = schedule_with(&fx.project, plan, 2, &sim);
+        assert_eq!(sim.launches(), ["old", "replacement", "next"]);
+        assert_eq!(report.snapshot.condition(), Condition::AllCompleted);
+        assert_eq!(report.snapshot.status(ids[0]), Some(&TaskStatus::Cancelled));
+        // The cancelled task's attempt stays as it happened.
+        let generations = fx.store.generations(ids[0]).unwrap();
+        assert_eq!(
+            (generations.len(), generations[0].id, generations[0].state),
+            (1, old, GenerationState::Failed)
+        );
+        assert!(fx.store.execution(old).unwrap().is_some());
+        let replacement = fx.store.tasks(plan).unwrap()[2].id;
+        let source = fx.store.accepted_source("src/a.rs").unwrap().unwrap();
+        let accepted = fx.store.generations(replacement).unwrap()[0].id;
+        assert_eq!(source.generation, Some(accepted));
+    }
+
+    #[test]
+    fn completed_and_unfinished_work_is_never_replanned() {
+        let tasks: [(&str, &[&str], &[&str]); 3] = [
+            ("done", &["src/a.rs"], &[]),
+            ("unfinished", &["src/b.rs"], &[]),
+            ("failing", &["src/c.rs"], &[]),
+        ];
+        let (mut fx, plan, ids) = project(&tasks);
+        let scripts = [
+            (
+                "unfinished",
+                Script {
+                    unfinished: true,
+                    ..PASS
+                },
+            ),
+            (
+                "failing",
+                Script {
+                    exec: Exec::Fail,
+                    ..PASS
+                },
+            ),
+        ];
+        let sim = Simulated::new(&fx.project, &scripts).rerunning(&["failing"]);
+        schedule_with(&fx.project, plan, 3, &sim);
+        let done = fx.store.generations(ids[0]).unwrap()[0].id;
+        let unfinished = fx.store.generations(ids[1]).unwrap()[0].id;
+        let accepted = |fx: &Fixture| {
+            (
+                fx.store.accepted_source("src/a.rs").unwrap(),
+                fx.store.accepted_source("src/b.rs").unwrap(),
+                fx.store.acceptance(done).unwrap(),
+                fx.store.acceptance(unfinished).unwrap(),
+                fx.store.generations(ids[0]).unwrap(),
+                fx.store.generations(ids[1]).unwrap(),
+                fx.store.owned_paths(unfinished).unwrap(),
+                fx.store.task(ids[0]).unwrap(),
+            )
+        };
+        let before = accepted(&fx);
+        assert_eq!(before.3.as_ref().unwrap().phase, AcceptancePhase::Published);
+        let (_, basis) = planner::feedback(&fx.project, &fx.store, plan).unwrap();
+        for (key, expected) in [("done", "completed"), ("unfinished", "not established")] {
+            for command in [
+                retry(key),
+                planner::Command::CancelTask { task: key.into() },
+                planner::Command::SetDependencies {
+                    task: key.into(),
+                    depends_on: Vec::new(),
+                },
+                planner::Command::UpdateTask {
+                    task: key.into(),
+                    objective: Some("Redo it".into()),
+                    context: None,
+                    paths: None,
+                },
+            ] {
+                let refused =
+                    planner::apply_replan(&fx.project, &mut fx.store, plan, &basis, &[command]);
+                let message = format!("{:#}", refused.unwrap_err());
+                assert!(message.contains(expected), "{message}");
+            }
+        }
+        // Replanning the rest, follow-up work included, leaves both as they
+        // were.
+        replan(
+            &fx.project,
+            &mut fx.store,
+            plan,
+            &[
+                retry("failing"),
+                planner::Command::AddTask {
+                    task: "follow-up".into(),
+                    objective: "Build on done".into(),
+                    context: String::new(),
+                    paths: vec!["src/d.rs".into()],
+                    depends_on: vec!["done".into()],
+                },
+            ],
+        );
+        schedule_with(&fx.project, plan, 3, &sim);
+        assert_eq!(accepted(&fx), before);
+        let mut launched = sim.launches();
+        launched.sort();
+        assert_eq!(
+            launched,
+            ["done", "failing", "failing", "follow-up", "unfinished"]
+        );
+        assert_eq!(status(&fx, plan, ids[2]), TaskStatus::Completed);
+        assert_eq!(status(&fx, plan, ids[1]), TaskStatus::Scheduled(unfinished));
+    }
+
+    const FAILS_VERIFICATION: Script = Script {
+        judge: Judge::Fail,
+        ..PASS
+    };
+
+    const ACCEPTED: Option<&str> = Some("// accepted\n");
+
+    /// What the working tree holds at each of `paths`.
+    fn tree(project: &Project, paths: &[&str]) -> Tree {
+        paths
+            .iter()
+            .map(|p| (p.to_string(), fs::read_to_string(project.root.join(p)).ok()))
+            .collect()
+    }
+
+    fn holding(paths: &[&str], content: Option<&str>) -> Tree {
+        paths
+            .iter()
+            .map(|p| (p.to_string(), content.map(str::to_owned)))
+            .collect()
+    }
+
+    /// Literal names, in authority order.
+    const LITERAL: [&str; 6] = [
+        "src/(group).rs",
+        "src/@scope.rs",
+        "src/[id].rs",
+        "src/a+b.rs",
+        "src/with space.rs",
+        "src/日本語.rs",
+    ];
+
+    #[test]
+    fn a_retry_starts_from_accepted_state_never_the_failed_candidate() {
+        let tasks: [(&str, &[&str], &[&str]); 3] = [
+            ("modify", &LITERAL, &[]),
+            ("delete", &["src/gone.rs"], &[]),
+            ("create", &["src/new.rs"], &[]),
+        ];
+        let (mut fx, plan, ids) = project_without(&tasks, &["src/new.rs"]);
+        let deletes = Script {
+            exec: Exec::Delete,
+            ..FAILS_VERIFICATION
+        };
+        let scripts = [
+            ("modify", FAILS_VERIFICATION),
+            ("delete", deletes),
+            ("create", FAILS_VERIFICATION),
+        ];
+        let sim = Simulated::new(&fx.project, &scripts).rerunning(&["modify", "delete", "create"]);
+        schedule_with(&fx.project, plan, 3, &sim);
+        // Each failed candidate is installed in the working tree, and no
+        // path it changed has accepted state from it.
+        let first: Vec<GenerationId> = ids
+            .iter()
+            .map(|&t| fx.store.generations(t).unwrap()[0].id)
+            .collect();
+        let candidate =
+            |key: &str, generation| Some(format!("// {key}, generation {generation}\n"));
+        let installed = tree(&fx.project, &LITERAL);
+        for (_, content) in &installed {
+            assert_eq!(*content, candidate("modify", first[0]));
+        }
+        assert_eq!(tree(&fx.project, &["src/gone.rs"])[0].1, None);
+        assert_eq!(
+            tree(&fx.project, &["src/new.rs"])[0].1,
+            candidate("create", first[2])
+        );
+        assert_eq!(fx.store.accepted_source("src/new.rs").unwrap(), None);
+
+        replan(
+            &fx.project,
+            &mut fx.store,
+            plan,
+            &[retry("modify"), retry("delete"), retry("create")],
+        );
+        // Restored exactly: modified and deleted files to their accepted
+        // bytes, the created one to absence, whatever their names.
+        assert_eq!(tree(&fx.project, &LITERAL), holding(&LITERAL, ACCEPTED));
+        assert_eq!(
+            tree(&fx.project, &["src/gone.rs", "src/new.rs"]),
+            [
+                ("src/gone.rs".to_owned(), Some("// accepted\n".to_owned())),
+                ("src/new.rs".to_owned(), None)
+            ]
+        );
+        for (&task, &generation) in ids.iter().zip(&first) {
+            assert_eq!(
+                fx.store.generations(task).unwrap()[0].state,
+                GenerationState::Rejected
+            );
+            assert!(fx.store.owned_paths(generation).unwrap().is_empty());
+        }
+
+        // Each fresh executor starts from accepted state alone.
+        let report = schedule_with(&fx.project, plan, 3, &sim);
+        assert_eq!(report.snapshot.condition(), Condition::AllCompleted);
+        assert_eq!(sim.seen("modify"), holding(&LITERAL, ACCEPTED));
+        assert_eq!(sim.seen("delete"), holding(&["src/gone.rs"], ACCEPTED));
+        assert_eq!(sim.seen("create"), holding(&["src/new.rs"], None));
+    }
+
+    #[test]
+    fn abandoning_one_candidate_never_touches_anothers() {
+        let tasks: [(&str, &[&str], &[&str]); 2] =
+            [("a", &["src/a.rs"], &[]), ("b", &["src/b.rs"], &[])];
+        let (mut fx, plan, ids) = project(&tasks);
+        let unresolved = Script {
+            judge: Judge::Unresolved,
+            ..PASS
+        };
+        let sim = Simulated::new(&fx.project, &[("a", FAILS_VERIFICATION), ("b", unresolved)]);
+        schedule_with(&fx.project, plan, 2, &sim);
+        let b = fx.store.generations(ids[1]).unwrap()[0].id;
+        let provisional = Some(format!("// b, generation {b}\n"));
+        assert_eq!(tree(&fx.project, &["src/b.rs"])[0].1, provisional);
+        replan(&fx.project, &mut fx.store, plan, &[retry("a")]);
+        assert_eq!(tree(&fx.project, &["src/a.rs"])[0].1.as_deref(), ACCEPTED);
+        // `b`'s candidate, still being verified, stays installed and owned.
+        assert_eq!(tree(&fx.project, &["src/b.rs"])[0].1, provisional);
+        assert_eq!(fx.store.owned_paths(b).unwrap(), ["src/b.rs"]);
+        assert_eq!(status(&fx, plan, ids[1]), TaskStatus::Scheduled(b));
+    }
+
+    #[test]
+    fn drifted_paths_are_never_overwritten_and_nothing_is_replanned() {
+        let (mut fx, plan, ids) = project(&[("a", &["src/a.rs", "src/b.rs"], &[])]);
+        let sim = Simulated::new(&fx.project, &[("a", FAILS_VERIFICATION)]).rerunning(&["a"]);
+        schedule_with(&fx.project, plan, 1, &sim);
+        let generation = fx.store.generations(ids[0]).unwrap()[0].id;
+        let candidate = Some(format!("// a, generation {generation}\n"));
+        // Someone changed one of the candidate's paths since it was
+        // installed.
+        fs::write(fx.project.root.join("src/b.rs"), "// drift\n").unwrap();
+        let everything = |fx: &Fixture| {
+            (
+                fx.store.generations(ids[0]).unwrap(),
+                fx.store.owned_paths(generation).unwrap(),
+                fx.store.retry_authorizations(ids[0]).unwrap(),
+                fx.store.replans(plan).unwrap(),
+                fx.store.revisions(ids[0]).unwrap(),
+                tree(&fx.project, &["src/a.rs", "src/b.rs"]),
+            )
+        };
+        let before = everything(&fx);
+        let (_, basis) = planner::feedback(&fx.project, &fx.store, plan).unwrap();
+        let refused =
+            planner::apply_replan(&fx.project, &mut fx.store, plan, &basis, &[retry("a")]);
+        let reason = refused.unwrap_err();
+        assert!(reason.downcast_ref::<planner::Rejection>().is_some());
+        let message = format!("{reason:#}");
+        assert!(
+            message.contains("neither") && message.contains("src/b.rs"),
+            "{message}"
+        );
+        // Nothing written, not even the path still holding the candidate.
+        assert_eq!(everything(&fx), before);
+        assert_eq!(before.5[0].1, candidate);
+        assert_eq!(before.0[0].state, GenerationState::Active);
+
+        // Should a path already hold its accepted state, as an interrupted
+        // restoration leaves it, restoring completes the rest.
+        fs::write(fx.project.root.join("src/b.rs"), "// accepted\n").unwrap();
+        replan(&fx.project, &mut fx.store, plan, &[retry("a")]);
+        assert_eq!(
+            tree(&fx.project, &["src/a.rs", "src/b.rs"]),
+            holding(&["src/a.rs", "src/b.rs"], ACCEPTED)
+        );
+        schedule_with(&fx.project, plan, 1, &sim);
+        assert_eq!(sim.seen("a"), holding(&["src/a.rs", "src/b.rs"], ACCEPTED));
+    }
+
+    #[test]
+    fn racing_replans_restore_once_and_a_claim_only_follows_restoration() {
+        for _ in 0..3 {
+            let (fx, plan, ids) = project(&[("a", &["src/a.rs"], &[])]);
+            let sim = Simulated::new(&fx.project, &[("a", FAILS_VERIFICATION)]);
+            schedule_with(&fx.project, plan, 1, &sim);
+            let (_, basis) = planner::feedback(&fx.project, &fx.store, plan).unwrap();
+            let project = &fx.project;
+            let barrier = Barrier::new(3);
+            let (replans, claimed) = thread::scope(|scope| {
+                let replanning: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut store = Store::open(&project.state_path()).unwrap();
+                            barrier.wait();
+                            let commands = [retry("a")];
+                            planner::apply_replan(project, &mut store, plan, &basis, &commands)
+                                .unwrap()
+                        })
+                    })
+                    .collect();
+                // A scheduler of another process claims as soon as it can,
+                // and reads what the working tree then holds.
+                let claiming = scope.spawn(|| {
+                    let mut store = Store::open(&project.state_path()).unwrap();
+                    barrier.wait();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    loop {
+                        if let Claim::Claimed(g) = store.claim(ids[0], limit(4)).unwrap() {
+                            let seen = fs::read_to_string(project.root.join("src/a.rs")).unwrap();
+                            return (g, seen);
+                        }
+                        assert!(std::time::Instant::now() < deadline, "never claimed");
+                        thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                });
+                let replans: Vec<Replan> =
+                    replanning.into_iter().map(|h| h.join().unwrap()).collect();
+                (replans, claiming.join().unwrap())
+            });
+            let applied = replans
+                .iter()
+                .filter(|r| matches!(r, Replan::Applied(_)))
+                .count();
+            assert_eq!(applied, 1, "{replans:?}");
+            assert!(replans.contains(&Replan::Stale), "{replans:?}");
+            assert_eq!(claimed.1, "// accepted\n");
+            assert_eq!(fx.store.generations(ids[0]).unwrap()[1].id, claimed.0);
+        }
+    }
+
+    #[test]
+    fn cancelling_discards_the_failed_candidate_for_later_work() {
+        let (mut fx, plan, _) = project(&[("old", &["src/a.rs"], &[])]);
+        let sim = Simulated::new(&fx.project, &[("old", FAILS_VERIFICATION)]);
+        schedule_with(&fx.project, plan, 1, &sim);
+        assert_ne!(tree(&fx.project, &["src/a.rs"])[0].1.as_deref(), ACCEPTED);
+        replan(
+            &fx.project,
+            &mut fx.store,
+            plan,
+            &[
+                planner::Command::CancelTask { task: "old".into() },
+                planner::Command::AddTask {
+                    task: "replacement".into(),
+                    objective: "Change a another way".into(),
+                    context: String::new(),
+                    paths: vec!["src/a.rs".into()],
+                    depends_on: Vec::new(),
+                },
+            ],
+        );
+        assert_eq!(tree(&fx.project, &["src/a.rs"])[0].1.as_deref(), ACCEPTED);
+        schedule_with(&fx.project, plan, 1, &sim);
+        assert_eq!(sim.seen("replacement"), holding(&["src/a.rs"], ACCEPTED));
+    }
+
+    #[test]
+    fn revising_dependencies_needs_a_fresh_authorization() {
+        let tasks: [(&str, &[&str], &[&str]); 2] =
+            [("b", &["src/b.rs"], &[]), ("c", &["src/c.rs"], &[])];
+        let (mut fx, plan, ids) = project(&tasks);
+        let fails = Script {
+            exec: Exec::Fail,
+            ..PASS
+        };
+        let sim = Simulated::new(&fx.project, &[("b", fails)]).rerunning(&["b"]);
+        schedule_with(&fx.project, plan, 2, &sim);
+        let first = replan(&fx.project, &mut fx.store, plan, &[retry("b")]);
+        // `c` completed, so `b` depending on it changes nothing but its
+        // definition, which the authorization did not authorize.
+        let on_c = planner::Command::SetDependencies {
+            task: "b".into(),
+            depends_on: vec!["c".into()],
+        };
+        replan(&fx.project, &mut fx.store, plan, &[on_c]);
+        assert!(
+            schedule_with(&fx.project, plan, 2, &sim)
+                .finished
+                .is_empty()
+        );
+        let mut launched = sim.launches();
+        launched.sort();
+        assert_eq!(launched, ["b", "c"]);
+        let second = replan(&fx.project, &mut fx.store, plan, &[retry("b")]);
+        let report = schedule_with(&fx.project, plan, 2, &sim);
+        assert_eq!(report.finished.len(), 1);
+        assert_eq!(report.snapshot.condition(), Condition::AllCompleted);
+        let retried = fx.store.generations(ids[0]).unwrap()[1].id;
+        assert_eq!(fx.store.generation_revision(retried).unwrap(), Some(2));
+        let authorizations = fx.store.retry_authorizations(ids[0]).unwrap();
+        assert_eq!(
+            authorizations
+                .iter()
+                .map(|a| (a.revision, a.replan, a.used_by))
+                .collect::<Vec<_>>(),
+            [(1, first, None), (2, second, Some(retried))]
+        );
+    }
+
+    #[test]
+    fn work_accepted_or_in_flight_is_never_abandoned_beneath_the_store() {
+        let tasks: [(&str, &[&str], &[&str]); 4] = [
+            ("done", &["src/a.rs"], &[]),
+            ("unfinished", &["src/b.rs"], &[]),
+            ("unknown", &["src/c.rs"], &[]),
+            ("other", &["src/d.rs"], &[]),
+        ];
+        let (mut fx, plan, ids) = project(&tasks);
+        let scripts = [
+            (
+                "unfinished",
+                Script {
+                    unfinished: true,
+                    ..PASS
+                },
+            ),
+            (
+                "unknown",
+                Script {
+                    exec: Exec::Unknown,
+                    ..PASS
+                },
+            ),
+            ("other", FAILS_VERIFICATION),
+        ];
+        let sim = Simulated::new(&fx.project, &scripts);
+        schedule_with(&fx.project, plan, 4, &sim);
+        let replan = replan(&fx.project, &mut fx.store, plan, &[retry("other")]);
+        for &task in &ids[..3] {
+            let generation = fx.store.generations(task).unwrap()[0].id;
+            let owned = fx.store.owned_paths(generation).unwrap();
+            for (sql, expected) in [
+                (
+                    format!(
+                        "INSERT INTO generation_abandonments VALUES
+                           ({generation}, 'failed', {replan}, {generation}, NULL, 0)"
+                    ),
+                    "only a replan abandons",
+                ),
+                (
+                    format!("UPDATE generations SET state = 'failed' WHERE id = {generation}"),
+                    "abandons it",
+                ),
+            ] {
+                let message = fx.store.raw().execute_batch(&sql).unwrap_err().to_string();
+                assert!(message.contains(expected), "{sql}: {message}");
+            }
+            // Accepting released what the completed one owned.
+            assert_eq!(owned.is_empty(), task == ids[0]);
+            let release = format!("DELETE FROM ownership WHERE generation_id = {generation}");
+            assert_eq!(
+                fx.store.raw().execute_batch(&release).is_err(),
+                !owned.is_empty()
+            );
+            assert_eq!(fx.store.owned_paths(generation).unwrap(), owned);
+        }
+        let states: Vec<GenerationState> = ids[..3]
+            .iter()
+            .map(|&t| fx.store.generations(t).unwrap()[0].state)
+            .collect();
+        assert_eq!(
+            states,
+            [
+                GenerationState::Accepted,
+                GenerationState::Active,
+                GenerationState::Active
+            ]
+        );
     }
 }

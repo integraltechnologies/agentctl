@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::{
@@ -97,7 +97,7 @@ impl Store {
 }
 
 /// Applies one command, returning whether it finalized the plan.
-fn apply(
+pub(super) fn apply(
     tx: &Transaction,
     plan: PlanId,
     command: &Command,
@@ -188,6 +188,9 @@ fn apply(
         Command::Finalize {} => {
             check_ready(tx, plan, scope)?;
             return Ok(true);
+        }
+        Command::CancelTask { .. } | Command::RetryTask { .. } => {
+            bail!("only a finalized plan's tasks are cancelled or retried")
         }
     }
     Ok(false)
@@ -282,7 +285,7 @@ fn find(tx: &Transaction, plan: PlanId, key: &str) -> Result<Option<TaskId>> {
     .map_err(Into::into)
 }
 
-fn lookup(tx: &Transaction, plan: PlanId, key: &str) -> Result<TaskId> {
+pub(super) fn lookup(tx: &Transaction, plan: PlanId, key: &str) -> Result<TaskId> {
     find(tx, plan, key)?.with_context(|| format!("plan {plan} has no task `{key:.64}`"))
 }
 

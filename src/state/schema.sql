@@ -1,4 +1,8 @@
--- agentctl canonical project state, schema version 13.
+-- agentctl canonical project state, schema version 1.
+--
+-- This is the one canonical schema, created whole in a fresh store. Until
+-- agentctl is first dogfooded no store is upgraded from any other schema:
+-- a change here replaces this schema outright (see `SCHEMA_VERSION`).
 --
 -- The schema enforces structure: references, value domains and uniqueness.
 -- Lifecycle transitions are enforced by `Store`, the only writer.
@@ -42,6 +46,25 @@ CREATE TABLE tasks (
     UNIQUE (id, plan_id),
     UNIQUE (plan_id, key)
 ) STRICT;
+
+-- A task is known by its plan and key, as created: its revisions,
+-- authorizations and executors all name that identity, and only its
+-- definition (see `task_definitions`) is ever revised.
+CREATE TRIGGER tasks_identity_immutable BEFORE UPDATE ON tasks
+WHEN NEW.id IS NOT OLD.id OR NEW.plan_id IS NOT OLD.plan_id
+    OR NEW.key IS NOT OLD.key OR NEW.created_at IS NOT OLD.created_at
+BEGIN SELECT RAISE(ABORT, 'a task''s identity is immutable'); END;
+
+-- Nor is it replaced. REPLACE conflict resolution (INSERT OR REPLACE,
+-- REPLACE INTO) deletes a row whose id or plan and key a new row takes, and
+-- fires no UPDATE or DELETE trigger doing so; this trigger runs before any
+-- conflict is resolved, so a row inserted must be wholly new. An id SQLite
+-- is yet to assign reads -1 here, never an id it assigned. A task actually
+-- deleted (a draft's, see `Command::RemoveTask`) no longer conflicts.
+CREATE TRIGGER tasks_identity_not_replaced BEFORE INSERT ON tasks
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.id
+        OR (plan_id = NEW.plan_id AND key = NEW.key))
+BEGIN SELECT RAISE(ABORT, 'a task''s identity is immutable'); END;
 
 -- The exact project paths a task requests to mutate: literal names, never
 -- patterns.
@@ -362,8 +385,8 @@ BEGIN SELECT RAISE(ABORT, 'execution history is immutable'); END;
 -- `execution_installs`). `reported` and `claimed` are what the executor
 -- said, when it said anything well formed: evidence, never proof.
 -- `attribution` says why observed changes are not attributed to it;
--- 'contested' and 'concurrent' were derived only by schema versions 8 and
--- 9, whose executors worked in the project's working tree itself.
+-- 'contested' and 'concurrent' apply only to executors working in the
+-- project's working tree itself, which no executor does now.
 -- `head_after` is the project's Git HEAD at capture.
 --
 -- The triggers keep an outcome consistent with the facts recorded beside
@@ -952,9 +975,13 @@ WHERE g.state = 'accepted';
 -- A scheduler's claim on a task: the generation it started for it, which
 -- owns the task's whole scope, and one unit of the project's scheduling
 -- capacity, held until the claim is released. Recorded in the transaction
--- that starts the generation and acquires its ownership, and only for a
--- task of a running plan that no generation ever served and whose every
--- dependency is completed, while fewer than `capacity` claims are held:
+-- that starts the generation, binds it to its task's current definition
+-- (`generation_revisions`) and acquires its ownership, and only for a
+-- task of a running plan that is not cancelled, whose every dependency is
+-- completed and that no generation ever served, unless a planner's retry
+-- authorization, after its latest, abandoned generation, of the very
+-- revision this one is bound to, is used by this one
+-- (`retry_authorizations`), while fewer than `capacity` claims are held:
 -- the concurrency ceiling the scheduler worked under. Never changed after.
 CREATE TABLE scheduler_claims (
     generation_id INTEGER PRIMARY KEY REFERENCES generations (id),
@@ -1014,8 +1041,14 @@ WHEN EXISTS (SELECT 1 FROM scheduler_claims WHERE generation_id = NEW.generation
         JOIN plans p ON p.id = t.plan_id
         WHERE g.id = NEW.generation_id AND t.id = NEW.task_id
             AND g.state = 'active' AND p.state = 'running'
-            AND NOT EXISTS (SELECT 1 FROM generations o
-                WHERE o.task_id = t.id AND o.id <> g.id)
+            AND NOT EXISTS (SELECT 1 FROM task_cancellations x WHERE x.task_id = t.id)
+            AND EXISTS (SELECT 1 FROM generation_revisions v WHERE v.generation_id = g.id)
+            AND (NOT EXISTS (SELECT 1 FROM generations o
+                    WHERE o.task_id = t.id AND o.id <> g.id)
+                OR EXISTS (SELECT 1 FROM retry_authorizations r
+                    JOIN generation_revisions v ON v.generation_id = r.generation_id
+                    WHERE r.task_id = t.id AND r.generation_id = g.id
+                        AND v.revision = r.revision))
             AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.generation_id = g.id)
             AND NOT EXISTS (SELECT 1 FROM task_dependencies d WHERE d.task_id = t.id
                 AND NOT EXISTS (SELECT 1 FROM completed_tasks c
@@ -1043,3 +1076,270 @@ CREATE TRIGGER scheduler_releases_immutable BEFORE UPDATE ON scheduler_releases
 BEGIN SELECT RAISE(ABORT, 'scheduler history is immutable'); END;
 CREATE TRIGGER scheduler_releases_no_delete BEFORE DELETE ON scheduler_releases
 BEGIN SELECT RAISE(ABORT, 'scheduler history is immutable'); END;
+
+-- A plan's replanning: planner commands, validated as a whole against the
+-- plan's state and applied in one transaction, after its planning was
+-- finalized. `basis` identifies the plan's replanning state the proposal
+-- was made against (see `Store::replan_basis`), which the transaction found
+-- unchanged; `journal_id` is the planner action that proposed it, when a
+-- planner invocation did. What a replan did is recorded where it did it:
+-- the revisions, retry authorizations and cancellations naming it. Never
+-- changed after.
+CREATE TABLE replans (
+    id         INTEGER PRIMARY KEY,
+    plan_id    INTEGER NOT NULL REFERENCES plans (id),
+    journal_id INTEGER UNIQUE REFERENCES journal (id),
+    basis      TEXT    NOT NULL CHECK (length(basis) = 64 AND basis NOT GLOB '*[^0-9a-f]*'),
+    commands   INTEGER NOT NULL CHECK (commands > 0),
+    applied_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TRIGGER replans_applied BEFORE INSERT ON replans
+WHEN NOT EXISTS (SELECT 1 FROM plans p WHERE p.id = NEW.plan_id
+        AND p.state IN ('ready', 'running', 'paused'))
+    OR (NEW.journal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM journal j
+        JOIN agents a ON a.id = j.agent_id
+        WHERE j.id = NEW.journal_id AND j.state = 'attempted'
+            AND a.role = 'planner' AND a.plan_id = NEW.plan_id))
+BEGIN SELECT RAISE(ABORT, 'only a finalized plan is replanned, by its planner'); END;
+CREATE TRIGGER replans_immutable BEFORE UPDATE ON replans
+BEGIN SELECT RAISE(ABORT, 'replanning history is immutable'); END;
+CREATE TRIGGER replans_no_delete BEFORE DELETE ON replans
+BEGIN SELECT RAISE(ABORT, 'replanning history is immutable'); END;
+
+-- Each task's current definition, as a revision records it: its objective,
+-- its context, and its scope and dependencies as JSON arrays, in order.
+CREATE VIEW task_definitions (task_id, objective, context, scope, depends_on) AS
+SELECT t.id, t.objective, t.context,
+    (SELECT json_group_array(s.path ORDER BY s.path) FROM task_scope s WHERE s.task_id = t.id),
+    (SELECT json_group_array(d.depends_on ORDER BY d.depends_on) FROM task_dependencies d
+        WHERE d.task_id = t.id)
+FROM tasks t;
+
+-- The definitions a task has had since one of its generations was first
+-- scheduled or it was first replanned, numbered from 1, each exactly as
+-- `task_definitions` held it when recorded: the latest is the definition
+-- then current. `replan_id` is the replan that made it current; NULL when
+-- it was planned before any replan revised the task, and recorded only
+-- once needed. Never changed after.
+CREATE TABLE task_revisions (
+    task_id     INTEGER NOT NULL REFERENCES tasks (id),
+    number      INTEGER NOT NULL CHECK (number > 0),
+    objective   TEXT    NOT NULL,
+    context     TEXT    NOT NULL,
+    scope       TEXT    NOT NULL,
+    depends_on  TEXT    NOT NULL,
+    replan_id   INTEGER REFERENCES replans (id),
+    recorded_at INTEGER NOT NULL,
+    PRIMARY KEY (task_id, number)
+) STRICT;
+
+CREATE TRIGGER task_revisions_recorded BEFORE INSERT ON task_revisions
+WHEN NEW.number IS NOT (SELECT coalesce(max(number), 0) + 1 FROM task_revisions
+        WHERE task_id = NEW.task_id)
+    OR NOT EXISTS (SELECT 1 FROM task_definitions d WHERE d.task_id = NEW.task_id
+        AND d.objective = NEW.objective AND d.context = NEW.context
+        AND d.scope = NEW.scope AND d.depends_on = NEW.depends_on)
+    OR (NEW.replan_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM replans r
+        JOIN tasks t ON t.plan_id = r.plan_id WHERE r.id = NEW.replan_id AND t.id = NEW.task_id))
+BEGIN SELECT RAISE(ABORT, 'a revision records its task''s current definition, in order'); END;
+CREATE TRIGGER task_revisions_immutable BEFORE UPDATE ON task_revisions
+BEGIN SELECT RAISE(ABORT, 'task revisions are immutable'); END;
+CREATE TRIGGER task_revisions_no_delete BEFORE DELETE ON task_revisions
+BEGIN SELECT RAISE(ABORT, 'task revisions are immutable'); END;
+
+-- The definition a scheduled generation was started to execute: its task's
+-- latest revision, then its current definition, recorded in the
+-- transaction that claims it, before any agent serves it. A generation
+-- started unscheduled (see `Store::start_generation`) has none: what it
+-- executed is not known. Never changed after.
+CREATE TABLE generation_revisions (
+    generation_id INTEGER PRIMARY KEY REFERENCES generations (id),
+    task_id       INTEGER NOT NULL,
+    revision      INTEGER NOT NULL,
+    FOREIGN KEY (task_id, revision) REFERENCES task_revisions (task_id, number)
+) STRICT;
+
+CREATE TRIGGER generation_revisions_bound BEFORE INSERT ON generation_revisions
+WHEN NOT EXISTS (SELECT 1 FROM generations g WHERE g.id = NEW.generation_id
+        AND g.task_id = NEW.task_id AND g.state = 'active'
+        AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.generation_id = g.id))
+    OR NEW.revision IS NOT (SELECT max(number) FROM task_revisions WHERE task_id = NEW.task_id)
+    OR NOT EXISTS (SELECT 1 FROM task_revisions v
+        JOIN task_definitions d ON d.task_id = v.task_id
+        WHERE v.task_id = NEW.task_id AND v.number = NEW.revision
+            AND d.objective = v.objective AND d.context = v.context
+            AND d.scope = v.scope AND d.depends_on = v.depends_on)
+BEGIN SELECT RAISE(ABORT, 'a generation is bound to its task''s current definition'); END;
+CREATE TRIGGER generation_revisions_immutable BEFORE UPDATE ON generation_revisions
+BEGIN SELECT RAISE(ABORT, 'generation revisions are immutable'); END;
+CREATE TRIGGER generation_revisions_no_delete BEFORE DELETE ON generation_revisions
+BEGIN SELECT RAISE(ABORT, 'generation revisions are immutable'); END;
+
+-- A planner's explicit authorization of one more attempt at a task, after
+-- its latest generation: a scheduled one whose pipeline conclusively
+-- stopped short of acceptance, which a replan abandoned (see
+-- `generation_abandonments`). It authorizes one exact definition of the
+-- task: `revision`, current when authorized. A scheduler's claim uses it
+-- for exactly one fresh generation, the next, bound to that very revision,
+-- recording it in `generation_id`. Once the task is revised again it is
+-- stale: never retargeted, and never usable, so that only another
+-- authorization runs the new definition. Nothing else ever lets a task
+-- that a generation served be claimed again. Never withdrawn, and never
+-- changed otherwise.
+CREATE TABLE retry_authorizations (
+    id               INTEGER PRIMARY KEY,
+    after_generation INTEGER NOT NULL REFERENCES generations (id),
+    task_id          INTEGER NOT NULL REFERENCES tasks (id),
+    revision         INTEGER NOT NULL,
+    replan_id        INTEGER NOT NULL REFERENCES replans (id),
+    generation_id    INTEGER UNIQUE REFERENCES generations (id),
+    authorized_at    INTEGER NOT NULL,
+    FOREIGN KEY (task_id, revision) REFERENCES task_revisions (task_id, number),
+    UNIQUE (after_generation, revision),
+    UNIQUE (after_generation, replan_id)
+) STRICT;
+
+CREATE TRIGGER retry_authorizations_given BEFORE INSERT ON retry_authorizations
+WHEN NEW.generation_id IS NOT NULL
+    OR NOT EXISTS (SELECT 1 FROM generations g
+        JOIN tasks t ON t.id = g.task_id
+        JOIN replans p ON p.id = NEW.replan_id AND p.plan_id = t.plan_id
+        JOIN generation_abandonments b ON b.generation_id = g.id
+        JOIN scheduler_releases r ON r.generation_id = g.id
+        JOIN scheduler_outcomes o ON o.generation_id = g.id
+        WHERE g.id = NEW.after_generation AND g.task_id = NEW.task_id
+            AND g.state IN ('failed', 'rejected')
+            AND r.outcome <> 'accepted' AND o.outcome IS NOT NULL
+            AND g.number = (SELECT max(number) FROM generations WHERE task_id = g.task_id)
+            AND NOT EXISTS (SELECT 1 FROM ownership w WHERE w.generation_id = g.id))
+    OR NOT EXISTS (SELECT 1 FROM task_revisions v
+        JOIN task_definitions d ON d.task_id = v.task_id
+        WHERE v.task_id = NEW.task_id AND v.number = NEW.revision
+            AND v.number = (SELECT max(number) FROM task_revisions WHERE task_id = v.task_id)
+            AND d.objective = v.objective AND d.context = v.context
+            AND d.scope = v.scope AND d.depends_on = v.depends_on)
+    OR EXISTS (SELECT 1 FROM task_cancellations WHERE task_id = NEW.task_id)
+    OR EXISTS (SELECT 1 FROM completed_tasks WHERE task_id = NEW.task_id)
+BEGIN
+    SELECT RAISE(ABORT, 'only the current revision of a task whose abandoned, conclusively stopped latest generation ended is retried');
+END;
+CREATE TRIGGER retry_authorizations_used BEFORE UPDATE ON retry_authorizations
+WHEN OLD.generation_id IS NOT NULL
+    OR NEW.id IS NOT OLD.id OR NEW.after_generation IS NOT OLD.after_generation
+    OR NEW.task_id IS NOT OLD.task_id OR NEW.revision IS NOT OLD.revision
+    OR NEW.replan_id IS NOT OLD.replan_id OR NEW.authorized_at IS NOT OLD.authorized_at
+    OR NOT EXISTS (SELECT 1 FROM generations g
+        JOIN generations a ON a.id = OLD.after_generation
+        JOIN generation_revisions v ON v.generation_id = g.id
+        WHERE g.id = NEW.generation_id AND g.task_id = OLD.task_id AND g.state = 'active'
+            AND g.number = a.number + 1 AND v.revision = OLD.revision
+            AND NOT EXISTS (SELECT 1 FROM agents x WHERE x.generation_id = g.id))
+    OR EXISTS (SELECT 1 FROM task_cancellations WHERE task_id = OLD.task_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a retry authorization starts one fresh generation of the revision it authorized, once');
+END;
+CREATE TRIGGER retry_authorizations_no_delete BEFORE DELETE ON retry_authorizations
+BEGIN SELECT RAISE(ABORT, 'retry authorizations are never withdrawn'); END;
+
+-- A task a replan cancelled: superseded, never claimed again, and never
+-- depended on, while everything it and its generations recorded stays. Only
+-- a task no generation is running or accepted is cancelled. Never changed
+-- after.
+CREATE TABLE task_cancellations (
+    task_id      INTEGER PRIMARY KEY REFERENCES tasks (id),
+    replan_id    INTEGER NOT NULL REFERENCES replans (id),
+    cancelled_at INTEGER NOT NULL,
+    UNIQUE (task_id, replan_id)
+) STRICT;
+
+CREATE TRIGGER task_cancellations_recorded BEFORE INSERT ON task_cancellations
+WHEN EXISTS (SELECT 1 FROM generations g WHERE g.task_id = NEW.task_id
+        AND g.state IN ('active', 'accepted'))
+    OR NOT EXISTS (SELECT 1 FROM replans p JOIN tasks t ON t.plan_id = p.plan_id
+        WHERE p.id = NEW.replan_id AND t.id = NEW.task_id)
+BEGIN SELECT RAISE(ABORT, 'only a task with no active or accepted generation is cancelled'); END;
+CREATE TRIGGER task_cancellations_immutable BEFORE UPDATE ON task_cancellations
+BEGIN SELECT RAISE(ABORT, 'cancellations are immutable'); END;
+CREATE TRIGGER task_cancellations_no_delete BEFORE DELETE ON task_cancellations
+BEGIN SELECT RAISE(ABORT, 'cancellations are immutable'); END;
+
+-- A replan's abandonment of a scheduled generation whose pipeline
+-- conclusively stopped short of acceptance, as its released claim and
+-- `scheduler_outcomes` establish, with no acceptance begun: its planner
+-- decided that attempt is never accepted, and retried (`retried`, the
+-- generation) or cancelled (`cancelled`, its task) the task. Recorded in
+-- the replan's transaction, once the candidate it installed, if any, was
+-- restored in the working tree to the last accepted state, and before the
+-- generation ends as `state` and releases its ownership, which nothing
+-- else does to a scheduled generation short of acceptance. It cannot
+-- commit without the whole of that: its deferred references require the
+-- generation ended as `state`, which it does only owning nothing, and the
+-- replan's retry authorization after it or cancellation of its task.
+-- Never changed after.
+CREATE TABLE generation_abandonments (
+    generation_id INTEGER PRIMARY KEY,
+    state         TEXT    NOT NULL CHECK (state IN ('failed', 'rejected')),
+    replan_id     INTEGER NOT NULL REFERENCES replans (id),
+    retried       INTEGER,
+    cancelled     INTEGER,
+    abandoned_at  INTEGER NOT NULL,
+    CHECK ((retried IS NULL) <> (cancelled IS NULL)),
+    FOREIGN KEY (generation_id, state) REFERENCES generations (id, state)
+        DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (retried, replan_id) REFERENCES retry_authorizations (after_generation, replan_id)
+        DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (cancelled, replan_id) REFERENCES task_cancellations (task_id, replan_id)
+        DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+-- What an abandonment's deferred reference to its generation needs.
+CREATE UNIQUE INDEX generations_state ON generations (id, state);
+
+-- Only the latest replan of the generation's plan abandons it, and only
+-- the latest generation of its task, while scheduled, released and
+-- conclusively stopped short of acceptance: nothing of it is live or
+-- unknown and no acceptance of it began. It ends rejected when a verifier
+-- failed it, failed otherwise; one that ended already stays as it ended.
+CREATE TRIGGER generation_abandonments_authorized BEFORE INSERT ON generation_abandonments
+WHEN NOT EXISTS (SELECT 1 FROM generations g
+        JOIN tasks t ON t.id = g.task_id
+        JOIN replans p ON p.id = NEW.replan_id AND p.plan_id = t.plan_id
+        JOIN scheduler_releases r ON r.generation_id = g.id
+        JOIN scheduler_outcomes o ON o.generation_id = g.id
+        WHERE g.id = NEW.generation_id
+            AND NEW.state IS CASE WHEN g.state <> 'active' THEN g.state
+                WHEN o.outcome = 'verification_failed' THEN 'rejected' ELSE 'failed' END
+            AND r.outcome <> 'accepted' AND o.outcome IS NOT NULL AND o.outcome <> 'accepted'
+            AND NOT EXISTS (SELECT 1 FROM acceptances a WHERE a.generation_id = g.id)
+            AND g.number = (SELECT max(number) FROM generations WHERE task_id = g.task_id)
+            AND p.id = (SELECT max(id) FROM replans WHERE plan_id = t.plan_id)
+            AND (NEW.retried IS g.id OR NEW.cancelled IS g.task_id))
+BEGIN SELECT RAISE(ABORT, 'only a replan abandons a conclusively stopped scheduled generation'); END;
+CREATE TRIGGER generation_abandonments_immutable BEFORE UPDATE ON generation_abandonments
+BEGIN SELECT RAISE(ABORT, 'abandonments are immutable'); END;
+CREATE TRIGGER generation_abandonments_no_delete BEFORE DELETE ON generation_abandonments
+BEGIN SELECT RAISE(ABORT, 'abandonments are immutable'); END;
+
+-- A scheduled generation ends short of acceptance only as its abandonment
+-- says, once it owns nothing.
+CREATE TRIGGER generations_abandoned_by_replan BEFORE UPDATE ON generations
+WHEN NEW.state IS NOT OLD.state AND NEW.state IN ('failed', 'rejected')
+    AND EXISTS (SELECT 1 FROM scheduler_claims WHERE generation_id = OLD.id)
+    AND (NOT EXISTS (SELECT 1 FROM generation_abandonments
+            WHERE generation_id = OLD.id AND state = NEW.state)
+        OR EXISTS (SELECT 1 FROM ownership WHERE generation_id = OLD.id))
+BEGIN
+    SELECT RAISE(ABORT, 'a scheduled generation ends short of acceptance only as a replan abandons it, owning nothing');
+END;
+
+-- A scheduled generation keeps its ownership until accepted (see
+-- `ownership_held_through_acceptance`) or abandoned.
+CREATE TRIGGER ownership_held_until_abandoned BEFORE DELETE ON ownership
+WHEN EXISTS (SELECT 1 FROM scheduler_claims WHERE generation_id = OLD.generation_id)
+    AND NOT EXISTS (SELECT 1 FROM acceptances WHERE generation_id = OLD.generation_id)
+    AND NOT EXISTS (SELECT 1 FROM generation_abandonments
+        WHERE generation_id = OLD.generation_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a scheduled generation''s ownership is released only by accepting or abandoning it');
+END;

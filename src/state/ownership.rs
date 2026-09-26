@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+use super::scheduling::scheduled;
 use super::{
     GenerationId, GenerationState, PlanId, PlanState, Store, TaskId, active_generation, check_path,
     event, generation_info, plan_state,
@@ -69,30 +70,22 @@ impl Store {
 
     /// Releases every path an ended generation owns, and only those. When
     /// that is safe is for the caller's acceptance or recovery lifecycle to
-    /// decide. An ended generation never acquires again.
+    /// decide. An ended generation never acquires again. A scheduled
+    /// generation's ownership is released only by completing its
+    /// acceptance or by the replan abandoning it, never here.
     pub fn release_ownership(&mut self, generation: GenerationId) -> Result<()> {
         self.write(|tx| {
-            let (plan, task, number, state) = generation_info(tx, generation)?;
+            let (_, _, _, state) = generation_info(tx, generation)?;
             ensure!(
                 state != GenerationState::Active,
                 "generation {generation} is still active"
             );
-            let released = tx.execute(
-                "DELETE FROM ownership WHERE generation_id = ?1",
-                [generation],
-            )?;
-            if released == 0 {
-                return Ok(());
-            }
-            let detail = format!("generation {number}: {released} paths");
-            event(
-                tx,
-                "ownership.released",
-                Some(plan),
-                Some(task),
-                None,
-                &detail,
-            )
+            ensure!(
+                !scheduled(tx, generation)?,
+                "generation {generation} was scheduled: only accepting it, or a replan \
+                 abandoning it, releases its ownership"
+            );
+            release(tx, generation)
         })
     }
 
@@ -109,6 +102,28 @@ impl Store {
             .collect::<rusqlite::Result<_>>()
             .map_err(Into::into)
     }
+}
+
+/// Releases every path `generation` owns within `tx`, and only those. The
+/// caller establishes that it may; see [`Store::release_ownership`].
+pub(super) fn release(tx: &Transaction, generation: GenerationId) -> Result<()> {
+    let (plan, task, number, _) = generation_info(tx, generation)?;
+    let released = tx.execute(
+        "DELETE FROM ownership WHERE generation_id = ?1",
+        [generation],
+    )?;
+    if released == 0 {
+        return Ok(());
+    }
+    let detail = format!("generation {number}: {released} paths");
+    event(
+        tx,
+        "ownership.released",
+        Some(plan),
+        Some(task),
+        None,
+        &detail,
+    )
 }
 
 /// Acquires `paths` for `generation` within `tx`; see

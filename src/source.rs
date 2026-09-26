@@ -38,7 +38,7 @@ use crate::project::{Project, STATE_DIR};
 use crate::state::{GenerationId, Store, check_path};
 use objects::Objects;
 pub(crate) use snapshot::{Snapshot, observe_paths, snapshot, snapshot_paths};
-pub(crate) use workspace::{Installation, Preparation, Workspace};
+pub(crate) use workspace::{Installation, Preparation, Workspace, restore_candidate};
 
 /// How a path's working state compares with its accepted state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -496,8 +496,7 @@ fn name(path: &str) -> &str {
 mod tests {
     use super::*;
     use crate::config::tests::sample;
-    use crate::project::STATE_DB;
-    use crate::state::tests::{downgrade_to_v1, objective};
+    use crate::state::tests::objective;
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
@@ -1095,42 +1094,6 @@ mod tests {
         fs::remove_file(fx.object_path(b"accepted b")).unwrap();
         fails(fx.restore(&["src/b.rs"]), "unavailable");
         assert!(!fx.exists("src/b.rs"));
-    }
-
-    #[test]
-    fn baseline_establishes_sources_a_version_1_store_named() {
-        let fx = Fixture::new("src");
-        fx.write("src/a.rs", b"a");
-        let Fixture {
-            _dir,
-            project,
-            store,
-        } = fx;
-        drop(store);
-        // Version 1 named content, even the right content, with no object.
-        downgrade_to_v1(
-            &project.root.join(STATE_DIR).join(STATE_DB),
-            &[
-                ("src/a.rs", &sha256(b"a"), None),
-                ("src/gone.rs", &sha256(b"gone"), None),
-            ],
-        );
-
-        let store = project.hydrate().unwrap();
-        let mut fx = Fixture {
-            _dir,
-            project,
-            store,
-        };
-        assert_eq!(fx.store.accepted_source("src/a.rs").unwrap(), None);
-        assert_eq!(fx.store.accepted_source("src/gone.rs").unwrap(), None);
-        assert!(fx.objects().is_empty());
-
-        assert_eq!(fx.baseline(), ["src/a.rs"]);
-        assert_eq!(fx.objects(), [(sha256(b"a"), b"a".to_vec())]);
-        assert_eq!(fx.drift("src/a.rs"), Drift::Identical);
-        // Absence was never accepted, so none is invented.
-        assert_eq!(fx.store.accepted_source("src/gone.rs").unwrap(), None);
     }
 
     #[test]

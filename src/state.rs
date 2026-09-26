@@ -25,6 +25,7 @@ mod execution;
 mod graph;
 mod ownership;
 mod planning;
+mod replanning;
 mod scheduling;
 mod verification;
 
@@ -33,6 +34,8 @@ pub use acceptance::{Acceptance, AcceptedChange};
 pub use execution::{Capture, Change, ChangeKind, Content, Execution, ExecutionStatus, Install};
 pub(crate) use execution::{ExecutorResult, Observed};
 pub use ownership::{Acquisition, Conflict, Owner};
+pub(crate) use replanning::Restoration;
+pub use replanning::{Basis, Replan, ReplanRecord, RetryAuthorization, Revision, Standing};
 pub use scheduling::{
     Capacity, Claim, ClaimRecord, Condition, DagDefect, Release, Snapshot, TaskStatus,
 };
@@ -60,26 +63,11 @@ use serde_json::{Map, Value};
 /// Stamped into the SQLite header (`application_id`) so an agentctl store is
 /// recognized by what it is, not merely by its schema version number.
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"agct");
-const SCHEMA_VERSION: i64 = 13;
+/// The one canonical schema. Until agentctl is first dogfooded there is no
+/// persistence compatibility boundary: a schema change replaces `SCHEMA`
+/// outright, and a store of any other schema is refused, never upgraded.
+const SCHEMA_VERSION: i64 = 1;
 const SCHEMA: &str = include_str!("state/schema.sql");
-const MIGRATE_V1: &str = include_str!("state/migrate_v1.sql");
-const MIGRATE_V2: &str = include_str!("state/migrate_v2.sql");
-const MIGRATE_V3: &str = include_str!("state/migrate_v3.sql");
-const MIGRATE_V4: &str = include_str!("state/migrate_v4.sql");
-const MIGRATE_V5: &str = include_str!("state/migrate_v5.sql");
-const MIGRATE_V6: &str = include_str!("state/migrate_v6.sql");
-const MIGRATE_V7: &str = include_str!("state/migrate_v7.sql");
-const MIGRATE_V8: &str = include_str!("state/migrate_v8.sql");
-const MIGRATE_V9: &str = include_str!("state/migrate_v9.sql");
-const MIGRATE_V10: &str = include_str!("state/migrate_v10.sql");
-const MIGRATE_V11: &str = include_str!("state/migrate_v11.sql");
-const MIGRATE_V12: &str = include_str!("state/migrate_v12.sql");
-/// The version 1 `accepted_sources` definition, exactly as SQLite keeps it.
-const V1_ACCEPTED_SOURCES: &str = "CREATE TABLE accepted_sources (
-    path          TEXT    PRIMARY KEY,
-    hash          TEXT    NOT NULL CHECK (hash <> ''),
-    generation_id INTEGER REFERENCES generations (id)
-) STRICT, WITHOUT ROWID";
 /// How long a transaction waits for another process's writer to finish.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds on what the journal records, so that it holds structure rather
@@ -142,7 +130,8 @@ ids!(
     InvocationId,
     JournalId,
     ExecutionId,
-    VerificationId
+    VerificationId,
+    ReplanId
 );
 
 macro_rules! text_enum {
@@ -333,11 +322,11 @@ text_enum!(
         Unsettled = "unsettled",
         /// It changed although no executor process was ever launched.
         NeverLaunched = "never_launched",
-        /// Schema versions 8 and 9 only, whose executors worked in the project's
-        /// working tree: a path another generation owns changed.
+        /// Only for executors working in the project's working tree, which none
+        /// does now: a path another generation owns changed.
         Contested = "contested",
-        /// Schema versions 8 and 9 only: the working tree changed while another
-        /// journaled action was in flight too.
+        /// Only for executors working in the project's working tree, which none
+        /// does now: it changed while another journaled action was in flight too.
         Concurrent = "concurrent",
     }
 );
@@ -686,22 +675,8 @@ impl Store {
             let mut conn = Connection::open_with_flags(path, flags)?;
             conn.busy_timeout(BUSY_TIMEOUT)?;
             // Identify the file before switching it to WAL, which rewrites
-            // its header, so a refused file is left untouched. Only the
-            // migration to version 6 rebuilds referenced tables, which
-            // needs references unenforced until `migrate` has checked them;
-            // a current store is never opened without enforcement.
-            let rebuild = rebuilds_referenced_tables(&conn)?;
-            if rebuild {
-                set_foreign_keys(&conn, false)?;
-            }
-            let migrated = migrate(&mut conn);
-            let restored = if rebuild {
-                set_foreign_keys(&conn, true)
-            } else {
-                Ok(())
-            };
-            migrated?;
-            restored?;
+            // its header, so a refused file is left untouched.
+            identify(&mut conn)?;
             ensure!(
                 conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))?,
                 "foreign key enforcement is off"
@@ -873,8 +848,10 @@ impl Store {
         self.write(|tx| insert_generation(tx, task).map(|(_, generation, _)| generation))
     }
 
-    /// Ends an active generation without accepting it. The generation keeps
-    /// the paths it owns until they are explicitly released.
+    /// Ends an active generation that was never scheduled without
+    /// accepting it. The generation keeps the paths it owns until they are
+    /// explicitly released. A scheduled generation ends short of acceptance
+    /// only as the replan abandoning it ends it (see `crate::planner`).
     pub fn finish_generation(
         &mut self,
         generation: GenerationId,
@@ -884,7 +861,14 @@ impl Store {
             GenerationEnd::Rejected => GenerationState::Rejected,
             GenerationEnd::Failed => GenerationState::Failed,
         };
-        self.end_generation(generation, to, &[])
+        self.write(|tx| {
+            ensure!(
+                !scheduling::scheduled(tx, generation)?,
+                "generation {generation} was scheduled: only a replan abandoning it ends it \
+                 short of acceptance"
+            );
+            end_generation(tx, generation, to, &[])
+        })
     }
 
     /// Accepts an active generation, atomically recording the source it
@@ -911,45 +895,7 @@ impl Store {
         to: GenerationState,
         sources: &[(&str, Option<&str>)],
     ) -> Result<()> {
-        self.write(|tx| {
-            let (plan, task, number) = active_generation(tx, generation)?;
-            let (executed, accepting): (bool, bool) = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM executions WHERE generation_id = ?1),
-                        EXISTS (SELECT 1 FROM acceptances WHERE generation_id = ?1)",
-                [generation],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            ensure!(
-                !accepting,
-                "generation {generation} is being accepted; only its acceptance ends it"
-            );
-            ensure!(
-                to != GenerationState::Accepted || !executed,
-                "generation {generation} executed, so only accepting its verified candidate \
-                 accepts it"
-            );
-            tx.execute(
-                "UPDATE generations SET state = ?2, ended_at = ?3 WHERE id = ?1",
-                params![generation, to, now()],
-            )?;
-            for &(path, hash) in sources {
-                check_identity(path, hash)?;
-                tx.execute(
-                    "INSERT INTO accepted_sources (path, hash, generation_id) VALUES (?1, ?2, ?3)
-                     ON CONFLICT (path) DO UPDATE
-                     SET hash = excluded.hash, generation_id = excluded.generation_id",
-                    params![path, hash, generation],
-                )?;
-            }
-            event(
-                tx,
-                "generation.ended",
-                Some(plan),
-                Some(task),
-                None,
-                &format!("generation {number} {to}"),
-            )
-        })
+        self.write(|tx| end_generation(tx, generation, to, sources))
     }
 
     pub fn generations(&self, task: TaskId) -> Result<Vec<Generation>> {
@@ -1437,44 +1383,11 @@ fn create(path: &Path) -> Result<()> {
     }
 }
 
-/// The last schema version whose migration rebuilds tables other tables
-/// reference, which SQLite allows only with foreign keys unenforced.
-const LAST_REBUILT_VERSION: i64 = 5;
-
-/// Whether migrating the store `conn` opens would rebuild referenced
-/// tables. Versions only rise, so a store found current stays current.
-fn rebuilds_referenced_tables(conn: &Connection) -> Result<bool> {
-    let (id, version): (i32, i64) = conn.query_row(
-        "SELECT (SELECT application_id FROM pragma_application_id),
-                (SELECT user_version FROM pragma_user_version)",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    Ok(id == APPLICATION_ID && (1..=LAST_REBUILT_VERSION).contains(&version))
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Every foreign key enforcement switch `Store::open` made on this
-    /// thread, in order.
-    static FOREIGN_KEY_SWITCHES: std::cell::RefCell<Vec<bool>> = const {
-        std::cell::RefCell::new(Vec::new())
-    };
-}
-
-/// Switches foreign key enforcement; outside any transaction, where SQLite
-/// ignores the switch.
-fn set_foreign_keys(conn: &Connection, on: bool) -> Result<()> {
-    #[cfg(test)]
-    FOREIGN_KEY_SWITCHES.with(|s| s.borrow_mut().push(on));
-    conn.pragma_update(None, "foreign_keys", on)?;
-    Ok(())
-}
-
-/// Brings an existing store's schema to `SCHEMA_VERSION`, refusing files it
-/// does not own or understand. Each version migrates to the next in turn,
-/// all in one transaction.
-fn migrate(conn: &mut Connection) -> Result<()> {
+/// Refuses any file that is not a store of exactly `SCHEMA`: another
+/// program's database, a partial or altered one, or one of another schema
+/// version, such as a development build's from before the canonical schema.
+/// Nothing is migrated or written, so a refused file is left as found.
+fn identify(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (id, version): (i32, i64) = tx.query_row(
         "SELECT (SELECT application_id FROM pragma_application_id),
@@ -1483,82 +1396,20 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     ensure!(id == APPLICATION_ID, "not an agentctl state database");
-    match version {
-        1..=SCHEMA_VERSION => {}
-        v if v > SCHEMA_VERSION => bail!(
-            "state schema version {v} is newer than this agentctl supports \
-             ({SCHEMA_VERSION}); upgrade agentctl"
-        ),
-        v => bail!("unknown state schema version {v}"),
-    }
-    let mismatch = || format!("state database does not match agentctl schema version {version}");
-    if version == 1 {
-        let sources: Option<String> = tx
-            .query_row(
-                "SELECT sql FROM sqlite_schema WHERE name = 'accepted_sources'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        ensure!(sources.as_deref() == Some(V1_ACCEPTED_SOURCES), mismatch());
-        tx.execute_batch(MIGRATE_V1)
-            .context("migrating state schema version 1")?;
-    }
-    if version <= 2 {
-        tx.execute_batch(MIGRATE_V2).with_context(mismatch)?;
-    }
-    if version <= 3 {
-        tx.execute_batch(MIGRATE_V3).with_context(mismatch)?;
-    }
-    if version <= 4 {
-        tx.execute_batch(MIGRATE_V4).with_context(mismatch)?;
-    }
-    if version <= LAST_REBUILT_VERSION {
-        let enforced: bool = tx.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
-        ensure!(
-            !enforced,
-            "state schema version {version} changed while opening"
-        );
-        tx.execute_batch(MIGRATE_V5).with_context(mismatch)?;
-        let dangling: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM pragma_foreign_key_check)",
-            [],
-            |r| r.get(0),
-        )?;
-        ensure!(!dangling, mismatch());
-    }
-    if version <= 6 {
-        tx.execute_batch(MIGRATE_V6).with_context(mismatch)?;
-    }
-    if version <= 7 {
-        tx.execute_batch(MIGRATE_V7).with_context(mismatch)?;
-    }
-    if version <= 8 {
-        tx.execute_batch(MIGRATE_V8).with_context(mismatch)?;
-    }
-    if version <= 9 {
-        tx.execute_batch(MIGRATE_V9).with_context(mismatch)?;
-    }
-    if version <= 10 {
-        tx.execute_batch(MIGRATE_V10).with_context(mismatch)?;
-    }
-    if version <= 11 {
-        tx.execute_batch(MIGRATE_V11).with_context(mismatch)?;
-    }
-    if version <= 12 {
-        tx.execute_batch(MIGRATE_V12).with_context(mismatch)?;
-    }
+    let reset = "agentctl upgrades no other: remove this file (and its -wal and -shm \
+                 files) and run `agentctl init` to start afresh; project sources are \
+                 left untouched";
+    ensure!(
+        version == SCHEMA_VERSION,
+        "state schema version {version} is incompatible with this agentctl's \
+         ({SCHEMA_VERSION}); {reset}"
+    );
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SCHEMA)?;
-    // A failed check rolls back any migration, leaving the file as found.
     ensure!(
         schema_objects(&tx)? == schema_objects(&expected)?,
-        mismatch()
+        "state database does not match agentctl schema version {SCHEMA_VERSION}; {reset}"
     );
-    if version != SCHEMA_VERSION {
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    }
-    tx.commit()?;
     Ok(())
 }
 
@@ -1617,6 +1468,54 @@ fn event(
         params![now(), kind, plan, task, agent, detail],
     )?;
     Ok(())
+}
+
+/// Ends an active generation as `to`, recording the accepted source
+/// `sources` it establishes; see [`Store::finish_generation`] and
+/// [`Store::accept_generation`].
+fn end_generation(
+    tx: &Transaction,
+    generation: GenerationId,
+    to: GenerationState,
+    sources: &[(&str, Option<&str>)],
+) -> Result<()> {
+    let (plan, task, number) = active_generation(tx, generation)?;
+    let (executed, accepting): (bool, bool) = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM executions WHERE generation_id = ?1),
+                EXISTS (SELECT 1 FROM acceptances WHERE generation_id = ?1)",
+        [generation],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure!(
+        !accepting,
+        "generation {generation} is being accepted; only its acceptance ends it"
+    );
+    ensure!(
+        to != GenerationState::Accepted || !executed,
+        "generation {generation} executed, so only accepting its verified candidate \
+         accepts it"
+    );
+    tx.execute(
+        "UPDATE generations SET state = ?2, ended_at = ?3 WHERE id = ?1",
+        params![generation, to, now()],
+    )?;
+    for &(path, hash) in sources {
+        check_identity(path, hash)?;
+        tx.execute(
+            "INSERT INTO accepted_sources (path, hash, generation_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT (path) DO UPDATE
+             SET hash = excluded.hash, generation_id = excluded.generation_id",
+            params![path, hash, generation],
+        )?;
+    }
+    event(
+        tx,
+        "generation.ended",
+        Some(plan),
+        Some(task),
+        None,
+        &format!("generation {number} {to}"),
+    )
 }
 
 /// Starts the next generation of a pending task, returning its plan, id
@@ -2051,7 +1950,6 @@ impl Evidence {
 pub(crate) mod tests {
     use super::*;
     use crate::planner::Command;
-    use rusqlite::types::Value;
     use serde_json::json;
     use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
@@ -2192,19 +2090,189 @@ pub(crate) mod tests {
         assert_eq!(mode, "wal");
     }
 
+    /// Every object of the canonical schema, as `(type, name)`, in
+    /// `schema_objects` order: what a fresh store must hold, whatever
+    /// `SCHEMA` itself says.
+    const CANONICAL_OBJECTS: [(&str, &str); 128] = [
+        ("index", "agents_one_executor"),
+        ("index", "generations_live"),
+        ("index", "generations_state"),
+        ("index", "graph_relations_by_source"),
+        ("index", "graph_relations_from"),
+        ("index", "graph_relations_to"),
+        ("index", "invocations_live"),
+        ("index", "journal_by_agent"),
+        ("index", "ownership_by_generation"),
+        ("table", "acceptance_completions"),
+        ("table", "acceptance_phases"),
+        ("table", "acceptance_sources"),
+        ("table", "acceptances"),
+        ("table", "accepted_sources"),
+        ("table", "agents"),
+        ("table", "decisions"),
+        ("table", "events"),
+        ("table", "execution_baseline"),
+        ("table", "execution_captures"),
+        ("table", "execution_changes"),
+        ("table", "execution_install_results"),
+        ("table", "execution_installs"),
+        ("table", "executions"),
+        ("table", "generation_abandonments"),
+        ("table", "generation_revisions"),
+        ("table", "generations"),
+        ("table", "graph_entities"),
+        ("table", "graph_relations"),
+        ("table", "graph_sites"),
+        ("table", "graph_sources"),
+        ("table", "invocations"),
+        ("table", "journal"),
+        ("table", "ownership"),
+        ("table", "plans"),
+        ("table", "replans"),
+        ("table", "retry_authorizations"),
+        ("table", "scheduler_claims"),
+        ("table", "scheduler_releases"),
+        ("table", "task_cancellations"),
+        ("table", "task_dependencies"),
+        ("table", "task_revisions"),
+        ("table", "task_scope"),
+        ("table", "tasks"),
+        ("table", "verification_results"),
+        ("table", "verifications"),
+        ("trigger", "acceptance_completions_given_back"),
+        ("trigger", "acceptance_completions_held"),
+        ("trigger", "acceptance_completions_taken"),
+        ("trigger", "acceptance_phases_completed"),
+        ("trigger", "acceptance_phases_immutable"),
+        ("trigger", "acceptance_phases_no_delete"),
+        ("trigger", "acceptance_phases_ordered"),
+        ("trigger", "acceptance_sources_derived"),
+        ("trigger", "acceptance_sources_immutable"),
+        ("trigger", "acceptance_sources_no_delete"),
+        ("trigger", "acceptances_immutable"),
+        ("trigger", "acceptances_intended"),
+        ("trigger", "acceptances_no_delete"),
+        ("trigger", "accepted_sources_held_by_acceptance"),
+        ("trigger", "decisions_no_delete"),
+        ("trigger", "decisions_no_update"),
+        ("trigger", "events_no_delete"),
+        ("trigger", "events_no_update"),
+        ("trigger", "execution_baseline_immutable"),
+        ("trigger", "execution_baseline_no_delete"),
+        ("trigger", "execution_baseline_precedes_attempt"),
+        ("trigger", "execution_captures_derived"),
+        ("trigger", "execution_captures_immutable"),
+        ("trigger", "execution_captures_no_delete"),
+        ("trigger", "execution_changes_derived"),
+        ("trigger", "execution_changes_immutable"),
+        ("trigger", "execution_changes_no_delete"),
+        ("trigger", "execution_install_results_derived"),
+        ("trigger", "execution_install_results_immutable"),
+        ("trigger", "execution_install_results_no_delete"),
+        ("trigger", "execution_installs_immutable"),
+        ("trigger", "execution_installs_intended"),
+        ("trigger", "execution_installs_no_delete"),
+        ("trigger", "executions_immutable"),
+        ("trigger", "executions_intended"),
+        ("trigger", "executions_no_delete"),
+        ("trigger", "generation_abandonments_authorized"),
+        ("trigger", "generation_abandonments_immutable"),
+        ("trigger", "generation_abandonments_no_delete"),
+        ("trigger", "generation_revisions_bound"),
+        ("trigger", "generation_revisions_immutable"),
+        ("trigger", "generation_revisions_no_delete"),
+        ("trigger", "generations_abandoned_by_replan"),
+        ("trigger", "generations_accepted_by_acceptance"),
+        ("trigger", "journal_forward_only"),
+        ("trigger", "journal_no_delete"),
+        ("trigger", "journal_reconciles_execution"),
+        ("trigger", "journal_reconciles_install"),
+        ("trigger", "journal_reconciles_verification"),
+        ("trigger", "ownership_acquired"),
+        ("trigger", "ownership_held_through_acceptance"),
+        ("trigger", "ownership_held_until_abandoned"),
+        ("trigger", "ownership_not_transferred"),
+        ("trigger", "plans_intent_immutable"),
+        ("trigger", "replans_applied"),
+        ("trigger", "replans_immutable"),
+        ("trigger", "replans_no_delete"),
+        ("trigger", "retry_authorizations_given"),
+        ("trigger", "retry_authorizations_no_delete"),
+        ("trigger", "retry_authorizations_used"),
+        ("trigger", "scheduler_claims_immutable"),
+        ("trigger", "scheduler_claims_no_delete"),
+        ("trigger", "scheduler_claims_taken"),
+        ("trigger", "scheduler_releases_derived"),
+        ("trigger", "scheduler_releases_immutable"),
+        ("trigger", "scheduler_releases_no_delete"),
+        ("trigger", "task_cancellations_immutable"),
+        ("trigger", "task_cancellations_no_delete"),
+        ("trigger", "task_cancellations_recorded"),
+        ("trigger", "task_revisions_immutable"),
+        ("trigger", "task_revisions_no_delete"),
+        ("trigger", "task_revisions_recorded"),
+        ("trigger", "tasks_identity_immutable"),
+        ("trigger", "tasks_identity_not_replaced"),
+        ("trigger", "verification_results_derived"),
+        ("trigger", "verification_results_immutable"),
+        ("trigger", "verification_results_no_delete"),
+        ("trigger", "verifications_immutable"),
+        ("trigger", "verifications_intended"),
+        ("trigger", "verifications_no_delete"),
+        ("view", "completed_tasks"),
+        ("view", "scheduler_outcomes"),
+        ("view", "task_definitions"),
+    ];
+
     #[test]
-    fn refuses_newer_or_foreign_databases_untouched() {
+    fn a_fresh_store_holds_exactly_the_canonical_schema() {
         let dir = tempfile::tempdir().unwrap();
-        let newer = dir.path().join("newer.db");
-        Store::open(&newer).unwrap();
-        Connection::open(&newer)
-            .unwrap()
-            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).unwrap();
+        let objects = schema_objects(&store.conn).unwrap();
+        let names: Vec<_> = objects
+            .iter()
+            .map(|(kind, name, _)| (kind.as_str(), name.as_str()))
+            .collect();
+        assert_eq!(names, CANONICAL_OBJECTS);
+        let built = Connection::open_in_memory().unwrap();
+        built.execute_batch(SCHEMA).unwrap();
+        assert_eq!(objects, schema_objects(&built).unwrap());
+        let id: i32 = store
+            .conn
+            .pragma_query_value(None, "application_id", |r| r.get(0))
             .unwrap();
-        let message = err(Store::open(&newer));
-        let expected = format!("version {} is newer", SCHEMA_VERSION + 1);
-        assert!(message.contains(&expected), "{message}");
-        assert_eq!(version(&newer), SCHEMA_VERSION + 1);
+        assert_eq!((id, version(&path)), (APPLICATION_ID, 1));
+        assert!(enforces_foreign_keys(&store));
+        // No other schema is kept to be read or upgraded from.
+        let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/state");
+        for entry in std::fs::read_dir(sources).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            assert!(!name.starts_with("migrate"), "{name}");
+        }
+    }
+
+    #[test]
+    fn refuses_other_schema_versions_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        // Earlier development builds' versions, and any other, are never
+        // upgraded or reinterpreted, even over the current schema itself.
+        for other in [0, 2, 13, 14, SCHEMA_VERSION + 100, -1] {
+            let name = format!("v{other}.db");
+            let path = dir.path().join(&name);
+            drop(Store::open(&path).unwrap());
+            Connection::open(&path)
+                .unwrap()
+                .pragma_update(None, "user_version", other)
+                .unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let message = err(Store::open(&path));
+            let expected = format!("state schema version {other} is incompatible");
+            assert!(message.contains(&expected), "{message}");
+            assert!(message.contains("agentctl init"), "{message}");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{name}");
+            assert_eq!(version(&path), other, "{name}");
+        }
 
         // Neither an unrelated schema nor one spoofing the current version
         // number is mistaken for an agentctl store, or modified.
@@ -2233,6 +2301,19 @@ pub(crate) mod tests {
             ("partial.db", "DROP TABLE accepted_sources"),
             ("altered.db", "DROP TRIGGER events_no_update"),
             ("extra.db", "CREATE TABLE notes (body TEXT)"),
+            // The first development builds' stores, numbered version 1 as
+            // well, differ from the canonical schema and are never read.
+            (
+                "development.db",
+                "DROP TABLE graph_sites; DROP TABLE graph_relations;
+                 DROP TABLE graph_entities; DROP TABLE graph_sources;
+                 DROP TABLE accepted_sources;
+                 CREATE TABLE accepted_sources (
+                     path          TEXT    PRIMARY KEY,
+                     hash          TEXT    NOT NULL CHECK (hash <> ''),
+                     generation_id INTEGER REFERENCES generations (id)
+                 ) STRICT, WITHOUT ROWID",
+            ),
         ];
         for (name, change) in cases {
             let path = dir.path().join(name);
@@ -2258,542 +2339,6 @@ pub(crate) mod tests {
                 let side = dir.path().join(format!("{name}{suffix}"));
                 assert!(!side.exists(), "{name}{suffix}");
             }
-        }
-    }
-
-    /// The journal entry version 4 migrates to `legacy.v4` with the prose
-    /// intent `description`, so it survives a round trip through version 4.
-    fn legacy_intent(description: &str) -> Intent {
-        let parameters = json!({ "description": description });
-        Intent {
-            action: "legacy.v4".into(),
-            parameters: parameters.as_object().unwrap().clone(),
-        }
-    }
-
-    /// Rewrites the store at `path` as schema version 12, which records no
-    /// scheduler claim.
-    pub(crate) fn downgrade_to_v12(path: &Path) {
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "DROP VIEW scheduler_outcomes;
-             DROP TABLE scheduler_releases;
-             DROP TABLE scheduler_claims;
-             DROP VIEW completed_tasks;",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 12).unwrap();
-    }
-
-    /// Rewrites the store at `path` as schema version 11, which records no
-    /// acceptance.
-    pub(crate) fn downgrade_to_v11(path: &Path) {
-        downgrade_to_v12(path);
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "DROP TRIGGER ownership_held_through_acceptance;
-             DROP TRIGGER generations_accepted_by_acceptance;
-             DROP TRIGGER accepted_sources_held_by_acceptance;
-             DROP TABLE acceptance_completions;
-             DROP TABLE acceptance_phases;
-             DROP TABLE acceptance_sources;
-             DROP TABLE acceptances;",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 11).unwrap();
-    }
-
-    /// Rewrites the store at `path` as schema version 10, which records no
-    /// verification.
-    pub(crate) fn downgrade_to_v10(path: &Path) {
-        downgrade_to_v11(path);
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "DROP TRIGGER journal_reconciles_verification;
-             DROP TABLE verification_results;
-             DROP TABLE verifications;",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 10).unwrap();
-    }
-
-    /// Rewrites the store at `path` as schema version 9, whose executors
-    /// worked in the working tree itself and whose candidates were never
-    /// installed. The store must hold no install.
-    pub(crate) fn downgrade_to_v9(path: &Path) {
-        downgrade_to_v10(path);
-        let conn = Connection::open(path).unwrap();
-        let start = MIGRATE_V8
-            .find("CREATE TRIGGER execution_captures_derived")
-            .unwrap();
-        let end = start + MIGRATE_V8[start..].find("END;").unwrap() + "END;".len();
-        conn.execute_batch(&format!(
-            "DROP TRIGGER journal_reconciles_install;
-             DROP TABLE execution_install_results;
-             DROP TABLE execution_installs;
-             DROP TRIGGER execution_captures_derived;
-             {}",
-            &MIGRATE_V8[start..end]
-        ))
-        .unwrap();
-        conn.pragma_update(None, "user_version", 9).unwrap();
-    }
-
-    /// Rewrites the store at `path` as schema version 8, which records an
-    /// execution's capture on its row, guarded only against rewriting.
-    pub(crate) fn downgrade_to_v8(path: &Path) {
-        downgrade_to_v9(path);
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys = OFF;
-             DROP TRIGGER journal_reconciles_execution;
-             CREATE TEMP TABLE v9_executions AS
-                 SELECT e.*, c.outcome, c.attribution, c.reported, c.claimed, c.head_after,
-                        c.captured_at
-                 FROM executions e LEFT JOIN execution_captures c ON c.execution_id = e.id;
-             CREATE TEMP TABLE v9_baseline AS SELECT * FROM execution_baseline;
-             CREATE TEMP TABLE v9_changes AS SELECT * FROM execution_changes;
-             DROP TABLE execution_captures;
-             DROP TABLE execution_changes;
-             DROP TABLE execution_baseline;
-             DROP TABLE executions;",
-        )
-        .unwrap();
-        conn.execute_batch(MIGRATE_V7).unwrap();
-        conn.execute_batch(
-            "INSERT INTO executions SELECT * FROM v9_executions;
-             INSERT INTO execution_baseline SELECT * FROM v9_baseline;
-             INSERT INTO execution_changes SELECT * FROM v9_changes;",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 8).unwrap();
-    }
-
-    /// Rewrites the store at `path` as schema version 7, which records no
-    /// executor attempts.
-    pub(crate) fn downgrade_to_v7(path: &Path) {
-        downgrade_to_v8(path);
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "DROP TABLE execution_changes;
-             DROP TABLE execution_baseline;
-             DROP TABLE executions;",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 7).unwrap();
-    }
-
-    /// Rewrites the store at `path` as schema version 6, whose database
-    /// accepts any ownership row a path's uniqueness allows.
-    pub(crate) fn downgrade_to_v6(path: &Path) {
-        downgrade_to_v7(path);
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "DROP TRIGGER ownership_acquired;
-             DROP TRIGGER ownership_not_transferred;
-             DROP INDEX ownership_by_generation;",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 6).unwrap();
-    }
-
-    /// Rewrites the store at `path` as schema version 5, whose plans state
-    /// intent as one statement and whose tasks have only a description. It
-    /// keeps each objective, and nothing else of intent or tasks.
-    pub(crate) fn downgrade_to_v5(path: &Path) {
-        downgrade_to_v6(path);
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys = OFF;
-             PRAGMA legacy_alter_table = ON;
-             DROP TRIGGER plans_intent_immutable;
-             DROP TABLE task_scope;
-             ALTER TABLE plans RENAME TO plans_v6;
-             CREATE TABLE plans (
-                 id         INTEGER PRIMARY KEY,
-                 intent     TEXT    NOT NULL CHECK (intent <> ''),
-                 state      TEXT    NOT NULL CHECK (state IN
-                     ('planning', 'ready', 'running', 'paused', 'needs_attention', 'completed')),
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL
-             ) STRICT;
-             INSERT INTO plans SELECT id, objective, state, created_at, updated_at FROM plans_v6;
-             DROP TABLE plans_v6;
-             ALTER TABLE tasks RENAME TO tasks_v6;
-             CREATE TABLE tasks (
-                 id          INTEGER PRIMARY KEY,
-                 plan_id     INTEGER NOT NULL REFERENCES plans (id),
-                 description TEXT    NOT NULL CHECK (description <> ''),
-                 created_at  INTEGER NOT NULL,
-                 UNIQUE (id, plan_id)
-             ) STRICT;
-             INSERT INTO tasks SELECT id, plan_id, objective, created_at FROM tasks_v6;
-             DROP TABLE tasks_v6;",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 5).unwrap();
-    }
-
-    /// Rewrites the store at `path` as schema version 4, whose journal
-    /// records intents and outcomes as prose. Entries must not be
-    /// reconciled; those of `legacy_intent` keep their intent's prose.
-    pub(crate) fn downgrade_to_v4(path: &Path) {
-        downgrade_to_v5(path);
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "DROP TRIGGER journal_forward_only;
-             DROP TRIGGER journal_no_delete;
-             DROP INDEX journal_by_agent;
-             ALTER TABLE journal RENAME TO journal_v5;
-             CREATE TABLE journal (
-                 id         INTEGER PRIMARY KEY,
-                 agent_id   INTEGER NOT NULL REFERENCES agents (id),
-                 intent     TEXT    NOT NULL CHECK (intent <> ''),
-                 state      TEXT    NOT NULL CHECK (state IN
-                     ('intended', 'attempted', 'completed', 'deviated', 'failed')),
-                 outcome    TEXT,
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL,
-                 CHECK (state IN ('completed', 'deviated', 'failed') OR outcome IS NULL),
-                 CHECK (state NOT IN ('deviated', 'failed') OR coalesce(outcome, '') <> '')
-             ) STRICT;
-             INSERT INTO journal
-                 SELECT id, agent_id, coalesce(parameters ->> 'description', action), state,
-                        NULL, intended_at, coalesce(attempted_at, intended_at)
-                 FROM journal_v5;
-             DROP TABLE journal_v5;
-             CREATE INDEX journal_by_agent ON journal (agent_id);",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 4).unwrap();
-    }
-
-    /// Rewrites the store at `path` as schema version 3, whose invocations
-    /// record only when they started and ended.
-    pub(crate) fn downgrade_to_v3(path: &Path) {
-        downgrade_to_v4(path);
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "DROP INDEX invocations_live;
-             ALTER TABLE invocations RENAME TO invocations_v4;
-             CREATE TABLE invocations (
-                 id         INTEGER PRIMARY KEY,
-                 agent_id   INTEGER NOT NULL REFERENCES agents (id),
-                 provider   TEXT    NOT NULL CHECK (provider <> ''),
-                 model      TEXT    NOT NULL CHECK (model <> ''),
-                 started_at INTEGER NOT NULL,
-                 ended_at   INTEGER
-             ) STRICT;
-             INSERT INTO invocations
-                 SELECT id, agent_id, provider, model, started_at, ended_at FROM invocations_v4;
-             DROP TABLE invocations_v4;
-             CREATE UNIQUE INDEX invocations_live ON invocations (agent_id)
-                 WHERE ended_at IS NULL;",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 3).unwrap();
-    }
-
-    /// Rewrites the store at `path` as schema version 2, which lacks only
-    /// the CodeGraph tables.
-    pub(crate) fn downgrade_to_v2(path: &Path) {
-        downgrade_to_v3(path);
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "DROP TABLE graph_sites; DROP TABLE graph_relations;
-             DROP TABLE graph_entities; DROP TABLE graph_sources;",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 2).unwrap();
-    }
-
-    /// Rewrites the store at `path` as schema version 1, whose only
-    /// difference from version 2 is the `accepted_sources` table, holding
-    /// `accepted`.
-    pub(crate) fn downgrade_to_v1(path: &Path, accepted: &[(&str, &str, Option<GenerationId>)]) {
-        downgrade_to_v2(path);
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(&format!(
-            "DROP TABLE accepted_sources; {V1_ACCEPTED_SOURCES};"
-        ))
-        .unwrap();
-        for (path, hash, generation) in accepted {
-            conn.execute(
-                "INSERT INTO accepted_sources (path, hash, generation_id) VALUES (?1, ?2, ?3)",
-                params![path, hash, generation],
-            )
-            .unwrap();
-        }
-        conn.pragma_update(None, "user_version", 1).unwrap();
-    }
-
-    /// The tables version 6 reshapes; see its migration.
-    const RESHAPED_IN_V6: [&str; 3] = ["plans", "tasks", "task_scope"];
-
-    /// The tables versions 8 to 13 add, which no migration from before
-    /// version 8 fills, nor any migration installs, verifies, accepts or
-    /// schedules.
-    const ADDED_SINCE_V8: [&str; 14] = [
-        "executions",
-        "execution_baseline",
-        "execution_changes",
-        "execution_captures",
-        "execution_installs",
-        "execution_install_results",
-        "verifications",
-        "verification_results",
-        "acceptances",
-        "acceptance_sources",
-        "acceptance_phases",
-        "acceptance_completions",
-        "scheduler_claims",
-        "scheduler_releases",
-    ];
-
-    /// Every row of every table except those `excluded` and those versions
-    /// 8 to 13 add, by table.
-    pub(crate) fn rows_besides(path: &Path, excluded: &[&str]) -> Vec<(String, Vec<Vec<Value>>)> {
-        let conn = Connection::open(path).unwrap();
-        let tables: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        tables
-            .into_iter()
-            .filter(|table| {
-                !excluded.contains(&table.as_str()) && !ADDED_SINCE_V8.contains(&table.as_str())
-            })
-            .map(|table| {
-                let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
-                let columns = stmt.column_count();
-                let rows = stmt
-                    .query_map([], |r| (0..columns).map(|i| r.get(i)).collect())
-                    .unwrap()
-                    .collect::<rusqlite::Result<_>>()
-                    .unwrap();
-                (table, rows)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn migrating_version_1_keeps_state_but_not_unrecoverable_sources() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v1.db");
-        let mut store = Store::open(&path).unwrap();
-        let tasks: [(&str, &[&str], &[&str]); 2] = [
-            ("task", &["src/a.rs"], &[]),
-            ("next", &["src/b.rs"], &["task"]),
-        ];
-        let (plan, tasks) = ready_plan(&mut store, &tasks);
-        let accepted = store.start_generation(tasks[0]).unwrap();
-        let agent = store
-            .create_agent(Role::Planner, AgentScope::Plan(plan))
-            .unwrap();
-        let invocation = store.start_invocation(agent, "codex", "gpt", None).unwrap();
-        store.invocation_running(invocation).unwrap();
-        let intent = store.intend(agent, &legacy_intent("write a.rs")).unwrap();
-        store.act(intent, None).unwrap();
-        store.record_decision(plan, "concern", "decision").unwrap();
-        acquire(&mut store, accepted, &["src/a.rs"]);
-        store
-            .accept_generation(accepted, &[("src/a.rs", Some(&hash(1)))])
-            .unwrap();
-        let active = store.start_generation(tasks[1]).unwrap();
-        acquire(&mut store, active, &["src/b.rs"]);
-        drop(store);
-        let reshaped = [&["accepted_sources"][..], &RESHAPED_IN_V6].concat();
-        let before = rows_besides(&path, &reshaped);
-        for (table, rows) in &before {
-            assert!(
-                !rows.is_empty() || table.starts_with("graph_") || table == "task_scope",
-                "{table} is exercised"
-            );
-        }
-
-        // Well-formed or not, no version 1 hash names a known recovery object.
-        downgrade_to_v1(
-            &path,
-            &[
-                ("src/a.rs", &hash(0), Some(accepted)),
-                ("src/b.rs", &hash(2), None),
-                ("src/c.rs", "h0", None),
-            ],
-        );
-        let mut store = Store::open(&path).unwrap();
-        assert_eq!(version(&path), SCHEMA_VERSION);
-        for source in ["src/a.rs", "src/b.rs", "src/c.rs"] {
-            assert_eq!(store.accepted_source(source).unwrap(), None, "{source}");
-        }
-        let count: i64 = store
-            .conn
-            .query_row("SELECT count(*) FROM accepted_sources", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
-        assert_eq!(rows_besides(&path, &reshaped), before);
-
-        // The migrated store accepts source state established afresh.
-        store
-            .record_baseline(&[("src/a.rs", Some(&hash(3))), ("src/c.rs", None)])
-            .unwrap();
-        drop(store);
-        let store = Store::open(&path).unwrap();
-        assert_eq!(
-            store.accepted_source("src/a.rs").unwrap(),
-            Some(AcceptedSource {
-                hash: Some(hash(3)),
-                generation: None
-            })
-        );
-    }
-
-    #[test]
-    fn refuses_version_1_files_without_agentctl_schema_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("altered.db");
-        Store::open(&path).unwrap();
-        downgrade_to_v1(&path, &[("src/a.rs", &hash(0), None)]);
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch("DROP TRIGGER events_no_update")
-            .unwrap();
-        let message = err(Store::open(&path));
-        assert!(message.contains("schema version 1"), "{message}");
-        assert_eq!(version(&path), 1);
-        let conn = Connection::open(&path).unwrap();
-        let stored: String = conn
-            .query_row("SELECT hash FROM accepted_sources", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(stored, hash(0));
-        assert!(
-            conn.execute(
-                "INSERT INTO accepted_sources (path, hash) VALUES ('x', NULL)",
-                []
-            )
-            .is_err(),
-            "the version 1 table is left in place"
-        );
-    }
-
-    /// A store at `path` holding state of every kind the version 2 schema
-    /// has, including accepted content and accepted absence.
-    fn populated_v2(path: &Path) {
-        let mut store = Store::open(path).unwrap();
-        let tasks: [(&str, &[&str], &[&str]); 2] = [
-            ("task", &["src/a.rs"], &[]),
-            ("next", &["src/b.rs"], &["task"]),
-        ];
-        let (plan, tasks) = ready_plan(&mut store, &tasks);
-        let accepted = store.start_generation(tasks[0]).unwrap();
-        let agent = store
-            .create_agent(Role::Planner, AgentScope::Plan(plan))
-            .unwrap();
-        let invocation = store.start_invocation(agent, "codex", "gpt", None).unwrap();
-        store.invocation_running(invocation).unwrap();
-        store.intend(agent, &legacy_intent("write a.rs")).unwrap();
-        store.record_decision(plan, "concern", "decision").unwrap();
-        acquire(&mut store, accepted, &["src/a.rs"]);
-        store
-            .record_baseline(&[("src/base.rs", Some(&hash(4))), ("src/none.rs", None)])
-            .unwrap();
-        store
-            .accept_generation(
-                accepted,
-                &[("src/a.rs", Some(&hash(1))), ("src/gone.rs", None)],
-            )
-            .unwrap();
-        let active = store.start_generation(tasks[1]).unwrap();
-        acquire(&mut store, active, &["src/b.rs"]);
-        drop(store);
-        downgrade_to_v2(path);
-    }
-
-    #[test]
-    fn migrating_version_2_keeps_all_state_and_indexes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v2.db");
-        populated_v2(&path);
-        let before = rows_besides(&path, &[]);
-        for (table, rows) in &before {
-            assert!(!rows.is_empty(), "{table} is exercised");
-        }
-
-        let store = Store::open(&path).unwrap();
-        assert_eq!(version(&path), SCHEMA_VERSION);
-        drop(store);
-        let after = rows_besides(&path, &[]);
-        let (graph, rest): (Vec<_>, Vec<_>) = after
-            .into_iter()
-            .partition(|(table, _)| table.starts_with("graph_"));
-        // Invocations, the journal, plans and tasks change shape in versions
-        // 4 to 6; see their migrations.
-        let reshaped = |rows: &[(String, Vec<Vec<Value>>)]| {
-            rows.iter()
-                .filter(|(table, _)| {
-                    !["invocations", "journal"].contains(&table.as_str())
-                        && !RESHAPED_IN_V6.contains(&table.as_str())
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            reshaped(&rest),
-            reshaped(&before),
-            "every version 2 row is kept exactly"
-        );
-        assert_eq!(graph.len(), 4);
-        for (table, rows) in graph {
-            assert!(rows.is_empty(), "{table} starts empty");
-        }
-
-        // Nothing is promoted into graph facts: sources are merely unindexed.
-        let store = Store::open(&path).unwrap();
-        use crate::graph::Freshness;
-        assert_eq!(
-            store.graph_status("src/a.rs").unwrap(),
-            Freshness::Unindexed
-        );
-        assert_eq!(
-            store.graph_status("src/base.rs").unwrap(),
-            Freshness::Unindexed
-        );
-        assert_eq!(
-            store.graph_status("src/gone.rs").unwrap(),
-            Freshness::Absent
-        );
-        assert_eq!(
-            store.graph_status("src/none.rs").unwrap(),
-            Freshness::Absent
-        );
-        assert!(store.graph_status("src/b.rs").is_err(), "untracked");
-    }
-
-    #[test]
-    fn refuses_version_2_files_without_agentctl_schema_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        let cases = [
-            ("altered.db", "DROP TRIGGER events_no_update"),
-            ("extra.db", "CREATE TABLE notes (body TEXT)"),
-            // Claims version 2 yet already holds a (forged) graph table.
-            ("forged.db", "CREATE TABLE graph_sources (path TEXT)"),
-        ];
-        for (name, change) in cases {
-            let path = dir.path().join(name);
-            populated_v2(&path);
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(change).unwrap();
-            drop(conn);
-            let before = std::fs::read(&path).unwrap();
-            let message = err(Store::open(&path));
-            assert!(
-                message.contains("does not match agentctl schema version 2"),
-                "{name}: {message}"
-            );
-            assert_eq!(std::fs::read(&path).unwrap(), before, "{name}");
-            assert_eq!(version(&path), 2, "{name}");
         }
     }
 
@@ -3186,46 +2731,6 @@ pub(crate) mod tests {
                 )
                 .is_err()
         );
-    }
-
-    #[test]
-    fn migrating_version_3_keeps_what_invocations_knew() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v3.db");
-        let mut store = Store::open(&path).unwrap();
-        let plan = store.create_plan(&objective("intent")).unwrap();
-        let agent = |store: &mut Store| {
-            store
-                .create_agent(Role::Planner, AgentScope::Plan(plan))
-                .unwrap()
-        };
-        let (a, b) = (agent(&mut store), agent(&mut store));
-        let ended = store.start_invocation(a, "claude", "m1", None).unwrap();
-        store.invocation_running(ended).unwrap();
-        store.finish_invocation(ended, &succeeded()).unwrap();
-        let live = store.start_invocation(b, "codex", "m2", None).unwrap();
-        drop(store);
-        downgrade_to_v3(&path);
-        let reshaped = [&["invocations"][..], &RESHAPED_IN_V6].concat();
-        let before = rows_besides(&path, &reshaped);
-
-        let mut store = Store::open(&path).unwrap();
-        assert_eq!(version(&path), SCHEMA_VERSION);
-        let was_ended = store.invocation(ended).unwrap();
-        assert_eq!(was_ended.state, InvocationState::Interrupted);
-        assert!(was_ended.ended_at.is_some());
-        let end = was_ended.end.unwrap();
-        assert_eq!((end.failure, end.usage), (None, Usage::Unavailable));
-        assert!(end.diagnostic.is_some());
-        let was_live = store.invocation(live).unwrap();
-        assert_eq!(
-            (was_live.state, was_live.ended_at, was_live.end),
-            (InvocationState::Running, None, None)
-        );
-        // Still live: the agent cannot be embodied twice.
-        assert!(store.start_invocation(b, "codex", "m2", None).is_err());
-        drop(store);
-        assert_eq!(rows_besides(&path, &reshaped), before);
     }
 
     #[test]
@@ -3684,216 +3189,6 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn migrating_version_4_never_claims_an_outcome() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v4.db");
-        let mut store = Store::open(&path).unwrap();
-        let plan = store.create_plan(&objective("intent")).unwrap();
-        let agent = store
-            .create_agent(Role::Planner, AgentScope::Plan(plan))
-            .unwrap();
-        drop(store);
-        downgrade_to_v4(&path);
-        let conn = Connection::open(&path).unwrap();
-        // Every state version 4 allows.
-        let states = [
-            ("intended", None),
-            ("attempted", None),
-            ("completed", None),
-            ("completed", Some("done")),
-            ("deviated", Some("edited c.rs too")),
-            ("failed", Some("never started")),
-            ("failed", Some("tests failed")),
-        ];
-        for (id, (state, outcome)) in (1..).zip(states) {
-            conn.execute(
-                "INSERT INTO journal (id, agent_id, intent, state, outcome, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 10, 20)",
-                params![id, agent, format!("step {id}"), state, outcome],
-            )
-            .unwrap();
-        }
-        drop(conn);
-        let reshaped = [&["journal"][..], &RESHAPED_IN_V6].concat();
-        let before = rows_besides(&path, &reshaped);
-
-        let store = Store::open(&path).unwrap();
-        assert_eq!(version(&path), SCHEMA_VERSION);
-        let continuation = store.continuation(agent).unwrap();
-        let attempted = Attempt {
-            invocation: None,
-            at: 20,
-        };
-        for (i, entry) in continuation.iter().enumerate() {
-            assert_eq!(entry.intent, legacy_intent(&format!("step {}", i + 1)));
-            assert_eq!(entry.intended_at, 10);
-            // Only an attempt is carried over, never an outcome, and a
-            // failure does not establish an attempt.
-            let expected = match states[i].0 {
-                "attempted" | "completed" | "deviated" => {
-                    ActionStatus::OutcomeUnknown(attempted.clone())
-                }
-                _ => ActionStatus::NotAttempted,
-            };
-            assert_eq!(entry.status, expected, "entry {}", i + 1);
-        }
-        assert_eq!(continuation.len(), states.len());
-        drop(store);
-        assert_eq!(rows_besides(&path, &reshaped), before);
-    }
-
-    #[test]
-    fn migrating_version_5_keeps_objectives_and_the_task_dag() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v5.db");
-        let mut store = Store::open(&path).unwrap();
-        let tasks: [(&str, &[&str], &[&str]); 2] =
-            [("task", &["src/a.rs"], &[]), ("second", &[], &["task"])];
-        let (plan, tasks) = ready_plan(&mut store, &tasks);
-        let [first, second] = tasks[..] else { panic!() };
-        let generation = store.start_generation(first).unwrap();
-        acquire(&mut store, generation, &["src/a.rs"]);
-        drop(store);
-        downgrade_to_v5(&path);
-        let before = rows_besides(&path, &RESHAPED_IN_V6);
-        drop(Store::open(&path).unwrap());
-        assert_eq!(version(&path), SCHEMA_VERSION);
-        assert_eq!(rows_besides(&path, &RESHAPED_IN_V6), before);
-
-        // Version 5's one statement of intent is the objective; no
-        // constraint or criterion is invented. Tasks keep their place in
-        // the DAG, keyed afresh, with nothing requested.
-        let mut store = Store::open(&path).unwrap();
-        assert_eq!(store.plan(plan).unwrap().intent, objective("intent"));
-        let owner = store.owner("src/a.rs").unwrap().unwrap();
-        assert_eq!(owner.generation, generation, "ownership outlives its scope");
-        let tasks: Vec<_> = store
-            .tasks(plan)
-            .unwrap()
-            .into_iter()
-            .map(|t| (t.id, t.key, t.objective, t.context, t.scope, t.depends_on))
-            .collect();
-        let migrated = |id: TaskId, objective: &str, depends_on| {
-            let key = format!("task-{id}");
-            (id, key, objective.into(), String::new(), vec![], depends_on)
-        };
-        assert_eq!(
-            tasks,
-            [
-                migrated(first, "task", vec![]),
-                migrated(second, "second", vec![first])
-            ]
-        );
-        assert_eq!(store.task(first).unwrap().state, TaskState::Running);
-
-        // References into the rebuilt tables hold and are enforced, and
-        // the intent is immutable.
-        let raw = |store: &Store, sql: &str| store.conn.execute(sql, []).unwrap_err().to_string();
-        let delete = format!("DELETE FROM tasks WHERE id = {first}");
-        assert!(raw(&store, &delete).contains("FOREIGN KEY"));
-        let rewrite = "UPDATE plans SET constraints = '[\"none\"]'";
-        assert!(raw(&store, rewrite).contains("human intent is immutable"));
-        store.set_plan_state(plan, PlanState::Running).unwrap();
-        store.set_plan_state(plan, PlanState::Planning).unwrap();
-        store.add_task(plan, "third", &[second]).unwrap();
-    }
-
-    #[test]
-    fn migrating_version_6_keeps_ownership_exactly() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v6.db");
-        let mut store = Store::open(&path).unwrap();
-        let tasks: [(&str, &[&str], &[&str]); 2] =
-            [("a", &["src/a.rs"], &[]), ("b", &["src/legacy.rs"], &[])];
-        let (_, tasks) = ready_plan(&mut store, &tasks);
-        let (a, b) = (tasks[0], tasks[1]);
-        let owner = store.start_generation(a).unwrap();
-        acquire(&mut store, owner, &["src/a.rs"]);
-        drop(store);
-        // Version 6 let ownership be claimed outside any scope.
-        downgrade_to_v6(&path);
-        Connection::open(&path)
-            .unwrap()
-            .execute(
-                "INSERT INTO ownership (path, generation_id) VALUES ('src/legacy.rs', ?1)",
-                [owner],
-            )
-            .unwrap();
-        let before = rows_besides(&path, &[]);
-
-        let mut store = Store::open(&path).unwrap();
-        assert_eq!(version(&path), SCHEMA_VERSION);
-        assert_eq!(
-            rows_besides(&path, &[]),
-            before,
-            "nothing invented or dropped"
-        );
-        let other = store.start_generation(b).unwrap();
-        let conflicted = store.acquire_ownership(other, &["src/legacy.rs"]).unwrap();
-        let Acquisition::Conflicted(conflicts) = conflicted else {
-            panic!("{conflicted:?}")
-        };
-        assert_eq!(conflicts[0].owner.generation, owner);
-        assert!(store.owned_paths(other).unwrap().is_empty());
-
-        // The migrated protections are the current schema's, so a draft
-        // scope authorizes no ownership there either.
-        let fresh = dir.path().join("fresh.db");
-        drop(Store::open(&fresh).unwrap());
-        assert_eq!(ownership_schema(&path), ownership_schema(&fresh));
-        let draft = store.create_plan(&objective("draft")).unwrap();
-        let task = store.add_task(draft, "draft", &[]).unwrap();
-        let generation = store.start_generation(task).unwrap();
-        let scope = format!("INSERT INTO task_scope VALUES ({task}, 'src/draft.rs')");
-        store.conn.execute(&scope, []).unwrap();
-        let claim = format!("INSERT INTO ownership VALUES ('src/draft.rs', {generation})");
-        let message = store.conn.execute(&claim, []).unwrap_err().to_string();
-        assert!(message.contains("not acquirable"), "{message}");
-    }
-
-    #[test]
-    fn migrating_version_7_records_no_executions() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v7.db");
-        let mut store = Store::open(&path).unwrap();
-        let (_, tasks) = ready_plan(&mut store, &[("a", &["src/a.rs"], &[])]);
-        let generation = store.start_generation(tasks[0]).unwrap();
-        acquire(&mut store, generation, &["src/a.rs"]);
-        drop(store);
-        downgrade_to_v7(&path);
-        let before = rows_besides(&path, &[]);
-
-        let store = Store::open(&path).unwrap();
-        assert_eq!(version(&path), SCHEMA_VERSION);
-        assert_eq!(rows_besides(&path, &[]), before, "nothing changed");
-        for table in ADDED_SINCE_V8 {
-            let sql = format!("SELECT count(*) FROM {table}");
-            let rows: i64 = store.conn.query_row(&sql, [], |r| r.get(0)).unwrap();
-            assert_eq!(rows, 0, "{table}");
-        }
-        assert_eq!(store.execution(generation).unwrap(), None);
-    }
-
-    /// The definitions of the ownership table's index and triggers.
-    fn ownership_schema(path: &Path) -> Vec<String> {
-        let conn = Connection::open(path).unwrap();
-        let mut query = conn
-            .prepare(
-                "SELECT sql FROM sqlite_schema
-                 WHERE tbl_name = 'ownership' AND type IN ('index', 'trigger') ORDER BY name",
-            )
-            .unwrap();
-        let rows = query.query_map([], |r| r.get(0)).unwrap();
-        rows.collect::<rusqlite::Result<_>>().unwrap()
-    }
-
-    /// The foreign key enforcement switches `Store::open` has made on this
-    /// thread since last asked.
-    fn foreign_key_switches() -> Vec<bool> {
-        FOREIGN_KEY_SWITCHES.with(|s| s.take())
-    }
-
     fn enforces_foreign_keys(store: &Store) -> bool {
         store
             .conn
@@ -3902,73 +3197,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn opening_a_current_store_never_disables_foreign_keys() {
+    fn opening_a_store_always_enforces_foreign_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        drop(Store::open(&path).unwrap());
-        assert!(foreign_key_switches().is_empty());
+        assert!(enforces_foreign_keys(&Store::open(&path).unwrap()));
         let store = Store::open(&path).unwrap();
         assert_eq!(version(&path), SCHEMA_VERSION);
-        assert!(foreign_key_switches().is_empty());
         assert!(enforces_foreign_keys(&store));
-    }
-
-    #[test]
-    fn migrating_version_5_disables_foreign_keys_only_while_rebuilding() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v5.db");
-        let mut store = Store::open(&path).unwrap();
-        running_generation(&mut store);
-        drop(store);
-        downgrade_to_v5(&path);
-        foreign_key_switches();
-        let store = Store::open(&path).unwrap();
-        assert_eq!(foreign_key_switches(), [false, true]);
-        assert!(enforces_foreign_keys(&store));
-        drop(store);
-        drop(Store::open(&path).unwrap());
-        assert!(foreign_key_switches().is_empty());
-    }
-
-    #[test]
-    fn migrating_version_4_through_the_rebuild_restores_foreign_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v4.db");
-        let mut store = Store::open(&path).unwrap();
-        running_generation(&mut store);
-        drop(store);
-        downgrade_to_v4(&path);
-        foreign_key_switches();
-        let store = Store::open(&path).unwrap();
-        assert_eq!(version(&path), SCHEMA_VERSION);
-        assert_eq!(foreign_key_switches(), [false, true]);
-        assert!(enforces_foreign_keys(&store));
-    }
-
-    #[test]
-    fn refuses_version_5_files_with_dangling_references_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dangling.db");
-        let mut store = Store::open(&path).unwrap();
-        running_generation(&mut store);
-        drop(store);
-        downgrade_to_v5(&path);
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM tasks;")
-            .unwrap();
-        drop(conn);
-
-        let before = std::fs::read(&path).unwrap();
-        foreign_key_switches();
-        let message = err(Store::open(&path));
-        assert!(
-            message.contains("does not match agentctl schema version 5"),
-            "{message}"
-        );
-        // No store is returned, and enforcement was restored regardless.
-        assert_eq!(foreign_key_switches(), [false, true]);
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert_eq!(version(&path), 5);
     }
 
     #[test]
@@ -4307,13 +3542,24 @@ pub(crate) mod tests {
 pub struct AcceptedSourceIsRestricted;
 
 /// Only `crate::planner`, which checks requested paths against the project,
-/// revises a plan's tasks or makes it ready. Other crates can neither revise
-/// a plan directly:
+/// revises or replans a plan's tasks or makes it ready. Other crates can
+/// neither revise a plan directly:
 ///
 /// ```compile_fail,E0624
 /// # use agentctl::{planner::Command, state::{PlanId, Store}};
 /// # fn f(store: &mut Store, plan: PlanId) {
 /// store.revise_plan(plan, &[Command::Finalize {}], &|_| Ok(())).unwrap();
+/// # }
+/// ```
+///
+/// nor replan one:
+///
+/// ```compile_fail,E0624
+/// # use agentctl::{planner::Command, state::{PlanId, Store}};
+/// # fn f(store: &mut Store, plan: PlanId) {
+/// let basis = store.replan_basis(plan).unwrap();
+/// let retry = Command::RetryTask { task: "a".into() };
+/// store.replan(plan, &basis, None, &[retry], &|_| Ok(()), &|_| Ok(Vec::new())).unwrap();
 /// # }
 /// ```
 ///

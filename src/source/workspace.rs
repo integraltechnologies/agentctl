@@ -19,6 +19,11 @@
 //! recovery objects, which is all writing then reads. Only a prepared
 //! install may be recorded as attempted, and only then written, so that a
 //! crash part way leaves every path recoverable without the workspace.
+//!
+//! Once a replan abandons a generation, its installed candidate is
+//! restored from those same recovery objects, and the accepted source's,
+//! to the last accepted state ([`restore_candidate`]): never over anything
+//! else a path came to hold.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File};
@@ -32,7 +37,7 @@ use super::snapshot::{Snapshot, identify, snapshot_tree};
 use super::{Entry, Objects, entry, objects, parent, remove, reserved, write_object};
 use crate::platform;
 use crate::project::{Project, STATE_DIR};
-use crate::state::{Change, Content};
+use crate::state::{Change, Content, Restoration};
 
 /// A disposable copy of the repository, removed when dropped.
 #[derive(Debug)]
@@ -109,6 +114,52 @@ impl Prepared<'_> {
         }
         Ok(Installation::Installed)
     }
+}
+
+/// Restores each path an abandoned generation's installed candidate
+/// changed in the project's working tree to its last accepted state, from
+/// recovery objects alone. A path already holding that state is left as it
+/// is; every other path must hold exactly what the candidate installed
+/// there, or nothing is written and the paths that do not are returned:
+/// whatever they hold since is not the candidate's to discard. Each path is
+/// checked again right before it is written, atomically, the paths one at
+/// a time, which narrows but cannot close the window in which a writer
+/// outside agentctl could be overwritten. Fails when writing failed or a
+/// path changed meanwhile, possibly part way: each path written holds its
+/// accepted state, and the others what they held.
+pub(crate) fn restore_candidate(
+    project: &Project,
+    restorations: &[Restoration],
+) -> Result<Vec<String>> {
+    let root = &project.root;
+    let mut pending = Vec::new();
+    let mut drifted = Vec::new();
+    for restoration in restorations {
+        match current(root, &restoration.path)? {
+            Some(found) if found == restoration.accepted => {}
+            Some(found) if found == restoration.candidate => pending.push(restoration),
+            _ => drifted.push(restoration.path.clone()),
+        }
+    }
+    if !drifted.is_empty() {
+        return Ok(drifted);
+    }
+    let objects = Objects::open(&root.join(STATE_DIR))?;
+    // Every byte to be written is available before anything is.
+    for restoration in &pending {
+        if let Content::File(hash) = &restoration.accepted {
+            objects.copy_to(hash, &mut io::sink())?;
+        }
+    }
+    for restoration in pending {
+        let path = &restoration.path;
+        ensure!(
+            current(root, path)?.as_ref() == Some(&restoration.candidate),
+            "`{path}` changed while its abandoned candidate was being restored"
+        );
+        write(root, &objects, path, &restoration.accepted)?;
+    }
+    Ok(Vec::new())
 }
 
 impl Workspace {

@@ -17,13 +17,14 @@ use std::sync::{Barrier, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agentctl::planner::{self, Command as Plan};
+use agentctl::planner::{self, Command as Plan, Planned};
 use agentctl::project::Project;
 use agentctl::scheduler::{self, Report};
 use agentctl::source;
 use agentctl::state::{
-    AcceptancePhase, Condition, HumanIntent, PipelineOutcome, PlanId, PlanState, Release, Store,
-    TaskId, TaskStatus, VerificationOutcome, VerificationStatus,
+    AcceptancePhase, ActionOutcome, ActionStatus, Condition, Evidence, GenerationState,
+    HumanIntent, PipelineOutcome, PlanId, PlanState, Release, Replan, Store, TaskId, TaskStatus,
+    VerificationOutcome, VerificationStatus,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -77,6 +78,18 @@ fn main() -> ExitCode {
         (
             "verifiers_never_see_other_processes_candidates",
             verifiers_never_see_other_processes_candidates,
+        ),
+        (
+            "a_fresh_planner_retries_stopped_work_from_canonical_state",
+            a_fresh_planner_retries_stopped_work_from_canonical_state,
+        ),
+        (
+            "failed_replanning_changes_nothing",
+            failed_replanning_changes_nothing,
+        ),
+        (
+            "a_stale_replan_is_never_applied",
+            a_stale_replan_is_never_applied,
         ),
     ];
     let filters: Vec<String> = env::args()
@@ -132,6 +145,9 @@ fn fake() -> ExitCode {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).unwrap();
     let packet: Value = serde_json::from_str(&input).unwrap();
+    if bootstrap.starts_with("You are the planning agent") {
+        return replan(&args, &packet);
+    }
     let key = packet["task"]["key"].as_str().unwrap().to_owned();
     let objective = packet["task"]["objective"].as_str().unwrap().to_owned();
     let says = |token: &str| objective.split_whitespace().any(|t| t == token);
@@ -198,6 +214,70 @@ fn fake() -> ExitCode {
     println!("{init}\n{result}");
     std::io::stdout().flush().unwrap();
     ExitCode::SUCCESS
+}
+
+/// Acts as Claude Code replanning, as the `planner-script` marker says:
+/// crashing, answering malformed output, deriving its commands from its
+/// input alone (`auto`: retry every stopped task, without the tokens that
+/// made it fail), or answering the commands the marker holds; after being
+/// held until let go, when it starts with `hold `. Records its input.
+fn replan(args: &[String], packet: &Value) -> ExitCode {
+    // Nothing is resumed: the input is all a planner knows.
+    assert!(args.iter().any(|a| a == "--no-session-persistence"));
+    assert!(!args.iter().any(|a| a.starts_with("--resume")));
+    let n = (0..).find(|n| !marker(&format!("planner-input-{n}")).exists());
+    let recorded = marker(&format!("planner-input-{}", n.unwrap()));
+    fs::write(recorded, packet.to_string()).unwrap();
+    log("start planner");
+    let script = fs::read_to_string(marker("planner-script")).unwrap_or_default();
+    let script = match script.strip_prefix("hold ") {
+        Some(rest) => {
+            fs::write(marker("planning"), "").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !marker("release-planner").exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            rest
+        }
+        None => script.as_str(),
+    };
+    let commands = match script {
+        "crash" => return ExitCode::from(3),
+        "malformed" => json!("not a list of commands"),
+        "auto" => {
+            let mut commands = Vec::new();
+            for task in packet["plan"]["tasks"].as_array().unwrap() {
+                if task["status"] != "stopped" {
+                    continue;
+                }
+                let objective = task["objective"].as_str().unwrap();
+                let objective: Vec<&str> = objective
+                    .split_whitespace()
+                    .filter(|t| !t.ends_with("=fail"))
+                    .collect();
+                commands.push(json!({"op": "update_task", "task": task["task"],
+                    "objective": objective.join(" "), "context": null, "paths": null}));
+                commands.push(json!({"op": "retry_task", "task": task["task"]}));
+            }
+            Value::from(commands)
+        }
+        literal => serde_json::from_str(literal).unwrap(),
+    };
+    log("end planner");
+    let init = json!({"type": "system", "subtype": "init", "session_id": "fake-session"});
+    let result = json!({"type": "result", "subtype": "success", "is_error": false,
+        "session_id": "fake-session", "result": "prose",
+        "structured_output": {"commands": commands, "explanation": "prose"},
+        "usage": {"input_tokens": 3, "output_tokens": 2}});
+    println!("{init}\n{result}");
+    std::io::stdout().flush().unwrap();
+    ExitCode::SUCCESS
+}
+
+/// What the `n`th planner invocation was given.
+fn planner_input(n: usize) -> Value {
+    let text = fs::read_to_string(marker(&format!("planner-input-{n}"))).unwrap();
+    serde_json::from_str(&text).unwrap()
 }
 
 /// Every file beneath `dir`, a verifier's working directory, by its path
@@ -433,6 +513,85 @@ impl Fixture {
             assert_eq!(end.error, None, "{end:?}");
         }
         report
+    }
+
+    /// Replans the plan as `agentctl plan update` would, from a store of
+    /// its own, with the fake as its planner.
+    fn replan(&self) -> Planned {
+        let project = Project::load(&self.project.root).unwrap();
+        let mut store = project.hydrate().unwrap();
+        planner::replan(&project, &mut store, self.plan, Some(fake_agent()))
+            .unwrap()
+            .finish(&project, &mut store)
+            .unwrap()
+    }
+
+    /// Everything replanning could change of the plan, or of how it runs.
+    fn replanning_state(&self) -> Value {
+        let store = self.store();
+        let tasks: Vec<Value> = store
+            .tasks(self.plan)
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let generations: Vec<Value> = store
+                    .generations(t.id)
+                    .unwrap()
+                    .iter()
+                    .map(|g| {
+                        json!([
+                            g.id,
+                            g.number,
+                            g.state.to_string(),
+                            store.generation_revision(g.id).unwrap(),
+                            store.owned_paths(g.id).unwrap()
+                        ])
+                    })
+                    .collect();
+                let revisions: Vec<Value> = store
+                    .revisions(t.id)
+                    .unwrap()
+                    .iter()
+                    .map(|r| json!([r.number, r.objective, r.scope]))
+                    .collect();
+                let authorizations: Vec<Value> = store
+                    .retry_authorizations(t.id)
+                    .unwrap()
+                    .iter()
+                    .map(|a| json!([a.after, a.used_by]))
+                    .collect();
+                json!({"key": t.key, "objective": t.objective, "context": t.context,
+                       "scope": t.scope, "depends_on": t.depends_on,
+                       "generations": generations, "revisions": revisions,
+                       "authorizations": authorizations,
+                       "cancelled": store.cancellation(t.id).unwrap()})
+            })
+            .collect();
+        let claims: Vec<Value> = store
+            .claims()
+            .unwrap()
+            .iter()
+            .map(|c| json!([c.generation, c.released.map(|(o, _)| o.to_string())]))
+            .collect();
+        let plan = store.plan(self.plan).unwrap();
+        json!({"state": plan.state.to_string(), "intent": plan.intent.objective, "tasks": tasks,
+               "claims": claims, "replans": store.replans(self.plan).unwrap().len()})
+    }
+
+    /// The planner's journal: each replanning action and what it
+    /// established.
+    fn planner_journal(&self) -> Vec<(String, Option<ActionOutcome>, Vec<Evidence>)> {
+        let mut store = self.store();
+        let agent = store.planner(self.plan).unwrap();
+        store
+            .continuation(agent)
+            .unwrap()
+            .into_iter()
+            .map(|e| match e.status {
+                ActionStatus::Reconciled(_, r) => (e.intent.action, Some(r.outcome), r.evidence),
+                _ => (e.intent.action, None, Vec::new()),
+            })
+            .collect()
     }
 
     fn status(&self, task: TaskId) -> TaskStatus {
@@ -862,4 +1021,174 @@ fn verifiers_never_see_other_processes_candidates() {
         None
     );
     assert_eq!(fx.read("src/b.rs"), "// b was here\n");
+}
+
+fn a_fresh_planner_retries_stopped_work_from_canonical_state() {
+    let fx = Fixture::new(
+        1,
+        &[
+            ("broken", "Change a exec=fail", &["src/a.rs"], &[]),
+            ("rejected", "Change b verify=fail", &["src/b.rs"], &[]),
+            ("after", "Change c", &["src/c.rs"], &["broken", "rejected"]),
+        ],
+    );
+    fx.run();
+    // Nothing reruns on the scheduler's account.
+    assert!(fx.run().finished.is_empty());
+    assert_eq!(launched(), ["broken", "rejected"]);
+
+    fs::write(marker("planner-script"), "auto").unwrap();
+    let Planned::Replanned { replan, .. } = fx.replan() else {
+        panic!("the replan applies");
+    };
+    // Its input: canonical feedback, with provider claims marked as such.
+    let input = planner_input(0);
+    let tasks = &input["plan"]["tasks"];
+    assert_eq!(input["intent"]["objective"], "Improve the demo");
+    let broken = &tasks[0]["generations"][0];
+    assert_eq!(broken["pipeline"], "execution_failed");
+    assert_eq!(broken["execution"]["outcome"], "reported_failed");
+    assert_eq!(
+        broken["execution"]["claimed_by_executor"]["reported"],
+        "failed"
+    );
+    let rejected = &tasks[1]["generations"][0];
+    assert_eq!(rejected["pipeline"], "verification_failed");
+    let blockers = &rejected["verifications"][0]["claimed_by_verifier"]["blockers"];
+    assert_eq!(blockers[0]["summary"], "wrong");
+    assert_eq!(tasks[2]["status"], "waiting_for_dependencies");
+    // A verifier failure is not an invocation failure.
+    let invocation = &rejected["verifications"][0]["invocation"];
+    assert_eq!(invocation["state"], "succeeded");
+
+    let report = fx.run();
+    assert_eq!(report.snapshot.condition(), Condition::AllCompleted);
+    assert_eq!(
+        launched(),
+        ["broken", "rejected", "broken", "rejected", "after"]
+    );
+    let store = fx.store();
+    for (task, first) in [
+        (fx.tasks[0], GenerationState::Failed),
+        (fx.tasks[1], GenerationState::Rejected),
+    ] {
+        let states: Vec<_> = store
+            .generations(task)
+            .unwrap()
+            .iter()
+            .map(|g| g.state)
+            .collect();
+        assert_eq!(states, [first, GenerationState::Accepted]);
+        let authorizations = store.retry_authorizations(task).unwrap();
+        assert_eq!(authorizations.len(), 1);
+        assert_eq!(authorizations[0].replan, replan);
+    }
+    assert_eq!(store.task(fx.tasks[0]).unwrap().objective, "Change a");
+    assert_eq!(fx.read("src/a.rs"), "// broken was here\n");
+    // The planner's action was reconciled with the replan itself.
+    let journal = fx.planner_journal();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(
+        (journal[0].0.as_str(), journal[0].1),
+        ("planner.replan", Some(ActionOutcome::CompletedAsIntended))
+    );
+    assert!(fx.run().finished.is_empty());
+}
+
+fn failed_replanning_changes_nothing() {
+    let fx = Fixture::new(
+        1,
+        &[
+            ("broken", "Change a exec=fail", &["src/a.rs"], &[]),
+            ("next", "Change b", &["src/b.rs"], &["broken"]),
+        ],
+    );
+    fx.run();
+    let before = fx.replanning_state();
+    let one_invalid = json!([
+        {"op": "update_task", "task": "broken", "objective": "Change a", "context": null,
+         "paths": null},
+        {"op": "retry_task", "task": "broken"},
+        {"op": "add_task", "task": "extra", "objective": "More", "context": "",
+         "paths": [], "depends_on": ["missing"]},
+    ]);
+    for (script, refused) in [
+        ("crash", false),
+        ("malformed", false),
+        // Outside the replanning protocol: the provider's output is refused.
+        (r#"[{"op": "remove_task", "task": "next"}]"#, false),
+        (r#"[{"op": "finalize"}]"#, false),
+        // Within it, but not allowed: agentctl refuses it.
+        (r#"[{"op": "retry_task", "task": "next"}]"#, true),
+        (&one_invalid.to_string(), true),
+    ] {
+        fs::write(marker("planner-script"), script).unwrap();
+        match fx.replan() {
+            Planned::NoResult(_) if !refused => {}
+            Planned::Refused { .. } if refused => {}
+            other => panic!("{script}: {other:?}"),
+        }
+        assert_eq!(fx.replanning_state(), before, "{script}");
+        let (action, outcome, evidence) = fx.planner_journal().pop().unwrap();
+        assert_eq!(
+            (action.as_str(), outcome),
+            ("planner.replan", Some(ActionOutcome::Failed))
+        );
+        let refusal = Evidence::Fact {
+            name: "replan.refused".into(),
+        };
+        assert_eq!(evidence.contains(&refusal), refused, "{script}");
+    }
+    assert!(fx.run().finished.is_empty());
+    assert_eq!(launched(), ["broken"]);
+}
+
+fn a_stale_replan_is_never_applied() {
+    let _unblock = Unblock(&["release-planner"]);
+    let fx = Fixture::new(
+        1,
+        &[
+            ("broken", "Change a exec=fail", &["src/a.rs"], &[]),
+            ("next", "Change b", &["src/b.rs"], &["broken"]),
+        ],
+    );
+    fx.run();
+    fs::write(marker("planner-script"), "hold auto").unwrap();
+    let planned = thread::scope(|scope| {
+        let replanning = scope.spawn(|| fx.replan());
+        await_marker("planning");
+        // Meanwhile another planner's replan applies.
+        let mut store = fx.store();
+        let basis = store.replan_basis(fx.plan).unwrap();
+        let other = [Plan::UpdateTask {
+            task: "next".into(),
+            objective: None,
+            context: Some("Changed meanwhile.".into()),
+            paths: None,
+        }];
+        let applied = planner::apply_replan(&fx.project, &mut store, fx.plan, &basis, &other);
+        assert!(matches!(applied.unwrap(), Replan::Applied(_)));
+        fs::write(marker("release-planner"), "").unwrap();
+        replanning.join().unwrap()
+    });
+    assert!(matches!(planned, Planned::Stale { .. }), "{planned:?}");
+    // Nothing of the stale proposal applied: no retry, no revision.
+    let store = fx.store();
+    assert!(store.retry_authorizations(fx.tasks[0]).unwrap().is_empty());
+    assert_eq!(
+        store.task(fx.tasks[0]).unwrap().objective,
+        "Change a exec=fail"
+    );
+    assert_eq!(
+        store.task(fx.tasks[1]).unwrap().context,
+        "Changed meanwhile."
+    );
+    assert_eq!(store.replans(fx.plan).unwrap().len(), 1);
+    let (_, outcome, evidence) = fx.planner_journal().pop().unwrap();
+    assert_eq!(outcome, Some(ActionOutcome::Failed));
+    assert!(evidence.contains(&Evidence::Fact {
+        name: "replan.stale".into()
+    }));
+    assert!(fx.run().finished.is_empty());
+    assert_eq!(launched(), ["broken"]);
 }

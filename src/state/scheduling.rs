@@ -3,16 +3,22 @@
 //! concurrency ceiling.
 //!
 //! A task is eligible only while its plan is running with a DAG that can be
-//! executed, no generation ever served it, every task it depends on is
-//! completed (see [`unsatisfied_dependencies`]: only a completed acceptance
-//! completes a task) and no other generation owns any path of its scope. A
-//! task with any generation is never claimed: an active one is running,
-//! unresolved or awaiting acceptance, and one that ended without completing
-//! awaits planner action, which is not the scheduler's.
+//! executed, it is not cancelled, no generation ever served it, every task
+//! it depends on is completed (see [`unsatisfied_dependencies`]: only a
+//! completed acceptance completes a task) and no other generation owns any
+//! path of its scope. A task with any generation is never claimed on the
+//! scheduler's own account: an active one is running, unresolved or
+//! awaiting acceptance, and one that stopped without completing awaits
+//! planner action, which is not the scheduler's. Only a planner's explicit
+//! retry authorization of the task's current definition, given by the
+//! replan that abandoned that generation or a later one, makes such a task
+//! eligible again, as if never run (see `crate::planner`).
 //!
 //! Claiming is one transaction: the task is found eligible, fewer claims
-//! than the ceiling are held, and then its generation is started, owns the
-//! task's whole scope and is claimed, all of it or nothing. Transactions of
+//! than the ceiling are held, and then its generation is started, bound to
+//! the task's current definition, owns the task's whole scope, uses the
+//! retry authorization it was eligible by, if any, which authorized that
+//! very definition, and is claimed, all of it or nothing. Transactions of
 //! every agentctl process serialize on the database, so racing schedulers
 //! cannot both start a task, or together exceed the ceiling they work
 //! under; the schema refuses both beneath `Store`.
@@ -27,10 +33,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::ownership::{acquire, owner};
+use super::replanning::{cancelled, record_revision, retry_pending};
 use super::{
     Acquisition, Conflict, GenerationId, GenerationState, PipelineOutcome, PlanId, PlanState,
     Store, TaskId, event, generation_info, insert_generation, now, plan_state,
@@ -54,14 +61,16 @@ pub enum TaskStatus {
     /// (an attempted action, a live invocation or an unfinished
     /// acceptance), which only recovery settles.
     Scheduled(GenerationId),
+    /// A replan cancelled it: it never runs again.
+    Cancelled,
     /// Its scheduled pipeline ended without completing it and released its
     /// capacity. What happens next is for the planner.
     Stopped {
         generation: GenerationId,
         outcome: PipelineOutcome,
     },
-    /// A generation no scheduler claimed, from before scheduling existed or
-    /// started by other means, is its latest: never scheduled over.
+    /// A generation no scheduler claimed, started by other means (see
+    /// `Store::start_generation`), is its latest: never scheduled over.
     Unscheduled {
         generation: GenerationId,
         state: GenerationState,
@@ -161,8 +170,9 @@ pub enum Condition {
     Runnable,
     /// Some task is eligible, and every unit of capacity is held.
     CapacityFull,
-    /// Every task is completed. The plan stays running: completing it is
-    /// for final integration verification, never for scheduling.
+    /// Every task is completed, or cancelled. The plan stays running:
+    /// completing it is for final integration verification, never for
+    /// scheduling.
     AllCompleted,
     /// Nothing is eligible now, while tasks are unfinished: each waits for
     /// dependencies, ownership or a scheduled pipeline, or stopped for the
@@ -177,7 +187,11 @@ impl Snapshot {
             Condition::NotRunning(self.state)
         } else if !self.defects.is_empty() {
             Condition::InvalidDag
-        } else if self.tasks.iter().all(|(_, s)| *s == TaskStatus::Completed) {
+        } else if self
+            .tasks
+            .iter()
+            .all(|(_, s)| matches!(s, TaskStatus::Completed | TaskStatus::Cancelled))
+        {
             Condition::AllCompleted
         } else if eligible && self.capacity.held < self.capacity.limit {
             Condition::Runnable
@@ -244,12 +258,33 @@ impl Store {
                     limit: limit.get(),
                 });
             }
+            let retry = retry_pending(tx, task)?;
             let (_, generation, number) = insert_generation(tx, task)?;
+            let revision = record_revision(tx, task, None)?;
+            tx.execute(
+                "INSERT INTO generation_revisions (generation_id, task_id, revision)
+                 VALUES (?1, ?2, ?3)",
+                params![generation, task, revision],
+            )?;
             let scope = scope(tx, task)?;
             let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
             if let Acquisition::Conflicted(conflicts) = acquire(tx, generation, &scope)? {
                 // Found free within this transaction; rolls everything back.
                 bail!("ownership of task {task}'s scope changed while claiming: {conflicts:?}");
+            }
+            if let Some(authorization) = retry {
+                // The schema refuses it unless it authorized the revision
+                // just bound.
+                let used = tx.execute(
+                    "UPDATE retry_authorizations SET generation_id = ?2
+                     WHERE id = ?1 AND generation_id IS NULL",
+                    params![authorization, generation],
+                )?;
+                // Found unused within this transaction; rolls everything back.
+                ensure!(
+                    used == 1,
+                    "task {task}'s retry authorization was used while claiming"
+                );
             }
             tx.execute(
                 "INSERT INTO scheduler_claims (generation_id, task_id, capacity, claimed_at)
@@ -390,8 +425,18 @@ fn scope(conn: &Connection, task: TaskId) -> Result<Vec<String>> {
         .map_err(Into::into)
 }
 
+/// Whether a scheduler claimed `generation`: it entered the scheduled
+/// pipeline, which only its acceptance or a replan abandoning it ends.
+pub(super) fn scheduled(conn: &Connection, generation: GenerationId) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM scheduler_claims WHERE generation_id = ?1)",
+        [generation],
+        |r| r.get(0),
+    )?)
+}
+
 /// Where `task` stands, apart from its plan and the capacity held.
-fn task_status(conn: &Connection, task: TaskId) -> Result<TaskStatus> {
+pub(super) fn task_status(conn: &Connection, task: TaskId) -> Result<TaskStatus> {
     let completed: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM completed_tasks WHERE task_id = ?1)",
         [task],
@@ -399,6 +444,9 @@ fn task_status(conn: &Connection, task: TaskId) -> Result<TaskStatus> {
     )?;
     if completed {
         return Ok(TaskStatus::Completed);
+    }
+    if cancelled(conn, task)? {
+        return Ok(TaskStatus::Cancelled);
     }
     let latest: Option<(GenerationId, GenerationState, bool, Option<PipelineOutcome>)> = conn
         .query_row(
@@ -410,7 +458,10 @@ fn task_status(conn: &Connection, task: TaskId) -> Result<TaskStatus> {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    if let Some((generation, state, claimed, released)) = latest {
+    // A retry authorized after its latest generation leaves the task as if
+    // no generation had served it.
+    let retried = retry_pending(conn, task)?.is_some();
+    if let Some((generation, state, claimed, released)) = latest.filter(|_| !retried) {
         return Ok(match (claimed, released) {
             (true, None) => TaskStatus::Scheduled(generation),
             (true, Some(outcome)) => TaskStatus::Stopped {
@@ -440,7 +491,7 @@ fn task_status(conn: &Connection, task: TaskId) -> Result<TaskStatus> {
 /// another plan or the task itself, and cycles among its other edges. The
 /// store refuses each of them; finding one means canonical state was
 /// changed beneath it, and nothing of the plan is safe to run.
-fn dag_defects(conn: &Connection, plan: PlanId) -> Result<Vec<DagDefect>> {
+pub(super) fn dag_defects(conn: &Connection, plan: PlanId) -> Result<Vec<DagDefect>> {
     /// A dependency edge: its plan, task and dependency, and the plans the
     /// task and its dependency belong to, if they exist.
     type Edge = (PlanId, TaskId, TaskId, Option<PlanId>, Option<PlanId>);
@@ -508,9 +559,7 @@ mod tests {
     use crate::acceptance::Outcome;
     use crate::acceptance::tests::{Case, Judged};
     use crate::project::{STATE_DB, STATE_DIR};
-    use crate::state::tests::{
-        acquire, downgrade_to_v12, err, ready_plan, rows_besides, store, version,
-    };
+    use crate::state::tests::{acquire, err, ready_plan, store};
     use crate::state::{AcceptancePhase, AgentScope, Role};
 
     pub(crate) fn limit(n: u32) -> NonZeroU32 {
@@ -1188,36 +1237,5 @@ mod tests {
         assert!(fresh.is_err(), "b waits for a, whatever");
         assert_eq!(store.claims().unwrap().len(), 1);
         assert_eq!(store.claims().unwrap()[0].released, None);
-    }
-
-    #[test]
-    fn migrating_version_12_schedules_no_historical_work() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = path(&dir);
-        let mut store = Store::open(&path).unwrap();
-        let tasks: [(&str, &[&str], &[&str]); 2] =
-            [("old", &["src/a.rs"], &[]), ("new", &["src/b.rs"], &[])];
-        let (plan, ids) = running_plan(&mut store, &tasks);
-        let generation = store.start_generation(ids[0]).unwrap();
-        acquire(&mut store, generation, &["src/a.rs"]);
-        drop(store);
-        downgrade_to_v12(&path);
-        assert_eq!(version(&path), 12);
-        let before = rows_besides(&path, &[]);
-
-        let mut store = Store::open(&path).unwrap();
-        assert_eq!(version(&path), 13);
-        assert_eq!(rows_besides(&path, &[]), before, "nothing changed");
-        assert!(store.claims().unwrap().is_empty());
-        let unscheduled = TaskStatus::Unscheduled {
-            generation,
-            state: GenerationState::Active,
-        };
-        assert_eq!(
-            store.claim(ids[0], limit(4)).unwrap(),
-            Claim::Ineligible(unscheduled)
-        );
-        assert_eq!(store.snapshot(plan, limit(4)).unwrap().capacity.held, 0);
-        claimed(store.claim(ids[1], limit(4)).unwrap());
     }
 }

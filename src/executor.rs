@@ -198,35 +198,10 @@ pub fn input(
 /// path alone. Stale or missing graph facts are marked, never given, and
 /// working-tree bytes never appear.
 fn repository(project: &Project, store: &Store, authority: &[String]) -> Result<Value> {
-    let mut mutable = Vec::new();
-    for path in authority {
-        let accepted = match store.accepted_source(path)? {
-            None => {
-                mutable.push(json!({"path": path, "accepted": "untracked"}));
-                continue;
-            }
-            Some(source) if source.hash.is_none() => "absent",
-            Some(_) => "present",
-        };
-        let mut entry = json!({"path": path, "accepted": accepted});
-        entry["graph"] = match store.entities(path)? {
-            Freshness::Current(entities) => {
-                let listed: Vec<Value> = entities
-                    .iter()
-                    .take(ENTITIES_LIMIT)
-                    .map(|e| json!({"kind": e.id.kind, "symbol": e.id.symbol}))
-                    .collect();
-                entry["entities_omitted"] = json!(entities.len() - listed.len());
-                entry["entities"] = listed.into();
-                "current"
-            }
-            Freshness::Stale => "stale",
-            Freshness::Unindexed => "unindexed",
-            Freshness::Absent => "absent",
-        }
-        .into();
-        mutable.push(entry);
-    }
+    let mutable = authority
+        .iter()
+        .map(|path| describe(store, path))
+        .collect::<Result<Vec<_>>>()?;
     let roots = &project.config.codegraph.roots;
     let mut sources = Vec::new();
     let mut used = 0;
@@ -243,6 +218,34 @@ fn repository(project: &Project, store: &Store, authority: &[String]) -> Result<
         sources.push(path);
     }
     Ok(json!({"mutable": mutable, "sources": sources, "sources_omitted": omitted}))
+}
+
+/// A path's accepted state and the entities its current graph defines,
+/// from accepted source and CodeGraph alone, never the working tree.
+pub(crate) fn describe(store: &Store, path: &str) -> Result<Value> {
+    let accepted = match store.accepted_source(path)? {
+        None => return Ok(json!({"path": path, "accepted": "untracked"})),
+        Some(source) if source.hash.is_none() => "absent",
+        Some(_) => "present",
+    };
+    let mut entry = json!({"path": path, "accepted": accepted});
+    entry["graph"] = match store.entities(path)? {
+        Freshness::Current(entities) => {
+            let listed: Vec<Value> = entities
+                .iter()
+                .take(ENTITIES_LIMIT)
+                .map(|e| json!({"kind": e.id.kind, "symbol": e.id.symbol}))
+                .collect();
+            entry["entities_omitted"] = json!(entities.len() - listed.len());
+            entry["entities"] = listed.into();
+            "current"
+        }
+        Freshness::Stale => "stale",
+        Freshness::Unindexed => "unindexed",
+        Freshness::Absent => "absent",
+    }
+    .into();
+    Ok(entry)
 }
 
 /// How one executor attempt ended, as agentctl established it.
