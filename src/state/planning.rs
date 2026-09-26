@@ -111,7 +111,7 @@ pub(super) fn apply(
             paths,
             depends_on,
         } => {
-            check_key(task)?;
+            check_key("task", task)?;
             ensure!(
                 find(tx, plan, task)?.is_none(),
                 "task `{task}` already exists"
@@ -192,6 +192,9 @@ pub(super) fn apply(
         Command::CancelTask { .. } | Command::RetryTask { .. } => {
             bail!("only a finalized plan's tasks are cancelled or retried")
         }
+        Command::RaiseAttention { .. } => {
+            bail!("only a finalized plan's replanning raises a concern")
+        }
     }
     Ok(false)
 }
@@ -213,7 +216,7 @@ fn check_ready(tx: &Transaction, plan: PlanId, scope: &dyn Fn(&str) -> Result<()
             .prepare("SELECT path FROM task_scope WHERE task_id = ?1")?
             .query_map([id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        check_key(&key)
+        check_key("task", &key)
             .and_then(|()| check_objective(&objective))
             .and_then(|()| check_context(&context))
             .and_then(|()| paths.iter().try_for_each(|p| check_scope_path(p, scope)))
@@ -289,14 +292,15 @@ pub(super) fn lookup(tx: &Transaction, plan: PlanId, key: &str) -> Result<TaskId
     find(tx, plan, key)?.with_context(|| format!("plan {plan} has no task `{key:.64}`"))
 }
 
-/// Accepts only task keys: `[a-z][a-z0-9_-]*`, at most 64 bytes.
-fn check_key(key: &str) -> Result<()> {
+/// Accepts only keys, of tasks or concerns (`what`): `[a-z][a-z0-9_-]*`,
+/// at most 64 bytes.
+pub(super) fn check_key(what: &str, key: &str) -> Result<()> {
     let valid = key.len() <= KEY_LIMIT
         && key.starts_with(|c: char| c.is_ascii_lowercase())
         && key
             .bytes()
             .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'));
-    ensure!(valid, "`{key:.64}` is not a task key");
+    ensure!(valid, "`{key:.64}` is not a {what} key");
     Ok(())
 }
 

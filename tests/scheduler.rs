@@ -23,8 +23,8 @@ use agentctl::scheduler::{self, Report};
 use agentctl::source;
 use agentctl::state::{
     AcceptancePhase, ActionOutcome, ActionStatus, Condition, Evidence, GenerationState,
-    HumanIntent, PipelineOutcome, PlanId, PlanState, Release, Replan, Store, TaskId, TaskStatus,
-    VerificationOutcome, VerificationStatus,
+    HumanDecision, HumanIntent, PipelineOutcome, PlanId, PlanState, Release, Replan, Store, TaskId,
+    TaskStatus, VerificationOutcome, VerificationStatus,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -90,6 +90,10 @@ fn main() -> ExitCode {
         (
             "a_stale_replan_is_never_applied",
             a_stale_replan_is_never_applied,
+        ),
+        (
+            "a_human_decision_continues_a_plan_through_its_planner",
+            a_human_decision_continues_a_plan_through_its_planner,
         ),
     ];
     let filters: Vec<String> = env::args()
@@ -1191,4 +1195,61 @@ fn a_stale_replan_is_never_applied() {
     }));
     assert!(fx.run().finished.is_empty());
     assert_eq!(launched(), ["broken"]);
+}
+
+fn a_human_decision_continues_a_plan_through_its_planner() {
+    let fx = Fixture::new(
+        1,
+        &[
+            ("broken", "Change a exec=fail", &["src/a.rs"], &[]),
+            ("next", "Change b", &["src/b.rs"], &["broken"]),
+        ],
+    );
+    fx.run();
+    let raise = json!([{"op": "raise_attention", "concern": "approach",
+        "reason": "Two incompatible fixes", "evidence": ["the executor failed"],
+        "tasks": ["broken"]}]);
+    fs::write(marker("planner-script"), raise.to_string()).unwrap();
+    assert!(matches!(fx.replan(), Planned::Replanned { .. }));
+    let mut store = fx.store();
+    assert_eq!(
+        store.plan(fx.plan).unwrap().state,
+        PlanState::NeedsAttention
+    );
+    // Nothing of it runs, and no planner is invoked, until a human decides.
+    let refused = scheduler::run(&fx.project, fx.plan, Some(fake_agent())).unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("needs_attention"),
+        "{refused:#}"
+    );
+    let project = Project::load(&fx.project.root).unwrap();
+    let blocked = planner::replan(&project, &mut store, fx.plan, Some(fake_agent()));
+    assert!(format!("{:#}", blocked.err().unwrap()).contains("awaits a human decision"));
+    assert_eq!(launched(), ["broken"]);
+    assert!(!marker("planner-input-1").exists());
+
+    let concern = store.attention(fx.plan).unwrap()[0].id;
+    let instruction = "Retry with the smaller fix.";
+    let decision = HumanDecision::Instruct(instruction.into());
+    let _ = store.decide(fx.plan, concern, &decision).unwrap();
+    fs::write(marker("planner-script"), "auto").unwrap();
+    assert!(matches!(fx.replan(), Planned::Replanned { .. }));
+    // The fresh planner was given the human's exact instruction.
+    let input = planner_input(1);
+    assert_eq!(input["plan"]["state"], "needs_attention");
+    assert_eq!(input["attention"][0]["concern"], "approach");
+    assert_eq!(
+        input["attention"][0]["human"],
+        json!({"decision": "instruct", "instruction": instruction})
+    );
+    assert_eq!(store.plan(fx.plan).unwrap().state, PlanState::Running);
+    let report = fx.run();
+    assert_eq!(report.snapshot.condition(), Condition::AllCompleted);
+    assert_eq!(launched(), ["broken", "broken", "next"]);
+
+    // Replayed, the decided concern is refused, and the plan runs on.
+    fs::write(marker("planner-script"), raise.to_string()).unwrap();
+    assert!(matches!(fx.replan(), Planned::Refused { .. }));
+    assert_eq!(store.plan(fx.plan).unwrap().state, PlanState::Running);
+    assert_eq!(store.attention(fx.plan).unwrap().len(), 1);
 }

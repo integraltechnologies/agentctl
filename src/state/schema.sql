@@ -31,6 +31,13 @@ WHEN NEW.id IS NOT OLD.id OR NEW.objective IS NOT OLD.objective
     OR NEW.completion_criteria IS NOT OLD.completion_criteria
 BEGIN SELECT RAISE(ABORT, 'human intent is immutable'); END;
 
+-- Nor is a plan replaced: REPLACE would delete it, firing no trigger (see
+-- `tasks_identity_not_replaced`), and put another in its place, in any
+-- state, under whatever still names it.
+CREATE TRIGGER plans_not_replaced BEFORE INSERT ON plans
+WHEN EXISTS (SELECT 1 FROM plans WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a plan is never replaced'); END;
+
 -- Planned work, named within its plan by a planner-chosen `key` so that
 -- planning never depends on storage rows. `context` is what a worker is
 -- told beyond the objective. A task's lifecycle is derived from its
@@ -213,14 +220,6 @@ BEGIN SELECT RAISE(ABORT, 'journal history is immutable'); END;
 CREATE TRIGGER journal_no_delete BEFORE DELETE ON journal
 BEGIN SELECT RAISE(ABORT, 'journal history is immutable'); END;
 
-CREATE TABLE decisions (
-    id         INTEGER PRIMARY KEY,
-    plan_id    INTEGER NOT NULL REFERENCES plans (id),
-    concern    TEXT    NOT NULL CHECK (concern <> ''),
-    decision   TEXT    NOT NULL CHECK (decision <> ''),
-    decided_at INTEGER NOT NULL
-) STRICT;
-
 -- Runtime history. Writers are serialized, so `seq` order is commit order
 -- and a reader resuming after its last seen `seq` never misses an event.
 CREATE TABLE events (
@@ -237,10 +236,6 @@ CREATE TRIGGER events_no_update BEFORE UPDATE ON events
 BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
 CREATE TRIGGER events_no_delete BEFORE DELETE ON events
 BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
-CREATE TRIGGER decisions_no_update BEFORE UPDATE ON decisions
-BEGIN SELECT RAISE(ABORT, 'human decisions are immutable'); END;
-CREATE TRIGGER decisions_no_delete BEFORE DELETE ON decisions
-BEGIN SELECT RAISE(ABORT, 'human decisions are immutable'); END;
 
 -- Paths owned for mutation by the generation that acquired them: exclusive
 -- authority to mutate that exact literal path, never any other path it
@@ -1083,20 +1078,25 @@ BEGIN SELECT RAISE(ABORT, 'scheduler history is immutable'); END;
 -- was made against (see `Store::replan_basis`), which the transaction found
 -- unchanged; `journal_id` is the planner action that proposed it, when a
 -- planner invocation did. What a replan did is recorded where it did it:
--- the revisions, retry authorizations and cancellations naming it. Never
--- changed after.
+-- the revisions, retry authorizations, cancellations and concerns naming
+-- it. A plan that needs attention is replanned only once no concern blocks
+-- it, to act on its human's decisions, possibly with no command at all.
+-- Never changed after.
 CREATE TABLE replans (
     id         INTEGER PRIMARY KEY,
     plan_id    INTEGER NOT NULL REFERENCES plans (id),
     journal_id INTEGER UNIQUE REFERENCES journal (id),
     basis      TEXT    NOT NULL CHECK (length(basis) = 64 AND basis NOT GLOB '*[^0-9a-f]*'),
-    commands   INTEGER NOT NULL CHECK (commands > 0),
+    commands   INTEGER NOT NULL CHECK (commands >= 0),
     applied_at INTEGER NOT NULL
 ) STRICT;
 
 CREATE TRIGGER replans_applied BEFORE INSERT ON replans
 WHEN NOT EXISTS (SELECT 1 FROM plans p WHERE p.id = NEW.plan_id
-        AND p.state IN ('ready', 'running', 'paused'))
+        AND (p.state IN ('ready', 'running', 'paused') OR (p.state = 'needs_attention'
+            AND NOT EXISTS (SELECT 1 FROM attention_concerns c
+                LEFT JOIN attention_decisions d ON d.concern_id = c.id
+                WHERE c.plan_id = p.id AND coalesce(d.kind, 'stop') = 'stop'))))
     OR (NEW.journal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM journal j
         JOIN agents a ON a.id = j.agent_id
         WHERE j.id = NEW.journal_id AND j.state = 'attempted'
@@ -1342,4 +1342,119 @@ WHEN EXISTS (SELECT 1 FROM scheduler_claims WHERE generation_id = OLD.generation
         WHERE generation_id = OLD.generation_id)
 BEGIN
     SELECT RAISE(ABORT, 'a scheduled generation''s ownership is released only by accepting or abandoning it');
+END;
+
+-- A concern a plan's planner raised, in a replan, because continuing
+-- needs a human's judgment or authority that agentctl does not have: why,
+-- the evidence, and the keys of the tasks it affects. `key` is its
+-- canonical identity, chosen by the planner: a plan raises a key once, so a
+-- concern a human decided is never raised again as if undecided, whatever
+-- its prose. While a concern has no decision, or its decision is 'stop',
+-- it blocks its plan: the plan needs attention, and nothing of it is
+-- claimed or replanned. Never changed after.
+CREATE TABLE attention_concerns (
+    id        INTEGER PRIMARY KEY,
+    plan_id   INTEGER NOT NULL REFERENCES plans (id),
+    key       TEXT    NOT NULL CHECK (length(key) <= 64
+        AND key GLOB '[a-z]*' AND key NOT GLOB '*[^a-z0-9_-]*'),
+    reason    TEXT    NOT NULL CHECK (reason <> ''),
+    evidence  TEXT    NOT NULL
+        CHECK (json_valid(evidence) AND json_type(evidence) = 'array'),
+    tasks     TEXT    NOT NULL
+        CHECK (json_valid(tasks) AND json_type(tasks) = 'array'),
+    replan_id INTEGER NOT NULL REFERENCES replans (id),
+    raised_at INTEGER NOT NULL,
+    UNIQUE (plan_id, key),
+    UNIQUE (id, plan_id)
+) STRICT;
+
+-- Raised only by its plan's latest replan, of a ready, running or
+-- attended plan, and wholly new: REPLACE never supersedes a concern.
+CREATE TRIGGER attention_concerns_raised BEFORE INSERT ON attention_concerns
+WHEN EXISTS (SELECT 1 FROM attention_concerns
+        WHERE id = NEW.id OR (plan_id = NEW.plan_id AND key = NEW.key))
+    OR NOT EXISTS (SELECT 1 FROM replans r JOIN plans p ON p.id = r.plan_id
+        WHERE r.id = NEW.replan_id AND r.plan_id = NEW.plan_id
+            AND r.id = (SELECT max(id) FROM replans WHERE plan_id = NEW.plan_id)
+            AND p.state IN ('ready', 'running', 'needs_attention'))
+BEGIN SELECT RAISE(ABORT, 'a concern is raised once, by its plan''s replan'); END;
+-- It affects tasks of its own plan, each named once by its key.
+CREATE TRIGGER attention_concerns_affect_own_tasks BEFORE INSERT ON attention_concerns
+WHEN json_type(NEW.tasks) IS NOT 'array'
+    OR EXISTS (SELECT 1 FROM json_each(NEW.tasks) j WHERE j.type <> 'text'
+        OR NOT EXISTS (SELECT 1 FROM tasks t
+            WHERE t.plan_id = NEW.plan_id AND t.key = j.value))
+    OR (SELECT count(DISTINCT value) FROM json_each(NEW.tasks))
+        <> json_array_length(NEW.tasks)
+BEGIN SELECT RAISE(ABORT, 'a concern names each task it affects once, of its own plan'); END;
+-- Raising it stops its plan, in the same statement: a concern never
+-- stands while its plan runs (see `plans_attended`).
+CREATE TRIGGER attention_concerns_attended AFTER INSERT ON attention_concerns
+BEGIN
+    UPDATE plans SET state = 'needs_attention', updated_at = NEW.raised_at
+    WHERE id = NEW.plan_id AND state <> 'needs_attention';
+END;
+CREATE TRIGGER attention_concerns_immutable BEFORE UPDATE ON attention_concerns
+BEGIN SELECT RAISE(ABORT, 'concerns are immutable'); END;
+CREATE TRIGGER attention_concerns_no_delete BEFORE DELETE ON attention_concerns
+BEGIN SELECT RAISE(ABORT, 'concerns are immutable'); END;
+-- Nor is a task a concern names ever removed from under it.
+CREATE TRIGGER tasks_named_by_concerns BEFORE DELETE ON tasks
+WHEN EXISTS (SELECT 1 FROM attention_concerns c, json_each(c.tasks) j
+    WHERE c.plan_id = OLD.plan_id AND j.value = OLD.key)
+BEGIN SELECT RAISE(ABORT, 'a task a concern names is never removed'); END;
+
+-- A human's decision on one concern of their plan, once: 'accept' lets the
+-- plan continue unchanged despite it, 'instruct' gives the planner
+-- `instruction` to act on, and 'stop' authorizes no autonomous
+-- continuation of the plan, ever. `replan_id` is the plan's latest replan
+-- when decided: an instruction is pending until a later replan of the plan
+-- consumes it. Made only while the plan needs attention and no planner of
+-- it is acting: no planner invocation of it is live and no planner action
+-- of it is attempted. Never changed after.
+CREATE TABLE attention_decisions (
+    concern_id  INTEGER PRIMARY KEY,
+    plan_id     INTEGER NOT NULL,
+    kind        TEXT    NOT NULL CHECK (kind IN ('accept', 'instruct', 'stop')),
+    instruction TEXT    CHECK (instruction <> ''),
+    replan_id   INTEGER NOT NULL REFERENCES replans (id),
+    decided_at  INTEGER NOT NULL,
+    CHECK ((kind = 'instruct') = (instruction IS NOT NULL)),
+    FOREIGN KEY (concern_id, plan_id) REFERENCES attention_concerns (id, plan_id)
+) STRICT;
+
+CREATE TRIGGER attention_decisions_made BEFORE INSERT ON attention_decisions
+WHEN EXISTS (SELECT 1 FROM attention_decisions WHERE concern_id = NEW.concern_id)
+    OR NOT EXISTS (SELECT 1 FROM plans p WHERE p.id = NEW.plan_id
+        AND p.state = 'needs_attention')
+    OR NEW.replan_id IS NOT (SELECT max(id) FROM replans WHERE plan_id = NEW.plan_id)
+    OR EXISTS (SELECT 1 FROM agents a JOIN invocations i ON i.agent_id = a.id
+        WHERE a.role = 'planner' AND a.plan_id = NEW.plan_id AND i.ended_at IS NULL)
+    OR EXISTS (SELECT 1 FROM agents a JOIN journal j ON j.agent_id = a.id
+        WHERE a.role = 'planner' AND a.plan_id = NEW.plan_id AND j.state = 'attempted')
+BEGIN
+    SELECT RAISE(ABORT, 'a human decides an undecided concern once, while its plan needs attention and no planner acts');
+END;
+CREATE TRIGGER attention_decisions_immutable BEFORE UPDATE ON attention_decisions
+BEGIN SELECT RAISE(ABORT, 'human decisions are immutable'); END;
+CREATE TRIGGER attention_decisions_no_delete BEFORE DELETE ON attention_decisions
+BEGIN SELECT RAISE(ABORT, 'human decisions are immutable'); END;
+
+-- A plan needs attention exactly while a concern blocks it or an
+-- instruction awaits its planner: it enters that state only with a
+-- blocking concern, and leaves it only to run again, once neither holds.
+CREATE TRIGGER plans_attended BEFORE UPDATE OF state ON plans
+WHEN NEW.state IS NOT OLD.state AND (
+    (NEW.state = 'needs_attention' AND NOT EXISTS (SELECT 1 FROM attention_concerns c
+        LEFT JOIN attention_decisions d ON d.concern_id = c.id
+        WHERE c.plan_id = NEW.id AND coalesce(d.kind, 'stop') = 'stop'))
+    OR (OLD.state = 'needs_attention' AND (NEW.state <> 'running'
+        OR EXISTS (SELECT 1 FROM attention_concerns c
+            LEFT JOIN attention_decisions d ON d.concern_id = c.id
+            WHERE c.plan_id = NEW.id AND coalesce(d.kind, 'stop') = 'stop')
+        OR EXISTS (SELECT 1 FROM attention_decisions d WHERE d.plan_id = NEW.id
+            AND d.kind = 'instruct'
+            AND d.replan_id = (SELECT max(id) FROM replans WHERE plan_id = NEW.id)))))
+BEGIN
+    SELECT RAISE(ABORT, 'a plan needs attention exactly while a concern blocks it or an instruction awaits its planner');
 END;

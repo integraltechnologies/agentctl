@@ -59,6 +59,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
+use super::attention::{blocked, raise, resume};
 use super::ownership::release;
 use super::planning::{self, lookup};
 use super::scheduling::{dag_defects, task_status};
@@ -70,8 +71,9 @@ use super::{
 use crate::planner::{Command, Rejection};
 
 /// Identifies a plan's replanning state: its state and tasks, their
-/// definitions and dependencies, and everything recorded about their
-/// generations, claims, authorizations, cancellations and revisions.
+/// definitions and dependencies, everything recorded about their
+/// generations, claims, authorizations, cancellations and revisions, and
+/// its concerns and their human decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Basis(String);
 
@@ -179,8 +181,11 @@ impl Store {
     }
 
     /// Applies a replan a planner proposed against `basis` for a ready,
-    /// running or paused plan, as one transaction: see the module
-    /// documentation. `scope` checks a requested path against the project.
+    /// running or paused plan, or one that needs attention while no concern
+    /// blocks it, as one transaction: see the module documentation and
+    /// `attention`'s. A replan raising a concern makes the plan need
+    /// attention; one of a plan that needs attention, raising none, runs it
+    /// again. `scope` checks a requested path against the project.
     /// `restore` restores the candidates of the generations it abandons in
     /// the working tree, within the transaction, returning the paths it
     /// found holding anything else, having written nothing. `action` is the
@@ -198,15 +203,25 @@ impl Store {
     ) -> Result<Replan> {
         self.write(|tx| {
             let state = plan_state(tx, plan)?;
-            if !matches!(
-                state,
-                PlanState::Ready | PlanState::Running | PlanState::Paused
-            ) {
-                let why = anyhow!("plan {plan} is {state}; only a finalized plan is replanned");
+            let why = match state {
+                PlanState::Ready | PlanState::Running | PlanState::Paused => None,
+                PlanState::NeedsAttention if blocked(tx, plan)? => Some(anyhow!(
+                    "plan {plan} awaits a human decision, so it is not replanned"
+                )),
+                PlanState::NeedsAttention => None,
+                _ => Some(anyhow!(
+                    "plan {plan} is {state}; only a finalized plan is replanned"
+                )),
+            };
+            if let Some(why) = why {
                 return Err(Rejection::response(why).into());
             }
             if self::basis(tx, plan)? != *basis {
                 return Ok(Replan::Stale);
+            }
+            if commands.is_empty() && state != PlanState::NeedsAttention {
+                let why = anyhow!("only acting on a human's decisions proposes no command");
+                return Err(Rejection::response(why).into());
             }
             tx.execute(
                 "INSERT INTO replans (plan_id, journal_id, basis, commands, applied_at)
@@ -231,6 +246,9 @@ impl Store {
             }
             let detail = format!("replan {replan}: {} commands applied", commands.len());
             event(tx, "plan.replanned", Some(plan), None, None, &detail)?;
+            // Having acted on its human's decisions, a plan runs again
+            // unless it raised another concern, which stopped it already.
+            resume(tx, plan)?;
             if let Some((entry, invocation)) = action {
                 let evidence = [
                     Evidence::Invocation { invocation },
@@ -444,6 +462,14 @@ fn apply(
             )?;
             let detail = format!("replan {replan}");
             event(tx, "task.cancelled", Some(plan), Some(id), None, &detail)?;
+        }
+        Command::RaiseAttention {
+            concern,
+            reason,
+            evidence,
+            tasks,
+        } => {
+            raise(tx, plan, replan, concern, reason, evidence, tasks)?;
         }
         Command::RemoveTask { .. } => {
             bail!("a finalized plan's tasks are never removed: cancel_task supersedes one")
@@ -679,7 +705,7 @@ pub(super) fn record_revision(
 
 /// Everything recorded about `plan` that replanning depends on, one query
 /// after another in order, each row and value delimited.
-const BASIS_QUERIES: [&str; 10] = [
+const BASIS_QUERIES: [&str; 11] = [
     "SELECT state FROM plans WHERE id = ?1",
     "SELECT id, key, objective, context FROM tasks WHERE plan_id = ?1 ORDER BY id",
     "SELECT s.task_id, s.path FROM task_scope s JOIN tasks t ON t.id = s.task_id
@@ -713,6 +739,8 @@ const BASIS_QUERIES: [&str; 10] = [
     "SELECT v.task_id, max(v.number) FROM task_revisions v JOIN tasks t ON t.id = v.task_id
      WHERE t.plan_id = ?1 GROUP BY v.task_id ORDER BY 1",
     "SELECT max(id) FROM replans WHERE plan_id = ?1",
+    "SELECT c.id, c.key, d.kind, d.instruction FROM attention_concerns c
+     LEFT JOIN attention_decisions d ON d.concern_id = c.id WHERE c.plan_id = ?1 ORDER BY 1",
 ];
 
 fn basis(conn: &Connection, plan: PlanId) -> Result<Basis> {
@@ -2041,14 +2069,22 @@ mod tests {
         let (ready, _) = ready_plan(&mut store, &[("b", &[], &[])]);
         applied(&mut store, ready, &[update("b", "x")]);
         store.set_plan_state(ready, PlanState::Running).unwrap();
-        store
-            .set_plan_state(ready, PlanState::NeedsAttention)
-            .unwrap();
+        let raise = Command::RaiseAttention {
+            concern: "unclear".into(),
+            reason: "Unclear".into(),
+            evidence: vec!["b".into()],
+            tasks: Vec::new(),
+        };
+        applied(&mut store, ready, &[raise]);
         refused(
             &mut store,
             ready,
             &[update("b", "y")],
-            "only a finalized plan",
+            "awaits a human decision",
         );
+        store
+            .set_plan_state(ready, PlanState::Planning)
+            .unwrap_err();
+        refused(&mut store, ready, &[], "awaits a human decision");
     }
 }

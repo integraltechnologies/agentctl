@@ -27,6 +27,11 @@
 //! canonical; restoring the working tree for an abandoned attempt, which
 //! that transaction does before committing, may have begun, and
 //! replanning again completes it (see `crate::state`'s replanning).
+//!
+//! When continuing safely needs a human's judgment, a replan raises a
+//! concern instead (`raise_attention`), which stops the plan until a human
+//! decides it. The planner never decides: only `Store::decide` does, and its
+//! decisions reach later planners as canonical input.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -43,9 +48,9 @@ use crate::project::Project;
 use crate::runtime::{self, Control, Launch, Outcome, Provider, Workspace};
 use crate::source;
 use crate::state::{
-    ActionOutcome, AgentId, Basis, ClaimRecord, Evidence, ExecutionStatus, GenerationId, Install,
-    Intent, InvocationId, JournalId, PlanId, PlanState, Replan, ReplanId, Standing, Store, Task,
-    TaskId, TaskStatus, VerificationStatus,
+    ActionOutcome, AgentId, Basis, ClaimRecord, Concern, Evidence, ExecutionStatus, GenerationId,
+    HumanDecision, Install, Intent, InvocationId, JournalId, PlanId, PlanState, Replan, ReplanId,
+    Standing, Store, Task, TaskId, TaskStatus, VerificationStatus,
 };
 
 /// Bounds on one response.
@@ -63,6 +68,9 @@ const REVISIONS_LIMIT: usize = 8;
 const CHANGES_LIMIT: usize = 64;
 const FOCUS_LIMIT: usize = 256;
 const REPLANS_LIMIT: usize = 16;
+/// The latest concerns raised, with their decisions, that replanning is
+/// given.
+const CONCERNS_LIMIT: usize = 16;
 /// How many times gathering feedback is tried while the plan keeps
 /// changing beneath it.
 const FEEDBACK_ATTEMPTS: usize = 3;
@@ -105,7 +113,8 @@ was gathered.
 
 Your input is JSON holding the human's intent, every task of the plan with \
 its status and the history of its generations (attempts), the plan's \
-earlier replans, and repository context drawn from accepted source and its \
+earlier replans, the concerns raised with their human's decisions, and \
+repository context drawn from accepted source and its \
 code graph. It is the complete planning state: nothing of any earlier \
 session carries over. Everything in it is agentctl's own record, except \
 what is marked as claimed by an executor or a verifier: a verifier's \
@@ -130,9 +139,25 @@ new executor and verifier, of its definition as it stands then, starting \
 from accepted source: the failed attempt's changes are discarded. Revise a \
 task before retrying it, never after: revising it later leaves the \
 authorization unusable. Without it, a stopped task never runs again.
+- raise_attention: stops the plan for a human's decision, only when \
+continuing safely needs judgment or authority you do not have: the intent \
+is ambiguous in a way that materially changes the work, the work would \
+conflict with a constraint the human set, it needs a destructive or \
+high-consequence choice nothing authorizes, or the objective cannot be met \
+without changing what the human requires. Never for a failure a replan can \
+handle. `concern` is its identity, a key like a task's, raised once per \
+plan; `reason` says why continuing is unsafe; `evidence` lists the facts; \
+`tasks` lists the keys of the tasks it affects.
 A completed task stays completed: follow-up work is a new task. \
 `paths` are exact project-relative files within the source roots, \
-separated by `/`: literal names, never patterns.";
+separated by `/`: literal names, never patterns.
+Your input's `attention` lists concerns already raised, each with its \
+human's decision: `accept` settles it, so the plan continues despite it; \
+`instruct` gives the human's instruction, which is authoritative within \
+their intent and which your commands carry out. Never raise a decided \
+concern again, under any key; only a materially different concern is \
+raised. When the plan needs attention because an instruction awaits you, \
+your commands act on it, and an empty list continues the plan unchanged.";
 
 /// A change a planner proposes to its plan, naming tasks by their keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +193,14 @@ pub enum Command {
     /// Replanning only: authorizes one fresh attempt at a task whose latest
     /// generation conclusively stopped short of acceptance.
     RetryTask { task: String },
+    /// Replanning only: stops the plan for a human's decision on concern
+    /// `concern`, its canonical identity, which a plan raises once.
+    RaiseAttention {
+        concern: String,
+        reason: String,
+        evidence: Vec<String>,
+        tasks: Vec<String>,
+    },
 }
 
 impl Command {
@@ -180,6 +213,7 @@ impl Command {
             Self::Finalize {} => "finalize",
             Self::CancelTask { .. } => "cancel_task",
             Self::RetryTask { .. } => "retry_task",
+            Self::RaiseAttention { .. } => "raise_attention",
         }
     }
 }
@@ -255,6 +289,7 @@ pub fn replan_schema() -> Value {
         "set_dependencies",
         "cancel_task",
         "retry_task",
+        "raise_attention",
     ])
 }
 
@@ -293,6 +328,10 @@ fn schema(ops: &[&str]) -> Value {
         command("finalize", json!({})),
         command("cancel_task", json!({"task": text})),
         command("retry_task", json!({"task": text})),
+        command(
+            "raise_attention",
+            json!({"concern": text, "reason": text, "evidence": keys, "tasks": keys}),
+        ),
     ]
     .into_iter()
     .filter(|c| {
@@ -355,9 +394,11 @@ fn replan_commands(
     action: Option<(JournalId, InvocationId)>,
     commands: &[Command],
 ) -> Result<Replan> {
+    // Acting on a human's decisions may change nothing.
+    let least = usize::from(store.plan(plan)?.state != PlanState::NeedsAttention);
     let count = commands.len();
-    if !(1..=COMMANDS_LIMIT).contains(&count) {
-        let why = anyhow!("a response proposes 1 to {COMMANDS_LIMIT} commands, not {count}");
+    if !(least..=COMMANDS_LIMIT).contains(&count) {
+        let why = anyhow!("a response proposes {least} to {COMMANDS_LIMIT} commands, not {count}");
         return Err(Rejection::response(why).into());
     }
     store.replan(
@@ -465,7 +506,8 @@ pub fn feedback(project: &Project, store: &Store, plan: PlanId) -> Result<(Value
 /// Everything a fresh replanning invocation is given, from canonical state
 /// alone: the human's intent; every task's definition, where it stands,
 /// what a replan may do with it, its latest generations and revisions; the
-/// plan's latest replans; and repository context drawn from accepted source
+/// plan's latest replans; its latest concerns, each with its human's exact
+/// decision; and repository context drawn from accepted source
 /// and CodeGraph, targeted at the paths replanning may affect, beside the
 /// planning map. Executors' and verifiers' own words appear only as their
 /// claims; the working tree never appears.
@@ -495,6 +537,22 @@ pub fn replan_input(project: &Project, store: &Store, plan: PlanId) -> Result<Va
         .iter()
         .map(|r| json!({"replan": r.id, "commands": r.commands, "by_planner": r.journal.is_some()}))
         .collect();
+    let concerns = store.attention(plan)?;
+    let concerns_omitted = concerns.len().saturating_sub(CONCERNS_LIMIT);
+    let attention: Vec<Value> = concerns[concerns_omitted..]
+        .iter()
+        .map(|c| {
+            let decision = c.decision.as_ref().map(|(d, _)| match d {
+                HumanDecision::Accept => json!({"decision": "accept"}),
+                HumanDecision::Instruct(text) => {
+                    json!({"decision": "instruct", "instruction": text})
+                }
+                HumanDecision::Stop => json!({"decision": "stop"}),
+            });
+            json!({"concern": c.key, "reason": c.reason, "evidence": c.evidence,
+                   "tasks": c.tasks, "raised_by_replan": c.replan, "human": decision})
+        })
+        .collect();
     let roots: Vec<&str> = project
         .config
         .codegraph
@@ -511,6 +569,8 @@ pub fn replan_input(project: &Project, store: &Store, plan: PlanId) -> Result<Va
         "plan": {"state": current.state.to_string(), "tasks": listed},
         "replans": replans,
         "replans_omitted": replans_omitted,
+        "attention": attention,
+        "attention_omitted": concerns_omitted,
         "source_roots": roots,
         "focus": focus,
         "focus_omitted": focus_omitted,
@@ -805,9 +865,13 @@ pub fn replan(
     ensure!(
         matches!(
             state,
-            PlanState::Ready | PlanState::Running | PlanState::Paused
+            PlanState::Ready | PlanState::Running | PlanState::Paused | PlanState::NeedsAttention
         ),
         "plan {plan} is {state}; only a finalized plan is replanned"
+    );
+    ensure!(
+        !store.attention(plan)?.iter().any(Concern::blocks),
+        "plan {plan} awaits a human decision, so it is not replanned"
     );
     let role = &project.config.agents.planner;
     let (input, basis) = feedback(project, store, plan)?;
@@ -1375,6 +1439,71 @@ mod tests {
         let basis = fx.store.replan_basis(plan).unwrap();
         let empty = apply_replan(&fx.project, &mut fx.store, plan, &basis, &[]);
         assert!(format!("{:#}", empty.unwrap_err()).contains("1 to 128 commands"));
+    }
+
+    #[test]
+    fn concerns_are_raised_only_as_proposals_and_decisions_reach_the_planner() {
+        // The protocol raises a concern and nothing else: no command
+        // decides, accepts or resumes, and a concern carries no decision.
+        let validator = jsonschema::validator_for(&replan_schema()).unwrap();
+        let raise = json!({"op": "raise_attention", "concern": "schema", "reason": "Why",
+                           "evidence": ["fact"], "tasks": ["parse"]});
+        let valid = json!({"commands": [raise], "explanation": null});
+        assert!(validator.is_valid(&valid));
+        serde_json::from_value::<Response>(valid).unwrap();
+        for invalid in [
+            json!({"commands": [{"op": "decide", "concern": "schema", "decision": "accept"}],
+                   "explanation": null}),
+            json!({"commands": [{"op": "accept_attention", "concern": "schema"}],
+                   "explanation": null}),
+            json!({"commands": [{"op": "raise_attention", "concern": "schema", "reason": "r",
+                   "evidence": [], "tasks": [], "decision": "accept"}], "explanation": null}),
+            json!({"commands": [], "explanation": null, "decisions": [{"concern": "schema"}]}),
+        ] {
+            assert!(!validator.is_valid(&invalid), "{invalid}");
+            assert!(serde_json::from_value::<Response>(invalid).is_err());
+        }
+        let planning = jsonschema::validator_for(&response_schema()).unwrap();
+        assert!(!planning.is_valid(&json!({"commands": [raise], "explanation": null})));
+
+        let mut fx = Fixture::new("src");
+        let plan = fx.store.create_plan(&intent()).unwrap();
+        let commands = [add("parse", &[], &[]), Command::Finalize {}];
+        apply(&fx.project, &mut fx.store, plan, &commands).unwrap();
+        fx.store.start_plan(plan).unwrap();
+        let basis = fx.store.replan_basis(plan).unwrap();
+        let raise: Command = serde_json::from_value(raise).unwrap();
+        let replanned = apply_replan(&fx.project, &mut fx.store, plan, &basis, &[raise]);
+        assert!(matches!(replanned.unwrap(), Replan::Applied(_)));
+        // While it blocks, no planner is even invoked.
+        let blocked = replan(&fx.project, &mut fx.store, plan, None)
+            .err()
+            .unwrap();
+        assert!(format!("{blocked:#}").contains("awaits a human decision"));
+
+        let concern = fx.store.attention(plan).unwrap()[0].id;
+        let text = "Keep the old format readable; add the new one beside it.";
+        let decided = fx
+            .store
+            .decide(plan, concern, &HumanDecision::Instruct(text.into()))
+            .unwrap();
+        assert_eq!(decided, crate::state::Decided::Recorded { resumed: false });
+        // A fresh planner is given the exact instruction, canonically.
+        let (input, basis) = feedback(&fx.project, &fx.store, plan).unwrap();
+        assert_eq!(input["plan"]["state"], "needs_attention");
+        assert_eq!(
+            input["attention"],
+            json!([{"concern": "schema", "reason": "Why", "evidence": ["fact"],
+                    "tasks": ["parse"], "raised_by_replan": 1,
+                    "human": {"decision": "instruct", "instruction": text}}])
+        );
+        assert_eq!(input["attention_omitted"], 0);
+        // Acting on it may change nothing, which runs the plan again.
+        let replanned = apply_replan(&fx.project, &mut fx.store, plan, &basis, &[]);
+        assert!(matches!(replanned.unwrap(), Replan::Applied(_)));
+        assert_eq!(fx.store.plan(plan).unwrap().state, PlanState::Running);
+        let (input, _) = feedback(&fx.project, &fx.store, plan).unwrap();
+        assert_eq!(input["attention"][0]["human"]["instruction"], text);
     }
 
     #[test]

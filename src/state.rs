@@ -21,6 +21,7 @@
 //! through `crate::acceptance` (see [`Acceptance`]).
 
 mod acceptance;
+mod attention;
 mod execution;
 mod graph;
 mod ownership;
@@ -31,6 +32,7 @@ mod verification;
 
 pub(crate) use acceptance::Publication;
 pub use acceptance::{Acceptance, AcceptedChange};
+pub use attention::{Concern, Decided, HumanDecision};
 pub use execution::{Capture, Change, ChangeKind, Content, Execution, ExecutionStatus, Install};
 pub(crate) use execution::{ExecutorResult, Observed};
 pub use ownership::{Acquisition, Conflict, Owner};
@@ -131,7 +133,8 @@ ids!(
     JournalId,
     ExecutionId,
     VerificationId,
-    ReplanId
+    ReplanId,
+    ConcernId
 );
 
 macro_rules! text_enum {
@@ -176,6 +179,9 @@ text_enum!(PlanState {
     Ready = "ready",
     Running = "running",
     Paused = "paused",
+    /// A concern its planner raised blocks it, or a human's instruction
+    /// awaits its planner: nothing of it is claimed. Entered and left only
+    /// through attention (see `Store::decide`).
     NeedsAttention = "needs_attention",
     Completed = "completed",
 });
@@ -185,11 +191,10 @@ impl PlanState {
         use PlanState::*;
         matches!(
             (self, to),
-            (Planning, Ready | NeedsAttention)
+            (Planning, Ready)
                 | (Ready, Running | Planning)
-                | (Running, Paused | NeedsAttention | Planning | Completed)
+                | (Running, Paused | Planning | Completed)
                 | (Paused, Running)
-                | (NeedsAttention, Planning | Ready | Running)
         )
     }
 }
@@ -627,13 +632,6 @@ pub struct Reconciliation {
     pub outcome: ActionOutcome,
     pub evidence: Vec<Evidence>,
     pub at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Decision {
-    pub concern: String,
-    pub decision: String,
-    pub decided_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1216,34 +1214,6 @@ impl Store {
                 "{JOURNAL_COLUMNS} WHERE agent_id = ?1 ORDER BY id"
             ))?
             .query_map([agent], journal_row)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(Into::into)
-    }
-
-    /// Records an explicit, immutable human decision on a plan's concern.
-    pub fn record_decision(&mut self, plan: PlanId, concern: &str, decision: &str) -> Result<()> {
-        self.write(|tx| {
-            tx.execute(
-                "INSERT INTO decisions (plan_id, concern, decision, decided_at) VALUES (?1, ?2, ?3, ?4)",
-                params![plan, concern, decision, now()],
-            )
-            .with_context(|| format!("recording a decision for plan {plan}"))?;
-            event(tx, "decision.recorded", Some(plan), None, None, concern)
-        })
-    }
-
-    pub fn decisions(&self, plan: PlanId) -> Result<Vec<Decision>> {
-        self.conn
-            .prepare(
-                "SELECT concern, decision, decided_at FROM decisions WHERE plan_id = ?1 ORDER BY id",
-            )?
-            .query_map([plan], |r| {
-                Ok(Decision {
-                    concern: r.get(0)?,
-                    decision: r.get(1)?,
-                    decided_at: r.get(2)?,
-                })
-            })?
             .collect::<rusqlite::Result<_>>()
             .map_err(Into::into)
     }
@@ -2093,7 +2063,7 @@ pub(crate) mod tests {
     /// Every object of the canonical schema, as `(type, name)`, in
     /// `schema_objects` order: what a fresh store must hold, whatever
     /// `SCHEMA` itself says.
-    const CANONICAL_OBJECTS: [(&str, &str); 128] = [
+    const CANONICAL_OBJECTS: [(&str, &str); 138] = [
         ("index", "agents_one_executor"),
         ("index", "generations_live"),
         ("index", "generations_state"),
@@ -2109,7 +2079,8 @@ pub(crate) mod tests {
         ("table", "acceptances"),
         ("table", "accepted_sources"),
         ("table", "agents"),
-        ("table", "decisions"),
+        ("table", "attention_concerns"),
+        ("table", "attention_decisions"),
         ("table", "events"),
         ("table", "execution_baseline"),
         ("table", "execution_captures"),
@@ -2153,8 +2124,14 @@ pub(crate) mod tests {
         ("trigger", "acceptances_intended"),
         ("trigger", "acceptances_no_delete"),
         ("trigger", "accepted_sources_held_by_acceptance"),
-        ("trigger", "decisions_no_delete"),
-        ("trigger", "decisions_no_update"),
+        ("trigger", "attention_concerns_affect_own_tasks"),
+        ("trigger", "attention_concerns_attended"),
+        ("trigger", "attention_concerns_immutable"),
+        ("trigger", "attention_concerns_no_delete"),
+        ("trigger", "attention_concerns_raised"),
+        ("trigger", "attention_decisions_immutable"),
+        ("trigger", "attention_decisions_made"),
+        ("trigger", "attention_decisions_no_delete"),
         ("trigger", "events_no_delete"),
         ("trigger", "events_no_update"),
         ("trigger", "execution_baseline_immutable"),
@@ -2192,7 +2169,9 @@ pub(crate) mod tests {
         ("trigger", "ownership_held_through_acceptance"),
         ("trigger", "ownership_held_until_abandoned"),
         ("trigger", "ownership_not_transferred"),
+        ("trigger", "plans_attended"),
         ("trigger", "plans_intent_immutable"),
+        ("trigger", "plans_not_replaced"),
         ("trigger", "replans_applied"),
         ("trigger", "replans_immutable"),
         ("trigger", "replans_no_delete"),
@@ -2213,6 +2192,7 @@ pub(crate) mod tests {
         ("trigger", "task_revisions_recorded"),
         ("trigger", "tasks_identity_immutable"),
         ("trigger", "tasks_identity_not_replaced"),
+        ("trigger", "tasks_named_by_concerns"),
         ("trigger", "verification_results_derived"),
         ("trigger", "verification_results_immutable"),
         ("trigger", "verification_results_no_delete"),
@@ -2385,11 +2365,16 @@ pub(crate) mod tests {
         store
             .revise_plan(plan, &[Command::Finalize {}], &|_| Ok(()))
             .unwrap();
-        for to in [Running, Paused, Running, Planning, NeedsAttention] {
+        for to in [Running, Paused, Running, Planning] {
             store.set_plan_state(plan, to).unwrap();
         }
         assert!(err(store.set_plan_state(plan, Ready)).contains(finalizing));
+        store
+            .revise_plan(plan, &[Command::Finalize {}], &|_| Ok(()))
+            .unwrap();
         store.set_plan_state(plan, Running).unwrap();
+        // Only a concern its planner raises makes a plan need attention.
+        assert!(err(store.set_plan_state(plan, NeedsAttention)).contains("cannot go from"));
 
         let message = err(store.set_plan_state(plan, Completed));
         assert!(message.contains("1 uncompleted tasks"), "{message}");
@@ -2414,7 +2399,6 @@ pub(crate) mod tests {
         assert!(store.add_task(PlanId(99), "orphan", &[]).is_err());
         assert!(store.add_task(a, "cross-plan", &[in_b]).is_err());
         assert!(store.add_task(b, "dangling", &[TaskId(99)]).is_err());
-        assert!(store.record_decision(PlanId(99), "c", "d").is_err());
         assert!(store.start_generation(TaskId(99)).is_err());
         assert!(
             store
@@ -3204,31 +3188,6 @@ pub(crate) mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(version(&path), SCHEMA_VERSION);
         assert!(enforces_foreign_keys(&store));
-    }
-
-    #[test]
-    fn decisions_persist_immutably() {
-        let (_dir, mut store) = store();
-        let plan = store.create_plan(&objective("intent")).unwrap();
-        store
-            .record_decision(plan, "tests are flaky on CI", "quarantine them")
-            .unwrap();
-        let decisions = store.decisions(plan).unwrap();
-        assert_eq!(
-            (
-                decisions[0].concern.as_str(),
-                decisions[0].decision.as_str()
-            ),
-            ("tests are flaky on CI", "quarantine them")
-        );
-        assert!(
-            store
-                .conn
-                .execute("UPDATE decisions SET decision = 'x'", [])
-                .is_err()
-        );
-        assert!(store.conn.execute("DELETE FROM decisions", []).is_err());
-        assert_eq!(store.decisions(plan).unwrap(), decisions);
     }
 
     #[test]
