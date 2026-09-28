@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "v0.3-alpha"]
+  pull_request:
+
+# Read-only token; no secrets are referenced anywhere in this workflow.
+permissions:
+  contents: read
+
+# Superseded runs of the same ref are cancelled. CI keeps no external mutable
+# state, so cancellation cannot corrupt anything.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # FORMATTING / STATIC ANALYSIS. Windows is included because cfg(windows)
+  # code is otherwise never linted on the Unix runner.
+  static:
+    name: static (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          cargo --version
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: static
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: cargo check --all-targets
+        run: cargo check --locked --all-targets
+      - name: cargo clippy --all-targets -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  # NATIVE TEST SUITE, per OS. Includes the orchestration recovery tests
+  # (session liveness, journal withdrawal, interrupted outcomes, recovery
+  # barriers, install/verifier/acceptance recovery). Some of those use bounded
+  # `sleep 30` fixtures; the per-job timeout is the backstop.
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, host: x86_64-unknown-linux-gnu }
+          - { os: macos-15, host: aarch64-apple-darwin } # Apple Silicon
+          - { os: macos-15-intel, host: x86_64-apple-darwin } # Intel
+          - { os: windows-latest, host: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo --version
+          rustc --version
+          # The runner label must actually provide the intended architecture.
+          rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.host }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+      - name: cargo test --no-fail-fast
+        run: cargo test --locked --no-fail-fast
