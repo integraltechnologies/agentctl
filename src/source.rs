@@ -41,8 +41,10 @@ use crate::platform;
 use crate::project::{CONFIG_FILE, Project, STATE_DIR};
 use crate::state::{GenerationId, Store, check_path};
 use objects::Objects;
-pub(crate) use snapshot::{Snapshot, observe_paths, snapshot, snapshot_paths};
-pub(crate) use workspace::{Installation, Preparation, Workspace, restore_candidate};
+pub(crate) use snapshot::{Snapshot, head, observe_paths, snapshot, snapshot_paths};
+pub(crate) use workspace::{
+    Installation, Interrupted, Preparation, Workspace, recover_install, restore_candidate,
+};
 
 /// How a path's working state compares with its accepted state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

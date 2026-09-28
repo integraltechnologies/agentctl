@@ -395,6 +395,7 @@ pub fn start(
     let invocation = runtime::spawn_after(store, &launch, |store, invocation| {
         store.act(entry, Some(invocation))
     })?;
+    failpoint!("verification.spawned");
     Ok(Verifier {
         verification,
         run: Some(Run {

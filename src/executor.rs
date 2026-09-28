@@ -309,6 +309,7 @@ pub fn start(
         &baseline.head,
         since,
     )?;
+    failpoint!("execution.intended");
     let launch = Launch {
         agent,
         provider,
@@ -322,8 +323,11 @@ pub fn start(
         workspace: runtime::Workspace::Editable,
     };
     let invocation = runtime::spawn_after(store, &launch, |store, invocation| {
-        store.act(entry, Some(invocation))
+        store.act(entry, Some(invocation))?;
+        failpoint!("execution.attempted");
+        Ok(())
     })?;
+    failpoint!("execution.spawned");
     Ok(Executor {
         generation,
         execution,
@@ -381,6 +385,7 @@ impl Executor {
             result,
         };
         let captured = store.finish_execution(self.execution, &observed)?;
+        failpoint!("execution.captured");
         let install_diagnostic = match captured {
             ExecutionOutcome::Candidate => {
                 let capture = capture(store, self.generation)?;
@@ -451,6 +456,7 @@ fn install_with(
     store.act(entry, None)?;
     acted(store)?;
     let (outcome, drifted, diagnostic) = verdict_of(prepared.apply(project)?);
+    failpoint!("install.applied");
     store.finish_install(execution, outcome, &drifted)?;
     Ok(diagnostic)
 }

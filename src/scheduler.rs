@@ -186,6 +186,7 @@ pub fn schedule(
     pipeline: &impl Pipeline,
 ) -> Result<Report> {
     let mut store = Store::open(state)?;
+    store.barrier(plan)?;
     store.start_plan(plan)?;
     let (done, ended) = mpsc::channel::<Finished>();
     let mut finished = Vec::new();

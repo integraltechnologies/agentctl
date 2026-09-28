@@ -2,6 +2,7 @@ use std::io;
 
 use agentctl::planner::{self, Planned};
 use agentctl::project::Project;
+use agentctl::recovery::{self, Outcome};
 use agentctl::state::{
     ConcernId, Decided, HumanDecision, IntegrationOutcome, IntegrationStatus, PlanId, PlanState,
     Store,
@@ -34,6 +35,12 @@ enum Command {
         #[command(subcommand)]
         command: PlanCommand,
     },
+    /// Settle what agentctl processes that are no longer running left
+    /// interrupted: establish what their actions did as far as can be
+    /// proven, and preserve the rest, including any provider invocation
+    /// whose lifecycle cannot be proven settled. Nothing is retried, judged or accepted anew. New work waits
+    /// for this wherever interrupted work remains.
+    Recover,
 }
 
 #[derive(Subcommand)]
@@ -120,6 +127,37 @@ fn main() -> Result<()> {
             );
             if let Some(why) = report.stopped {
                 anyhow::bail!("scheduling stopped early: {why}");
+            }
+            Ok(())
+        }
+        Command::Recover => {
+            let cwd = std::env::current_dir()?;
+            let project = Project::discover(&cwd)?.context("no agentctl project here")?;
+            let report = recovery::recover(&project)?;
+            if report.clean() {
+                println!("nothing to recover");
+                return Ok(());
+            }
+            for item in &report.items {
+                let generation = item
+                    .generation
+                    .map(|g| format!(" generation {g}"))
+                    .unwrap_or_default();
+                println!(
+                    "plan {}{generation}: {}: {}",
+                    item.plan, item.subject, item.outcome
+                );
+            }
+            let count =
+                |f: fn(&Outcome) -> bool| report.items.iter().filter(|i| f(&i.outcome)).count();
+            let recovered = count(|o| matches!(o, Outcome::Recovered(_)));
+            let running = count(|o| matches!(o, Outcome::Running));
+            let blocked = count(|o| matches!(o, Outcome::Blocked(_) | Outcome::Unsupported(_)));
+            println!(
+                "{recovered} recovered, {running} left to running processes, {blocked} blocked"
+            );
+            if !report.settled() {
+                bail!("recovery is blocked: what it could not establish stays as it was found");
             }
             Ok(())
         }

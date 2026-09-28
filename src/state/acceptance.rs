@@ -116,6 +116,7 @@ impl Store {
         generation: GenerationId,
         observe: impl FnOnce(&[String]) -> Result<Vec<(String, Content)>>,
     ) -> Result<Publication> {
+        self.barrier_of(task)?;
         self.write(|tx| {
             let recorded = recorded(tx, generation)?;
             // Published meanwhile, by a racing call: never again.
@@ -141,8 +142,8 @@ impl Store {
                 None => {
                     tx.execute(
                         "INSERT INTO acceptances
-                           (generation_id, execution_id, verification_id, started_at)
-                         VALUES (?1, ?2, ?3, ?4)",
+                           (generation_id, session, execution_id, verification_id, started_at)
+                         VALUES (?1, (SELECT id FROM temp.own_session), ?2, ?3, ?4)",
                         params![
                             generation,
                             acceptable.execution,

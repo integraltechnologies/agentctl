@@ -115,6 +115,7 @@ pub(crate) fn accept_with(
     {
         return Ok(declined);
     }
+    failpoint!("acceptance.published");
     if matches!(
         phase,
         AcceptancePhase::Intended | AcceptancePhase::Published
@@ -125,6 +126,7 @@ pub(crate) fn accept_with(
             reason: format!("synchronizing CodeGraph failed: {e:#}"),
         });
     }
+    failpoint!("acceptance.synchronized");
     if phase != AcceptancePhase::Completed
         && let Err(e) = store.complete_acceptance(generation)
     {
@@ -1168,7 +1170,7 @@ pub(crate) mod tests {
             assert!(any, "{expected}: {message}");
         };
         let verification = |case: &Case| case.fx.store.verifications(case.generation).unwrap();
-        let intend = "INSERT INTO acceptances VALUES (?1, ?2, ?3, 1)";
+        let intend = "INSERT INTO acceptances VALUES (?1, (SELECT id FROM sessions), ?2, ?3, 1)";
         let is_accepted = "is accepted, once";
         let failed_verification = verification(&case)[0].id;
         refused(
@@ -1292,7 +1294,7 @@ pub(crate) mod tests {
         }
         refused(
             conn.execute(
-                "INSERT OR REPLACE INTO acceptances VALUES (?1, ?2, ?3, 3)",
+                "INSERT OR REPLACE INTO acceptances VALUES (?1, (SELECT id FROM sessions), ?2, ?3, 3)",
                 rusqlite::params![case.generation, case.execution, passed],
             ),
             is_accepted,

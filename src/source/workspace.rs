@@ -23,7 +23,9 @@
 //! Once a replan abandons a generation, its installed candidate is
 //! restored from those same recovery objects, and the accepted source's,
 //! to the last accepted state ([`restore_candidate`]): never over anything
-//! else a path came to hold.
+//! else a path came to hold. An install interrupted part way, by agentctl
+//! ending, is settled from them too ([`recover_install`]): what it wrote is
+//! restored to what each path held before, unless it wrote everything.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File};
@@ -94,7 +96,10 @@ impl Prepared<'_> {
                 Ok(found) if found.as_ref() == Some(&change.before) => {
                     written.push(change);
                     match write(root, &self.objects, &change.path, &change.after) {
-                        Ok(()) => continue,
+                        Ok(()) => {
+                            failpoint!("install.written.{}", written.len());
+                            continue;
+                        }
                         Err(e) => Installation::Failed(e),
                     }
                 }
@@ -160,6 +165,69 @@ pub(crate) fn restore_candidate(
         write(root, &objects, path, &restoration.accepted)?;
     }
     Ok(Vec::new())
+}
+
+/// How far an install interrupted by agentctl ending got, as the working
+/// tree showed once [`recover_install`] settled it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Interrupted {
+    /// Every changed path held the candidate: the install completed.
+    Installed,
+    /// Every changed path holds what it held before the install, restored
+    /// where the install had written it: nothing of the candidate stays.
+    Restored,
+    /// These paths held neither, so nothing was written: whatever they
+    /// hold is not the install's to discard.
+    Drifted(Vec<String>),
+}
+
+/// Settles an install of `changes` that was attempted and never finished,
+/// because agentctl ended part way. Each path was written atomically, from
+/// recovery objects, and only while it held its content before the
+/// install, so each holds either that or the candidate's, unless another
+/// writer changed it. When every path holds the candidate, the install
+/// completed; otherwise each path holding the candidate is restored, one at
+/// a time, from the recovery objects preparing the install kept, until
+/// every path holds what it held before. Should any path hold anything
+/// else, nothing is written. Should restoring stop part way, calling this
+/// again finishes it: each path it restored holds what it held before, and
+/// the others the candidate. Each path is checked again right before it is
+/// written, which narrows but cannot close the window in which a writer
+/// outside agentctl could be overwritten.
+pub(crate) fn recover_install(project: &Project, changes: &[Change]) -> Result<Interrupted> {
+    let root = &project.root;
+    let mut written = Vec::new();
+    let mut drifted = Vec::new();
+    for change in changes {
+        match current(root, &change.path)? {
+            Some(found) if found == change.before => {}
+            Some(found) if found == change.after => written.push(change),
+            _ => drifted.push(change.path.clone()),
+        }
+    }
+    if !drifted.is_empty() {
+        return Ok(Interrupted::Drifted(drifted));
+    }
+    if written.len() == changes.len() {
+        return Ok(Interrupted::Installed);
+    }
+    let objects = Objects::open(&root.join(STATE_DIR))?;
+    // Every byte to be written is available before anything is.
+    for change in &written {
+        if let Content::File(hash) = &change.before {
+            objects.copy_to(hash, &mut io::sink())?;
+        }
+    }
+    for (n, change) in written.into_iter().enumerate() {
+        let path = &change.path;
+        ensure!(
+            current(root, path)?.as_ref() == Some(&change.after),
+            "`{path}` changed while its interrupted install was being restored"
+        );
+        write(root, &objects, path, &change.before)?;
+        failpoint!("recovery.restored.{}", n + 1);
+    }
+    Ok(Interrupted::Restored)
 }
 
 impl Workspace {

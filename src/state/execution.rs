@@ -276,6 +276,7 @@ impl Store {
             since <= now(),
             "the baseline cannot be observed in the future"
         );
+        self.barrier_of(task)?;
         self.write(|tx| {
             let authority = authority(tx, task, generation)?;
             ensure!(
@@ -478,7 +479,9 @@ impl Store {
             let action = match outcome {
                 Candidate => ActionOutcome::CompletedAsIntended,
                 ScopeViolated | Unattributable => ActionOutcome::CompletedWithDeviation,
-                ReportedFailed | MalformedResult | InvocationFailed => ActionOutcome::Failed,
+                ReportedFailed | MalformedResult | InvocationFailed | Interrupted => {
+                    ActionOutcome::Failed
+                }
             };
             reconcile_entry(tx, entry, action, &evidence)?;
             let (plan, task, number, _) = generation_info(tx, generation)?;

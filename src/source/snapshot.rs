@@ -182,7 +182,7 @@ pub(super) fn identify(root: &Path, path: &str) -> Result<Content> {
 
 /// Identifies Git's HEAD by the branch it names and the commit it resolves
 /// to, so that commits, checkouts and resets are observed.
-fn head(project: &Project) -> Result<String> {
+pub(crate) fn head(project: &Project) -> Result<String> {
     let ask = |args: &[&str], otherwise: &str| -> Result<String> {
         let output = git(project, Command::new("git").args(args), b"")?;
         match output.status.code() {

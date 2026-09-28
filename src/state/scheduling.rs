@@ -232,6 +232,7 @@ impl Store {
     /// transaction: see the module documentation. Anything but a claim
     /// changes nothing.
     pub fn claim(&mut self, task: TaskId, limit: NonZeroU32) -> Result<Claim> {
+        self.barrier_of(task)?;
         self.write(|tx| {
             let plan: PlanId = tx
                 .query_row("SELECT plan_id FROM tasks WHERE id = ?1", [task], |r| {
@@ -287,8 +288,8 @@ impl Store {
                 );
             }
             tx.execute(
-                "INSERT INTO scheduler_claims (generation_id, task_id, capacity, claimed_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO scheduler_claims (generation_id, task_id, session, capacity, claimed_at)
+                 VALUES (?1, ?2, (SELECT id FROM temp.own_session), ?3, ?4)",
                 params![generation, task, limit.get(), now()],
             )?;
             let detail = format!("generation {number}: {} of {limit} claims held", held + 1);
@@ -1191,7 +1192,9 @@ mod tests {
         );
         let generation = store.start_generation(a).unwrap();
         let claim = |g: GenerationId, t: TaskId, capacity: u32| {
-            format!("INSERT INTO scheduler_claims VALUES ({g}, {t}, {capacity}, 0)")
+            format!(
+                "INSERT INTO scheduler_claims VALUES ({g}, {t}, (SELECT id FROM sessions), {capacity}, 0)"
+            )
         };
         // Without the task's ownership, then beyond the ceiling, then bound
         // to another task.
@@ -1206,7 +1209,10 @@ mod tests {
         // Rewriting history.
         refused(
             &store,
-            &format!("INSERT OR REPLACE INTO scheduler_claims VALUES ({held}, {c}, 9, 0)"),
+            &format!(
+                "INSERT OR REPLACE INTO scheduler_claims
+                 VALUES ({held}, {c}, (SELECT id FROM sessions), 9, 0)"
+            ),
         );
         refused(
             &store,

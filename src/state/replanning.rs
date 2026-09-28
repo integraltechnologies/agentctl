@@ -1286,7 +1286,9 @@ mod tests {
         );
         forged(
             &store,
-            &format!("INSERT INTO scheduler_claims VALUES ({fresh}, {b}, 8, 0)"),
+            &format!(
+                "INSERT INTO scheduler_claims VALUES ({fresh}, {b}, (SELECT id FROM sessions), 8, 0)"
+            ),
             "only an eligible task owning its whole scope is claimed",
         );
         forged(

@@ -65,6 +65,18 @@ impl Store {
         generation: GenerationId,
         paths: &[&str],
     ) -> Result<Acquisition> {
+        let plan: Option<PlanId> = self
+            .conn
+            .query_row(
+                "SELECT t.plan_id FROM generations g JOIN tasks t ON t.id = g.task_id
+                 WHERE g.id = ?1",
+                [generation],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(plan) = plan {
+            self.barrier(plan)?;
+        }
         self.write(|tx| acquire(tx, generation, paths))
     }
 

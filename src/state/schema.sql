@@ -109,6 +109,13 @@ CREATE TABLE generations (
 CREATE UNIQUE INDEX generations_live ON generations (task_id)
     WHERE state IN ('active', 'accepted');
 
+-- An ended generation stays as it ended: never reactivated, however it
+-- ended or was interrupted, so that other work is only ever a fresh one.
+CREATE TRIGGER generations_ended_final BEFORE UPDATE ON generations
+WHEN OLD.state <> 'active' AND (NEW.state IS NOT OLD.state
+    OR NEW.ended_at IS NOT OLD.ended_at)
+BEGIN SELECT RAISE(ABORT, 'an ended generation stays ended'); END;
+
 -- Logical agents. Planners serve a plan and executors one generation.
 -- Verifiers serve one generation, judging its candidate, or a plan,
 -- judging its accepted result as a whole (see `integration_verifications`).
@@ -126,6 +133,23 @@ CREATE TABLE agents (
 CREATE UNIQUE INDEX agents_one_executor ON agents (generation_id)
     WHERE role = 'executor';
 
+-- The agentctl processes that recorded work which may still be live: an
+-- invocation, a journaled action, a scheduler claim or an acceptance each
+-- names the session that recorded it. A session holds a lock file of the
+-- same name beside the store for as long as its process runs, which the
+-- operating system gives up however the process ends: whether a session
+-- still runs is established by that lock alone, never by a process id.
+-- Never changed after.
+CREATE TABLE sessions (
+    id         TEXT    PRIMARY KEY CHECK (length(id) = 32 AND id NOT GLOB '*[^0-9a-f]*'),
+    started_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER sessions_immutable BEFORE UPDATE ON sessions
+BEGIN SELECT RAISE(ABORT, 'sessions are immutable'); END;
+CREATE TRIGGER sessions_no_delete BEFORE DELETE ON sessions
+BEGIN SELECT RAISE(ABORT, 'sessions are immutable'); END;
+
 -- Physical provider attempts made on behalf of a logical agent. An
 -- invocation is 'starting' until its process is known to have launched and
 -- 'running' until agentctl establishes how it ended. 'interrupted' records
@@ -134,12 +158,24 @@ CREATE UNIQUE INDEX agents_one_executor ON agents (generation_id)
 -- A provider's own session is noncanonical metadata: continuity lives in the
 -- journal, never in provider sessions.
 --
+-- `session` is the agentctl process that launched it. `containment` names
+-- the kernel boundary its provider process and every process that one
+-- starts run within (see `crate::platform`), recorded while it is starting
+-- and before any process exists: which processes are the invocation's is
+-- whatever is within it. `pid` is the provider process once launched, and
+-- `process` what identifies that process to the kernel: never another's
+-- after it. A pid alone is never taken for the process.
+--
 -- `usage` is the provenance of the token counts. Input counts every input
 -- token the provider processed, cached or not; cached input, cache writes
 -- and reasoning are reported subsets where a provider distinguishes them.
 CREATE TABLE invocations (
     id                  INTEGER PRIMARY KEY,
     agent_id            INTEGER NOT NULL REFERENCES agents (id),
+    session             TEXT    NOT NULL REFERENCES sessions (id),
+    pid                 INTEGER CHECK (pid > 0),
+    process             TEXT    CHECK (process <> ''),
+    containment         TEXT    CHECK (containment <> ''),
     provider            TEXT    NOT NULL CHECK (provider <> ''),
     model               TEXT    NOT NULL CHECK (model <> ''),
     effort              TEXT    CHECK (effort <> ''),
@@ -165,6 +201,8 @@ CREATE TABLE invocations (
     CHECK (state NOT IN ('failed', 'interrupted') OR diagnostic IS NOT NULL),
     CHECK (ended_at IS NOT NULL OR
         (diagnostic IS NULL AND exit_code IS NULL AND provider_session IS NULL)),
+    CHECK (process IS NULL OR pid IS NOT NULL),
+    CHECK (pid IS NULL OR containment IS NOT NULL),
     CHECK ((ended_at IS NULL) = (usage IS NULL)),
     CHECK ((coalesce(usage, 'unavailable') <> 'unavailable') = (input_tokens IS NOT NULL)),
     CHECK ((input_tokens IS NULL) = (output_tokens IS NULL)),
@@ -176,6 +214,24 @@ CREATE TABLE invocations (
 CREATE UNIQUE INDEX invocations_live ON invocations (agent_id)
     WHERE ended_at IS NULL;
 
+-- What an invocation is never changes, nor how it ended once recorded: its
+-- process and its containment are recorded once, the containment only while
+-- it is starting, and only a launched invocation succeeds or is cancelled.
+-- So no interrupted invocation is ever made out to have succeeded after all.
+CREATE TRIGGER invocations_recorded BEFORE UPDATE ON invocations
+WHEN NEW.id IS NOT OLD.id OR NEW.agent_id IS NOT OLD.agent_id
+    OR NEW.session IS NOT OLD.session OR NEW.provider IS NOT OLD.provider
+    OR NEW.model IS NOT OLD.model OR NEW.effort IS NOT OLD.effort
+    OR NEW.started_at IS NOT OLD.started_at OR OLD.ended_at IS NOT NULL
+    OR (OLD.pid IS NOT NULL AND NEW.pid IS NOT OLD.pid)
+    OR (OLD.process IS NOT NULL AND NEW.process IS NOT OLD.process)
+    OR (NEW.containment IS NOT OLD.containment
+        AND (OLD.containment IS NOT NULL OR OLD.state <> 'starting'))
+    OR (OLD.state = 'starting' AND NEW.state IN ('succeeded', 'cancelled'))
+BEGIN SELECT RAISE(ABORT, 'invocation history is immutable'); END;
+CREATE TRIGGER invocations_no_delete BEFORE DELETE ON invocations
+BEGIN SELECT RAISE(ABORT, 'invocation history is immutable'); END;
+
 -- The engineering-control actions of a logical agent, journaled INTEND ->
 -- ACT -> RECONCILE so that a replacement can continue from this state
 -- alone. An entry is 'intended' until agentctl records, before acting, that
@@ -185,9 +241,12 @@ CREATE UNIQUE INDEX invocations_live ON invocations (agent_id)
 -- `parameters` and `evidence` are JSON written only by `Store`, which
 -- bounds them. Only an intended entry's action may be revised; everything
 -- recorded after that is final, which the trigger enforces beneath `Store`.
+-- `session` is the agentctl process that intended it, and the only one
+-- that ever acts on it.
 CREATE TABLE journal (
     id            INTEGER PRIMARY KEY,
     agent_id      INTEGER NOT NULL REFERENCES agents (id),
+    session       TEXT    NOT NULL REFERENCES sessions (id),
     action        TEXT    NOT NULL CHECK (length(action) <= 64
         AND action GLOB '[a-z]*' AND action NOT GLOB '*[^a-z0-9_.]*'),
     parameters    TEXT    NOT NULL
@@ -212,6 +271,7 @@ CREATE INDEX journal_by_agent ON journal (agent_id);
 
 CREATE TRIGGER journal_forward_only BEFORE UPDATE ON journal
 WHEN NEW.id IS NOT OLD.id OR NEW.agent_id IS NOT OLD.agent_id
+    OR NEW.session IS NOT OLD.session
     OR NEW.intended_at IS NOT OLD.intended_at OR OLD.state = 'reconciled'
     OR (OLD.state = 'intended' AND NEW.state = 'reconciled')
     OR (OLD.state = 'attempted' AND (NEW.state <> 'reconciled'
@@ -221,6 +281,30 @@ WHEN NEW.id IS NOT OLD.id OR NEW.agent_id IS NOT OLD.agent_id
 BEGIN SELECT RAISE(ABORT, 'journal history is immutable'); END;
 CREATE TRIGGER journal_no_delete BEFORE DELETE ON journal
 BEGIN SELECT RAISE(ABORT, 'journal history is immutable'); END;
+
+-- An intended entry whose session ended before attempting it: agentctl
+-- acts on an entry only once its attempt is recorded, by the session that
+-- intended it, so an entry left intended by a session that ended was never
+-- acted on, and never will be. Withdrawn by recovery once it established
+-- that the session ended (see `crate::recovery`); the entry itself stays
+-- intended, as it was left. Never changed after.
+CREATE TABLE journal_withdrawals (
+    journal_id   INTEGER PRIMARY KEY REFERENCES journal (id),
+    withdrawn_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TRIGGER journal_withdrawals_recorded BEFORE INSERT ON journal_withdrawals
+WHEN EXISTS (SELECT 1 FROM journal_withdrawals WHERE journal_id = NEW.journal_id)
+    OR NOT EXISTS (SELECT 1 FROM journal WHERE id = NEW.journal_id AND state = 'intended')
+BEGIN SELECT RAISE(ABORT, 'only an intended entry is withdrawn, once'); END;
+CREATE TRIGGER journal_withdrawals_immutable BEFORE UPDATE ON journal_withdrawals
+BEGIN SELECT RAISE(ABORT, 'journal history is immutable'); END;
+CREATE TRIGGER journal_withdrawals_no_delete BEFORE DELETE ON journal_withdrawals
+BEGIN SELECT RAISE(ABORT, 'journal history is immutable'); END;
+-- Nor is a withdrawn entry ever revised or attempted after all.
+CREATE TRIGGER journal_withdrawn_final BEFORE UPDATE ON journal
+WHEN EXISTS (SELECT 1 FROM journal_withdrawals WHERE journal_id = OLD.id)
+BEGIN SELECT RAISE(ABORT, 'a withdrawn entry is never acted on'); END;
 
 -- Runtime history. Writers are serialized, so `seq` order is commit order
 -- and a reader resuming after its last seen `seq` never misses an event.
@@ -384,14 +468,19 @@ BEGIN SELECT RAISE(ABORT, 'execution history is immutable'); END;
 -- `attribution` says why observed changes are not attributed to it;
 -- 'contested' and 'concurrent' apply only to executors working in the
 -- project's working tree itself, which no executor does now.
--- `head_after` is the project's Git HEAD at capture.
+-- `head_after` is the project's Git HEAD at capture. 'interrupted' records
+-- that the agentctl process running the execution ended before capturing
+-- its workspace, which is gone with it: nothing about what the executor did
+-- is established, no change is recorded, and nothing of it reaches the
+-- project (see `crate::recovery`).
 --
 -- The triggers keep an outcome consistent with the facts recorded beside
 -- it; that those facts match the repository only `Store` establishes.
 CREATE TABLE execution_captures (
     execution_id INTEGER PRIMARY KEY REFERENCES executions (id),
     outcome      TEXT    NOT NULL CHECK (outcome IN ('candidate', 'reported_failed',
-        'malformed_result', 'invocation_failed', 'scope_violated', 'unattributable')),
+        'malformed_result', 'invocation_failed', 'scope_violated', 'unattributable',
+        'interrupted')),
     attribution  TEXT    CHECK (attribution IN
         ('unsettled', 'never_launched', 'contested', 'concurrent')),
     reported     TEXT    CHECK (reported IN ('succeeded', 'failed')),
@@ -402,7 +491,8 @@ CREATE TABLE execution_captures (
     CHECK ((reported IS NULL) = (claimed IS NULL)),
     CHECK (outcome <> 'candidate' OR reported = 'succeeded'),
     CHECK (outcome <> 'reported_failed' OR reported = 'failed'),
-    CHECK (outcome NOT IN ('invocation_failed', 'malformed_result') OR reported IS NULL)
+    CHECK (outcome NOT IN ('invocation_failed', 'malformed_result', 'interrupted')
+        OR reported IS NULL)
 ) STRICT;
 
 -- An executor works in a disposable copy of the repository outside the
@@ -429,6 +519,9 @@ BEGIN
     WHERE e.id = NEW.execution_id AND NEW.outcome <> 'unattributable'
         AND i.failure IN ('executable_missing', 'spawn_failed')
         AND EXISTS (SELECT 1 FROM execution_changes c WHERE c.execution_id = e.id);
+    SELECT RAISE(ABORT, 'an interrupted execution captured nothing')
+    WHERE NEW.outcome = 'interrupted' AND EXISTS (SELECT 1 FROM execution_changes c
+        WHERE c.execution_id = NEW.execution_id);
     SELECT RAISE(ABORT, 'the outcome contradicts the changes beyond authority')
     FROM executions e
     WHERE e.id = NEW.execution_id AND NEW.outcome <> 'unattributable'
@@ -533,8 +626,8 @@ BEGIN SELECT RAISE(ABORT, 'an install is reconciled only by its result'); END;
 -- Intended with the verifier's journal entry, the agent's first and only
 -- action, while the generation is active and owns its task's whole scope.
 -- Numbered per candidate: another attempt, by another fresh verifier, only
--- once every earlier one is reconciled without a judgment. Never changed
--- after.
+-- once every earlier one is reconciled without a judgment, or withdrawn
+-- (see `journal_withdrawals`). Never changed after.
 CREATE TABLE verifications (
     id           INTEGER PRIMARY KEY,
     execution_id INTEGER NOT NULL REFERENCES execution_install_results (execution_id),
@@ -555,12 +648,14 @@ CREATE TABLE verifications (
 -- `checked`, `blockers` and `non_blocking`. Only a verdict whose candidate
 -- held still and whose workspace source stayed untouched is a judgment:
 -- 'passed' needs checked evidence and no blocker, 'failed' at least one
--- blocker. 'invocation_failed' and 'malformed_result' judge nothing.
+-- blocker. 'invocation_failed' and 'malformed_result' judge nothing, nor
+-- does 'interrupted': the agentctl process verifying ended before it
+-- recorded what its verifier yielded (see `crate::recovery`).
 CREATE TABLE verification_results (
     verification_id INTEGER PRIMARY KEY REFERENCES verifications (id),
     outcome         TEXT    NOT NULL CHECK (outcome IN ('passed', 'failed',
         'candidate_drifted', 'candidate_changed', 'boundary_violated', 'invocation_failed',
-        'malformed_result')),
+        'malformed_result', 'interrupted')),
     drifted         TEXT    CHECK (json_valid(drifted) AND json_type(drifted) = 'array'
         AND json_array_length(drifted) > 0),
     mutated         TEXT    CHECK (json_valid(mutated) AND json_type(mutated) = 'array'
@@ -579,8 +674,8 @@ CREATE TABLE verification_results (
     CHECK ((outcome = 'boundary_violated') = (drifted IS NULL AND mutated IS NOT NULL)),
     CHECK ((outcome = 'passed') = (verdict IS 'pass' AND drifted IS NULL AND mutated IS NULL)),
     CHECK ((outcome = 'failed') = (verdict IS 'fail' AND drifted IS NULL AND mutated IS NULL)),
-    CHECK (outcome NOT IN ('candidate_drifted', 'invocation_failed', 'malformed_result')
-        OR (verdict IS NULL AND mutated IS NULL))
+    CHECK (outcome NOT IN ('candidate_drifted', 'invocation_failed', 'malformed_result',
+        'interrupted') OR (verdict IS NULL AND mutated IS NULL))
 ) STRICT;
 
 CREATE TRIGGER verifications_intended BEFORE INSERT ON verifications
@@ -591,7 +686,9 @@ WHEN EXISTS (SELECT 1 FROM verifications WHERE id = NEW.id OR agent_id = NEW.age
     OR EXISTS (SELECT 1 FROM verifications v JOIN journal j ON j.id = v.journal_id
         LEFT JOIN verification_results r ON r.verification_id = v.id
         WHERE v.execution_id = NEW.execution_id
-            AND (j.state <> 'reconciled' OR r.outcome IN ('passed', 'failed')))
+            AND ((j.state <> 'reconciled' AND NOT EXISTS (SELECT 1 FROM journal_withdrawals w
+                    WHERE w.journal_id = j.id))
+                OR r.outcome IN ('passed', 'failed')))
     OR NOT EXISTS (SELECT 1 FROM executions e
         JOIN execution_installs i ON i.execution_id = e.id
         JOIN journal ij ON ij.id = i.journal_id
@@ -755,9 +852,11 @@ CREATE TABLE graph_sites (
 -- and the execution's authority, and its plan is ready or running. It is
 -- recorded together with the identities it publishes and the phase
 -- 'published', in the transaction that makes them accepted source, so a
--- candidate is never accepted in part. Never changed after.
+-- candidate is never accepted in part. `session` is the agentctl process
+-- that published it. Never changed after.
 CREATE TABLE acceptances (
     generation_id   INTEGER PRIMARY KEY REFERENCES generations (id),
+    session         TEXT    NOT NULL REFERENCES sessions (id),
     execution_id    INTEGER NOT NULL UNIQUE REFERENCES executions (id),
     verification_id INTEGER NOT NULL UNIQUE REFERENCES verifications (id),
     started_at      INTEGER NOT NULL
@@ -979,10 +1078,13 @@ WHERE g.state = 'accepted';
 -- authorization, after its latest, abandoned generation, of the very
 -- revision this one is bound to, is used by this one
 -- (`retry_authorizations`), while fewer than `capacity` claims are held:
--- the concurrency ceiling the scheduler worked under. Never changed after.
+-- the concurrency ceiling the scheduler worked under. `session` is the
+-- agentctl process that claimed it and runs its pipeline. Never changed
+-- after.
 CREATE TABLE scheduler_claims (
     generation_id INTEGER PRIMARY KEY REFERENCES generations (id),
     task_id       INTEGER NOT NULL REFERENCES tasks (id),
+    session       TEXT    NOT NULL REFERENCES sessions (id),
     capacity      INTEGER NOT NULL CHECK (capacity > 0),
     claimed_at    INTEGER NOT NULL
 ) STRICT;
@@ -1541,8 +1643,9 @@ BEGIN SELECT RAISE(ABORT, 'completion proposals are immutable'); END;
 -- exact accepted source it verifies (`integration_sources`); `basis`
 -- identifies the plan's replanning state then (see `Store::replan_basis`).
 -- Numbered per proposal: another attempt, by another fresh verifier, only
--- once every earlier one of the plan is reconciled, and none of the
--- proposal with a judgment. Never changed after.
+-- once every earlier one of the plan is reconciled or withdrawn (see
+-- `journal_withdrawals`), and none of the proposal with a judgment. Never
+-- changed after.
 CREATE TABLE integration_verifications (
     id         INTEGER PRIMARY KEY,
     plan_id    INTEGER NOT NULL REFERENCES plans (id),
@@ -1561,7 +1664,8 @@ WHEN EXISTS (SELECT 1 FROM integration_verifications WHERE id = NEW.id
     OR NEW.number <> 1 + (SELECT count(*) FROM integration_verifications
         WHERE replan_id = NEW.replan_id)
     OR EXISTS (SELECT 1 FROM integration_verifications v JOIN journal j ON j.id = v.journal_id
-        WHERE v.plan_id = NEW.plan_id AND j.state <> 'reconciled')
+        WHERE v.plan_id = NEW.plan_id AND j.state <> 'reconciled'
+            AND NOT EXISTS (SELECT 1 FROM journal_withdrawals w WHERE w.journal_id = j.id))
     OR EXISTS (SELECT 1 FROM integration_verifications v
         JOIN integration_results r ON r.verification_id = v.id
         WHERE v.replan_id = NEW.replan_id AND r.outcome IN ('passed', 'failed'))
@@ -1689,11 +1793,13 @@ WHERE v.replan_id = (SELECT max(id) FROM replans WHERE plan_id = v.plan_id)
 -- `non_blocking`. Only a verdict about the current basis, its repository
 -- inputs observed exactly as recorded, whose workspace source stayed
 -- untouched is a judgment: 'passed' needs checked evidence and no blocker,
--- 'failed' at least one blocker. Nothing else judges.
+-- 'failed' at least one blocker. Nothing else judges: 'interrupted' least
+-- of all, recording that the agentctl process verifying ended before it
+-- recorded what its verifier yielded (see `crate::recovery`).
 CREATE TABLE integration_results (
     verification_id INTEGER PRIMARY KEY REFERENCES integration_verifications (id),
     outcome         TEXT    NOT NULL CHECK (outcome IN ('passed', 'failed', 'basis_changed',
-        'boundary_violated', 'invocation_failed', 'malformed_result')),
+        'boundary_violated', 'invocation_failed', 'malformed_result', 'interrupted')),
     mutated         TEXT    CHECK (json_valid(mutated) AND json_type(mutated) = 'array'
         AND json_array_length(mutated) > 0),
     inputs          TEXT    CHECK (json_valid(inputs) AND json_type(inputs) = 'array'),
@@ -1711,7 +1817,9 @@ CREATE TABLE integration_results (
     CHECK (mutated IS NULL OR outcome IN ('basis_changed', 'boundary_violated')),
     CHECK (outcome <> 'passed' OR verdict IS 'pass'),
     CHECK (outcome <> 'failed' OR verdict IS 'fail'),
-    CHECK (outcome NOT IN ('invocation_failed', 'malformed_result') OR verdict IS NULL)
+    CHECK (outcome NOT IN ('invocation_failed', 'malformed_result', 'interrupted')
+        OR verdict IS NULL),
+    CHECK (outcome <> 'interrupted' OR inputs IS NULL)
 ) STRICT;
 
 -- A result follows its attempt, once the verifier's invocation ended,
@@ -1810,3 +1918,35 @@ BEGIN SELECT RAISE(ABORT, 'a plan is completed only by its final integration ver
 CREATE TRIGGER plans_created_uncompleted BEFORE INSERT ON plans
 WHEN NEW.state = 'completed'
 BEGIN SELECT RAISE(ABORT, 'a plan is completed only by its final integration verification, for good'); END;
+
+-- Everything recorded that may still be live, or whose outcome is not yet
+-- established, with the plan it is of and the session that recorded it:
+-- invocations with no recorded end, journaled actions neither reconciled
+-- nor withdrawn, claims not released and acceptances not completed. While
+-- that session runs it is its work; once it ended, what it left here is
+-- interrupted, and only recovery settles it (see `crate::recovery`). The
+-- subject is the invocation, journal entry or claimed or accepted
+-- generation.
+CREATE VIEW unresolved_authority (kind, subject, plan_id, generation_id, session) AS
+SELECT 'invocation', i.id, coalesce(a.plan_id, t.plan_id), a.generation_id, i.session
+FROM invocations i JOIN agents a ON a.id = i.agent_id
+LEFT JOIN generations g ON g.id = a.generation_id
+LEFT JOIN tasks t ON t.id = g.task_id
+WHERE i.ended_at IS NULL
+UNION ALL
+SELECT j.state, j.id, coalesce(a.plan_id, t.plan_id), a.generation_id, j.session
+FROM journal j JOIN agents a ON a.id = j.agent_id
+LEFT JOIN generations g ON g.id = a.generation_id
+LEFT JOIN tasks t ON t.id = g.task_id
+WHERE j.state <> 'reconciled'
+    AND NOT EXISTS (SELECT 1 FROM journal_withdrawals w WHERE w.journal_id = j.id)
+UNION ALL
+SELECT 'claim', c.generation_id, t.plan_id, c.generation_id, c.session
+FROM scheduler_claims c JOIN tasks t ON t.id = c.task_id
+WHERE NOT EXISTS (SELECT 1 FROM scheduler_releases r WHERE r.generation_id = c.generation_id)
+UNION ALL
+SELECT 'acceptance', a.generation_id, t.plan_id, a.generation_id, a.session
+FROM acceptances a JOIN generations g ON g.id = a.generation_id
+JOIN tasks t ON t.id = g.task_id
+WHERE NOT EXISTS (SELECT 1 FROM acceptance_phases p
+    WHERE p.generation_id = a.generation_id AND p.phase = 'completed');

@@ -418,6 +418,7 @@ impl Store {
             since <= now(),
             "the working tree cannot be observed in the future"
         );
+        self.barrier_of(task)?;
         self.write(|tx| {
             let verifiable = verifiable(tx, task, generation)?;
             let drifted = drifted(&verifiable.candidate, observed)?;
@@ -443,6 +444,7 @@ impl Store {
             since <= now(),
             "the working tree cannot be observed in the future"
         );
+        self.barrier_of(task)?;
         self.write(|tx| {
             let verifiable = verifiable(tx, task, generation)?;
             let drifted = drifted(&verifiable.candidate, observed)?;
@@ -616,8 +618,9 @@ fn verifiable(conn: &Connection, task: TaskId, generation: GenerationId) -> Resu
     }
     let mut number = 1;
     let mut stmt = conn.prepare(
-        "SELECT v.number, j.state, r.outcome FROM verifications v
-         JOIN journal j ON j.id = v.journal_id
+        "SELECT v.number, CASE WHEN EXISTS (SELECT 1 FROM journal_withdrawals w
+             WHERE w.journal_id = j.id) THEN 'withdrawn' ELSE j.state END, r.outcome
+         FROM verifications v JOIN journal j ON j.id = v.journal_id
          LEFT JOIN verification_results r ON r.verification_id = v.id
          WHERE v.execution_id = ?1 ORDER BY v.number",
     )?;
@@ -630,8 +633,9 @@ fn verifiable(conn: &Connection, task: TaskId, generation: GenerationId) -> Resu
     })?;
     for row in earlier {
         let (n, state, outcome) = row?;
+        // A withdrawn one was never attempted: it ended without judging.
         ensure!(
-            state == "reconciled",
+            state == "reconciled" || state == "withdrawn",
             "verification {n} of the candidate is {state}, not yet reconciled"
         );
         if let Some(judged @ (VerificationOutcome::Passed | VerificationOutcome::Failed)) = outcome
@@ -705,7 +709,7 @@ fn intend(
 
 /// Records how an attempted verification ended, reconciling its journal
 /// entry.
-fn record(
+pub(super) fn record(
     tx: &Transaction,
     verification: VerificationId,
     outcome: VerificationOutcome,

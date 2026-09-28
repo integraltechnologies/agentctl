@@ -955,6 +955,7 @@ pub fn replan(
     let invocation = runtime::spawn_after(store, &launch, |store, invocation| {
         store.act(entry, Some(invocation))
     })?;
+    failpoint!("replan.spawned");
     Ok(Planner {
         agent,
         plan,

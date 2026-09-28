@@ -29,8 +29,10 @@ mod graph;
 mod integration;
 mod ownership;
 mod planning;
+mod recovery;
 mod replanning;
 mod scheduling;
+mod session;
 mod verification;
 
 pub(crate) use acceptance::Publication;
@@ -41,11 +43,15 @@ pub(crate) use execution::{ExecutorResult, Observed};
 pub(crate) use integration::IntegrationObserved;
 pub use integration::{Integration, IntegrationResult, IntegrationStatus};
 pub use ownership::{Acquisition, Conflict, Owner};
+pub(crate) use recovery::ActedOn;
+pub use recovery::{Unresolved, UnresolvedKind};
 pub(crate) use replanning::Restoration;
 pub use replanning::{Basis, Replan, ReplanRecord, RetryAuthorization, Revision, Standing};
 pub use scheduling::{
     Capacity, Claim, ClaimRecord, Condition, DagDefect, Release, Snapshot, TaskStatus,
 };
+pub use session::Ended;
+pub(crate) use session::Liveness;
 pub use verification::{
     Blocker, Check, CheckOutcome, Note, Verdict, Verification, VerificationResult,
     VerificationStatus, VerifierReport,
@@ -53,7 +59,7 @@ pub use verification::{
 pub(crate) use verification::{VerifierObserved, VerifierResult, ViewBasis};
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -326,6 +332,10 @@ text_enum!(
         /// The workspace changed in a way that cannot safely be attributed
         /// to the executor (see [`Attribution`]).
         Unattributable = "unattributable",
+        /// The agentctl process running it ended before capturing its
+        /// workspace, which ended with it: nothing about what the executor
+        /// did is established, and nothing of it reaches the project.
+        Interrupted = "interrupted",
     }
 );
 
@@ -392,6 +402,9 @@ text_enum!(
         /// The invocation succeeded with a result breaking the verifier
         /// protocol: no judgment either.
         MalformedResult = "malformed_result",
+        /// The agentctl process verifying ended before it recorded what
+        /// its verifier yielded: no judgment, whatever the verifier did.
+        Interrupted = "interrupted",
     }
 );
 
@@ -420,6 +433,9 @@ text_enum!(
         /// The invocation succeeded with a result breaking the verifier
         /// protocol: no judgment either.
         MalformedResult = "malformed_result",
+        /// The agentctl process verifying ended before it recorded what
+        /// its verifier yielded: no judgment, whatever the verifier did.
+        Interrupted = "interrupted",
     }
 );
 
@@ -650,6 +666,11 @@ pub struct JournalEntry {
 pub enum ActionStatus {
     /// Intended, and never attempted.
     NotAttempted,
+    /// Intended, and never attempted: the agentctl process that intended
+    /// it ended first, so it never will be (see `crate::recovery`).
+    Withdrawn {
+        at: i64,
+    },
     /// Attempted: it may have been acted on, and its outcome is unknown.
     /// Nothing, including how the invocation ended, stands in for
     /// reconciliation.
@@ -695,6 +716,11 @@ pub struct AcceptedSource {
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
+    /// The store's canonical path.
+    path: PathBuf,
+    /// This process's session, once this connection wrote anything (see
+    /// `session`).
+    session: Option<String>,
 }
 
 impl Store {
@@ -717,18 +743,41 @@ impl Store {
                 "foreign key enforcement is off"
             );
             enable_wal(&conn)?;
-            Ok(Self { conn })
+            Ok(Self {
+                conn,
+                path: path.canonicalize()?,
+                session: None,
+            })
         };
         open().with_context(|| format!("opening state {}", path.display()))
     }
 
+    /// Runs `f` in one `IMMEDIATE` transaction, within this process's
+    /// session, which `own_session` names to every statement.
     fn write<T>(&mut self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
+        self.join_session()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&tx)?;
         tx.commit()?;
         Ok(value)
+    }
+
+    /// Makes this process's session this connection's: the one row of its
+    /// temporary table `own_session`, which records name as theirs.
+    fn join_session(&mut self) -> Result<()> {
+        if self.session.is_none() {
+            let id = session::own(&self.path, &self.conn)?;
+            self.conn.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS own_session (id TEXT NOT NULL);
+                 DELETE FROM temp.own_session;",
+            )?;
+            self.conn
+                .execute("INSERT INTO temp.own_session (id) VALUES (?1)", [&id])?;
+            self.session = Some(id);
+        }
+        Ok(())
     }
 
     /// Creates a plan in planning, establishing its human intent before
@@ -1012,8 +1061,9 @@ impl Store {
         self.write(|tx| {
             let (plan, task) = agent_subject(tx, agent)?;
             tx.execute(
-                "INSERT INTO invocations (agent_id, provider, model, effort, state, started_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO invocations
+                   (agent_id, session, provider, model, effort, state, started_at)
+                 VALUES (?1, (SELECT id FROM temp.own_session), ?2, ?3, ?4, ?5, ?6)",
                 params![
                     agent,
                     provider,
@@ -1322,7 +1372,9 @@ fn invocation_row(r: &rusqlite::Row) -> rusqlite::Result<Invocation> {
 }
 
 const JOURNAL_COLUMNS: &str = "SELECT id, agent_id, action, parameters, intended_at,
-    attempted_at, invocation_id, outcome, evidence, reconciled_at FROM journal";
+    attempted_at, invocation_id, outcome, evidence, reconciled_at,
+    (SELECT withdrawn_at FROM journal_withdrawals w WHERE w.journal_id = journal.id)
+    FROM journal";
 
 fn journal_row(r: &Row) -> rusqlite::Result<JournalEntry> {
     let attempt = |at| -> rusqlite::Result<Attempt> {
@@ -1333,7 +1385,10 @@ fn journal_row(r: &Row) -> rusqlite::Result<JournalEntry> {
     };
     // The schema guarantees which columns are set in each state.
     let status = match (r.get(5)?, r.get(7)?) {
-        (None, _) => ActionStatus::NotAttempted,
+        (None, _) => match r.get(10)? {
+            Some(at) => ActionStatus::Withdrawn { at },
+            None => ActionStatus::NotAttempted,
+        },
         (Some(at), None) => ActionStatus::OutcomeUnknown(attempt(at)?),
         (Some(at), Some(outcome)) => ActionStatus::Reconciled(
             attempt(at)?,
@@ -1680,8 +1735,8 @@ fn insert_intent(tx: &Transaction, agent: AgentId, intent: &Intent) -> Result<Jo
     let parameters = intent.check()?;
     let (plan, task) = agent_subject(tx, agent)?;
     tx.execute(
-        "INSERT INTO journal (agent_id, action, parameters, state, intended_at)
-         VALUES (?1, ?2, ?3, 'intended', ?4)",
+        "INSERT INTO journal (agent_id, session, action, parameters, state, intended_at)
+         VALUES (?1, (SELECT id FROM temp.own_session), ?2, ?3, 'intended', ?4)",
         params![agent, intent.action, parameters, now()],
     )?;
     let entry = JournalId(tx.last_insert_rowid());
@@ -1995,7 +2050,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(super) fn store() -> (tempfile::TempDir, Store) {
+    pub(crate) fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
         (dir, store)
@@ -2100,7 +2155,7 @@ pub(crate) mod tests {
     /// Every object of the canonical schema, as `(type, name)`, in
     /// `schema_objects` order: what a fresh store must hold, whatever
     /// `SCHEMA` itself says.
-    const CANONICAL_OBJECTS: [(&str, &str); 169] = [
+    const CANONICAL_OBJECTS: [(&str, &str); 181] = [
         ("index", "agents_one_executor"),
         ("index", "generations_live"),
         ("index", "generations_state"),
@@ -2140,6 +2195,7 @@ pub(crate) mod tests {
         ("table", "integration_verifications"),
         ("table", "invocations"),
         ("table", "journal"),
+        ("table", "journal_withdrawals"),
         ("table", "ownership"),
         ("table", "plan_completions"),
         ("table", "plans"),
@@ -2147,6 +2203,7 @@ pub(crate) mod tests {
         ("table", "retry_authorizations"),
         ("table", "scheduler_claims"),
         ("table", "scheduler_releases"),
+        ("table", "sessions"),
         ("table", "task_cancellations"),
         ("table", "task_dependencies"),
         ("table", "task_revisions"),
@@ -2207,6 +2264,7 @@ pub(crate) mod tests {
         ("trigger", "generation_revisions_no_delete"),
         ("trigger", "generations_abandoned_by_replan"),
         ("trigger", "generations_accepted_by_acceptance"),
+        ("trigger", "generations_ended_final"),
         ("trigger", "integration_inputs_immutable"),
         ("trigger", "integration_inputs_no_delete"),
         ("trigger", "integration_inputs_recorded"),
@@ -2220,12 +2278,18 @@ pub(crate) mod tests {
         ("trigger", "integration_verifications_intended"),
         ("trigger", "integration_verifications_no_delete"),
         ("trigger", "integration_verifications_sealed"),
+        ("trigger", "invocations_no_delete"),
+        ("trigger", "invocations_recorded"),
         ("trigger", "journal_forward_only"),
         ("trigger", "journal_no_delete"),
         ("trigger", "journal_reconciles_execution"),
         ("trigger", "journal_reconciles_install"),
         ("trigger", "journal_reconciles_integration"),
         ("trigger", "journal_reconciles_verification"),
+        ("trigger", "journal_withdrawals_immutable"),
+        ("trigger", "journal_withdrawals_no_delete"),
+        ("trigger", "journal_withdrawals_recorded"),
+        ("trigger", "journal_withdrawn_final"),
         ("trigger", "ownership_acquired"),
         ("trigger", "ownership_held_through_acceptance"),
         ("trigger", "ownership_held_until_abandoned"),
@@ -2250,6 +2314,8 @@ pub(crate) mod tests {
         ("trigger", "scheduler_releases_derived"),
         ("trigger", "scheduler_releases_immutable"),
         ("trigger", "scheduler_releases_no_delete"),
+        ("trigger", "sessions_immutable"),
+        ("trigger", "sessions_no_delete"),
         ("trigger", "task_cancellations_immutable"),
         ("trigger", "task_cancellations_no_delete"),
         ("trigger", "task_cancellations_recorded"),
@@ -2270,6 +2336,7 @@ pub(crate) mod tests {
         ("view", "scheduler_outcomes"),
         ("view", "settled_plans"),
         ("view", "task_definitions"),
+        ("view", "unresolved_authority"),
     ];
 
     #[test]
@@ -2915,6 +2982,7 @@ pub(crate) mod tests {
             .iter()
             .map(|e| match &e.status {
                 ActionStatus::NotAttempted => ("not attempted", None, None),
+                ActionStatus::Withdrawn { .. } => ("withdrawn", None, None),
                 ActionStatus::OutcomeUnknown(a) => ("unknown", a.invocation, None),
                 ActionStatus::Reconciled(a, r) => ("reconciled", a.invocation, Some(r.outcome)),
             })
@@ -3492,7 +3560,11 @@ pub(crate) mod tests {
         // The losing creators' private files are gone.
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let name = entry.unwrap().file_name();
-            assert!(name.to_str().unwrap().starts_with("state.db"), "{name:?}");
+            let name = name.to_str().unwrap();
+            assert!(
+                name.starts_with("state.db") || name == "sessions",
+                "{name:?}"
+            );
         }
 
         let mut store = Store::open(&path).unwrap();

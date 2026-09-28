@@ -136,6 +136,7 @@ impl Store {
             "accepted state cannot be read in the future"
         );
         let inputs = normalized(inputs)?;
+        self.barrier(plan)?;
         self.write(|tx| {
             let proposal = proposal(tx, plan)?.with_context(|| {
                 format!("plan {plan} has no current completion proposal to verify")
@@ -448,7 +449,7 @@ fn accepted_sources(conn: &Connection) -> Result<BTreeMap<String, Option<String>
 
 /// Records how an attempted integration verification ended, reconciling
 /// its journal entry.
-fn record(
+pub(super) fn record(
     tx: &Transaction,
     id: IntegrationId,
     invocation: InvocationId,

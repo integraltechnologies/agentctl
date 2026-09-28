@@ -266,6 +266,7 @@ pub fn start(
     let invocation = runtime::spawn_after(store, &launch, |store, invocation| {
         store.act(entry, Some(invocation))
     })?;
+    failpoint!("integration.spawned");
     Ok(Integrator {
         id: intended.id,
         invocation,

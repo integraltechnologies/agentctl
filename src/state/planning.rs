@@ -65,6 +65,7 @@ impl Store {
     /// The logical planner of a plan, created when it has none. Whatever
     /// embodies it starts from the plan's canonical state alone.
     pub fn planner(&mut self, plan: PlanId) -> Result<AgentId> {
+        self.barrier(plan)?;
         self.write(|tx| {
             plan_state(tx, plan)?;
             let existing: Option<AgentId> = tx.query_row(
