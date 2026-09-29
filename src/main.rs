@@ -1,13 +1,15 @@
-use std::io;
+use std::io::{self, Write as _};
+use std::time::Duration;
 
 use agentctl::planner::{self, Planned};
 use agentctl::project::Project;
 use agentctl::recovery::{self, Outcome};
+use agentctl::state::EventQuery;
 use agentctl::state::{
-    ConcernId, Decided, HumanDecision, IntegrationOutcome, IntegrationStatus, PlanId, PlanState,
-    Store,
+    AgentId, ConcernId, Decided, HumanDecision, IntegrationOutcome, IntegrationStatus, PlanId,
+    PlanState, Store, TaskId,
 };
-use agentctl::{init, integration, scheduler};
+use agentctl::{init, integration, observe, report, scheduler};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -41,6 +43,37 @@ enum Command {
     /// whose lifecycle cannot be proven settled. Nothing is retried, judged or accepted anew. New work waits
     /// for this wherever interrupted work remains.
     Recover,
+    /// Show where the project stands, from its recorded state alone: plans,
+    /// their tasks, what awaits you, unresolved work and token usage.
+    /// Changes nothing and never claims unfinished work is running or done.
+    Status,
+    /// Show the recorded event log, newest last. Chronology only: `status`
+    /// says where things stand.
+    Logs {
+        /// Only this plan's events.
+        #[arg(long)]
+        plan: Option<PlanId>,
+        /// Only this task's events.
+        #[arg(long)]
+        task: Option<TaskId>,
+        /// Only this agent's events.
+        #[arg(long)]
+        agent: Option<AgentId>,
+        /// Only events of this kind, or of a kind group when it ends in a
+        /// dot (`invocation.`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Show the first events after this sequence number, instead of the
+        /// newest.
+        #[arg(long)]
+        after: Option<i64>,
+        /// How many events to show.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        limit: u32,
+        /// Keep waiting for new events until interrupted.
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -129,6 +162,41 @@ fn main() -> Result<()> {
                 anyhow::bail!("scheduling stopped early: {why}");
             }
             Ok(())
+        }
+        Command::Status => {
+            let cwd = std::env::current_dir()?;
+            let project = Project::discover(&cwd)?.context("no agentctl project here")?;
+            let overview = match project.observe()? {
+                Some(store) => Some(observe::overview(
+                    &store,
+                    project.config.agents.max_concurrency,
+                )?),
+                None => None,
+            };
+            print!("{}", report::status(&project.root, overview.as_ref()));
+            Ok(())
+        }
+        Command::Logs {
+            plan,
+            task,
+            agent,
+            kind,
+            after,
+            limit,
+            follow,
+        } => {
+            let cwd = std::env::current_dir()?;
+            let project = Project::discover(&cwd)?.context("no agentctl project here")?;
+            let query = EventQuery {
+                after,
+                plan,
+                task,
+                agent,
+                kind,
+                limit,
+                newest: after.is_none(),
+            };
+            logs(&project, query, follow)
         }
         Command::Recover => {
             let cwd = std::env::current_dir()?;
@@ -318,5 +386,75 @@ fn show_attention(store: &Store, plan: PlanId) -> Result<()> {
             println!("an instruction awaits its planner: `agentctl plan update {plan}`");
         }
     }
+    Ok(())
+}
+
+/// Prints the events `query` selects, then, when `follow`, whatever is
+/// recorded after them, until interrupted. Reads only.
+fn logs(project: &Project, mut query: EventQuery, follow: bool) -> Result<()> {
+    const POLL: Duration = Duration::from_millis(500);
+    const BATCH: u32 = 1000;
+    let mut store = project.observe()?;
+    match &store {
+        Some(store) => {
+            let events = store.query_events(&query)?;
+            print_events(&events)?;
+            if let Some(last) = events.last() {
+                query.after = Some(last.seq);
+            } else if query.newest {
+                // Nothing matched: follow from whatever is recorded now.
+                query.after = store
+                    .query_events(&EventQuery {
+                        after: None,
+                        plan: None,
+                        task: None,
+                        agent: None,
+                        kind: None,
+                        limit: 1,
+                        newest: true,
+                    })?
+                    .last()
+                    .map(|e| e.seq);
+            }
+        }
+        None => {
+            println!("no state yet: nothing has been recorded here");
+        }
+    }
+    if !follow {
+        return Ok(());
+    }
+    query.newest = false;
+    query.limit = BATCH;
+    loop {
+        std::thread::sleep(POLL);
+        if store.is_none() {
+            match project.observe() {
+                Ok(opened) => store = opened,
+                Err(e) => {
+                    eprintln!("agentctl: reading state: {e:#}");
+                    continue;
+                }
+            }
+        }
+        let Some(open) = &store else { continue };
+        match open.query_events(&query) {
+            Ok(events) => {
+                print_events(&events)?;
+                if let Some(last) = events.last() {
+                    query.after = Some(last.seq);
+                }
+            }
+            Err(e) => eprintln!("agentctl: reading events: {e:#}"),
+        }
+    }
+}
+
+fn print_events(events: &[agentctl::state::Event]) -> Result<()> {
+    let mut out = io::stdout().lock();
+    for event in events {
+        writeln!(out, "{}", report::event_line(event))?;
+    }
+    out.flush()?;
     Ok(())
 }

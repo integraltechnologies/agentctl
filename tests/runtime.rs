@@ -8,12 +8,18 @@
 use std::env;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
+use std::num::NonZeroU32;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use agentctl::observe::{self, Dimension, GroupKey};
+use agentctl::project::Project;
+use agentctl::report;
 
 use agentctl::config::ReasoningEffort;
 use agentctl::platform::{self, Capability, Level, Need};
@@ -23,7 +29,8 @@ use agentctl::runtime::{
     self, FailureKind, InvocationState, Launch, Outcome, Provider, TokenUsage, Usage, Workspace,
 };
 use agentctl::state::{
-    ActionStatus, AgentId, AgentScope, Attempt, HumanIntent, Intent, Role, Store,
+    ActionStatus, AgentId, AgentScope, Attempt, EventQuery, HumanIntent, Intent, InvocationId,
+    Role, Store, UnresolvedKind,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -37,6 +44,10 @@ fn main() -> ExitCode {
     let argv0 = env::args_os().next().unwrap_or_default();
     if Path::new(&argv0).file_stem() == Some(OsStr::new(FAKE)) {
         return fake();
+    }
+    if env::var_os("AGENTCTL_TEST_CRASH_STATE").is_some() {
+        crash_child();
+        return ExitCode::SUCCESS;
     }
     // SAFETY: no other thread exists yet.
     unsafe {
@@ -142,6 +153,22 @@ fn main() -> ExitCode {
         (
             "independent_invocations_run_concurrently",
             independent_invocations_run_concurrently,
+        ),
+        (
+            "observation_keeps_provenance_of_real_invocations",
+            observation_keeps_provenance_of_real_invocations,
+        ),
+        (
+            "observation_counts_concurrent_invocations_once",
+            observation_counts_concurrent_invocations_once,
+        ),
+        (
+            "an_unproven_end_is_never_observed_as_success",
+            an_unproven_end_is_never_observed_as_success,
+        ),
+        (
+            "a_crashed_session_is_observed_until_recovery_settles_it",
+            a_crashed_session_is_observed_until_recovery_settles_it,
         ),
         ("live_claude", live_claude),
         ("live_codex", live_codex),
@@ -515,7 +542,7 @@ fn claude_success_is_recorded() {
             ("invocation.running".into(), format!("invocation {id}")),
             (
                 "invocation.ended".into(),
-                format!("invocation {id}: succeeded")
+                format!("invocation {id}: succeeded; usage provider_reported: 8 in, 2 out")
             ),
         ]
     );
@@ -1355,4 +1382,441 @@ fn live_claude() {
 
 fn live_codex() {
     live(Provider::Codex, "gpt-5.6-luna");
+}
+
+const OBSERVED_CONFIG: &str = r#"[project]
+name = "demo"
+version = "0.1.0"
+
+[codegraph]
+roots = ["src"]
+
+[agents]
+max_concurrency = 4
+
+[agents.planner]
+provider = "claude"
+model = "claude-opus-5-5"
+reasoning_effort = "high"
+
+[agents.executor]
+provider = "claude"
+model = "claude-opus-5-5"
+reasoning_effort = "medium"
+
+[agents.verifier]
+provider = "claude"
+model = "claude-opus-5-5"
+reasoning_effort = "xhigh"
+"#;
+
+fn observed_project() -> (TempDir, Project, Store) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("agentctl.toml"), OBSERVED_CONFIG).unwrap();
+    std::fs::create_dir_all(root.join(".agentctl")).unwrap();
+    let project = Project::load(root).unwrap();
+    let store = Store::open(&project.state_path()).unwrap();
+    (dir, project, store)
+}
+
+fn observed_launch(root: &Path, agent: AgentId, provider: Provider, scenario: &str) -> Launch {
+    Launch {
+        agent,
+        provider,
+        executable: Some(fake_provider().to_owned()),
+        model: scenario.to_owned(),
+        effort: None,
+        bootstrap: "Answer with the structured result only.".to_owned(),
+        input: "the task".to_owned(),
+        output_schema: json!({"type": "object"}),
+        cwd: root.to_path_buf(),
+        workspace: Workspace::ReadOnly,
+        lifecycle: runtime::ROLE_LIFECYCLE,
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+fn invocation_events(store: &Store) -> Vec<agentctl::state::Event> {
+    store
+        .query_events(&EventQuery {
+            after: None,
+            plan: None,
+            task: None,
+            agent: None,
+            kind: Some("invocation.".to_owned()),
+            limit: 10_000,
+            newest: false,
+        })
+        .unwrap()
+}
+
+fn is_unresolved(store: &Store, id: InvocationId) -> bool {
+    store
+        .unresolved(None)
+        .unwrap()
+        .iter()
+        .any(|u| matches!(&u.kind, UnresolvedKind::Invocation(i) if *i == id))
+}
+
+fn observation_keeps_provenance_of_real_invocations() {
+    let (dir, project, mut store) = observed_project();
+    let root = dir.path();
+    let plan = store.create_plan(&intent("observe")).unwrap();
+    let scenarios = [
+        (Provider::Claude, "ok"),
+        (Provider::Codex, "codex-ok"),
+        (Provider::Claude, "no-usage"),
+        (Provider::Codex, "codex-leak-prose"),
+    ];
+    for (provider, scenario) in scenarios {
+        let agent = store
+            .create_agent(Role::Planner, AgentScope::Plan(plan))
+            .unwrap();
+        runtime::spawn(
+            &mut store,
+            &observed_launch(root, agent, provider, scenario),
+        )
+        .unwrap()
+        .wait(&mut store)
+        .unwrap();
+    }
+    drop(store);
+
+    let reader = Store::open_existing(&project.state_path()).unwrap();
+    let records = reader.usage_records().unwrap();
+    assert_eq!(records.len(), 4);
+    let total = observe::total(&records);
+    assert_eq!(total.reported.invocations, 2);
+    assert_eq!(total.reported.input, 18);
+    assert_eq!(total.reported.output, 3);
+    assert_eq!(total.reported.cached_input, Some(9));
+    assert_eq!(total.reported.cache_write, None);
+    assert_eq!(total.reported.reasoning, None);
+    assert_eq!(total.reported.total(), 21);
+    assert_eq!(total.estimated.invocations, 0);
+    assert_eq!(total.unavailable, 2);
+    assert_eq!(total.pending, 0);
+
+    let groups = observe::group(&records, Dimension::Provider);
+    let find = |name: &str| {
+        groups
+            .iter()
+            .find(|(k, _)| matches!(k, GroupKey::Provider(p) if p == name))
+            .map(|(_, a)| a)
+            .unwrap()
+    };
+    let claude = find("claude");
+    assert_eq!(claude.reported.input, 8);
+    assert_eq!(claude.reported.output, 2);
+    assert_eq!(claude.unavailable, 1);
+    let codex = find("codex");
+    assert_eq!(codex.reported.input, 10);
+    assert_eq!(codex.reported.output, 1);
+    assert_eq!(codex.unavailable, 1);
+
+    let windows = observe::token_rate(&records, now_ms(), 60);
+    let last = windows.last().unwrap();
+    assert_eq!(last.reported, 21);
+    assert_eq!(last.estimated, 0);
+    assert_eq!(last.unavailable, 2);
+    assert_eq!(windows.iter().map(|w| w.reported).sum::<u64>(), 21);
+
+    let overview = observe::overview(&reader, NonZeroU32::new(4).unwrap()).unwrap();
+    let text = report::status(root, Some(&overview));
+    assert!(
+        text.contains("18 in / 3 out reported; 2 unavailable"),
+        "{text}"
+    );
+    assert!(!text.contains("pending"), "{text}");
+
+    let events = invocation_events(&reader);
+    assert_eq!(events.len(), 12, "{events:?}");
+    for record in &records {
+        let n = events
+            .iter()
+            .filter(|e| {
+                let own = format!("invocation {}", record.invocation);
+                e.detail == own || e.detail.starts_with(&format!("{own}: "))
+            })
+            .count();
+        assert_eq!(n, 3, "{events:?}");
+    }
+    let malformed = records
+        .iter()
+        .find(|r| r.model == "codex-leak-prose")
+        .unwrap();
+    let ended = events
+        .iter()
+        .find(|e| {
+            e.kind == "invocation.ended"
+                && e.detail
+                    .starts_with(&format!("invocation {}: ", malformed.invocation))
+        })
+        .unwrap();
+    assert!(ended.detail.ends_with("; usage unavailable"), "{ended:?}");
+    assert!(events.iter().all(|e| !e.detail.contains(LEAK)));
+}
+
+fn observation_counts_concurrent_invocations_once() {
+    let (dir, project, mut store) = observed_project();
+    let root = dir.path();
+    let path = project.state_path();
+    let mut launches = Vec::new();
+    let mut plans = Vec::new();
+    for _ in 0..3 {
+        let plan = store.create_plan(&intent("observe")).unwrap();
+        plans.push(plan);
+        for k in 0..2 {
+            let agent = store
+                .create_agent(Role::Planner, AgentScope::Plan(plan))
+                .unwrap();
+            let launch = if k == 0 {
+                observed_launch(root, agent, Provider::Codex, "codex-ok")
+            } else {
+                observed_launch(root, agent, Provider::Claude, "ok")
+            };
+            launches.push(launch);
+        }
+    }
+    drop(store);
+
+    let done = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let observer = scope.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut last = 0;
+            loop {
+                let finished = done.load(Ordering::SeqCst);
+                let reader = Store::open_existing(&path).unwrap();
+                let records = reader.usage_records().unwrap();
+                let total = observe::total(&records);
+                assert!(total.reported.invocations >= last);
+                assert!(total.reported.invocations <= 6);
+                last = total.reported.invocations;
+                let groups = observe::group(&records, Dimension::Provider);
+                let count = |name: &str| {
+                    groups
+                        .iter()
+                        .find(|(k, _)| matches!(k, GroupKey::Provider(p) if p == name))
+                        .map_or(0, |(_, a)| a.reported.invocations)
+                };
+                assert_eq!(
+                    total.reported.total(),
+                    count("claude") * 10 + count("codex") * 11
+                );
+                if finished || Instant::now() > deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let writers: Vec<_> = launches
+            .into_iter()
+            .map(|launch| {
+                let path = path.clone();
+                scope.spawn(move || {
+                    let mut store = Store::open(&path).unwrap();
+                    runtime::spawn(&mut store, &launch)
+                        .unwrap()
+                        .wait(&mut store)
+                        .unwrap();
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        observer.join().unwrap();
+    });
+
+    let reader = Store::open_existing(&path).unwrap();
+    let records = reader.usage_records().unwrap();
+    let total = observe::total(&records);
+    assert_eq!(total.reported.invocations, 6);
+    assert_eq!(total.reported.input, 54);
+    assert_eq!(total.reported.output, 9);
+    assert_eq!(total.pending, 0);
+    assert_eq!(total.unavailable, 0);
+    let mut ids: Vec<_> = records.iter().map(|r| r.invocation).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 6);
+
+    let by_plan = observe::group(&records, Dimension::Plan);
+    assert_eq!(by_plan.len(), 3);
+    for plan in &plans {
+        let (_, aggregate) = by_plan
+            .iter()
+            .find(|(k, _)| matches!(k, GroupKey::Plan(p) if p == plan))
+            .unwrap();
+        assert_eq!(aggregate.reported.invocations, 2);
+        assert_eq!(aggregate.reported.input, 18);
+        assert_eq!(aggregate.reported.output, 3);
+    }
+
+    let again = observe::total(&reader.usage_records().unwrap());
+    let fresh = observe::total(
+        &Store::open_existing(&path)
+            .unwrap()
+            .usage_records()
+            .unwrap(),
+    );
+    for other in [&again, &fresh] {
+        assert_eq!(other.reported.invocations, total.reported.invocations);
+        assert_eq!(other.reported.input, total.reported.input);
+        assert_eq!(other.reported.output, total.reported.output);
+        assert_eq!(other.reported.cached_input, total.reported.cached_input);
+        assert_eq!(other.unavailable, total.unavailable);
+        assert_eq!(other.pending, total.pending);
+    }
+}
+
+fn an_unproven_end_is_never_observed_as_success() {
+    let mut f = Fixture::new();
+    let _unproven = runtime::testing::evidence(runtime::testing::Mode::Unproven);
+    let invocation = f.spawn("ok").unwrap();
+    let id = invocation.id();
+    let _error = invocation.wait(&mut f.store).unwrap_err();
+
+    let reader = f.reopen();
+    let records = reader.usage_records().unwrap();
+    let record = records.iter().find(|r| r.invocation == id).unwrap();
+    assert!(record.usage.is_none());
+    assert_eq!(record.state, InvocationState::Running);
+    let total = observe::total(&records);
+    assert_eq!(total.pending, 1);
+    assert_eq!(total.reported.invocations, 0);
+    let overview = observe::overview(&reader, NonZeroU32::new(4).unwrap()).unwrap();
+    assert!(
+        overview
+            .unresolved
+            .iter()
+            .any(|u| matches!(&u.kind, UnresolvedKind::Invocation(i) if *i == id))
+    );
+    let text = report::status(f.dir.path(), Some(&overview));
+    assert!(
+        text.contains("1 invocations with no end recorded"),
+        "{text}"
+    );
+    assert!(text.contains("unresolved records"), "{text}");
+    let prefix = format!("invocation {id}: ");
+    assert!(
+        !invocation_events(&reader)
+            .iter()
+            .any(|e| e.kind == "invocation.ended" && e.detail.starts_with(&prefix))
+    );
+}
+
+fn crash_child() {
+    let path = env::var("AGENTCTL_TEST_CRASH_STATE").unwrap();
+    let agent: AgentId = env::var("AGENTCTL_TEST_CRASH_AGENT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut store = Store::open(Path::new(&path)).unwrap();
+    let id = store
+        .start_invocation(agent, "claude", "crashed", None)
+        .unwrap();
+    store.invocation_running(id).unwrap();
+    println!("{id}");
+    std::process::exit(0)
+}
+
+fn a_crashed_session_is_observed_until_recovery_settles_it() {
+    let (dir, project, mut store) = observed_project();
+    let root = dir.path();
+    let plan = store.create_plan(&intent("crash")).unwrap();
+    let agent = store
+        .create_agent(Role::Planner, AgentScope::Plan(plan))
+        .unwrap();
+    drop(store);
+
+    let output = std::process::Command::new(env::current_exe().unwrap())
+        .env("AGENTCTL_TEST_CRASH_STATE", project.state_path())
+        .env("AGENTCTL_TEST_CRASH_AGENT", agent.to_string())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let id: InvocationId = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let prefix = format!("invocation {id}: ");
+    let no_end = |events: &[agentctl::state::Event]| {
+        !events
+            .iter()
+            .any(|e| e.kind == "invocation.ended" && e.detail.starts_with(&prefix))
+    };
+
+    let reader = Store::open_existing(&project.state_path()).unwrap();
+    let records = reader.usage_records().unwrap();
+    let record = records.iter().find(|r| r.invocation == id).unwrap();
+    assert!(record.usage.is_none());
+    assert_eq!(record.state, InvocationState::Running);
+    assert_eq!(observe::total(&records).pending, 1);
+    assert!(is_unresolved(&reader, id));
+    let overview = observe::overview(&reader, NonZeroU32::new(4).unwrap()).unwrap();
+    let text = report::status(root, Some(&overview));
+    assert!(text.contains("unresolved records"), "{text}");
+    assert!(
+        text.contains("1 invocations with no end recorded"),
+        "{text}"
+    );
+    assert!(no_end(&invocation_events(&reader)));
+    drop(reader);
+
+    let mut store = Store::open(&project.state_path()).unwrap();
+    recovery::recover_with(&project, &mut store, &|_, _| {
+        Lifecycle::Uncertain("cannot prove".into())
+    })
+    .unwrap();
+    let reader = Store::open_existing(&project.state_path()).unwrap();
+    let records = reader.usage_records().unwrap();
+    let record = records.iter().find(|r| r.invocation == id).unwrap();
+    assert!(record.usage.is_none());
+    assert!(is_unresolved(&reader, id));
+    assert!(no_end(&invocation_events(&reader)));
+    drop(reader);
+
+    recovery::recover_with(&project, &mut store, &|_, _| Lifecycle::Gone).unwrap();
+    drop(store);
+    let reader = Store::open_existing(&project.state_path()).unwrap();
+    let records = reader.usage_records().unwrap();
+    let record = records.iter().find(|r| r.invocation == id).unwrap();
+    assert_eq!(record.state, InvocationState::Interrupted);
+    assert!(matches!(record.usage, Some(Usage::Unavailable)));
+    let total = observe::total(&records);
+    assert_eq!(total.unavailable, 1);
+    assert_eq!(total.pending, 0);
+    assert_eq!(total.reported.invocations, 0);
+    assert!(!is_unresolved(&reader, id));
+    let overview = observe::overview(&reader, NonZeroU32::new(4).unwrap()).unwrap();
+    let text = report::status(root, Some(&overview));
+    assert!(text.contains("1 unavailable"), "{text}");
+    assert!(!text.contains("no end recorded"), "{text}");
+    let events = invocation_events(&reader);
+    assert!(
+        events.iter().any(|e| e.kind == "invocation.ended"
+            && e.detail == format!("invocation {id}: interrupted; usage unavailable")),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|e| e.kind == "invocation.started"));
+    assert!(events.iter().any(|e| e.kind == "invocation.running"));
+
+    let second = Store::open_existing(&project.state_path()).unwrap();
+    let again = second.usage_records().unwrap();
+    assert_eq!(again.len(), records.len());
+    let again_record = again.iter().find(|r| r.invocation == id).unwrap();
+    assert_eq!(again_record.state, record.state);
+    assert_eq!(again_record.ended_at, record.ended_at);
+    assert_eq!(invocation_events(&second).len(), events.len());
 }

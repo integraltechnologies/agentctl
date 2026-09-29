@@ -27,6 +27,7 @@ mod attention;
 mod execution;
 mod graph;
 mod integration;
+mod observation;
 mod ownership;
 mod planning;
 mod recovery;
@@ -42,6 +43,7 @@ pub use execution::{Capture, Change, ChangeKind, Content, Execution, ExecutionSt
 pub(crate) use execution::{ExecutorResult, Observed};
 pub(crate) use integration::IntegrationObserved;
 pub use integration::{Integration, IntegrationResult, IntegrationStatus};
+pub use observation::{EventQuery, UsageRecord};
 pub use ownership::{Acquisition, Conflict, Owner};
 pub(crate) use recovery::ActedOn;
 pub use recovery::{Unresolved, UnresolvedKind};
@@ -727,8 +729,19 @@ impl Store {
     /// Opens the store at `path`, creating it if no file exists there. An
     /// existing file must already be an agentctl store.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_in(path, true)
+    }
+
+    /// Opens the store at `path`, which must already exist: nothing is
+    /// created, so observing a project that has no store leaves no trace.
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        Self::open_in(path, false)
+    }
+
+    fn open_in(path: &Path, create_missing: bool) -> Result<Self> {
         let open = || -> Result<Self> {
             if !path.try_exists()? {
+                ensure!(create_missing, "no state store exists");
                 create(path)?;
             }
             // Never create a file here: one that vanished since is an error.
@@ -812,24 +825,7 @@ impl Store {
 
     pub fn plan(&self, id: PlanId) -> Result<Plan> {
         self.conn
-            .query_row(
-                "SELECT objective, constraints, completion_criteria, state, created_at, updated_at
-                 FROM plans WHERE id = ?1",
-                [id],
-                |r| {
-                    Ok(Plan {
-                        id,
-                        intent: HumanIntent {
-                            objective: r.get(0)?,
-                            constraints: json_column(r, 1)?,
-                            completion_criteria: json_column(r, 2)?,
-                        },
-                        state: r.get(3)?,
-                        created_at: r.get(4)?,
-                        updated_at: r.get(5)?,
-                    })
-                },
-            )
+            .query_row(&format!("{PLAN_COLUMNS} WHERE id = ?1"), [id], plan_row)
             .optional()?
             .with_context(|| format!("plan {id} does not exist"))
     }
@@ -1233,10 +1229,23 @@ impl Store {
                 .with_context(|| format!("recording invocation {invocation} as {}", end.state))?
                 .with_context(|| format!("invocation {invocation} is not live"))?;
             let (plan, task) = agent_subject(tx, agent)?;
-            let detail = match end.failure {
+            let mut detail = match end.failure {
                 Some(kind) => format!("invocation {invocation}: {} ({kind})", end.state),
                 None => format!("invocation {invocation}: {}", end.state),
             };
+            // How usage was established, never provider text.
+            detail.push_str(&match end.usage {
+                Usage::ProviderReported(t) => {
+                    format!(
+                        "; usage provider_reported: {} in, {} out",
+                        t.input, t.output
+                    )
+                }
+                Usage::LocalEstimate(t) => {
+                    format!("; usage local_estimate: ~{} in, ~{} out", t.input, t.output)
+                }
+                Usage::Unavailable => "; usage unavailable".to_string(),
+            });
             event(
                 tx,
                 "invocation.ended",
@@ -1366,6 +1375,23 @@ impl Store {
             .collect::<rusqlite::Result<_>>()
             .map_err(Into::into)
     }
+}
+
+const PLAN_COLUMNS: &str = "SELECT id, objective, constraints, completion_criteria, state,
+    created_at, updated_at FROM plans";
+
+fn plan_row(r: &rusqlite::Row) -> rusqlite::Result<Plan> {
+    Ok(Plan {
+        id: r.get(0)?,
+        intent: HumanIntent {
+            objective: r.get(1)?,
+            constraints: json_column(r, 2)?,
+            completion_criteria: json_column(r, 3)?,
+        },
+        state: r.get(4)?,
+        created_at: r.get(5)?,
+        updated_at: r.get(6)?,
+    })
 }
 
 const INVOCATION_COLUMNS: &str = "SELECT id, agent_id, provider, model, effort, state,

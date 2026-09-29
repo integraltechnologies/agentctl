@@ -64,6 +64,17 @@ impl Project {
         self.root.join(STATE_DIR).join(STATE_DB)
     }
 
+    /// Opens the canonical state store for observation, or `None` when the
+    /// project has none. Creates nothing: no directory, no `.gitignore`
+    /// entry, no store.
+    pub fn observe(&self) -> Result<Option<Store>> {
+        let path = self.state_path();
+        if !path.try_exists()? {
+            return Ok(None);
+        }
+        Store::open_existing(&path).map(Some)
+    }
+
     /// Ensures the local, Git-ignored `.agentctl/` state directory exists and
     /// opens its canonical state store, creating it if absent.
     pub fn hydrate(&self) -> Result<Store> {
