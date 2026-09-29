@@ -42,6 +42,29 @@ jobs:
           rustup default stable
           cargo --version
           rustc --version
+      # procd is an immutable external dependency: fetched from its published
+      # tag (commit-pinned so a moved tag cannot change it), built with its own
+      # CMake, and staged into a runner-local prefix. procd v0.1.0 has no
+      # install rules, so the public header and static library are copied
+      # explicitly. autocrlf is off so procd.h keeps the bytes build.rs hashes.
+      - name: procd v0.1.0 (external dependency)
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/procd-src"
+          prefix="$RUNNER_TEMP/procd-prefix"
+          git -c core.autocrlf=false clone --quiet --depth 1 --branch v0.1.0 \
+            https://github.com/integraltechnologies/procd "$src"
+          test "$(git -C "$src" rev-parse HEAD)" = 2e3bb6e86156a8863dde52940f0020eb6d7d18e7
+          cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$src/build" --config Release --target procd
+          mkdir -p "$prefix/include" "$prefix/lib"
+          cp "$src/include/procd.h" "$prefix/include/procd.h"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "$src/build/Release/procd.lib" "$prefix/lib/procd.lib"
+          else
+            cp "$src/build/libprocd.a" "$prefix/lib/libprocd.a"
+          fi
+          echo "PROCD_PREFIX=$prefix" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           key: static
@@ -81,6 +104,29 @@ jobs:
           rustc --version
           # The runner label must actually provide the intended architecture.
           rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.host }}"
+      # procd is an immutable external dependency: fetched from its published
+      # tag (commit-pinned so a moved tag cannot change it), built with its own
+      # CMake, and staged into a runner-local prefix. procd v0.1.0 has no
+      # install rules, so the public header and static library are copied
+      # explicitly. autocrlf is off so procd.h keeps the bytes build.rs hashes.
+      - name: procd v0.1.0 (external dependency)
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/procd-src"
+          prefix="$RUNNER_TEMP/procd-prefix"
+          git -c core.autocrlf=false clone --quiet --depth 1 --branch v0.1.0 \
+            https://github.com/integraltechnologies/procd "$src"
+          test "$(git -C "$src" rev-parse HEAD)" = 2e3bb6e86156a8863dde52940f0020eb6d7d18e7
+          cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$src/build" --config Release --target procd
+          mkdir -p "$prefix/include" "$prefix/lib"
+          cp "$src/include/procd.h" "$prefix/include/procd.h"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "$src/build/Release/procd.lib" "$prefix/lib/procd.lib"
+          else
+            cp "$src/build/libprocd.a" "$prefix/lib/libprocd.a"
+          fi
+          echo "PROCD_PREFIX=$prefix" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           key: test

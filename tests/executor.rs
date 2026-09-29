@@ -23,9 +23,9 @@ use agentctl::planner::{self, Command as Plan};
 use agentctl::project::Project;
 use agentctl::runtime::{FailureKind, InvocationState};
 use agentctl::state::{
-    AcceptedSource, Acquisition, ActionOutcome, ActionStatus, AgentScope, Attribution, ChangeKind,
-    Content, ExecutionOutcome, ExecutionStatus, GenerationId, GenerationState, Install,
-    InstallOutcome, Intent, JournalId, Role, Store, TaskId, TaskState,
+    AcceptedSource, Acquisition, ActionOutcome, ActionStatus, AgentScope, ChangeKind, Content,
+    ExecutionOutcome, ExecutionStatus, GenerationId, GenerationState, Install, InstallOutcome,
+    Intent, JournalId, Role, Store, TaskId, TaskState,
 };
 use agentctl::{graph, source};
 use serde_json::{Value, json};
@@ -83,8 +83,8 @@ fn main() -> ExitCode {
             preexisting_drift_is_not_attributed,
         ),
         (
-            "lingering_writers_are_unattributable",
-            lingering_writers_are_unattributable,
+            "lingering_writers_end_with_their_lifecycle_domain",
+            lingering_writers_end_with_their_lifecycle_domain,
         ),
         (
             "workspaces_hold_no_canonical_state",
@@ -993,16 +993,17 @@ fn preexisting_drift_is_not_attributed() {
     assert_eq!(fx.read("README.md").unwrap(), b"# edited by a human\n");
 }
 
-fn lingering_writers_are_unattributable() {
-    // The workspace keeps changing after the executor ended.
+fn lingering_writers_end_with_their_lifecycle_domain() {
+    // A process the executor leaves behind keeps writing to the workspace,
+    // holding none of its streams. The executor's lifecycle domain is
+    // terminated when it ends, so nothing outlives it to change the workspace
+    // afterwards: what is captured is what the executor left.
     let fx = Fixture::new();
-    let untouched = tree(&fx);
     let (_, executed) = fx.run("linger", &["src/a.rs"]);
-    assert_eq!(executed.capture.outcome, ExecutionOutcome::Unattributable);
-    assert_eq!(executed.capture.attribution, Some(Attribution::Unsettled));
-    assert_eq!(executed.capture.install, Install::NotAttempted);
+    assert_eq!(executed.capture.outcome, ExecutionOutcome::Candidate);
+    let settled = tree(&fx);
     thread::sleep(Duration::from_secs(2));
-    assert_eq!(tree(&fx), untouched);
+    assert_eq!(tree(&fx), settled);
 }
 
 fn workspaces_hold_no_canonical_state() {

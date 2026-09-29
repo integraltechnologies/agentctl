@@ -8,6 +8,15 @@
 //! session is observed as metadata, never resumed and never identity.
 //! Provider command lines and output formats live only in the adapters.
 //!
+//! Lifecycle is procd's. Every invocation's processes run in a lifecycle
+//! domain that procd creates, before anything is recorded or run, at the
+//! strength the launch requires, and whose durable identity is recorded with
+//! the invocation before its first process exists. Cancellation, and the end
+//! of every invocation however it ended, terminate the domain by procd's
+//! authority: nothing a provider started is left to outlive it, or to depend
+//! on agentctl's death. The provider itself is started by a small shim, the
+//! domain's first process (see [`shim`]).
+//!
 //! A launch delivers its whole input on the provider's standard input, which
 //! is then closed: neither adapter's non-interactive mode accepts input
 //! mid-run. The provider must answer with one structured result satisfying
@@ -21,33 +30,115 @@
 
 mod claude;
 mod codex;
+pub mod shim;
+
+#[cfg(any(test, feature = "lifecycle-double"))]
+pub mod testing {
+    //! A test double for what terminating a domain proves, never built
+    //! into agentctl itself. By default a termination that succeeded is
+    //! taken for proof, so that suites can complete runs where procd's
+    //! backend cannot prove a domain empty. A test says otherwise with
+    //! [`evidence`] in its thread, or [`EVIDENCE`] in a child process's
+    //! environment (`real` or `unproven`).
+
+    use std::cell::Cell;
+
+    use crate::procd::{Evidence, State};
+
+    /// Set in a test process's environment to a [`Mode`]'s name.
+    pub const EVIDENCE: &str = "AGENTCTL_TEST_EVIDENCE";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Mode {
+        /// A termination that succeeded proves the domain empty.
+        Proven,
+        /// procd's own evidence, whatever it proves.
+        Real,
+        /// Nothing is ever proven: what a backend that cannot prove
+        /// emptiness reports.
+        Unproven,
+    }
+
+    thread_local!(static MODE: Cell<Option<Mode>> = const { Cell::new(None) });
+
+    /// Puts this thread in `mode` while it lives.
+    pub struct Guard(Option<Mode>);
+
+    pub fn evidence(mode: Mode) -> Guard {
+        Guard(MODE.replace(Some(mode)))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            MODE.set(self.0);
+        }
+    }
+
+    fn mode() -> Mode {
+        MODE.get()
+            .unwrap_or_else(|| match std::env::var(EVIDENCE).as_deref() {
+                Ok("real") => Mode::Real,
+                Ok("unproven") => Mode::Unproven,
+                _ => Mode::Proven,
+            })
+    }
+
+    pub(super) fn adjust(reported: Evidence) -> Evidence {
+        match mode() {
+            Mode::Real => reported,
+            Mode::Proven => Evidence {
+                admission_closed: true,
+                authority_directed: true,
+                emptiness_proven: true,
+                enforced: true,
+                final_state: Some(State::Empty),
+                detail: format!("test double over: {}", reported.detail),
+            },
+            Mode::Unproven => Evidence {
+                emptiness_proven: false,
+                enforced: false,
+                final_state: Some(State::Unresolved),
+                detail: format!("test double over: {}", reported.detail),
+                ..reported
+            },
+        }
+    }
+}
+
+/// Terminates `domain` by procd's authority, and says what that established.
+fn terminate_domain(domain: &Domain) -> Result<Evidence> {
+    let evidence = domain.terminate(procd::TERMINATE_TIMEOUT)?;
+    #[cfg(any(test, feature = "lifecycle-double"))]
+    let evidence = testing::adjust(evidence);
+    Ok(evidence)
+}
 
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
-use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use std::{env, fmt};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use jsonschema::Validator;
 use serde_json::{Map, Value};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 use crate::config::ReasoningEffort;
-use crate::platform::{self, Capability, Level};
+use crate::platform::{self, Need};
+use crate::procd::{self, Domain, Evidence};
 use crate::state::{AgentId, InvocationId, Store};
 
 pub use crate::state::{FailureKind, InvocationEnd, InvocationState, TokenUsage, Usage};
 
 const POLL: Duration = Duration::from_millis(20);
-/// How long a provider asked to terminate may take before it is killed.
-const TERMINATION_GRACE: Duration = Duration::from_secs(3);
-/// How long a killed provider may take to be observed exiting.
+/// How long a terminated domain's shim may take to be seen ending.
 const KILL_WAIT: Duration = Duration::from_secs(5);
 /// How long output may keep flowing once the provider has exited. A
 /// descendant that inherited its pipes can hold them open indefinitely.
@@ -106,6 +197,13 @@ pub enum Workspace {
     Disposable,
 }
 
+/// The lifecycle guarantee agentctl's own roles launch with. An invocation
+/// whose processes procd cannot enforce the termination of is not refused:
+/// procd's evidence, not agentctl's hope, decides what it may release, so
+/// whatever cannot be proven stays unresolved and blocks recovery (see
+/// `crate::recovery`). A launch may require `Need::RequireEnforced` instead.
+pub const ROLE_LIFECYCLE: Need = Need::AllowBestEffort;
+
 /// Everything needed to launch one invocation.
 #[derive(Debug, Clone)]
 pub struct Launch {
@@ -125,6 +223,12 @@ pub struct Launch {
     /// The absolute working directory.
     pub cwd: PathBuf,
     pub workspace: Workspace,
+    /// The lifecycle guarantee procd must establish for the invocation's
+    /// processes. `RequireEnforced` refuses the launch, before anything is
+    /// recorded or run, unless procd can enforce termination of the whole
+    /// process tree here; `AllowBestEffort` runs at whatever level procd
+    /// offers, and what it cannot prove afterwards stays unresolved.
+    pub lifecycle: Need,
 }
 
 /// How an invocation ended, with what agentctl received from the provider.
@@ -148,9 +252,10 @@ pub struct Outcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observation {
     pub state: InvocationState,
-    /// The provider process, once launched: diagnostic, never identity.
+    /// The first process of the invocation's lifecycle domain (its shim),
+    /// once launched: diagnostic, never identity or authority.
     pub pid: Option<u32>,
-    /// Whether agentctl has seen the process exit.
+    /// Whether agentctl has seen the provider exit.
     pub exited: bool,
     pub cancel_requested: bool,
     /// How long since the provider last wrote any output.
@@ -249,11 +354,18 @@ pub fn spawn_after(
         Provider::Codex => codex::prepare(launch),
     }?;
     let effort = launch.effort.map(|e| e.to_string());
-    let id = store.start_invocation(
+    // Admission: the domain that will own every process of the invocation
+    // is established, or refused, before anything is recorded or run.
+    let domain = Domain::create(launch.lifecycle, &format!("agentctl {}", launch.provider))
+        .map_err(|e| anyhow!("refusing to launch {}: {e}", launch.provider))?;
+    // Its identity is recorded with the invocation, so no process can exist
+    // that a restart cannot name the domain of.
+    let id = store.start_contained_invocation(
         launch.agent,
         launch.provider.name(),
         &launch.model,
         effort.as_deref(),
+        domain.identity(),
     )?;
     if let Err(e) = prepare(store, id) {
         let end = InvocationEnd {
@@ -273,9 +385,9 @@ pub fn spawn_after(
         progress: Mutex::new(Progress::new(prepared.decoder)),
         schema,
     });
-    let child = match start(launch, &prepared.args, &prepared.env) {
-        Ok(child) => child,
-        Err((kind, why)) => {
+    let process = match start(launch, &prepared.args, domain, &shared, &launch.input) {
+        Launched::Process(process) => *process,
+        Launched::Failed(kind, why) => {
             let end = InvocationEnd {
                 state: InvocationState::Failed,
                 failure: Some(kind),
@@ -299,14 +411,17 @@ pub fn spawn_after(
                 stage: Stage::Ended(Box::new(outcome)),
             });
         }
+        // A process may have existed, and its termination was not
+        // confirmed: the record stays `starting`, unresolved.
+        Launched::Unconfirmed(why) => bail!("{why}"),
     };
-    let process = Process::own(child, &shared, launch.input.clone(), prepared.files);
+    let process = process.with_files(prepared.files);
     let invocation = Invocation {
         id,
         shared,
         stage: Stage::Launched(process),
     };
-    // Should this fail, dropping `invocation` kills the process, and the
+    // Should this fail, dropping `invocation` terminates its domain, and the
     // record stays `starting`: a process may have existed.
     store.invocation_running(id)?;
     invocation.shared.progress().state = InvocationState::Running;
@@ -331,7 +446,11 @@ impl Invocation {
             Stage::Ended(outcome) => return Ok(*outcome),
             Stage::Launched(process) => process,
         };
-        let outcome = process.supervise(self.id, &self.shared);
+        // Unless procd proved the domain empty, nothing is recorded: the
+        // invocation keeps no end, which is what unresolved means.
+        let outcome = process
+            .supervise(self.id, &self.shared)
+            .map_err(anyhow::Error::new)?;
         store
             .finish_invocation(self.id, &outcome.end)
             .with_context(|| format!("recording how invocation {} ended", self.id))?;
@@ -343,7 +462,6 @@ impl Invocation {
 /// A provider command line, as an adapter prepares it.
 struct Prepared {
     args: Vec<OsString>,
-    env: Passthrough,
     decoder: Decoder,
     /// Files the arguments name, removed once the invocation ends.
     files: Vec<NamedTempFile>,
@@ -420,60 +538,141 @@ impl Passthrough {
     }
 }
 
-/// Spawns the provider executable itself: never through a shell, with only
-/// the environment it needs, and with every standard stream owned.
+/// What starting an invocation's processes came to.
+enum Launched {
+    Process(Box<Process>),
+    /// No provider process ran, for the reason given.
+    Failed(FailureKind, String),
+    /// A process may have run, and its domain could not be terminated.
+    Unconfirmed(String),
+}
+
+/// Starts the provider in `domain`: the provider executable itself, never
+/// through a shell, by way of the shim that gives it exactly the standard
+/// streams, working directory and environment agentctl constructs.
 fn start(
     launch: &Launch,
     args: &[OsString],
-    passthrough: &Passthrough,
-) -> Result<Child, (FailureKind, String)> {
+    domain: Domain,
+    shared: &Arc<Shared>,
+    input: &str,
+) -> Launched {
+    let failed = |kind, why: String| Launched::Failed(kind, why);
     let name = launch.provider.name();
     let exe = match &launch.executable {
         Some(path) => path.clone(),
-        None => which::which(name).map_err(|e| {
-            (
-                FailureKind::ExecutableMissing,
-                format!("no `{name}` executable on PATH ({e})"),
-            )
-        })?,
+        None => match which::which(name) {
+            Ok(path) => path,
+            Err(e) => {
+                return failed(
+                    FailureKind::ExecutableMissing,
+                    format!("no `{name}` executable on PATH ({e})"),
+                );
+            }
+        },
     };
     if !exe.is_file() {
-        return Err((
+        return failed(
             FailureKind::ExecutableMissing,
             format!("no {name} executable at {}", exe.display()),
-        ));
+        );
     }
     if !platform::runs_directly(&exe) {
-        return Err((
+        return failed(
             FailureKind::SpawnFailed,
             format!(
                 "{} would run through a command interpreter; agentctl runs providers directly",
                 exe.display()
             ),
-        ));
+        );
     }
-    Command::new(&exe)
-        .args(args)
-        .current_dir(&launch.cwd)
-        .env_clear()
-        .envs(
-            env::vars_os().filter(|(name, _)| name.to_str().is_some_and(|n| passthrough.passes(n))),
+    let spec = shim::Spec {
+        provider: launch.provider,
+        exe,
+        cwd: launch.cwd.clone(),
+        args: args.to_vec(),
+    };
+    let unusable = |what: &str, e: anyhow::Error| {
+        failed(
+            FailureKind::SpawnFailed,
+            format!("cannot start the provider: {what}: {e:#}"),
         )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            (
-                FailureKind::SpawnFailed,
-                format!(
-                    "cannot start {} in {}: {e}",
-                    exe.display(),
-                    launch.cwd.display()
-                ),
-            )
-        })
+    };
+    let shim_exe = match shim::locate() {
+        Ok(path) => path,
+        Err(e) => return unusable("no provider shim", e),
+    };
+    let rendezvous = match shim::Rendezvous::create(&spec) {
+        Ok(rendezvous) => rendezvous,
+        Err(e) => return unusable("no channel to the provider", e),
+    };
+    let (Some(shim_arg), Some(dir_arg)) = (shim_exe.to_str(), rendezvous.dir().to_str()) else {
+        return failed(
+            FailureKind::SpawnFailed,
+            "cannot start the provider: a path is not text procd can be given".into(),
+        );
+    };
+    // procd places the shim in the domain before it runs; when it cannot,
+    // nothing runs at all.
+    let pid = match domain.spawn(&[shim_arg, dir_arg]) {
+        Ok(pid) => pid,
+        Err(e) => return failed(FailureKind::SpawnFailed, format!("{e:#}")),
+    };
+    // From here a process exists: it is never left without its domain being
+    // terminated, or the invocation stays unresolved.
+    let abandon = |why: String| abandoned(terminate_domain(&domain), why);
+    let (streams, started, dir) = match rendezvous.accept() {
+        Ok(accepted) => accepted,
+        Err(e) => return abandon(format!("{e:#}")),
+    };
+    match started {
+        shim::Started::Yes => {}
+        shim::Started::Failed(why) => return abandon(why),
+    }
+    Launched::Process(Box::new(Process::own(
+        domain,
+        streams,
+        dir,
+        pid,
+        shared,
+        input.to_owned(),
+    )))
 }
+
+/// What abandoning a launch whose process may have run came to. That
+/// terminating succeeded says nothing of the domain: only evidence that
+/// proves it empty settles the launch as one that failed to spawn.
+fn abandoned(terminated: Result<Evidence>, why: String) -> Launched {
+    match terminated {
+        Ok(evidence) if evidence.proves_empty() => Launched::Failed(FailureKind::SpawnFailed, why),
+        Ok(evidence) => Launched::Unconfirmed(format!(
+            "{why}; and its domain was terminated but not proven empty ({})",
+            evidence.detail
+        )),
+        Err(e) => Launched::Unconfirmed(format!("{why}; and its domain is not terminated: {e:#}")),
+    }
+}
+
+/// An invocation whose lifecycle domain procd did not prove empty. Whatever
+/// the provider did or reported, nothing is recorded of how it ended: it
+/// stays unresolved, and only recovery may settle it, by procd's proof.
+#[derive(Debug)]
+pub struct Unresolved {
+    pub invocation: InvocationId,
+    pub why: String,
+}
+
+impl fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invocation {} is left unresolved: {}",
+            self.invocation, self.why
+        )
+    }
+}
+
+impl std::error::Error for Unresolved {}
 
 struct Shared {
     cancel: AtomicBool,
@@ -495,6 +694,11 @@ struct Progress {
     exited: bool,
     input_delivered: bool,
     input_error: Option<String>,
+    /// How the shim said the provider ended: its raw exit status, and
+    /// whether an output stream stayed open after it.
+    ended: Option<(i64, bool)>,
+    /// That the shim's control channel closed: it will report nothing more.
+    control_closed: bool,
     last_output: Option<Instant>,
     events: u64,
     last_event: Option<String>,
@@ -511,6 +715,8 @@ impl Progress {
             exited: false,
             input_delivered: false,
             input_error: None,
+            ended: None,
+            control_closed: false,
             last_output: None,
             events: 0,
             last_event: None,
@@ -586,124 +792,162 @@ fn parse_event(line: &[u8]) -> Result<(String, Value), &'static str> {
     }
 }
 
-/// A launched provider process and the threads serving its streams.
+/// How the provider ended, as agentctl observed it.
+enum End {
+    Exited {
+        status: ExitStatus,
+        held: bool,
+    },
+    /// agentctl terminated its domain first; the provider's own status is
+    /// known only if it was reported before it was cut off.
+    Cancelled {
+        status: Option<ExitStatus>,
+    },
+}
+
+/// An invocation's lifecycle domain and the threads serving its streams.
 struct Process {
-    child: Child,
-    reaped: bool,
+    domain: Domain,
+    /// What terminating the domain established, once it was terminated.
+    stopped: Option<Evidence>,
     threads: Vec<JoinHandle<()>>,
+    _dir: TempDir,
     _files: Vec<NamedTempFile>,
 }
 
 impl Process {
     fn own(
-        mut child: Child,
+        domain: Domain,
+        streams: shim::Streams,
+        dir: TempDir,
+        pid: Option<u32>,
         shared: &Arc<Shared>,
         input: String,
-        files: Vec<NamedTempFile>,
     ) -> Self {
-        shared.progress().pid = Some(child.id());
-        let mut stdin = child.stdin.take().expect("stdin is piped");
-        let stdout = child.stdout.take().expect("stdout is piped");
-        let stderr = child.stderr.take().expect("stderr is piped");
+        shared.progress().pid = pid;
+        let shim::Streams {
+            input: mut stdin,
+            output,
+            error,
+            control,
+        } = streams;
         let writer = {
             let shared = Arc::clone(shared);
-            // Dropping `stdin` afterwards closes it: the input is complete.
+            // Closing the stream afterwards says the input is complete. That
+            // it reached the provider is the shim's to report.
             thread::spawn(move || match stdin.write_all(input.as_bytes()) {
-                Ok(()) => shared.progress().input_delivered = true,
-                Err(e) => shared.progress().input_error = Some(e.to_string()),
+                Ok(()) => {
+                    let _ = stdin.shutdown(Shutdown::Write);
+                }
+                Err(e) => {
+                    shared
+                        .progress()
+                        .input_error
+                        .get_or_insert_with(|| e.to_string());
+                }
             })
         };
         let reader = {
             let shared = Arc::clone(shared);
-            thread::spawn(move || read_events(stdout, &shared))
+            thread::spawn(move || read_events(output, &shared))
         };
         let diagnostics = {
             let shared = Arc::clone(shared);
-            thread::spawn(move || read_stderr(stderr, &shared))
+            thread::spawn(move || read_stderr(error, &shared))
+        };
+        let supervisor = {
+            let shared = Arc::clone(shared);
+            thread::spawn(move || read_control(control, &shared))
         };
         Self {
-            child,
-            reaped: false,
-            threads: vec![writer, reader, diagnostics],
-            _files: files,
+            domain,
+            stopped: None,
+            threads: vec![writer, reader, diagnostics, supervisor],
+            _dir: dir,
+            _files: Vec::new(),
         }
     }
 
-    /// Waits for the process to end, terminating it once cancellation is
-    /// requested, and classifies how the invocation ended.
-    fn supervise(mut self, invocation: InvocationId, shared: &Shared) -> Outcome {
-        let ended = self.wait_or_terminate(&shared.cancel);
+    /// Keeps `files`, which the provider's arguments name, until the
+    /// invocation ends.
+    fn with_files(mut self, files: Vec<NamedTempFile>) -> Self {
+        self._files = files;
+        self
+    }
+
+    /// Terminates the domain by procd's authority, if not yet terminated:
+    /// the one way an invocation's processes are ended.
+    fn terminate(&mut self) -> Result<&Evidence, String> {
+        if self.stopped.is_none() {
+            let evidence = terminate_domain(&self.domain).map_err(|e| format!("{e:#}"))?;
+            self.stopped = Some(evidence);
+        }
+        Ok(self.stopped.as_ref().expect("terminated"))
+    }
+
+    /// Waits for the provider to end, terminating its domain once
+    /// cancellation is requested, and classifies how the invocation ended.
+    /// Unresolved unless procd proved the domain empty.
+    fn supervise(
+        mut self,
+        invocation: InvocationId,
+        shared: &Shared,
+    ) -> Result<Outcome, Unresolved> {
+        let ended = self.wait_or_terminate(shared);
+        // However it ended, nothing it started is left behind, and nothing
+        // relies on a parent's death: the domain is terminated.
+        let cleaned = self.terminate().cloned();
         shared.progress().exited = ended.is_ok();
-        let drained = ended.is_ok() && self.drain();
-        let p = shared.progress();
-        let (state, failure, mut diagnostic, status) = match ended {
-            Ok((status, cancelled)) => {
-                let (state, failure, diagnostic) = classify(status, cancelled, &p, &shared.schema);
-                (state, failure, diagnostic, Some(status))
-            }
-            Err(why) => (InvocationState::Interrupted, None, Some(why), None),
-        };
-        if status.is_some() && !drained {
-            let note = "its output stayed open after it exited, held by a process it started";
-            diagnostic = Some(match diagnostic {
-                Some(d) => format!("{d}; {note}"),
-                None => note.to_owned(),
-            });
-        }
-        Outcome {
+        conclude(
             invocation,
-            end: InvocationEnd {
-                state,
-                failure,
-                diagnostic: diagnostic.map(|d| clip(&d, DIAGNOSTIC_LIMIT)),
-                exit_code: status.and_then(|s| s.code()),
-                provider_session: p.stream.session.clone(),
-                usage: p.stream.usage(),
-            },
-            payload: (state == InvocationState::Succeeded)
-                .then(|| p.stream.result.clone())
-                .flatten(),
-            provider_metadata: p.stream.metadata.clone(),
-            stderr: String::from_utf8_lossy(&p.stderr).into_owned(),
-        }
+            ended,
+            cleaned,
+            || self.drain(),
+            &shared.progress(),
+            &shared.schema,
+        )
     }
 
-    /// The process's exit status, and whether agentctl terminated it; an
-    /// error when its end cannot be established.
-    fn wait_or_terminate(&mut self, cancel: &AtomicBool) -> Result<(ExitStatus, bool), String> {
-        let mut kill_at: Option<Instant> = None;
-        let mut killed: Option<(Instant, Option<std::io::Error>)> = None;
+    /// How the provider ended; an error when that cannot be established.
+    fn wait_or_terminate(&mut self, shared: &Shared) -> Result<End, String> {
+        let mut terminated: Option<Instant> = None;
         loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    self.reaped = true;
-                    return Ok((status, kill_at.is_some()));
+            {
+                let p = shared.progress();
+                if let Some((raw, held)) = p.ended {
+                    let status = shim::status_from_raw(raw).ok_or_else(|| {
+                        format!("the provider's exit status ({raw}) is not one this host has")
+                    })?;
+                    return Ok(match terminated {
+                        Some(_) => End::Cancelled {
+                            status: Some(status),
+                        },
+                        None => End::Exited { status, held },
+                    });
                 }
-                Ok(None) => {}
-                Err(e) => return Err(format!("cannot observe the provider process: {e}")),
+                if p.control_closed {
+                    return match terminated {
+                        Some(_) => Ok(End::Cancelled { status: None }),
+                        None => Err("the provider's shim ended without reporting how the \
+                                     provider ended"
+                            .into()),
+                    };
+                }
             }
             let now = Instant::now();
-            if kill_at.is_none() && cancel.load(Ordering::SeqCst) {
-                // Without a graceful request, termination is the kill.
-                kill_at = Some(match platform::request_termination(&self.child) {
-                    Ok(true) => now + TERMINATION_GRACE,
-                    Ok(false) | Err(_) => now,
-                });
-            }
-            match &killed {
-                None if kill_at.is_some_and(|at| now >= at) => {
-                    killed = Some((now, self.child.kill().err()));
+            match terminated {
+                None if shared.cancel.load(Ordering::SeqCst) => {
+                    self.terminate()
+                        .map_err(|why| format!("termination not confirmed: {why}"))?;
+                    terminated = Some(now);
+                    continue;
                 }
-                Some((at, error)) if now >= *at + KILL_WAIT => {
-                    let error = error
-                        .as_ref()
-                        .map(|e| format!(" ({e})"))
-                        .unwrap_or_default();
-                    return Err(format!(
-                        "termination not confirmed: provider process {} was killed{error} \
-                         but not seen to exit",
-                        self.child.id()
-                    ));
+                Some(at) if now >= at + KILL_WAIT => {
+                    return Err(
+                        "termination not confirmed: the domain was terminated but its \
+                                shim was not seen to end"
+                            .into(),
+                    );
                 }
                 _ => {}
             }
@@ -725,43 +969,112 @@ impl Process {
     }
 }
 
-impl Drop for Process {
-    /// A process agentctl stops owning is killed and, if it exits in time,
-    /// reaped, so that it neither lingers nor becomes a zombie.
-    fn drop(&mut self) {
-        if self.reaped {
-            return;
+/// Why `terminated` does not settle an invocation's lifecycle, if it does
+/// not. Only evidence that proves the domain empty does: a termination
+/// that succeeded is no proof.
+fn unproven(terminated: &Result<Evidence, String>) -> Option<String> {
+    match terminated {
+        Ok(evidence) if evidence.proves_empty() => None,
+        Ok(evidence) => Some(format!(
+            "its lifecycle domain was terminated but not proven empty ({})",
+            evidence.detail
+        )),
+        Err(why) => Some(format!("termination not confirmed: {why}")),
+    }
+}
+
+/// What an invocation came to, given how the provider ended and what
+/// terminating its domain established. The provider's result is not
+/// lifecycle settlement: with the domain unproven it is discarded, success,
+/// failure and cancellation alike, and the invocation stays unresolved.
+fn conclude(
+    invocation: InvocationId,
+    ended: Result<End, String>,
+    terminated: Result<Evidence, String>,
+    drain: impl FnOnce() -> bool,
+    p: &Progress,
+    schema: &Validator,
+) -> Result<Outcome, Unresolved> {
+    if let Some(why) = unproven(&terminated) {
+        return Err(Unresolved { invocation, why });
+    }
+    let held = matches!(ended, Ok(End::Exited { held: true, .. }));
+    let drained = ended.is_ok() && drain() && !held;
+    let (state, failure, mut diagnostic, status) = match ended {
+        Ok(end) => {
+            let (state, failure, diagnostic) = classify(&end, p, schema);
+            let status = match end {
+                End::Exited { status, .. } => Some(status),
+                End::Cancelled { status } => status,
+            };
+            (state, failure, diagnostic, status)
         }
-        let _ = self.child.kill();
-        let deadline = Instant::now() + KILL_WAIT;
-        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
-            thread::sleep(POLL);
+        // The provider's end is unknown, its domain proven gone.
+        Err(why) => (InvocationState::Interrupted, None, Some(why), None),
+    };
+    if ended_ok(state) && !drained {
+        let note = "its output stayed open after it exited, held by a process it started";
+        diagnostic = Some(match diagnostic {
+            Some(d) => format!("{d}; {note}"),
+            None => note.to_owned(),
+        });
+    }
+    Ok(Outcome {
+        invocation,
+        end: InvocationEnd {
+            state,
+            failure,
+            diagnostic: diagnostic.map(|d| clip(&d, DIAGNOSTIC_LIMIT)),
+            exit_code: status.and_then(|s| s.code()),
+            provider_session: p.stream.session.clone(),
+            usage: p.stream.usage(),
+        },
+        payload: (state == InvocationState::Succeeded)
+            .then(|| p.stream.result.clone())
+            .flatten(),
+        provider_metadata: p.stream.metadata.clone(),
+        stderr: String::from_utf8_lossy(&p.stderr).into_owned(),
+    })
+}
+
+/// Whether `state` records that agentctl saw the provider end.
+fn ended_ok(state: InvocationState) -> bool {
+    state != InvocationState::Interrupted
+}
+
+impl Drop for Process {
+    /// A domain agentctl stops owning is terminated, so that nothing in it
+    /// lingers.
+    fn drop(&mut self) {
+        if self.stopped.is_none() {
+            let _ = self.domain.terminate(KILL_WAIT);
         }
     }
 }
 
-/// How an invocation whose process exited with `status` ended. The
-/// diagnostic is agentctl's own: it quotes nothing the provider wrote.
+/// How an invocation whose provider ended as `end` ended. The diagnostic is
+/// agentctl's own: it quotes nothing the provider wrote. The domain is
+/// already proven empty: see [`conclude`].
 fn classify(
-    status: ExitStatus,
-    cancelled: bool,
+    end: &End,
     p: &Progress,
     schema: &Validator,
 ) -> (InvocationState, Option<FailureKind>, Option<String>) {
     use FailureKind::*;
     let failed = |kind, why: String| (InvocationState::Failed, Some(kind), Some(why));
     let stream = &p.stream;
-    if cancelled {
-        let untracked = match platform::capabilities()
-            .get(Capability::ProcessTreeTermination)
-            .level
-        {
-            Level::Enforced => "",
-            _ => "; processes it started are not tracked and may outlive it",
-        };
-        let why = format!("cancelled by agentctl; the provider {status}{untracked}");
-        return (InvocationState::Cancelled, None, Some(why));
-    }
+    let status = match end {
+        End::Cancelled { status } => {
+            let how = status
+                .map(|s| format!("; the provider {s}"))
+                .unwrap_or_default();
+            let why = format!(
+                "cancelled by agentctl; its lifecycle domain was terminated and proven empty{how}"
+            );
+            return (InvocationState::Cancelled, None, Some(why));
+        }
+        End::Exited { status, .. } => *status,
+    };
     if !p.input_delivered {
         let why = p
             .input_error
@@ -790,7 +1103,30 @@ fn classify(
     }
 }
 
-fn read_events(stdout: ChildStdout, shared: &Shared) {
+/// Serves the shim's control channel: how it says input and the provider
+/// ended. Anything it does not understand is ignored, never acted on.
+fn read_control(mut control: BufReader<TcpStream>, shared: &Shared) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match control.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => match shim::Message::parse(&line) {
+                Some(shim::Message::Input(Ok(()))) => shared.progress().input_delivered = true,
+                Some(shim::Message::Input(Err(why))) => {
+                    shared.progress().input_error.get_or_insert(why);
+                }
+                Some(shim::Message::Exit { raw, held }) => {
+                    shared.progress().ended = Some((raw, held))
+                }
+                None => {}
+            },
+        }
+    }
+    shared.progress().control_closed = true;
+}
+
+fn read_events(stdout: TcpStream, shared: &Shared) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
     loop {
@@ -809,7 +1145,7 @@ fn read_events(stdout: ChildStdout, shared: &Shared) {
 }
 
 /// Keeps the end of the provider's standard error.
-fn read_stderr(mut stderr: ChildStderr, shared: &Shared) {
+fn read_stderr(mut stderr: TcpStream, shared: &Shared) {
     let mut buf = [0; 4096];
     while let Ok(n @ 1..) = stderr.read(&mut buf) {
         let mut p = shared.progress();
@@ -884,6 +1220,142 @@ mod tests {
     fn clipping_respects_characters() {
         assert_eq!(clip("short", 10), "short");
         assert_eq!(clip("ééééé", 8), "éé...");
+    }
+
+    use crate::procd::State;
+    use serde_json::json;
+
+    fn evidence(proven: bool) -> Evidence {
+        Evidence {
+            admission_closed: proven,
+            authority_directed: true,
+            emptiness_proven: proven,
+            enforced: proven,
+            final_state: Some(if proven {
+                State::Empty
+            } else {
+                State::Unresolved
+            }),
+            detail: "fake".into(),
+        }
+    }
+
+    fn status(code: i32) -> ExitStatus {
+        #[cfg(unix)]
+        return std::os::unix::process::ExitStatusExt::from_raw(code << 8);
+        #[cfg(windows)]
+        return std::os::windows::process::ExitStatusExt::from_raw(code as u32);
+    }
+
+    /// A provider that reported a valid result, whatever its exit status.
+    fn reported() -> Progress {
+        let mut p = Progress::new(Decoder::Claude(claude::Decoder::default()));
+        p.input_delivered = true;
+        p.stream.result = Some(json!({"n": 7}));
+        p
+    }
+
+    fn schema() -> Validator {
+        jsonschema::validator_for(&json!({"type": "object"})).unwrap()
+    }
+
+    fn concluded(
+        end: Result<End, String>,
+        terminated: Result<Evidence, String>,
+        p: &Progress,
+    ) -> Result<Outcome, Unresolved> {
+        conclude("1".parse().unwrap(), end, terminated, || true, p, &schema())
+    }
+
+    fn exited(code: i32) -> Result<End, String> {
+        Ok(End::Exited {
+            status: status(code),
+            held: false,
+        })
+    }
+
+    fn cancelled() -> Result<End, String> {
+        Ok(End::Cancelled {
+            status: Some(status(1)),
+        })
+    }
+
+    #[test]
+    fn a_valid_success_with_an_unproven_domain_is_never_settled() {
+        // The provider exited 0 with a valid result, and terminating the
+        // domain succeeded without proving it empty.
+        let unresolved = concluded(exited(0), Ok(evidence(false)), &reported()).unwrap_err();
+        assert!(unresolved.why.contains("not proven empty"), "{unresolved}");
+        // Proof settles it, as before.
+        let outcome = concluded(exited(0), Ok(evidence(true)), &reported()).unwrap();
+        assert_eq!(outcome.end.state, InvocationState::Succeeded);
+        assert_eq!(outcome.payload, Some(json!({"n": 7})));
+    }
+
+    #[test]
+    fn a_known_failure_with_an_unproven_domain_stays_unresolved() {
+        assert!(concluded(exited(3), Ok(evidence(false)), &reported()).is_err());
+        let mut errored = reported();
+        errored.stream.error = Some("the provider reported an error");
+        assert!(concluded(exited(0), Ok(evidence(false)), &errored).is_err());
+        let outcome = concluded(exited(3), Ok(evidence(true)), &reported()).unwrap();
+        assert_eq!(outcome.end.state, InvocationState::Failed);
+        assert_eq!(outcome.end.failure, Some(FailureKind::ExitStatus));
+    }
+
+    #[test]
+    fn cancellation_with_an_unproven_domain_stays_unresolved() {
+        assert!(concluded(cancelled(), Ok(evidence(false)), &reported()).is_err());
+        let outcome = concluded(cancelled(), Ok(evidence(true)), &reported()).unwrap();
+        assert_eq!(outcome.end.state, InvocationState::Cancelled);
+    }
+
+    #[test]
+    fn a_lost_end_or_failed_termination_stays_unresolved() {
+        // Not knowing how the provider ended is settled as interrupted only
+        // where the domain is proven gone.
+        let lost = || Err("the shim ended without a report".to_owned());
+        assert!(concluded(lost(), Ok(evidence(false)), &reported()).is_err());
+        let outcome = concluded(lost(), Ok(evidence(true)), &reported()).unwrap();
+        assert_eq!(outcome.end.state, InvocationState::Interrupted);
+        for end in [exited(0), cancelled(), lost()] {
+            let why = concluded(end, Err("procd refused".into()), &reported())
+                .unwrap_err()
+                .why;
+            assert!(why.contains("termination not confirmed"), "{why}");
+        }
+    }
+
+    #[test]
+    fn nothing_but_full_evidence_is_proof() {
+        for spoil in 0..5 {
+            let mut e = evidence(true);
+            match spoil {
+                0 => e.admission_closed = false,
+                1 => e.authority_directed = false,
+                2 => e.emptiness_proven = false,
+                3 => e.enforced = false,
+                _ => e.final_state = None,
+            }
+            assert!(concluded(exited(0), Ok(e), &reported()).is_err(), "{spoil}");
+        }
+    }
+
+    #[test]
+    fn an_abandoned_launch_is_settled_only_by_proof() {
+        let why = || "no channel".to_owned();
+        assert!(matches!(
+            abandoned(Ok(evidence(true)), why()),
+            Launched::Failed(FailureKind::SpawnFailed, _)
+        ));
+        assert!(matches!(
+            abandoned(Ok(evidence(false)), why()),
+            Launched::Unconfirmed(_)
+        ));
+        assert!(matches!(
+            abandoned(Err(anyhow!("procd refused")), why()),
+            Launched::Unconfirmed(_)
+        ));
     }
 
     #[test]

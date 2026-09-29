@@ -18,10 +18,10 @@
 //!
 //! 1. Each invocation with no recorded end. Only once its lifecycle is
 //!    settled ([`Lifecycle`]) is it interrupted, which says nothing of how
-//!    it would have ended. Agentctl has no authority of its own to settle a
-//!    provider's processes (see [`settle_lifecycle`]): until one is
-//!    provided, the invocation stays unresolved, and so does everything
-//!    waiting on it.
+//!    it would have ended. Settling it is procd's (see
+//!    [`settle_lifecycle`]): only its proof that the invocation's lifecycle
+//!    domain is gone counts, and anything less leaves the invocation
+//!    unresolved, and everything waiting on it.
 //! 2. Each attempted action, from what its own record and the working tree
 //!    establish: an execution, verification or integration verification
 //!    whose process ended before recording what its invocation yielded is
@@ -54,6 +54,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::acceptance::{self, Outcome as Accepted};
+use crate::procd;
 use crate::project::Project;
 use crate::source::{self, Interrupted};
 use crate::state::{
@@ -70,14 +71,21 @@ pub enum Lifecycle {
     Uncertain(String),
 }
 
-/// Settles the lifecycle of an interrupted invocation.
-pub type Settle<'a> = &'a dyn Fn(InvocationId) -> Lifecycle;
+/// Settles the lifecycle of an interrupted invocation, given the identity of
+/// the lifecycle domain recorded for it, if any was.
+pub type Settle<'a> = &'a dyn Fn(InvocationId, Option<&str>) -> Lifecycle;
 
-/// Agentctl's production settlement: none. It owns no authority over a
-/// provider's processes, and a missing process is no proof that they ended,
-/// so this never says `Gone`. A later block supplies the authority.
-pub fn settle_lifecycle(_: InvocationId) -> Lifecycle {
-    Lifecycle::Uncertain("agentctl has no authority to settle a provider's lifecycle yet".into())
+/// Agentctl's production settlement: procd's. Only its authoritative
+/// evidence that the recorded domain is gone or empty says `Gone`. A missing
+/// process, a missing or malformed identity, a backend that cannot prove
+/// anything and an unresolved recovery are all `Uncertain`: nothing else,
+/// not process ids, ancestry, time or the provider's own state, ever proves
+/// one.
+pub fn settle_lifecycle(_: InvocationId, identity: Option<&str>) -> Lifecycle {
+    match procd::settle(identity) {
+        procd::Settlement::Gone => Lifecycle::Gone,
+        procd::Settlement::Uncertain(why) => Lifecycle::Uncertain(why),
+    }
 }
 
 /// What recovery found and did.
@@ -320,7 +328,11 @@ impl Session<'_> {
 
     /// Records `invocation` interrupted once its lifecycle is settled.
     fn invocation(&mut self, invocation: InvocationId) -> Outcome {
-        if let Lifecycle::Uncertain(why) = (self.settle)(invocation) {
+        let identity = match self.store.containment(invocation) {
+            Ok(identity) => identity,
+            Err(e) => return Outcome::Blocked(format!("{e:#}")),
+        };
+        if let Lifecycle::Uncertain(why) = (self.settle)(invocation, identity.as_deref()) {
             return Outcome::Unsupported(format!("its provider's processes may still run: {why}"));
         }
         let mut ended = || -> Result<Outcome> {
@@ -511,6 +523,7 @@ pub(crate) mod tests {
         use crate::graph::tests::Fixture;
         use crate::integration;
         use crate::planner::{self, Command as Plan};
+        use crate::runtime::testing;
         use crate::scheduler::{self, tests::project_in};
         use crate::state::tests::ready_plan;
         use crate::state::{
@@ -585,7 +598,7 @@ esac
                     integration::verify(&project, &mut store, plan, fake).unwrap();
                 }
                 "recover" => {
-                    let settled = recover_with(&project, &mut store, &|_| Lifecycle::Gone);
+                    let settled = recover_with(&project, &mut store, &|_, _| Lifecycle::Gone);
                     eprintln!("{:?}", settled.unwrap());
                 }
                 other => panic!("unknown scenario {other}"),
@@ -649,6 +662,26 @@ esac
             }
 
             fn crash_with(&self, scenario: &str, at: &str, vars: &[(&str, String)]) {
+                let (status, output) = self.run_child(scenario, at, vars);
+                assert_eq!(status.code(), Some(ENDED), "{scenario} at {at}: {output}");
+            }
+
+            /// Runs `scenario` in a child agentctl process for which
+            /// procd's evidence proves no domain empty, to its end, which
+            /// is never a failpoint's: its standard error says how.
+            fn run_unproven(&self, scenario: &str) -> String {
+                let unproven = [(testing::EVIDENCE, "unproven".to_owned())];
+                let (status, output) = self.run_child(scenario, "no-such-failpoint", &unproven);
+                assert_ne!(status.code(), Some(ENDED), "{scenario}: {output}");
+                output
+            }
+
+            fn run_child(
+                &self,
+                scenario: &str,
+                at: &str,
+                vars: &[(&str, String)],
+            ) -> (std::process::ExitStatus, String) {
                 let log = self.provider.path().join(format!("{scenario}-{at}.log"));
                 let mut child = Command::new(env::current_exe().unwrap())
                     .args(["recovery::tests::crashes::child", "--exact", "--nocapture"])
@@ -676,13 +709,13 @@ esac
                     thread::sleep(Duration::from_millis(20));
                 };
                 let output = fs::read_to_string(log.with_extension("err")).unwrap_or_default();
-                assert_eq!(status.code(), Some(ENDED), "{scenario} at {at}: {output}");
+                (status, output)
             }
 
             /// Recovers with every interrupted invocation's lifecycle
             /// injected as settled: nothing here can prove one.
             fn recover(&mut self) -> Report {
-                self.recover_with(&|_| Lifecycle::Gone)
+                self.recover_with(&|_, _| Lifecycle::Gone)
             }
 
             fn recover_with(&mut self, settle: Settle) -> Report {
@@ -887,15 +920,36 @@ esac
                 "journal history is immutable",
             );
 
-            // Agentctl has no authority to settle it: whatever else is
-            // settled, it stays as it was found, uncertain, and holds back
-            // everything that waits on it.
+            // procd's evidence settles it, and where the host's procd cannot
+            // prove anything (this one is best-effort), whatever else is
+            // settled it stays as it was found, uncertain, and holds back
+            // everything that waits on it. Its domain's identity was durable
+            // before the provider ran.
+            let id =
+                h.fx.store
+                    .unresolved(Some(h.plan))
+                    .unwrap()
+                    .iter()
+                    .find_map(|u| match u.kind {
+                        UnresolvedKind::Invocation(id) => Some(id),
+                        _ => None,
+                    })
+                    .unwrap();
+            assert!(h.fx.store.containment(id).unwrap().is_some());
             let report = recover_store(&h.fx.project, &mut h.fx.store).unwrap();
+            let host_proves = matches!(
+                procd::capabilities(),
+                Ok(c) if c.process_tree_termination == crate::platform::Level::Enforced
+            );
+            if host_proves {
+                // What follows is for hosts whose procd cannot prove it.
+                return;
+            }
             assert!(!report.settled(), "{report:?}");
             let Outcome::Unsupported(why) = outcome(&report, is_invocation) else {
                 panic!("{report:?}");
             };
-            assert!(why.contains("no authority"), "{why}");
+            assert!(why.contains("nothing it reports"), "{why}");
             assert!(blocked(outcome(&report, is_action("executor.run"))).contains("unresolved"));
             assert!(blocked(outcome(&report, is_claim)).contains("capacity"));
             assert!(!matches!(h.execution(), ExecutionStatus::Captured(_)));
@@ -916,7 +970,8 @@ esac
             assert_eq!(invocation.state, InvocationState::Running);
             assert!(invocation.end.is_none());
             // Said uncertain, it is settled only once something proves it.
-            let uncertain = |_: InvocationId| Lifecycle::Uncertain("still there".into());
+            let uncertain =
+                |_: InvocationId, _: Option<&str>| Lifecycle::Uncertain("still there".into());
             assert!(!h.recover_with(&uncertain).settled());
             assert!(h.barred());
 
@@ -954,6 +1009,91 @@ esac
                 "sessions are immutable",
             );
             h.refused("DELETE FROM sessions", "sessions are immutable");
+        }
+
+        /// The live path's uncertainty, not a crash's: the provider ended and
+        /// reported, and procd could not prove its domain empty.
+        #[test]
+        fn a_live_run_whose_lifecycle_was_never_proven_is_unresolved_for_recovery() {
+            let mut h = Harness::one();
+            h.edits("printf 'changed\\n' > src/a.rs\n");
+            // The fake executor answers with a valid success and exits.
+            let output = h.run_unproven("run");
+            assert!(output.contains("left unresolved"), "{output}");
+            assert!(output.contains("not proven empty"), "{output}");
+            let unresolved = h.fx.store.unresolved(Some(h.plan)).unwrap();
+            let id = unresolved
+                .iter()
+                .find_map(|u| match u.kind {
+                    UnresolvedKind::Invocation(id) => Some(id),
+                    _ => None,
+                })
+                .expect("the invocation is unresolved");
+            let invocation = h.fx.store.invocation(id).unwrap();
+            assert_eq!(invocation.state, InvocationState::Running);
+            assert!(invocation.end.is_none());
+            // Nothing was judged, captured, installed or released.
+            assert!(!matches!(h.execution(), ExecutionStatus::Captured(_)));
+            assert_eq!(h.read("src/a.rs").as_deref(), Some("// accepted\n"));
+            assert!(h.barred());
+            assert_eq!(
+                h.fx.store.release_claim(h.generation()).unwrap(),
+                Release::Retained
+            );
+            assert_eq!(h.owned(), ["src/a.rs"]);
+            // Recovery finds the same, and holds it while uncertain.
+            let uncertain = |_: InvocationId, _: Option<&str>| Lifecycle::Uncertain("no".into());
+            let report = h.recover_with(&uncertain);
+            assert!(!report.settled(), "{report:?}");
+            assert!(h.barred());
+            assert!(h.fx.store.invocation(id).unwrap().end.is_none());
+            // Only proof settles it, as interrupted: the provider's success
+            // was never established, and nothing was accepted from it.
+            let report = h.recover();
+            assert!(report.settled(), "{report:?}");
+            let capture = h.capture();
+            assert_eq!(capture.outcome, ExecutionOutcome::Interrupted);
+            assert_eq!(
+                h.fx.store.invocation(id).unwrap().state,
+                InvocationState::Interrupted
+            );
+            assert_eq!(h.claim(), Some(PipelineOutcome::ExecutionFailed));
+            assert_eq!(h.read("src/a.rs").as_deref(), Some("// accepted\n"));
+        }
+
+        #[test]
+        fn an_integration_verifier_left_unproven_can_complete_nothing() {
+            let mut h = Harness::one();
+            h.edits("printf 'pub fn changed() {}\\n' > src/a.rs\n");
+            let report = scheduler::run(&h.fx.project, h.plan, h.fake()).unwrap();
+            assert_eq!(
+                report.snapshot.condition(),
+                crate::state::Condition::AllCompleted
+            );
+            let basis = h.fx.store.replan_basis(h.plan).unwrap();
+            let propose = [Plan::ProposeCompletion {}];
+            let (project, store) = (&h.fx.project, &mut h.fx.store);
+            let proposed = planner::apply_replan(project, store, h.plan, &basis, &propose).unwrap();
+            assert!(matches!(proposed, Replan::Applied(_)));
+
+            let output = h.run_unproven("verify");
+            assert!(output.contains("left unresolved"), "{output}");
+            let integrations = h.fx.store.integrations(h.plan).unwrap();
+            assert!(
+                !matches!(integrations[0].status, IntegrationStatus::Finished(_)),
+                "{integrations:?}"
+            );
+            assert_eq!(h.fx.store.plan(h.plan).unwrap().state, PlanState::Running);
+            assert!(!h.fx.store.unresolved(Some(h.plan)).unwrap().is_empty());
+            let (plan, id) = (h.plan, integrations[0].id);
+            h.refused(
+                &format!(
+                    "INSERT INTO plan_completions (plan_id, verification_id, completed_at)
+                          VALUES ({plan}, {id}, 0)"
+                ),
+                "completes it",
+            );
+            assert!(h.fx.store.recovery_required(h.plan).unwrap().is_some());
         }
 
         #[test]

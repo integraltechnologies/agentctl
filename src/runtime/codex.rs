@@ -67,7 +67,6 @@ pub(super) fn prepare(launch: &Launch) -> Result<Prepared> {
     args.push("-".into());
     Ok(Prepared {
         args,
-        env: ENV,
         decoder: super::Decoder::Codex(Decoder::default()),
         files: vec![schema],
     })
@@ -367,6 +366,7 @@ mod tests {
             output_schema: json!({"type": "object"}),
             cwd: "/work dir".into(),
             workspace: Workspace::ReadOnly,
+            lifecycle: super::super::ROLE_LIFECYCLE,
         };
         let prepared = prepare(&launch).unwrap();
         let args: Vec<String> = prepared
@@ -408,6 +408,7 @@ mod tests {
             output_schema: json!({"type": "object"}),
             cwd: "/work".into(),
             workspace,
+            lifecycle: super::super::ROLE_LIFECYCLE,
         };
         let args = |workspace| -> Vec<String> {
             let prepared = prepare(&launch(workspace)).unwrap();

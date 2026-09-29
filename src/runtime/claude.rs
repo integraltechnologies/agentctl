@@ -61,7 +61,6 @@ pub(super) fn prepare(launch: &Launch) -> Result<Prepared> {
     args.push(format!("--json-schema={}", launch.output_schema));
     Ok(Prepared {
         args: args.into_iter().map(OsString::from).collect(),
-        env: ENV,
         decoder: super::Decoder::Claude(Decoder::default()),
         files: Vec::new(),
     })
@@ -279,6 +278,7 @@ mod tests {
             output_schema: json!({"type": "object"}),
             cwd: "/".into(),
             workspace: super::super::Workspace::ReadOnly,
+            lifecycle: super::super::ROLE_LIFECYCLE,
         };
         let args = prepare(&launch(Some(ReasoningEffort::High))).unwrap().args;
         assert!(args.contains(&"--model=--dangerously-skip-permissions".into()));
@@ -304,6 +304,7 @@ mod tests {
             output_schema: json!({"type": "object"}),
             cwd: "/work".into(),
             workspace,
+            lifecycle: super::super::ROLE_LIFECYCLE,
         };
         for (workspace, mode) in [
             (Workspace::ReadOnly, "--permission-mode=default"),

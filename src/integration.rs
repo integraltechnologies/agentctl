@@ -261,6 +261,7 @@ pub fn start(
         output_schema: verifier::result_schema(),
         cwd: intended.workspace.root().to_path_buf(),
         workspace: runtime::Workspace::Disposable,
+        lifecycle: runtime::ROLE_LIFECYCLE,
     };
     let entry = intended.entry;
     let invocation = runtime::spawn_after(store, &launch, |store, invocation| {

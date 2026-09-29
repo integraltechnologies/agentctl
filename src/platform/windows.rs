@@ -6,7 +6,6 @@ use std::iter;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, Prefix};
-use std::process::Child;
 
 use tempfile::NamedTempFile;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -68,12 +67,6 @@ pub(crate) fn symlink(_target: &Path, _link: &Path) -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "agentctl does not create symlinks on Windows",
     ))
-}
-
-/// Windows cannot ask a process without a console of its own to stop
-/// gracefully, so no request is sent; the caller terminates it outright.
-pub(crate) fn request_termination(_child: &Child) -> io::Result<bool> {
-    Ok(false)
 }
 
 /// Opens `path` if it is a regular file; `None` for a symlink, junction or

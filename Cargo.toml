@@ -17,11 +17,24 @@ tree-sitter = "0.27.0"
 tree-sitter-rust = "0.24.2"
 which = "8.0.6"
 
+[features]
+# Test builds only (the integration tests turn it on for themselves): a
+# termination procd reported as successful is taken for proof, so that the
+# suites can complete runs on hosts whose backend cannot prove emptiness.
+# Tests of the unproven path opt out with `runtime::testing::real_evidence`.
+lifecycle-double = []
+
+[build-dependencies]
+sha2 = "0.11.0"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_Security_Cryptography"] }
+
+[dev-dependencies]
+agentctl = { path = ".", features = ["lifecycle-double"] }
 
 # Its own `main`, so the test binary can also act as a fake provider.
 [[test]]

@@ -898,6 +898,7 @@ pub fn start(
         output_schema: response_schema(),
         cwd: project.root.clone(),
         workspace: Workspace::ReadOnly,
+        lifecycle: runtime::ROLE_LIFECYCLE,
     };
     let invocation = runtime::spawn(store, &launch)?;
     Ok(Planner {
@@ -951,6 +952,7 @@ pub fn replan(
         output_schema: replan_schema(),
         cwd: project.root.clone(),
         workspace: Workspace::ReadOnly,
+        lifecycle: runtime::ROLE_LIFECYCLE,
     };
     let invocation = runtime::spawn_after(store, &launch, |store, invocation| {
         store.act(entry, Some(invocation))

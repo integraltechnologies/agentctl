@@ -16,6 +16,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agentctl::config::ReasoningEffort;
+use agentctl::platform::{self, Capability, Level, Need};
+use agentctl::procd::{self, Domain, Settlement};
+use agentctl::recovery::{self, Lifecycle};
 use agentctl::runtime::{
     self, FailureKind, InvocationState, Launch, Outcome, Provider, TokenUsage, Usage, Workspace,
 };
@@ -84,10 +87,45 @@ fn main() -> ExitCode {
             "cancellation_is_observed_and_reaped",
             cancellation_is_observed_and_reaped,
         ),
-        #[cfg(unix)]
         (
-            "cancellation_escalates_to_kill",
-            cancellation_escalates_to_kill,
+            "lifecycle_is_owned_before_execution",
+            lifecycle_is_owned_before_execution,
+        ),
+        (
+            "required_enforcement_is_never_downgraded",
+            required_enforcement_is_never_downgraded,
+        ),
+        (
+            "cancellation_terminates_the_whole_tree",
+            cancellation_terminates_the_whole_tree,
+        ),
+        (
+            "an_ordinary_end_leaves_no_descendants",
+            an_ordinary_end_leaves_no_descendants,
+        ),
+        (
+            "a_lost_domain_is_never_taken_for_gone_without_proof",
+            a_lost_domain_is_never_taken_for_gone_without_proof,
+        ),
+        (
+            "a_successful_provider_with_an_unproven_lifecycle_stays_unresolved",
+            a_successful_provider_with_an_unproven_lifecycle_stays_unresolved,
+        ),
+        (
+            "a_failed_provider_with_an_unproven_lifecycle_stays_unresolved",
+            a_failed_provider_with_an_unproven_lifecycle_stays_unresolved,
+        ),
+        (
+            "a_cancellation_with_an_unproven_lifecycle_stays_unresolved",
+            a_cancellation_with_an_unproven_lifecycle_stays_unresolved,
+        ),
+        (
+            "an_abandoned_launch_with_an_unproven_lifecycle_stays_unresolved",
+            an_abandoned_launch_with_an_unproven_lifecycle_stays_unresolved,
+        ),
+        (
+            "an_escaped_writer_never_becomes_settled_success",
+            an_escaped_writer_never_becomes_settled_success,
         ),
         (
             "abandoned_invocations_stay_unresolved",
@@ -136,6 +174,22 @@ fn fake() -> ExitCode {
         .unwrap_or_default()
         .to_owned();
     let mut input = String::new();
+    if let Some(secs) = scenario.strip_prefix("sleeper:") {
+        // A bounded descendant: ends on its own whatever else happens.
+        thread::sleep(Duration::from_secs(secs.parse().unwrap()));
+        return ExitCode::SUCCESS;
+    }
+    if scenario == "escaper" {
+        // Leaves its containment as far as a process can on Unix, then
+        // starts a bounded descendant and goes.
+        #[cfg(unix)]
+        // SAFETY: setsid takes no pointers.
+        unsafe {
+            libc::setsid();
+        }
+        start_descendant();
+        return ExitCode::SUCCESS;
+    }
     if scenario != "ignore-input" {
         std::io::stdin().read_to_string(&mut input).unwrap();
     }
@@ -194,6 +248,35 @@ fn fake() -> ExitCode {
         "hang" => {
             say(&init);
             hang();
+        }
+        "mark" => {
+            std::fs::write("ran", "").unwrap();
+            say(&result(json!({"n": 7})));
+        }
+        // Starts a bounded descendant of its own and waits, itself bounded.
+        "tree" => {
+            say(&init);
+            start_descendant();
+            for _ in 0..30 {
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+        // Answers and exits at once, leaving its descendant behind.
+        "orphaning" => {
+            start_descendant();
+            say(&result(json!({"n": 7})));
+        }
+        // Answers and exits at once, leaving behind a descendant that has
+        // escaped into a session of its own by way of a second process.
+        "escaping" => {
+            std::process::Command::new(env::current_exe().unwrap())
+                .arg("--model=escaper")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            say(&result(json!({"n": 7})));
         }
         #[cfg(unix)]
         "stubborn" => {
@@ -335,6 +418,7 @@ impl Fixture {
             output_schema: json!({"type": "object"}),
             cwd: self.dir.path().to_owned(),
             workspace: Workspace::ReadOnly,
+            lifecycle: runtime::ROLE_LIFECYCLE,
         }
     }
 
@@ -689,6 +773,175 @@ fn undelivered_input_fails_closed() {
     assert_eq!(outcome.payload, None);
 }
 
+/// Starts a descendant that ends on its own within 20 seconds, and records
+/// its process id beside the working directory for the test to check.
+fn start_descendant() {
+    let child = std::process::Command::new(env::current_exe().unwrap())
+        .arg("--model=sleeper:20")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::fs::write("descendant.tmp", child.id().to_string()).unwrap();
+    std::fs::rename("descendant.tmp", "descendant").unwrap();
+    // Left running, and never waited for.
+    std::mem::forget(child);
+}
+
+/// The id of the descendant a fake provider started in `dir`.
+fn descendant(dir: &Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(id) = std::fs::read_to_string(dir.join("descendant")) {
+            return id.trim().parse().unwrap();
+        }
+        assert!(Instant::now() < deadline, "no descendant started");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Waits for `pid` to be gone, which a domain's termination must cause well
+/// within the 20 seconds the descendant lives on its own.
+#[cfg(unix)]
+fn assert_gone_soon(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "descendant {pid} survived its domain's termination"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(not(unix))]
+fn assert_gone_soon(_pid: u32) {}
+
+/// Whether procd can enforce process-tree termination on this host.
+fn host_enforces() -> bool {
+    platform::capabilities()
+        .get(Capability::ProcessTreeTermination)
+        .level
+        == Level::Enforced
+}
+
+fn lifecycle_is_owned_before_execution() {
+    let mut f = Fixture::new();
+    let launch = f.launch(Provider::Claude, "mark");
+    let ran = f.dir.path().join("ran");
+    let seen = std::cell::Cell::new(false);
+    let invocation = runtime::spawn_after(&mut f.store, &launch, |store, id| {
+        // Before any provider process exists, its lifecycle domain's
+        // identity is durable with the invocation, which is still starting.
+        let identity = store.containment(id)?.expect("a recorded identity");
+        assert!(!identity.is_empty() && identity.is_ascii());
+        assert_eq!(store.invocation(id)?.state, InvocationState::Starting);
+        assert!(
+            !ran.exists(),
+            "the provider ran before its domain was recorded"
+        );
+        seen.set(true);
+        Ok(())
+    })
+    .unwrap();
+    assert!(seen.get());
+    let id = invocation.id();
+    let outcome = invocation.wait(&mut f.store).unwrap();
+    assert_eq!(outcome.end.state, InvocationState::Succeeded);
+    // Durable, and the same for another process reading the store.
+    let recorded = f.reopen().containment(id).unwrap().unwrap();
+    assert_eq!(f.store.containment(id).unwrap().unwrap(), recorded);
+    assert!(ran.exists());
+}
+
+fn required_enforcement_is_never_downgraded() {
+    let mut f = Fixture::new();
+    let launch = Launch {
+        lifecycle: Need::RequireEnforced,
+        ..f.launch(Provider::Claude, "mark")
+    };
+    let result = runtime::spawn(&mut f.store, &launch);
+    if host_enforces() {
+        let outcome = result.unwrap().wait(&mut f.store).unwrap();
+        assert_eq!(outcome.end.state, InvocationState::Succeeded);
+        return;
+    }
+    // Refused before anything is recorded or run: no best-effort stand-in.
+    let refused = result.err().expect("the launch is refused").to_string();
+    assert!(refused.contains("refusing to launch"), "{refused}");
+    assert!(f.store.invocations(f.agent).unwrap().is_empty());
+    assert!(!f.dir.path().join("ran").exists());
+}
+
+fn cancellation_terminates_the_whole_tree() {
+    let mut f = Fixture::new();
+    let invocation = f.spawn("tree").unwrap();
+    let pid = descendant(f.dir.path());
+    let control = invocation.control();
+    control.cancel();
+    let started = Instant::now();
+    let outcome = invocation.wait(&mut f.store).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(outcome.end.state, InvocationState::Cancelled);
+    assert_gone_soon(pid);
+}
+
+fn an_ordinary_end_leaves_no_descendants() {
+    let mut f = Fixture::new();
+    let outcome = f.run(&f.launch(Provider::Claude, "orphaning"));
+    assert_eq!(outcome.end.state, InvocationState::Succeeded);
+    // Nothing relies on the provider's death, or agentctl's: the domain is
+    // terminated whatever the provider did.
+    assert_gone_soon(descendant(f.dir.path()));
+}
+
+fn a_lost_domain_is_never_taken_for_gone_without_proof() {
+    // agentctl is lost while its domain has a live process: the handle is
+    // released, not terminated, as a crash would.
+    let domain = Domain::create(Need::AllowBestEffort, "agentctl-test").unwrap();
+    let fake = fake_provider().to_str().unwrap();
+    domain.spawn(&[fake, "--model=sleeper:4"]).unwrap();
+    let identity = domain.identity().to_owned();
+    drop(domain);
+
+    // After the restart, only procd's proof says it is gone.
+    let settled = recovery::settle_lifecycle(runtime_invocation_id(), Some(&identity));
+    if host_enforces() {
+        // Recovered and terminated, or proven destroyed; or, where procd
+        // cannot say, uncertain: never anything else.
+        assert!(matches!(settled, Lifecycle::Gone | Lifecycle::Uncertain(_)));
+    } else {
+        let Lifecycle::Uncertain(why) = settled else {
+            panic!("a best-effort host took its own guess for proof");
+        };
+        assert!(why.contains("nothing it reports"), "{why}");
+    }
+    assert!(matches!(
+        recovery::settle_lifecycle(runtime_invocation_id(), Some("garbage")),
+        Lifecycle::Uncertain(_)
+    ));
+    assert!(matches!(
+        recovery::settle_lifecycle(runtime_invocation_id(), None),
+        Lifecycle::Uncertain(_)
+    ));
+    // The recorded process ends within its own 4 seconds.
+    assert!(matches!(procd::settle(None), Settlement::Uncertain(_)));
+    // The recorded process ends within its own 4 seconds.
+    thread::sleep(Duration::from_secs(5));
+}
+
+/// An invocation id to name in a settlement, which never consults it.
+fn runtime_invocation_id() -> agentctl::state::InvocationId {
+    let mut f = Fixture::new();
+    let launch = f.launch(Provider::Claude, "ok");
+    f.run(&launch).invocation
+}
+
 /// Waits until `invocation` has reported an event, and returns its pid.
 fn wait_for_first_event(invocation: &runtime::Invocation) -> u32 {
     let control = invocation.control();
@@ -740,17 +993,15 @@ fn cancellation_is_observed_and_reaped() {
     canceller.join().unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(3),
-        "SIGTERM suffices"
+        "terminating a domain does not wait on the provider"
     );
     assert_eq!(outcome.end.state, InvocationState::Cancelled);
     assert_eq!(outcome.end.failure, None);
+    // Recorded as cancelled only because the domain was proven empty.
+    let diagnostic = outcome.end.diagnostic.as_ref().unwrap();
     assert!(
-        outcome
-            .end
-            .diagnostic
-            .as_ref()
-            .unwrap()
-            .contains("not tracked")
+        diagnostic.contains("terminated and proven empty"),
+        "{diagnostic}"
     );
     assert_eq!(outcome.payload, None);
     assert!(outcome.stderr.contains("working"));
@@ -761,26 +1012,125 @@ fn cancellation_is_observed_and_reaped() {
     assert_reaped(pid);
 }
 
-#[cfg(unix)]
-fn cancellation_escalates_to_kill() {
-    let mut f = Fixture::new();
-    let invocation = f.spawn("stubborn").unwrap();
-    let pid = wait_for_first_event(&invocation);
-    let control = invocation.control();
-    control.cancel();
-    assert!(control.observe().cancel_requested);
-    let started = Instant::now();
-    let outcome = invocation.wait(&mut f.store).unwrap();
+/// What `wait` said of an invocation whose lifecycle domain was not proven
+/// empty: it is unresolved, and nothing of how it ended is recorded.
+fn assert_unresolved(f: &mut Fixture, id: agentctl::state::InvocationId, error: anyhow::Error) {
+    let unresolved = error
+        .downcast_ref::<runtime::Unresolved>()
+        .unwrap_or_else(|| panic!("not an unresolved invocation: {error:#}"));
+    assert_eq!(unresolved.invocation, id);
+    // Durable for another process: still live as far as anyone can prove.
+    let other = f.reopen();
+    let recorded = other.invocation(id).unwrap();
+    assert_eq!(recorded.state, InvocationState::Running);
+    assert_eq!(recorded.end, None);
+    let listed = other.unresolved(None).unwrap();
     assert!(
-        started.elapsed() >= Duration::from_secs(2),
-        "SIGTERM was ignored"
+        listed
+            .iter()
+            .any(|u| u.kind == agentctl::state::UnresolvedKind::Invocation(id)),
+        "{listed:?}"
     );
-    assert_eq!(outcome.end.state, InvocationState::Cancelled);
-    assert!(outcome.end.diagnostic.unwrap().contains("SIGKILL"));
-    let observed = control.observe();
-    assert_eq!(observed.state, InvocationState::Cancelled);
-    assert!(observed.exited && !observed.alive());
+    // Its agent stays embodied: nothing else runs as it.
+    assert!(f.spawn("ok").is_err());
+}
+
+fn a_successful_provider_with_an_unproven_lifecycle_stays_unresolved() {
+    let mut f = Fixture::new();
+    let _unproven = runtime::testing::evidence(runtime::testing::Mode::Unproven);
+    let invocation = f.spawn("ok").unwrap();
+    let id = invocation.id();
+    // A valid result, exit 0, and procd terminated the domain without
+    // proving it empty: not a success, and nothing else settled either.
+    let error = invocation.wait(&mut f.store).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not proven empty"),
+        "{error:#}"
+    );
+    assert_unresolved(&mut f, id, error);
+}
+
+fn a_failed_provider_with_an_unproven_lifecycle_stays_unresolved() {
+    for scenario in ["crash", "error", "wrong-shape", "eof"] {
+        let mut f = Fixture::new();
+        let _unproven = runtime::testing::evidence(runtime::testing::Mode::Unproven);
+        let invocation = f.spawn(scenario).unwrap();
+        let id = invocation.id();
+        let error = invocation.wait(&mut f.store).unwrap_err();
+        assert_unresolved(&mut f, id, error);
+    }
+}
+
+fn a_cancellation_with_an_unproven_lifecycle_stays_unresolved() {
+    let mut f = Fixture::new();
+    let _unproven = runtime::testing::evidence(runtime::testing::Mode::Unproven);
+    let invocation = f.spawn("hang").unwrap();
+    let id = invocation.id();
+    let pid = wait_for_first_event(&invocation);
+    invocation.control().cancel();
+    let error = invocation.wait(&mut f.store).unwrap_err();
+    assert_unresolved(&mut f, id, error);
+    // The termination itself was real.
     assert_reaped(pid);
+}
+
+fn an_abandoned_launch_with_an_unproven_lifecycle_stays_unresolved() {
+    let mut f = Fixture::new();
+    let _unproven = runtime::testing::evidence(runtime::testing::Mode::Unproven);
+    // The provider cannot be started in a directory that is not there: the
+    // shim reports it, and the launch is abandoned by terminating the domain.
+    let mut launch = f.launch(Provider::Claude, "ok");
+    launch.cwd = f.dir.path().join("no such directory");
+    let error = runtime::spawn(&mut f.store, &launch).err().unwrap();
+    assert!(
+        format!("{error:#}").contains("not proven empty"),
+        "{error:#}"
+    );
+    let recorded = f.store.invocations(f.agent).unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].state, InvocationState::Starting);
+    assert_eq!(recorded[0].end, None);
+    let listed = f.reopen().unresolved(None).unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|u| u.kind == agentctl::state::UnresolvedKind::Invocation(recorded[0].id)),
+        "{listed:?}"
+    );
+}
+
+/// A descendant that escaped its domain is the case emptiness proofs exist
+/// for. With procd's own evidence, an enforcing host contains it and the
+/// invocation settles; a best-effort one cannot prove it gone, and the
+/// invocation is never recorded as a success.
+fn an_escaped_writer_never_becomes_settled_success() {
+    let mut f = Fixture::new();
+    let _real = runtime::testing::evidence(runtime::testing::Mode::Real);
+    let invocation = f.spawn("escaping").unwrap();
+    let id = invocation.id();
+    let result = invocation.wait(&mut f.store);
+    let pid = descendant(f.dir.path());
+    // Whatever happens, the bounded fixture does not outlive the test: it
+    // is ended here, not by anyone's death.
+    let outcome = match result {
+        Ok(outcome) => {
+            assert!(host_enforces(), "a best-effort host settled an escapee");
+            assert_eq!(outcome.end.state, InvocationState::Succeeded);
+            assert_gone_soon(pid);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    #[cfg(unix)]
+    // SAFETY: the pid is of a descendant this test's provider started.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    assert_gone_soon(pid);
+    if let Some(error) = outcome {
+        assert!(!host_enforces(), "{error:#}");
+        assert_unresolved(&mut f, id, error);
+    }
 }
 
 fn abandoned_invocations_stay_unresolved() {

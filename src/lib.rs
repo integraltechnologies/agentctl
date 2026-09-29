@@ -18,6 +18,7 @@ pub mod init;
 pub mod integration;
 pub mod planner;
 pub mod platform;
+pub mod procd;
 pub mod project;
 pub mod recovery;
 pub mod runtime;

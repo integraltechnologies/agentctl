@@ -391,6 +391,7 @@ pub fn start(
         output_schema: result_schema(),
         cwd: workspace.root().to_path_buf(),
         workspace: runtime::Workspace::Disposable,
+        lifecycle: runtime::ROLE_LIFECYCLE,
     };
     let invocation = runtime::spawn_after(store, &launch, |store, invocation| {
         store.act(entry, Some(invocation))

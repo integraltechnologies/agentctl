@@ -21,6 +21,7 @@ use agentctl::executor::{self, Executed};
 use agentctl::graph::Freshness;
 use agentctl::planner::{self, Command as Plan};
 use agentctl::project::Project;
+use agentctl::runtime::testing::{self, Mode};
 use agentctl::runtime::{FailureKind, InvocationState};
 use agentctl::state::{
     AcceptedSource, Acquisition, ActionOutcome, ActionStatus, ExecutionOutcome, GenerationId,
@@ -103,6 +104,10 @@ fn main() -> ExitCode {
         (
             "interruption_never_fabricates_a_verdict",
             interruption_never_fabricates_a_verdict,
+        ),
+        (
+            "an_unproven_lifecycle_never_lets_a_verifier_judge",
+            an_unproven_lifecycle_never_lets_a_verifier_judge,
         ),
         (
             "new_paths_are_verified_without_invented_history",
@@ -1032,6 +1037,47 @@ fn interruption_never_fabricates_a_verdict() {
 /// A candidate creating paths that never had accepted state is verified
 /// over the candidate itself, without accepted history being invented for
 /// them, and its acceptance then records them truthfully.
+fn an_unproven_lifecycle_never_lets_a_verifier_judge() {
+    let fx = Fixture::new();
+    let (task, generation) = fx.installed("modify", &["src/a.rs"]);
+    let installed = fx.tree();
+    let accepted = fx.accepted();
+    let (project, mut store) = fx.open("none", "pass");
+    let _unproven = testing::evidence(Mode::Unproven);
+    let running =
+        verifier::start(&project, &mut store, task, generation, Some(fake_agent())).unwrap();
+    let id = running.id();
+    // The verifier passed the candidate, exited, and procd terminated its
+    // domain without proving it empty: no verdict, and no pass to accept.
+    let error = running.finish(&project, &mut store).err().unwrap();
+    let message = format!("{error:#}");
+    assert!(message.contains("not proven empty"), "{message}");
+    drop(store);
+    let (_, store) = fx.open("none", "none");
+    let verification = store.verification(id).unwrap();
+    let VerificationStatus::OutcomeUnknown {
+        invocation: Some(invocation),
+    } = verification.status
+    else {
+        panic!("{:?}", verification.status);
+    };
+    let recorded = store.invocation(invocation).unwrap();
+    assert_eq!(
+        (recorded.state, recorded.end),
+        (InvocationState::Running, None)
+    );
+    let entry = store.journal_entry(verification.journal).unwrap();
+    assert!(matches!(entry.status, ActionStatus::OutcomeUnknown(_)));
+    assert_eq!(store.owned_paths(generation).unwrap(), ["src/a.rs"]);
+    assert_eq!(fx.accepted(), accepted);
+    assert_eq!(fx.tree(), installed);
+    // Nor is another verification begun while that one is unresolved.
+    let (project, mut store) = fx.open("none", "pass");
+    let refused = verifier::start(&project, &mut store, task, generation, Some(fake_agent()));
+    let message = format!("{:#}", refused.err().unwrap());
+    assert!(message.contains("not yet reconciled"), "{message}");
+}
+
 fn new_paths_are_verified_without_invented_history() {
     let fx = Fixture::new();
     {

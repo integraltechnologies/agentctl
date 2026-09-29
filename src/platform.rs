@@ -3,11 +3,15 @@
 //! semantics differ between operating systems.
 //!
 //! Capabilities report what agentctl itself implements and relies on, not
-//! what the operating system could offer. They describe the current host, so
+//! what the operating system could offer; process lifecycle is procd's, so
+//! its levels are exactly what procd reports, never raised. They describe
+//! the current host, so
 //! they are never persisted and never enter canonical state or graph
 //! identity. Mechanism names are diagnostic evidence, not policy.
 
 use std::fmt;
+
+use crate::procd;
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 compile_error!("agentctl supports macOS, Linux and Windows");
@@ -22,8 +26,8 @@ mod windows;
 use windows as backend;
 
 pub(crate) use backend::{
-    literal_name, open_regular, publish_new, replace, request_termination, runs_directly, stage,
-    symlink, sync_dir, write_back,
+    literal_name, open_regular, publish_new, replace, runs_directly, stage, symlink, sync_dir,
+    write_back,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +82,9 @@ pub enum Capability {
     DurablePublication,
     /// Terminating a process together with every descendant it started.
     ProcessTreeTermination,
+    /// Establishing, after agentctl itself was lost, whether a lifecycle
+    /// domain's processes are gone: authoritatively, never by guessing.
+    SafeRecovery,
     /// Bounding a process tree's CPU, memory and process count.
     ResourceLimits,
     /// Restricting which files a process tree can read and write.
@@ -89,11 +96,12 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub const ALL: [Capability; 8] = [
+    pub const ALL: [Capability; 9] = [
         Capability::NoFollowOpen,
         Capability::ConfinedResolution,
         Capability::DurablePublication,
         Capability::ProcessTreeTermination,
+        Capability::SafeRecovery,
         Capability::ResourceLimits,
         Capability::FilesystemIsolation,
         Capability::NetworkIsolation,
@@ -143,6 +151,23 @@ pub fn capabilities() -> Capabilities {
             Some("agentctl has no backend mechanism for this yet"),
         )
     };
+    // What procd reports of a lifecycle capability, truthfully: what it
+    // cannot report is unsupported.
+    let lifecycle = |capability, of: fn(&procd::Capabilities) -> Level| match procd::capabilities()
+    {
+        Ok(caps) => Support {
+            capability,
+            level: of(caps),
+            mechanism: &caps.backend,
+            reason: (of(caps) != Level::Enforced).then_some(caps.detail.as_str()),
+        },
+        Err(why) => support(
+            capability,
+            Level::Unsupported,
+            "procd_unavailable",
+            Some(why.as_str()),
+        ),
+    };
     Capabilities([
         support(
             Capability::NoFollowOpen,
@@ -162,7 +187,10 @@ pub fn capabilities() -> Capabilities {
             backend::DURABLE_PUBLICATION,
             None,
         ),
-        not_implemented(Capability::ProcessTreeTermination),
+        lifecycle(Capability::ProcessTreeTermination, |c| {
+            c.process_tree_termination
+        }),
+        lifecycle(Capability::SafeRecovery, |c| c.safe_recovery),
         not_implemented(Capability::ResourceLimits),
         not_implemented(Capability::FilesystemIsolation),
         not_implemented(Capability::NetworkIsolation),
@@ -298,7 +326,6 @@ mod tests {
     fn reports_only_what_agentctl_implements() {
         let caps = capabilities();
         for capability in [
-            Capability::ProcessTreeTermination,
             Capability::ResourceLimits,
             Capability::FilesystemIsolation,
             Capability::NetworkIsolation,
@@ -306,6 +333,16 @@ mod tests {
         ] {
             assert_eq!(caps.get(capability).level, Level::Unsupported);
         }
+        // Process lifecycle is procd's: exactly what it reports, never more.
+        let procd = procd::capabilities().as_ref().unwrap();
+        assert_eq!(
+            caps.get(Capability::ProcessTreeTermination).level,
+            procd.process_tree_termination
+        );
+        assert_eq!(
+            caps.get(Capability::SafeRecovery).level,
+            procd.safe_recovery
+        );
         // Ancestors are checked by path, so a concurrent swap is possible.
         assert_eq!(
             caps.get(Capability::ConfinedResolution).level,

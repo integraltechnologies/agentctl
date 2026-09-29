@@ -415,6 +415,9 @@ fn copy_named(copy: &OnceLock<(TempDir, PathBuf)>, name: &str) -> PathBuf {
             .path()
             .join(format!("{name}{}", env::consts::EXE_SUFFIX));
         fs::copy(env::current_exe().unwrap(), &path).unwrap();
+        // A process that launches providers finds their shim beside itself.
+        let shim = format!("agentctl-shim{}", env::consts::EXE_SUFFIX);
+        fs::copy(env!("CARGO_BIN_EXE_agentctl-shim"), dir.path().join(shim)).unwrap();
         (dir, path)
     })
     .1

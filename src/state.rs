@@ -1058,14 +1058,46 @@ impl Store {
         model: &str,
         effort: Option<&str>,
     ) -> Result<InvocationId> {
+        self.start_invocation_in(agent, provider, model, effort, None)
+    }
+
+    /// [`Store::start_invocation`], recording with it `containment`, the
+    /// durable identity of the lifecycle domain that will own every process
+    /// of the invocation. It is recorded in the same write that starts the
+    /// invocation, so no invocation can have a process whose domain a
+    /// restart cannot name.
+    pub fn start_contained_invocation(
+        &mut self,
+        agent: AgentId,
+        provider: &str,
+        model: &str,
+        effort: Option<&str>,
+        containment: &str,
+    ) -> Result<InvocationId> {
+        ensure!(
+            !containment.is_empty(),
+            "a containment identity is not empty"
+        );
+        self.start_invocation_in(agent, provider, model, effort, Some(containment))
+    }
+
+    fn start_invocation_in(
+        &mut self,
+        agent: AgentId,
+        provider: &str,
+        model: &str,
+        effort: Option<&str>,
+        containment: Option<&str>,
+    ) -> Result<InvocationId> {
         self.write(|tx| {
             let (plan, task) = agent_subject(tx, agent)?;
             tx.execute(
                 "INSERT INTO invocations
-                   (agent_id, session, provider, model, effort, state, started_at)
-                 VALUES (?1, (SELECT id FROM temp.own_session), ?2, ?3, ?4, ?5, ?6)",
+                   (agent_id, session, containment, provider, model, effort, state, started_at)
+                 VALUES (?1, (SELECT id FROM temp.own_session), ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     agent,
+                    containment,
                     provider,
                     model,
                     effort,
@@ -1086,6 +1118,19 @@ impl Store {
             )?;
             Ok(invocation)
         })
+    }
+
+    /// The durable identity of the lifecycle domain that owns `invocation`'s
+    /// processes, if one was recorded.
+    pub fn containment(&self, invocation: InvocationId) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT containment FROM invocations WHERE id = ?1",
+                [invocation],
+                |r| r.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("invocation {invocation} does not exist"))
     }
 
     /// Records that a starting invocation's process has launched.
