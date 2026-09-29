@@ -358,7 +358,7 @@ pub fn start(
     executable: Option<PathBuf>,
 ) -> Result<Verifier> {
     let role = &project.config.agents.verifier;
-    let provider = role.provider.as_str().parse::<Provider>()?;
+    let provider = Provider::resolve(&project.config, role.provider.as_str())?;
     let candidate = store.verification_candidate(task, generation)?;
     let paths: Vec<String> = candidate.iter().map(|(path, _)| path.clone()).collect();
     let input = serde_json::to_string_pretty(&input(project, store, task, generation)?)?;

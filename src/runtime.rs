@@ -30,6 +30,7 @@
 
 mod claude;
 mod codex;
+mod generic;
 pub mod shim;
 
 #[cfg(any(test, feature = "lifecycle-double"))]
@@ -119,7 +120,6 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -130,7 +130,7 @@ use jsonschema::Validator;
 use serde_json::{Map, Value};
 use tempfile::{NamedTempFile, TempDir};
 
-use crate::config::ReasoningEffort;
+use crate::config::{Adapter, Config, ReasoningEffort};
 use crate::platform::{self, Need};
 use crate::procd::{self, Domain, Evidence};
 use crate::state::{AgentId, InvocationId, Store};
@@ -146,37 +146,63 @@ const DRAIN: Duration = Duration::from_secs(2);
 const STDERR_TAIL: usize = 16 * 1024;
 const DIAGNOSTIC_LIMIT: usize = 1000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provider {
-    Claude,
-    Codex,
+/// A provider as configured, resolved: an opaque name, and what runs it. The
+/// name is what invocations record; the adapter decides only the wire
+/// protocol, never anything about what the provider is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provider {
+    pub name: String,
+    pub adapter: Adapter,
+    /// The executable: a path, or a name found on `PATH`.
+    pub command: String,
+    /// Arguments placed before the adapter's own.
+    pub args: Vec<String>,
+    /// Exact environment variable names passed on beyond the adapter's own.
+    pub env: Vec<String>,
 }
 
 impl Provider {
-    /// The provider's configuration name, which is also its CLI's name.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
+    /// A provider run as `command`, with no fixed arguments or extra
+    /// environment.
+    pub fn new(name: &str, adapter: Adapter, command: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            adapter,
+            command: command.to_owned(),
+            args: Vec::new(),
+            env: Vec::new(),
         }
     }
-}
 
-impl FromStr for Provider {
-    type Err = anyhow::Error;
+    /// The provider `name` as `config` declares it, or as implied.
+    pub fn resolve(config: &Config, name: &str) -> Result<Self> {
+        let def = config
+            .provider(name)
+            .with_context(|| format!("unknown provider `{name}`"))?;
+        Ok(Self {
+            name: name.to_owned(),
+            adapter: def.adapter,
+            command: def.command.to_string(),
+            args: def.args,
+            env: def.env.iter().map(ToString::to_string).collect(),
+        })
+    }
 
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            _ => bail!("unknown provider `{s}`; agentctl runs claude and codex"),
-        }
+    /// What the provider's process may see of agentctl's environment.
+    fn passthrough(&self) -> Passthrough {
+        let mut passes = match self.adapter {
+            Adapter::Claude => claude::env(),
+            Adapter::Codex => codex::env(),
+            Adapter::Generic => Passthrough::default(),
+        };
+        passes.names.extend(self.env.iter().cloned());
+        passes
     }
 }
 
 impl fmt::Display for Provider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        f.write_str(&self.name)
     }
 }
 
@@ -210,7 +236,7 @@ pub struct Launch {
     /// The logical agent the invocation embodies.
     pub agent: AgentId,
     pub provider: Provider,
-    /// The provider CLI; `None` finds the provider's executable on `PATH`.
+    /// The provider's executable; `None` finds its command on `PATH`.
     pub executable: Option<PathBuf>,
     pub model: String,
     pub effort: Option<ReasoningEffort>,
@@ -349,9 +375,10 @@ pub fn spawn_after(
     // cannot fetch files or URLs.
     let schema = jsonschema::validator_for(&launch.output_schema)
         .map_err(|e| anyhow!("the output schema is not a valid JSON Schema: {e}"))?;
-    let prepared = match launch.provider {
-        Provider::Claude => claude::prepare(launch),
-        Provider::Codex => codex::prepare(launch),
+    let prepared = match launch.provider.adapter {
+        Adapter::Claude => claude::prepare(launch),
+        Adapter::Codex => codex::prepare(launch),
+        Adapter::Generic => generic::prepare(launch),
     }?;
     let effort = launch.effort.map(|e| e.to_string());
     // Admission: the domain that will own every process of the invocation
@@ -362,7 +389,7 @@ pub fn spawn_after(
     // that a restart cannot name the domain of.
     let id = store.start_contained_invocation(
         launch.agent,
-        launch.provider.name(),
+        &launch.provider.name,
         &launch.model,
         effort.as_deref(),
         domain.identity(),
@@ -385,7 +412,13 @@ pub fn spawn_after(
         progress: Mutex::new(Progress::new(prepared.decoder)),
         schema,
     });
-    let process = match start(launch, &prepared.args, domain, &shared, &launch.input) {
+    let process = match start(
+        launch,
+        &prepared.args,
+        prepared.input.as_deref().unwrap_or(&launch.input),
+        domain,
+        &shared,
+    ) {
         Launched::Process(process) => *process,
         Launched::Failed(kind, why) => {
             let end = InvocationEnd {
@@ -463,15 +496,19 @@ impl Invocation {
 struct Prepared {
     args: Vec<OsString>,
     decoder: Decoder,
+    /// What the provider receives on standard input, where that is not the
+    /// launch's input as it is.
+    input: Option<String>,
     /// Files the arguments name, removed once the invocation ends.
     files: Vec<NamedTempFile>,
 }
 
 /// Environment variables a provider needs beyond [`COMMON_ENV`], typically
 /// for its authentication and configuration.
+#[derive(Debug, Default)]
 struct Passthrough {
-    names: &'static [&'static str],
-    prefixes: &'static [&'static str],
+    names: Vec<String>,
+    prefixes: Vec<String>,
 }
 
 /// What any provider may need from the environment: to find programs and
@@ -524,12 +561,21 @@ const COMMON_ENV: &[&str] = &[
 ];
 
 impl Passthrough {
+    fn new(names: &[&str], prefixes: &[&str]) -> Self {
+        let own = |list: &[&str]| list.iter().map(ToString::to_string).collect();
+        Self {
+            names: own(names),
+            prefixes: own(prefixes),
+        }
+    }
+
     /// Whether the variable `name` is passed on. Names compare ignoring
     /// ASCII case, as Windows compares them.
     fn passes(&self, name: &str) -> bool {
         COMMON_ENV
             .iter()
-            .chain(self.names)
+            .copied()
+            .chain(self.names.iter().map(String::as_str))
             .any(|n| n.eq_ignore_ascii_case(name))
             || self.prefixes.iter().any(|p| {
                 name.get(..p.len())
@@ -553,12 +599,12 @@ enum Launched {
 fn start(
     launch: &Launch,
     args: &[OsString],
+    input: &str,
     domain: Domain,
     shared: &Arc<Shared>,
-    input: &str,
 ) -> Launched {
     let failed = |kind, why: String| Launched::Failed(kind, why);
-    let name = launch.provider.name();
+    let name = &launch.provider.command;
     let exe = match &launch.executable {
         Some(path) => path.clone(),
         None => match which::which(name) {
@@ -587,10 +633,16 @@ fn start(
         );
     }
     let spec = shim::Spec {
-        provider: launch.provider,
+        env: launch.provider.passthrough(),
         exe,
         cwd: launch.cwd.clone(),
-        args: args.to_vec(),
+        args: launch
+            .provider
+            .args
+            .iter()
+            .map(OsString::from)
+            .chain(args.iter().cloned())
+            .collect(),
     };
     let unusable = |what: &str, e: anyhow::Error| {
         failed(
@@ -737,6 +789,7 @@ impl Progress {
                 match &mut self.decoder {
                     Decoder::Claude(d) => d.decode(&kind, event, &mut self.stream),
                     Decoder::Codex(d) => d.decode(&kind, event, &mut self.stream),
+                    Decoder::Generic(d) => d.decode(&kind, event, &mut self.stream),
                 }
                 self.last_event = Some(kind);
             }
@@ -748,14 +801,17 @@ impl Progress {
 enum Decoder {
     Claude(claude::Decoder),
     Codex(codex::Decoder),
+    Generic(generic::Decoder),
 }
 
 /// What a provider's structured output has established, in neutral terms.
 #[derive(Debug, Default)]
 struct Stream {
     session: Option<String>,
-    /// Token usage the provider reported.
+    /// Token usage the provider reported, or estimated.
     tokens: Option<TokenUsage>,
+    /// Whether `tokens` is the provider's own estimate, not a report.
+    estimated: bool,
     result: Option<Value>,
     /// That the provider reported an error, in agentctl's words: what it
     /// said is provider-controlled, so it goes to `metadata` at most.
@@ -778,8 +834,11 @@ impl Stream {
     }
 
     fn usage(&self) -> Usage {
-        self.tokens
-            .map_or(Usage::Unavailable, Usage::ProviderReported)
+        match self.tokens {
+            Some(t) if self.estimated => Usage::LocalEstimate(t),
+            Some(t) => Usage::ProviderReported(t),
+            None => Usage::Unavailable,
+        }
     }
 }
 
@@ -1182,7 +1241,7 @@ mod tests {
 
     #[test]
     fn only_needed_environment_passes() {
-        let claude = &claude::ENV;
+        let claude = &claude::env();
         for name in [
             "PATH",
             "Path",
@@ -1204,7 +1263,7 @@ mod tests {
         ] {
             assert!(!claude.passes(name), "{name}");
         }
-        let codex = &codex::ENV;
+        let codex = &codex::env();
         for name in ["OPENAI_API_KEY", "CODEX_HOME", "SystemRoot"] {
             assert!(codex.passes(name), "{name}");
         }
@@ -1489,10 +1548,25 @@ mod tests {
     }
 
     #[test]
-    fn providers_are_named_as_configured() {
-        for provider in [Provider::Claude, Provider::Codex] {
-            assert_eq!(provider.name().parse::<Provider>().unwrap(), provider);
+    fn declared_environment_names_pass_exactly() {
+        let provider = Provider {
+            name: "local".into(),
+            adapter: Adapter::Generic,
+            command: "agent".into(),
+            args: Vec::new(),
+            env: vec!["MY_RUNTIME_HOME".into()],
+        };
+        let passes = provider.passthrough();
+        for name in ["PATH", "MY_RUNTIME_HOME", "my_runtime_home"] {
+            assert!(passes.passes(name), "{name}");
         }
-        assert!("gemini".parse::<Provider>().is_err());
+        for name in [
+            "MY_RUNTIME_HOME2",
+            "MY_RUNTIME",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+        ] {
+            assert!(!passes.passes(name), "{name}");
+        }
     }
 }

@@ -248,7 +248,7 @@ pub fn start(
     executable: Option<PathBuf>,
 ) -> Result<Integrator> {
     let role = &project.config.agents.verifier;
-    let provider = role.provider.as_str().parse::<Provider>()?;
+    let provider = Provider::resolve(&project.config, role.provider.as_str())?;
     let intended = intend(project, store, plan)?;
     let launch = Launch {
         agent: intended.agent,

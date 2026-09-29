@@ -20,10 +20,12 @@ use serde_json::Value;
 use super::{Launch, Passthrough, Prepared, Stream, TokenUsage, Workspace};
 use crate::config::ReasoningEffort;
 
-pub(super) const ENV: Passthrough = Passthrough {
-    names: &["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"],
-    prefixes: &["ANTHROPIC_", "CLAUDE_CODE_USE_"],
-};
+pub(super) fn env() -> Passthrough {
+    Passthrough::new(
+        &["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"],
+        &["ANTHROPIC_", "CLAUDE_CODE_USE_"],
+    )
+}
 
 /// The tools running commands, on any platform, that a disposable
 /// workspace allows.
@@ -62,6 +64,7 @@ pub(super) fn prepare(launch: &Launch) -> Result<Prepared> {
     Ok(Prepared {
         args: args.into_iter().map(OsString::from).collect(),
         decoder: super::Decoder::Claude(Decoder::default()),
+        input: None,
         files: Vec::new(),
     })
 }
@@ -269,7 +272,11 @@ mod tests {
     fn values_cannot_become_options() {
         let launch = |effort| Launch {
             agent: crate::state::tests::agent_id(1),
-            provider: super::super::Provider::Claude,
+            provider: super::super::Provider::new(
+                "claude",
+                crate::config::Adapter::Claude,
+                "claude",
+            ),
             executable: None,
             model: "--dangerously-skip-permissions".into(),
             effort,
@@ -295,7 +302,11 @@ mod tests {
     fn workspaces_use_claude_permission_modes() {
         let launch = |workspace| Launch {
             agent: crate::state::tests::agent_id(1),
-            provider: super::super::Provider::Claude,
+            provider: super::super::Provider::new(
+                "claude",
+                crate::config::Adapter::Claude,
+                "claude",
+            ),
             executable: None,
             model: "m".into(),
             effort: None,

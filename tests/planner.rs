@@ -23,6 +23,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const FAKE: &str = "fake-planner";
+/// Fixed argument that makes the fake speak the generic protocol.
+const GENERIC: &str = "--generic-runtime";
 /// Stands for anything a planner might say that must never be recorded.
 const PROSE: &str = "PLANNER-PROSE-7d1e";
 
@@ -39,6 +41,10 @@ fn main() -> ExitCode {
         (
             "failed_planning_leaves_the_plan_intact",
             failed_planning_leaves_the_plan_intact,
+        ),
+        (
+            "a_declared_provider_plans_through_the_generic_protocol",
+            a_declared_provider_plans_through_the_generic_protocol,
         ),
     ];
     let filters: Vec<String> = env::args()
@@ -74,10 +80,22 @@ fn fake() -> ExitCode {
         .to_owned();
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).unwrap();
-    let input: Value = serde_json::from_str(&input).unwrap();
-    // Nothing is resumed: the input is all a planner knows.
-    assert!(args.iter().any(|a| a == "--no-session-persistence"));
-    assert!(!args.iter().any(|a| a.starts_with("--resume")));
+    let mut input: Value = serde_json::from_str(&input).unwrap();
+    let generic = args.iter().any(|a| a == GENERIC);
+    let scenario = if generic {
+        // The request of the generic protocol, whose input is the task.
+        assert_eq!(input["protocol"], 1);
+        assert_eq!(input["workspace"], "read_only");
+        assert!(input["output_schema"].is_object());
+        let request = input.take();
+        input = serde_json::from_str(request["input"].as_str().unwrap()).unwrap();
+        request["model"].as_str().unwrap().to_owned()
+    } else {
+        // Nothing is resumed: the input is all a planner knows.
+        assert!(args.iter().any(|a| a == "--no-session-persistence"));
+        assert!(!args.iter().any(|a| a.starts_with("--resume")));
+        scenario
+    };
     let add = |task: &str, paths: Value, depends_on: Value| {
         json!({"op": "add_task", "task": task, "objective": format!("Complete {task}"),
                "context": "Keep the public API.", "paths": paths, "depends_on": depends_on})
@@ -112,6 +130,12 @@ fn fake() -> ExitCode {
         "hang" => hang_bounded(),
         other => panic!("unknown scenario `{other}`"),
     };
+    if generic {
+        let value = json!({"commands": commands, "explanation": PROSE});
+        println!("{}", json!({"type": "usage", "input": 3, "output": 2}));
+        println!("{}", json!({"type": "result", "value": value}));
+        return ExitCode::SUCCESS;
+    }
     let init = json!({"type": "system", "subtype": "init", "session_id": "fake-session"});
     let result = json!({"type": "result", "subtype": "success", "is_error": false,
         "session_id": "fake-session", "result": PROSE,
@@ -161,6 +185,12 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::configured("claude", "")
+    }
+
+    /// A project whose roles use `provider`, with `declarations` appended
+    /// to its configuration.
+    fn configured(provider: &str, declarations: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let git = Command::new("git")
@@ -170,12 +200,13 @@ impl Fixture {
             .status()
             .unwrap();
         assert!(git.success());
-        let role = "provider = \"claude\"\nmodel = \"draft\"\nreasoning_effort = \"high\"\n";
+        let role =
+            format!("provider = \"{provider}\"\nmodel = \"draft\"\nreasoning_effort = \"high\"\n");
         let config = format!(
             "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n\
              [codegraph]\nroots = [\"src\"]\n\n\
              [agents]\nmax_concurrency = 1\n\n\
-             [agents.planner]\n{role}\n[agents.executor]\n{role}\n[agents.verifier]\n{role}"
+             [agents.planner]\n{role}\n[agents.executor]\n{role}\n[agents.verifier]\n{role}\n{declarations}"
         );
         fs::write(root.join("agentctl.toml"), config).unwrap();
         fs::create_dir(root.join("src")).unwrap();
@@ -284,6 +315,32 @@ fn planning_reaches_ready_across_fresh_invocations() {
         "{message}"
     );
     assert_eq!(store.invocations(a.agent).unwrap().len(), 2);
+}
+
+/// A provider agentctl was not compiled with, declared in configuration
+/// alone, runs the whole planning path.
+fn a_declared_provider_plans_through_the_generic_protocol() {
+    let fx = Fixture::configured(
+        "acme-local",
+        &format!(
+            "[providers.acme-local]\nadapter = \"generic\"\ncommand = \"acme-agent\"\nargs = [\"{GENERIC}\"]\n"
+        ),
+    );
+    let (_, mut store) = fx.open("draft");
+    let plan = fx.plan(&mut store);
+    let Planned::Applied { invocation, .. } = fx.run(plan, "draft") else {
+        panic!("the draft applies");
+    };
+    let (_, tasks) = state(&store, plan);
+    let keys: Vec<_> = tasks.iter().map(|t| t.key.as_str()).collect();
+    assert_eq!(keys, ["parse", "check"]);
+    let recorded = store.invocation(invocation).unwrap();
+    assert_eq!(recorded.provider, "acme-local");
+    assert_eq!(recorded.state, InvocationState::Succeeded);
+    assert!(matches!(
+        recorded.end.unwrap().usage,
+        agentctl::runtime::Usage::ProviderReported(_)
+    ));
 }
 
 fn failed_planning_leaves_the_plan_intact() {

@@ -889,7 +889,7 @@ pub fn start(
     let agent = store.planner(plan)?;
     let launch = Launch {
         agent,
-        provider: role.provider.as_str().parse::<Provider>()?,
+        provider: Provider::resolve(&project.config, role.provider.as_str())?,
         executable,
         model: role.model.to_string(),
         effort: Some(role.reasoning_effort),
@@ -943,7 +943,7 @@ pub fn replan(
     let entry = store.intend(agent, &intent)?;
     let launch = Launch {
         agent,
-        provider: role.provider.as_str().parse::<Provider>()?,
+        provider: Provider::resolve(&project.config, role.provider.as_str())?,
         executable,
         model: role.model.to_string(),
         effort: Some(role.reasoning_effort),

@@ -20,10 +20,9 @@ use serde_json::Value;
 
 use super::{Launch, Passthrough, Prepared, Stream, TokenUsage, Workspace};
 
-pub(super) const ENV: Passthrough = Passthrough {
-    names: &["CODEX_HOME"],
-    prefixes: &["OPENAI_"],
-};
+pub(super) fn env() -> Passthrough {
+    Passthrough::new(&["CODEX_HOME"], &["OPENAI_"])
+}
 
 pub(super) fn prepare(launch: &Launch) -> Result<Prepared> {
     let mut schema = tempfile::Builder::new()
@@ -68,6 +67,7 @@ pub(super) fn prepare(launch: &Launch) -> Result<Prepared> {
     Ok(Prepared {
         args,
         decoder: super::Decoder::Codex(Decoder::default()),
+        input: None,
         files: vec![schema],
     })
 }
@@ -357,7 +357,7 @@ mod tests {
         let bootstrap = "Say \"hi\"\n= [not] a table\\ ''' -c x=1";
         let launch = Launch {
             agent: crate::state::tests::agent_id(1),
-            provider: super::super::Provider::Codex,
+            provider: super::super::Provider::new("codex", crate::config::Adapter::Codex, "codex"),
             executable: None,
             model: "m".into(),
             effort: Some(crate::config::ReasoningEffort::Minimal),
@@ -399,7 +399,7 @@ mod tests {
     fn workspaces_keep_codex_sandboxed() {
         let launch = |workspace| Launch {
             agent: crate::state::tests::agent_id(1),
-            provider: super::super::Provider::Codex,
+            provider: super::super::Provider::new("codex", crate::config::Adapter::Codex, "codex"),
             executable: None,
             model: "m".into(),
             effort: None,

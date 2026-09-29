@@ -591,6 +591,29 @@ pub(crate) mod tests {
     ];
 
     #[test]
+    fn a_passed_python_and_script_candidate_becomes_a_current_graph() {
+        let accepted = [
+            ("src/app.py", "def old(): pass\n"),
+            ("src/app.ts", "export const old = 1;\n"),
+            ("src/bad.py", "def ok(): pass\n"),
+        ];
+        let scope = ["src/app.py", "src/app.ts", "src/bad.py", "src/new.jsx"];
+        let edits = [
+            ("src/app.py", Some("class A:\n    def m(self): pass\n")),
+            ("src/app.ts", Some("export interface I {}\n")),
+            ("src/bad.py", Some("def broken(:\n")),
+            ("src/new.jsx", Some("export default () => <p/>;\n")),
+        ];
+        let mut case = Case::installed(&accepted, &scope, &edits);
+        case.verify(Judged::Pass);
+        completed(case.accept());
+        assert_eq!(case.symbols("src/app.py"), ["A", "A.m", "self"]);
+        assert_eq!(case.symbols("src/app.ts"), ["I", "self"]);
+        assert_eq!(case.symbols("src/new.jsx"), ["default", "self"]);
+        assert_eq!(case.status("src/bad.py"), Freshness::Unindexed);
+    }
+
+    #[test]
     fn a_passed_candidate_becomes_accepted_source_and_graph_exactly_once() {
         let mut case = Case::installed(&ACCEPTED, &SCOPE, &EDITS);
         case.verify(Judged::Pass);

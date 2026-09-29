@@ -3,6 +3,8 @@
 //! Every field is validated by its type during deserialization, so a parsed
 //! `Config` is always valid. Validity never depends on the current machine.
 
+use std::borrow::Borrow;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::str::FromStr;
@@ -16,6 +18,36 @@ pub struct Config {
     pub project: ProjectInfo,
     pub codegraph: CodeGraph,
     pub agents: Agents,
+    /// Provider declarations, by the name roles refer to. `claude` and
+    /// `codex` are implicit unless declared here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<Text, ProviderDef>,
+}
+
+/// A declared provider: which adapter speaks to which command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDef {
+    pub adapter: Adapter,
+    /// The executable: a path, or a name found on `PATH`.
+    pub command: Text,
+    /// Arguments placed before the adapter's own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Exact names of environment variables the provider may see, beyond
+    /// what every provider gets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<Text>,
+}
+
+/// The wire protocol a provider's command is run with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Adapter {
+    Claude,
+    Codex,
+    /// agentctl's external-agent protocol, version 1.
+    Generic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,8 +89,53 @@ pub struct Role {
 }
 
 impl Config {
+    /// Parses and validates `text`: beyond its shape, every role's
+    /// provider must be declared or implicit.
     pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(text)
+        let config: Self = toml::from_str(text)?;
+        config
+            .validate()
+            .map_err(<toml::de::Error as serde::de::Error>::custom)?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for (name, def) in &self.providers {
+            if let Some(env) = def.env.iter().find(|n| n.as_str().contains('=')) {
+                return Err(format!(
+                    "provider `{name}` names environment variable `{env}`, which contains `=`"
+                ));
+            }
+        }
+        for (role, config) in ["planner", "executor", "verifier"]
+            .into_iter()
+            .zip(self.agents.roles())
+        {
+            let name = config.provider.as_str();
+            if self.provider(name).is_none() {
+                return Err(format!(
+                    "the {role} role uses provider `{name}`, which is neither claude, codex \
+                     nor declared under [providers.{name}]"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The provider called `name`: as declared, or else the implicit
+    /// built-in of that name, whose command is its own name.
+    pub fn provider(&self, name: &str) -> Option<ProviderDef> {
+        let implicit = |adapter| ProviderDef {
+            adapter,
+            command: name.parse().expect("a provider name is text"),
+            args: Vec::new(),
+            env: Vec::new(),
+        };
+        self.providers.get(name).cloned().or(match name {
+            "claude" => Some(implicit(Adapter::Claude)),
+            "codex" => Some(implicit(Adapter::Codex)),
+            _ => None,
+        })
     }
 
     pub fn to_toml(&self) -> String {
@@ -101,12 +178,18 @@ impl fmt::Display for ReasoningEffort {
 }
 
 /// Non-empty text without surrounding whitespace.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Text(String);
 
 impl Text {
     pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for Text {
+    fn borrow(&self) -> &str {
         &self.0
     }
 }
@@ -290,7 +373,14 @@ pub(crate) mod tests {
                 executor: role(ReasoningEffort::Medium),
                 verifier: role(ReasoningEffort::Xhigh),
             },
+            providers: BTreeMap::new(),
         }
+    }
+
+    fn with_provider(name: &str) -> Config {
+        let mut config = sample();
+        config.agents.executor.provider = name.parse().unwrap();
+        config
     }
 
     #[test]
@@ -327,6 +417,73 @@ pub(crate) mod tests {
             "[agents.reviewer]",
             "unknown field `reviewer`",
         );
+    }
+
+    #[test]
+    fn built_in_providers_are_implicit() {
+        let config = sample();
+        let claude = config.provider("claude").unwrap();
+        assert_eq!(
+            (claude.adapter, claude.command.as_str()),
+            (Adapter::Claude, "claude")
+        );
+        let codex = config.provider("codex").unwrap();
+        assert_eq!(
+            (codex.adapter, codex.command.as_str()),
+            (Adapter::Codex, "codex")
+        );
+        assert!(config.provider("local").is_none());
+    }
+
+    #[test]
+    fn declared_providers_resolve_and_round_trip() {
+        let mut config = with_provider("local");
+        let def = |adapter, command: &str| ProviderDef {
+            adapter,
+            command: command.parse().unwrap(),
+            args: vec!["run".into()],
+            env: vec!["MY_RUNTIME_HOME".parse().unwrap()],
+        };
+        config
+            .providers
+            .insert("local".parse().unwrap(), def(Adapter::Generic, "my-agent"));
+        config
+            .providers
+            .insert("work".parse().unwrap(), def(Adapter::Claude, "claude"));
+        let text = config.to_toml();
+        assert!(text.contains("[providers.local]"), "{text}");
+        let parsed = Config::parse(&text).unwrap();
+        assert_eq!(parsed, config);
+        assert_eq!(
+            parsed.provider("local"),
+            config.providers.get("local").cloned()
+        );
+        assert_eq!(parsed.provider("work").unwrap().adapter, Adapter::Claude);
+    }
+
+    #[test]
+    fn a_role_needs_a_known_provider() {
+        let text = with_provider("local").to_toml();
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("executor role uses provider `local`"), "{err}");
+        let declared =
+            format!("{text}\n[providers.local]\nadapter = \"generic\"\ncommand = \"my-agent\"\n");
+        let config = Config::parse(&declared).unwrap();
+        assert!(config.providers.get("local").unwrap().args.is_empty());
+    }
+
+    #[test]
+    fn provider_declarations_are_strict() {
+        let declared = |body: &str| {
+            let mut config = with_provider("local").to_toml();
+            config.push_str(&format!("\n[providers.local]\n{body}"));
+            Config::parse(&config).unwrap_err().to_string()
+        };
+        let base = "adapter = \"generic\"\ncommand = \"x\"\n";
+        assert!(declared(&format!("{base}model = \"m\"")).contains("unknown field `model`"));
+        assert!(declared("adapter = \"gemini\"\ncommand = \"x\"").contains("unknown variant"));
+        assert!(declared("adapter = \"generic\"").contains("missing field `command`"));
+        assert!(declared(&format!("{base}env = [\"A=B\"]")).contains("contains `=`"));
     }
 
     #[test]

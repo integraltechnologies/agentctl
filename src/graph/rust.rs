@@ -39,12 +39,11 @@
 //! parameter are skipped, and `Self` becomes the impl's self type when that
 //! is a plain path, or is skipped too.
 
-use std::collections::{BTreeMap, HashMap};
+use anyhow::{Context, Result};
+use tree_sitter::Node as Syntax;
 
-use anyhow::{Context, Result, bail};
-use tree_sitter::{Node as Syntax, Parser};
-
-use super::{Contribution, EntityDef, EntityId, Evidence, External, Node, RelationDef, Span};
+use super::syntax::{Builder, named_children, parse, span};
+use super::{Contribution, EntityId, External};
 use crate::project::Project;
 use crate::source::{self, AcceptedContent};
 use crate::state::Store;
@@ -64,62 +63,15 @@ pub fn index(project: &Project, store: &mut Store, path: &str) -> Result<()> {
 /// The graph of the Rust source `path` with accepted content `content`, or
 /// why that content is not valid Rust.
 pub(crate) fn contribution(path: &str, content: &AcceptedContent) -> Result<Contribution> {
-    let text = std::str::from_utf8(content.bytes()).context("content is not UTF-8")?;
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
-    let tree = parser.parse(text, None).context("parsing was cancelled")?;
+    let (text, tree) = parse(&tree_sitter_rust::LANGUAGE.into(), content.bytes())?;
     let root = tree.root_node();
-    if let Some(error) = first_error(root) {
-        bail!("syntax error at byte {}", error.start_byte());
-    }
     let mut x = Extractor {
-        path,
         text,
-        entities: Vec::new(),
-        seen: HashMap::new(),
-        relations: BTreeMap::new(),
+        graph: Builder::new(path),
     };
     let file = x.define("module", "self".into(), root);
     x.items(root, "", &file);
-    Ok(Contribution {
-        path: path.into(),
-        hash: content.hash().into(),
-        language: LANGUAGE.into(),
-        entities: x.entities,
-        relations: x
-            .relations
-            .into_iter()
-            .map(|((from, kind, to), (evidence, sites))| RelationDef {
-                from,
-                kind,
-                to,
-                evidence,
-                sites,
-            })
-            .collect(),
-        resolved_against: BTreeMap::new(),
-    })
-}
-
-/// The first error or missing node Tree-sitter recovered from, if any: its
-/// recovery makes a tree of any input, so only one without them is Rust.
-fn first_error(root: Syntax) -> Option<Syntax> {
-    if !root.has_error() {
-        return None;
-    }
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.is_error() || node.is_missing() {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        let children: Vec<_> = node
-            .children(&mut cursor)
-            .filter(|c| c.has_error())
-            .collect();
-        stack.extend(children.into_iter().rev());
-    }
-    Some(root)
+    Ok(x.graph.finish(content.hash(), LANGUAGE))
 }
 
 /// Where a path is written: the module it resolves in, generic parameters
@@ -131,15 +83,9 @@ struct Scope<'s> {
     self_path: Option<String>,
 }
 
-type Key = (Node, String, Node);
-
 struct Extractor<'a> {
-    path: &'a str,
     text: &'a str,
-    entities: Vec<EntityDef>,
-    /// How often each (kind, symbol) was defined, to number repeats.
-    seen: HashMap<(&'static str, String), u32>,
-    relations: BTreeMap<Key, (Evidence, Vec<Span>)>,
+    graph: Builder<'a>,
 }
 
 impl<'a> Extractor<'a> {
@@ -478,31 +424,11 @@ impl<'a> Extractor<'a> {
     }
 
     fn define(&mut self, kind: &'static str, symbol: String, node: Syntax) -> EntityId {
-        let n = self.seen.entry((kind, symbol.clone())).or_default();
-        *n += 1;
-        let symbol = match *n {
-            1 => symbol,
-            n => format!("{symbol}#{n}"),
-        };
-        self.entities.push(EntityDef {
-            kind: kind.into(),
-            symbol: symbol.clone(),
-            span: span(node),
-        });
-        EntityId {
-            path: self.path.into(),
-            kind: kind.into(),
-            symbol,
-        }
+        self.graph.define(kind, symbol, span(node))
     }
 
     fn contains(&mut self, parent: &EntityId, child: &EntityId) {
-        let key = (
-            Node::Entity(parent.clone()),
-            "contains".to_string(),
-            Node::Entity(child.clone()),
-        );
-        self.relations.insert(key, (Evidence::Proven, Vec::new()));
+        self.graph.contains(parent, child);
     }
 
     /// An inferred relation to `name` as written in `scope`, evidenced at
@@ -516,23 +442,15 @@ impl<'a> Extractor<'a> {
         site: Syntax,
     ) {
         let namespace = match scope.module {
-            "" => self.path.to_string(),
-            module => format!("{}//{module}", self.path),
+            "" => self.graph.path.to_string(),
+            module => format!("{}//{module}", self.graph.path),
         };
-        let to = Node::External(External {
+        let to = External {
             ecosystem: Some(LANGUAGE.into()),
             namespace: Some(namespace),
             name,
-        });
-        let key = (Node::Entity(from.clone()), kind.to_string(), to);
-        let (_, sites) = self
-            .relations
-            .entry(key)
-            .or_insert((Evidence::Inferred, Vec::new()));
-        let site = span(site);
-        if !sites.contains(&site) {
-            sites.push(site);
-        }
+        };
+        self.graph.unresolved(from, kind, to, span(site));
     }
 
     /// A path node's text, if it is a plain path (`a::b::C`, no generics or
@@ -604,24 +522,11 @@ fn qualify(module: &str, name: &str) -> String {
     }
 }
 
-fn span(node: Syntax) -> Span {
-    Span {
-        start: node.start_byte() as u64,
-        end: node.end_byte() as u64,
-    }
-}
-
-fn named_children(node: Syntax) -> impl DoubleEndedIterator<Item = Syntax> {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    children.into_iter()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph::tests::{Fixture, current, fails};
-    use crate::graph::{Direction, Freshness};
+    use crate::graph::{Direction, Evidence, Freshness, Node, Span};
     use crate::project::STATE_DIR;
     use crate::state::tests::objective;
     use std::fs;

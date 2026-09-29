@@ -1,5 +1,6 @@
 //! `agentctl init`: bootstrap a new project or hydrate an existing one.
 
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::io::{BufRead, Write};
 use std::num::NonZeroU32;
@@ -9,6 +10,7 @@ use std::str::FromStr;
 use anyhow::{Result, bail};
 
 use crate::config::{Agents, CodeGraph, Config, ProjectInfo, ReasoningEffort, Role, Text};
+use crate::graph;
 use crate::project::{CONFIG_FILE, Project};
 
 /// Runs `init` from `cwd`. `provider_available` is the lightweight machine
@@ -25,8 +27,11 @@ pub fn run<R: BufRead, W: Write>(
                 "Found existing project at {}; local state is ready.",
                 project.root.display()
             ))?;
-            for provider in unavailable_providers(&project.config, &provider_available) {
-                prompt.say(format_args!("warning: {}", unavailable_message(provider)))?;
+            for (provider, command) in unavailable_providers(&project.config, &provider_available) {
+                prompt.say(format_args!(
+                    "warning: {}",
+                    unavailable_message(provider, &command)
+                ))?;
             }
             project
         }
@@ -38,8 +43,11 @@ pub fn run<R: BufRead, W: Write>(
                 .unwrap_or(cwd);
             let config = ask_config(prompt, root)?;
             let missing = unavailable_providers(&config, &provider_available);
-            for provider in &missing {
-                prompt.say(format_args!("warning: {}", unavailable_message(provider)))?;
+            for (provider, command) in &missing {
+                prompt.say(format_args!(
+                    "warning: {}",
+                    unavailable_message(provider, command)
+                ))?;
             }
             if !missing.is_empty() && !prompt.confirm("Continue initialization anyway?", false)? {
                 bail!("initialization cancelled; nothing was written");
@@ -60,12 +68,14 @@ pub fn run<R: BufRead, W: Write>(
     Ok(())
 }
 
-/// Attachment point for CodeGraph's initial index build.
+/// Builds the baseline CodeGraph from the project's accepted source.
 fn build_initial_index<R: BufRead, W: Write>(
-    _project: &Project,
+    project: &Project,
     prompt: &mut Prompter<R, W>,
 ) -> Result<()> {
-    prompt.say("Repository indexing is not available in this version; no index was built.")
+    let mut store = project.hydrate()?;
+    let indexed = graph::index_baseline(project, &mut store)?;
+    prompt.say(format_args!("Indexed {} source files.", indexed.len()))
 }
 
 fn ask_config<R: BufRead, W: Write>(prompt: &mut Prompter<R, W>, root: &Path) -> Result<Config> {
@@ -121,6 +131,7 @@ fn ask_config<R: BufRead, W: Write>(prompt: &mut Prompter<R, W>, root: &Path) ->
             executor,
             verifier,
         },
+        providers: BTreeMap::new(),
     })
 }
 
@@ -132,7 +143,12 @@ fn ask_role<R: BufRead, W: Write>(
     effort: ReasoningEffort,
 ) -> Result<Role> {
     Ok(Role {
-        provider: prompt.ask(&format!("{role} provider"), provider)?,
+        provider: prompt
+            .ask(
+                &format!("{role} provider (claude|codex)"),
+                provider.map(Builtin),
+            )?
+            .0,
         model: prompt.ask(&format!("{role} model"), model)?,
         reasoning_effort: prompt.ask(
             &format!("{role} reasoning effort (minimal|low|medium|high|xhigh|max)"),
@@ -141,19 +157,51 @@ fn ask_role<R: BufRead, W: Write>(
     })
 }
 
-fn unavailable_providers(config: &Config, provider_available: impl Fn(&str) -> bool) -> Vec<&str> {
-    let mut missing: Vec<&str> = Vec::new();
+/// Interactive bootstrap offers only the built-in providers; custom ones
+/// are declared by hand under `[providers.<name>]`.
+struct Builtin(Text);
+
+impl FromStr for Builtin {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "claude" | "codex" => s.parse::<Text>().map(Self).map_err(|e| e.to_string()),
+            _ => Err("expected `claude` or `codex`".to_owned()),
+        }
+    }
+}
+
+impl Display for Builtin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// The `(provider, command)` pairs whose resolved command is unavailable.
+fn unavailable_providers(
+    config: &Config,
+    provider_available: impl Fn(&str) -> bool,
+) -> Vec<(&str, String)> {
+    let mut missing: Vec<(&str, String)> = Vec::new();
+    let mut checked: Vec<&str> = Vec::new();
     for role in config.agents.roles() {
-        let provider = role.provider.as_str();
-        if !missing.contains(&provider) && !provider_available(provider) {
-            missing.push(provider);
+        let name = role.provider.as_str();
+        if checked.contains(&name) {
+            continue;
+        }
+        checked.push(name);
+        if let Some(def) = config.provider(name)
+            && !provider_available(def.command.as_str())
+        {
+            missing.push((name, def.command.as_str().to_owned()));
         }
     }
     missing
 }
 
-fn unavailable_message(provider: &str) -> String {
-    format!("provider `{provider}` appears unavailable (no `{provider}` executable on PATH)")
+fn unavailable_message(provider: &str, command: &str) -> String {
+    format!("provider `{provider}` appears unavailable (no `{command}` executable on PATH)")
 }
 
 /// Line-oriented interactive prompts.
@@ -229,6 +277,15 @@ mod tests {
     use crate::state::tests::objective;
     use std::fs;
 
+    fn git_init(dir: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     fn init(cwd: &Path, input: &str, available: bool) -> (Result<()>, String) {
         let mut output = Vec::new();
         let mut prompt = Prompter::new(input.as_bytes(), &mut output);
@@ -285,6 +342,7 @@ mod tests {
     #[test]
     fn existing_project_is_hydrated_not_overwritten() {
         let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path());
         let original = sample().to_toml();
         fs::write(dir.path().join(CONFIG_FILE), &original).unwrap();
 
@@ -299,7 +357,7 @@ mod tests {
         );
         assert!(dir.path().join(STATE_DIR).is_dir());
         assert!(output.contains("appears unavailable"), "{output}");
-        assert!(output.contains("no index was built"), "{output}");
+        assert!(output.contains("Indexed 0 source files."), "{output}");
     }
 
     #[test]
@@ -326,6 +384,87 @@ mod tests {
         let mut store = project.hydrate().unwrap();
         assert!(store.plan(plan).is_err(), "local state starts fresh");
         store.create_plan(&objective("new")).unwrap();
+    }
+
+    #[test]
+    fn generated_config_parses_and_has_no_custom_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (result, _) = init(dir.path(), &("\n".repeat(13) + "n\n"), true);
+        result.unwrap();
+        let text = fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        let config = Config::parse(&text).unwrap();
+        assert!(config.providers.is_empty());
+        assert!(!text.contains("providers"), "{text}");
+    }
+
+    #[test]
+    fn interactive_provider_must_be_a_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path());
+        let input = "\n\n\nwork\ncodex\n".to_owned() + &"\n".repeat(9) + "n\n";
+        let (result, output) = init(dir.path(), &input, true);
+        result.unwrap();
+        assert_eq!(output.matches("invalid value").count(), 1, "{output}");
+        let text = fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.agents.planner.provider.as_str(), "codex");
+    }
+
+    #[test]
+    fn availability_checks_the_resolved_command() {
+        let mut config = sample();
+        config.agents.executor.provider = "work".parse().unwrap();
+        config.providers.insert(
+            "work".parse().unwrap(),
+            crate::config::ProviderDef {
+                adapter: crate::config::Adapter::Claude,
+                command: "my-claude-wrapper".parse().unwrap(),
+                args: Vec::new(),
+                env: Vec::new(),
+            },
+        );
+        let checked = std::cell::RefCell::new(Vec::new());
+        let missing = unavailable_providers(&config, |command| {
+            checked.borrow_mut().push(command.to_owned());
+            command == "claude"
+        });
+        assert_eq!(checked.into_inner(), ["claude", "my-claude-wrapper"]);
+        assert_eq!(missing, [("work", "my-claude-wrapper".to_owned())]);
+        assert!(unavailable_message("work", "my-claude-wrapper").contains("`my-claude-wrapper`"));
+    }
+
+    #[test]
+    fn initial_index_covers_existing_source_and_is_repeatable() {
+        let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path());
+        fs::write(dir.path().join(CONFIG_FILE), sample().to_toml()).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        fs::write(dir.path().join("src/tool.py"), "def run(): pass\n").unwrap();
+        fs::write(dir.path().join("src/app.ts"), "export const x = 1;\n").unwrap();
+
+        let (result, output) = init(dir.path(), "y\n", true);
+        result.unwrap();
+        assert!(output.contains("Indexed 3 source files."), "{output}");
+
+        let project = Project::load(dir.path()).unwrap();
+        let store = project.hydrate().unwrap();
+        let paths = store.accepted_paths().unwrap();
+        let entities = |store: &crate::state::Store| {
+            paths
+                .iter()
+                .map(|p| store.entities(p).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = entities(&store);
+        drop(store);
+
+        let (result, output) = init(dir.path(), "y\n", true);
+        result.unwrap();
+        assert!(output.contains("Indexed 0 source files."), "{output}");
+        let store = project.hydrate().unwrap();
+        assert_eq!(store.accepted_paths().unwrap(), paths);
+        assert_eq!(entities(&store), before);
     }
 
     #[test]

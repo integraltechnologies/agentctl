@@ -21,7 +21,7 @@ use agentctl::observe::{self, Dimension, GroupKey};
 use agentctl::project::Project;
 use agentctl::report;
 
-use agentctl::config::ReasoningEffort;
+use agentctl::config::{Adapter, ReasoningEffort};
 use agentctl::platform::{self, Capability, Level, Need};
 use agentctl::procd::{self, Domain, Settlement};
 use agentctl::recovery::{self, Lifecycle};
@@ -36,6 +36,23 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const FAKE: &str = "fake-provider";
+
+fn claude() -> Provider {
+    Provider::new("claude", Adapter::Claude, "claude")
+}
+
+fn codex() -> Provider {
+    Provider::new("codex", Adapter::Codex, "codex")
+}
+
+/// A provider agentctl was not compiled with, speaking the generic
+/// protocol, which the fake runs as `scenario`.
+fn local(scenario: &str) -> Provider {
+    Provider {
+        args: vec![format!("--generic={scenario}")],
+        ..Provider::new("local-llm", Adapter::Generic, "no-such-name")
+    }
+}
 const SECRET: &str = "AGENTCTL_TEST_SECRET";
 /// Stands for a credential a provider might write anywhere in its output.
 const LEAK: &str = "sk-LEAKED-CREDENTIAL-4f7c";
@@ -170,6 +187,23 @@ fn main() -> ExitCode {
             "a_crashed_session_is_observed_until_recovery_settles_it",
             a_crashed_session_is_observed_until_recovery_settles_it,
         ),
+        ("generic_success_and_usage", generic_success_and_usage),
+        (
+            "generic_failures_are_classified_and_never_recorded",
+            generic_failures_are_classified_and_never_recorded,
+        ),
+        (
+            "generic_requests_carry_the_launch",
+            generic_requests_carry_the_launch,
+        ),
+        (
+            "the_configured_command_runs_whatever_the_provider_is_called",
+            the_configured_command_runs_whatever_the_provider_is_called,
+        ),
+        (
+            "only_configured_environment_reaches_a_provider",
+            only_configured_environment_reaches_a_provider,
+        ),
         ("live_claude", live_claude),
         ("live_codex", live_codex),
     ];
@@ -219,6 +253,9 @@ fn fake() -> ExitCode {
         .find_map(|a| a.strip_prefix("--model="))
         .unwrap_or_default()
         .to_owned();
+    if let Some(scenario) = args.iter().find_map(|a| a.strip_prefix("--generic=")) {
+        return fake_generic(scenario, &args);
+    }
     let mut input = String::new();
     if let Some(secs) = scenario.strip_prefix("sleeper:") {
         // A bounded descendant: ends on its own whatever else happens.
@@ -404,6 +441,59 @@ fn fake() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Acts as a generic-protocol runtime, following `scenario`.
+fn fake_generic(scenario: &str, args: &[String]) -> ExitCode {
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw).unwrap();
+    let request: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(request["protocol"], 1);
+    let say = |line: Value| println!("{line}");
+    let usage = json!({"type": "usage", "input": 3, "output": 2, "cached_input": 1});
+    let result = json!({"type": "result", "value": {"n": 7}});
+    match scenario {
+        "ok" => {
+            say(json!({"type": "session", "id": "fake-session"}));
+            say(usage);
+            say(result);
+        }
+        "estimated" => {
+            say(json!({"type": "usage", "input": 1, "output": 1}));
+            say(json!({"type": "usage", "input": 9, "output": 4, "estimated": true}));
+            say(result);
+        }
+        "no-usage" => say(result),
+        "unknown-events" => {
+            say(json!({"type": "telemetry", "text": LEAK}));
+            say(result);
+        }
+        "error" => {
+            eprintln!("{LEAK}");
+            say(json!({"type": "error", "message": LEAK}));
+            return ExitCode::from(1);
+        }
+        "missing" => say(json!({"type": "session", "id": "fake-session"})),
+        "duplicate" => {
+            say(result.clone());
+            say(result);
+        }
+        "wrong-shape" => say(json!({"type": "result", "value": {"wrong": true}})),
+        "garbage" => {
+            println!("token={LEAK}");
+            say(result);
+        }
+        "leak-usage" => say(json!({"type": "usage", "input": LEAK, "output": 1})),
+        "echo" => {
+            let mut names: Vec<String> = env::vars().map(|(name, _)| name).collect();
+            names.sort();
+            say(json!({"type": "result",
+                       "value": {"request": request, "args": args, "env": names}}));
+        }
+        other => panic!("unknown generic scenario `{other}`"),
+    }
+    std::io::stdout().flush().unwrap();
+    ExitCode::SUCCESS
+}
+
 /// The fake provider executable, shared by every test.
 fn fake_provider() -> &'static Path {
     static FAKE_DIR: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
@@ -472,8 +562,16 @@ impl Fixture {
         }
     }
 
+    /// A launch through the generic protocol of `local(scenario)`.
+    fn generic(&self, scenario: &str) -> Launch {
+        Launch {
+            model: "any-model".into(),
+            ..self.launch(local(scenario), "unused")
+        }
+    }
+
     fn spawn(&mut self, scenario: &str) -> anyhow::Result<runtime::Invocation> {
-        let launch = self.launch(Provider::Claude, scenario);
+        let launch = self.launch(claude(), scenario);
         runtime::spawn(&mut self.store, &launch)
     }
 
@@ -495,7 +593,7 @@ impl Fixture {
 
 fn claude_success_is_recorded() {
     let mut f = Fixture::new();
-    let outcome = f.run(&f.launch(Provider::Claude, "ok"));
+    let outcome = f.run(&f.launch(claude(), "ok"));
     assert_eq!(outcome.end.state, InvocationState::Succeeded);
     assert_eq!(outcome.payload, Some(json!({"n": 7})));
     assert_eq!((outcome.end.failure, outcome.end.diagnostic), (None, None));
@@ -550,7 +648,7 @@ fn claude_success_is_recorded() {
 
 fn codex_meets_the_same_contract() {
     let mut f = Fixture::new();
-    let outcome = f.run(&f.launch(Provider::Codex, "codex-ok"));
+    let outcome = f.run(&f.launch(codex(), "codex-ok"));
     assert_eq!(outcome.end.state, InvocationState::Succeeded);
     assert_eq!(outcome.payload, Some(json!({"n": 7})));
     assert_eq!(outcome.end.provider_session.as_deref(), Some("fake-thread"));
@@ -570,34 +668,238 @@ fn codex_meets_the_same_contract() {
     );
 }
 
+fn generic_success_and_usage() {
+    let mut f = Fixture::new();
+    let outcome = f.run(&f.generic("ok"));
+    assert_eq!(outcome.end.state, InvocationState::Succeeded);
+    assert_eq!(outcome.payload, Some(json!({"n": 7})));
+    assert_eq!(
+        outcome.end.provider_session.as_deref(),
+        Some("fake-session")
+    );
+    assert_eq!(
+        outcome.end.usage,
+        Usage::ProviderReported(TokenUsage {
+            input: 3,
+            output: 2,
+            cached_input: Some(1),
+            cache_write: None,
+            reasoning: None,
+        })
+    );
+    // The configured name is the recorded identity, whatever the adapter.
+    let recorded = f.store.invocation(outcome.invocation).unwrap();
+    assert_eq!(
+        (recorded.provider.as_str(), recorded.model.as_str()),
+        ("local-llm", "any-model")
+    );
+    // The last cumulative observation stands, and an estimate is one.
+    let outcome = f.run(&f.generic("estimated"));
+    assert_eq!(
+        outcome.end.usage,
+        Usage::LocalEstimate(TokenUsage {
+            input: 9,
+            output: 4,
+            ..TokenUsage::default()
+        })
+    );
+    let outcome = f.run(&f.generic("no-usage"));
+    assert_eq!(outcome.end.state, InvocationState::Succeeded);
+    assert_eq!(outcome.end.usage, Usage::Unavailable);
+    // Events of other kinds are ignored, whatever they say.
+    let outcome = f.run(&f.generic("unknown-events"));
+    assert_eq!(outcome.end.state, InvocationState::Succeeded);
+}
+
+fn generic_failures_are_classified_and_never_recorded() {
+    use FailureKind::*;
+    let mut f = Fixture::new();
+    let schema = json!({"type": "object", "required": ["n"]});
+    for (scenario, kind, evidence) in [
+        ("error", ProviderError, "the runtime reported an error"),
+        ("missing", NoResult, "without a result"),
+        ("duplicate", MalformedOutput, "more than one terminal"),
+        ("wrong-shape", MalformedOutput, "output schema"),
+        ("garbage", MalformedOutput, "not JSON"),
+        ("leak-usage", MalformedOutput, "invalid usage"),
+    ] {
+        let launch = Launch {
+            agent: f.agent(),
+            output_schema: schema.clone(),
+            ..f.generic(scenario)
+        };
+        let outcome = f.run(&launch);
+        assert_eq!(outcome.end.state, InvocationState::Failed, "{scenario}");
+        assert_eq!(outcome.end.failure, Some(kind), "{scenario}");
+        let diagnostic = outcome.end.diagnostic.clone().unwrap();
+        assert!(diagnostic.contains(evidence), "{scenario}: {diagnostic}");
+        assert_eq!(outcome.payload, None, "{scenario}");
+        let recorded = format!("{:?}", f.store.invocation(outcome.invocation).unwrap());
+        assert!(!recorded.contains(LEAK), "{scenario}: {recorded}");
+        if scenario == "error" {
+            // Returned for diagnosis, never recorded.
+            assert_eq!(outcome.provider_metadata["error_message"], json!(LEAK));
+        }
+    }
+    let events = format!("{:?}", f.store.events_after(0, 10_000).unwrap());
+    assert!(!events.contains(LEAK), "{events}");
+    for entry in std::fs::read_dir(f.dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !bytes.windows(LEAK.len()).any(|w| w == LEAK.as_bytes()),
+                "{} holds provider text",
+                path.display()
+            );
+        }
+    }
+}
+
+fn generic_requests_carry_the_launch() {
+    let mut f = Fixture::new();
+    for (workspace, name) in [
+        (Workspace::ReadOnly, "read_only"),
+        (Workspace::Editable, "editable"),
+        (Workspace::Disposable, "disposable"),
+    ] {
+        let schema = json!({"type": "object"});
+        let launch = Launch {
+            effort: Some(ReasoningEffort::High),
+            workspace,
+            provider: Provider {
+                args: vec!["--generic=echo".into(), "run".into(), "--fast".into()],
+                ..local("echo")
+            },
+            ..f.generic("echo")
+        };
+        let echoed = f.run(&launch).payload.unwrap();
+        assert_eq!(
+            echoed["request"],
+            json!({
+                "protocol": 1, "model": "any-model", "reasoning_effort": "high",
+                "instructions": "Answer with the structured result only.",
+                "input": "the task", "output_schema": schema, "workspace": name,
+            })
+        );
+        // Fixed arguments arrive as configured, and nothing else does.
+        assert_eq!(echoed["args"], json!(["--generic=echo", "run", "--fast"]));
+    }
+    // Reasoning effort is null when there is none.
+    let echoed = f.run(&f.generic("echo")).payload.unwrap();
+    assert_eq!(echoed["request"]["reasoning_effort"], Value::Null);
+}
+
+fn the_configured_command_runs_whatever_the_provider_is_called() {
+    let mut f = Fixture::new();
+    let command = fake_provider().to_str().unwrap().to_owned();
+    // No executable override, and no command by the provider's name on PATH.
+    let generic = Launch {
+        executable: None,
+        provider: Provider {
+            command: command.clone(),
+            ..local("ok")
+        },
+        ..f.generic("ok")
+    };
+    let outcome = f.run(&generic);
+    assert_eq!(outcome.end.state, InvocationState::Succeeded);
+    // A built-in adapter under another name records that name.
+    let alias = Launch {
+        executable: None,
+        provider: Provider::new("work", Adapter::Claude, &command),
+        ..f.launch(claude(), "ok")
+    };
+    let outcome = f.run(&alias);
+    assert_eq!(outcome.end.state, InvocationState::Succeeded);
+    assert_eq!(outcome.payload, Some(json!({"n": 7})));
+    assert_eq!(
+        f.store.invocation(outcome.invocation).unwrap().provider,
+        "work"
+    );
+    // A command that is not there is the command's, not the name's.
+    let absent = Launch {
+        executable: None,
+        provider: Provider::new("claude", Adapter::Claude, "no-such-agentctl-command"),
+        ..f.launch(claude(), "ok")
+    };
+    let outcome = f.run(&absent);
+    assert_eq!(outcome.end.failure, Some(FailureKind::ExecutableMissing));
+    assert!(
+        outcome
+            .end
+            .diagnostic
+            .unwrap()
+            .contains("no-such-agentctl-command")
+    );
+}
+
+fn only_configured_environment_reaches_a_provider() {
+    let mut f = Fixture::new();
+    let names = |payload: Value| -> Vec<String> {
+        payload["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let base = f.generic("echo");
+    let with = |provider: Provider| Launch {
+        provider,
+        ..base.clone()
+    };
+    // A generic runtime sees the common environment and only what its
+    // declaration names.
+    let bare = names(f.run(&with(local("echo"))).payload.unwrap());
+    assert!(
+        bare.iter().any(|n| n.eq_ignore_ascii_case("PATH")),
+        "{bare:?}"
+    );
+    for hidden in [
+        SECRET,
+        "ANTHROPIC_TEST_PASSTHROUGH",
+        "OPENAI_TEST_PASSTHROUGH",
+    ] {
+        assert!(!bare.iter().any(|n| n == hidden), "{hidden}: {bare:?}");
+    }
+    let declared = Provider {
+        env: vec![SECRET.into()],
+        ..local("echo")
+    };
+    let seen = names(f.run(&with(declared)).payload.unwrap());
+    assert!(seen.iter().any(|n| n == SECRET), "{seen:?}");
+    for hidden in ["ANTHROPIC_TEST_PASSTHROUGH", "OPENAI_TEST_PASSTHROUGH"] {
+        assert!(!seen.iter().any(|n| n == hidden), "{hidden}: {seen:?}");
+    }
+    // A built-in adapter's own environment stays, and adds to it.
+    let alias = Launch {
+        provider: Provider {
+            env: vec![SECRET.into()],
+            ..Provider::new("work", Adapter::Claude, "claude")
+        },
+        ..f.launch(claude(), "report-env")
+    };
+    let seen = names(f.run(&alias).payload.unwrap());
+    for shown in [SECRET, "ANTHROPIC_TEST_PASSTHROUGH"] {
+        assert!(seen.iter().any(|n| n == shown), "{shown}: {seen:?}");
+    }
+    assert!(!seen.iter().any(|n| n == "OPENAI_TEST_PASSTHROUGH"));
+}
+
 fn failures_are_classified_and_recorded() {
     use FailureKind::*;
     let mut f = Fixture::new();
     for (provider, scenario, kind, evidence) in [
-        (
-            Provider::Claude,
-            "error",
-            ProviderError,
-            "claude reported an error",
-        ),
-        (
-            Provider::Claude,
-            "prose",
-            MalformedOutput,
-            "no structured output",
-        ),
-        (Provider::Claude, "garbage", MalformedOutput, "not JSON"),
-        (Provider::Claude, "eof", NoResult, "without a result"),
+        (claude(), "error", ProviderError, "claude reported an error"),
+        (claude(), "prose", MalformedOutput, "no structured output"),
+        (claude(), "garbage", MalformedOutput, "not JSON"),
+        (claude(), "eof", NoResult, "without a result"),
         // The status text is the host's (`exit status: 3` / `exit code: 3`);
         // the code itself is asserted structurally below.
-        (Provider::Claude, "crash", ExitStatus, "the provider"),
-        (
-            Provider::Claude,
-            "late-exit",
-            ExitStatus,
-            "after its result",
-        ),
-        (Provider::Codex, "codex-fail", ProviderError, "turn failed"),
+        (claude(), "crash", ExitStatus, "the provider"),
+        (claude(), "late-exit", ExitStatus, "after its result"),
+        (codex(), "codex-fail", ProviderError, "turn failed"),
     ] {
         let outcome = f.run(&f.launch(provider, scenario));
         assert_eq!(outcome.end.state, InvocationState::Failed, "{scenario}");
@@ -606,12 +908,12 @@ fn failures_are_classified_and_recorded() {
         assert!(diagnostic.contains(evidence), "{scenario}: {diagnostic}");
         assert_eq!(outcome.payload, None, "{scenario}: no result on failure");
     }
-    let crash = f.run(&f.launch(Provider::Claude, "crash"));
+    let crash = f.run(&f.launch(claude(), "crash"));
     assert_eq!(crash.end.exit_code, Some(3));
     assert_eq!(crash.end.failure, Some(FailureKind::ExitStatus));
     assert!(crash.stderr.contains("disk on fire"));
     // A provider error keeps the usage the provider reported.
-    let error = f.run(&f.launch(Provider::Claude, "error"));
+    let error = f.run(&f.launch(claude(), "error"));
     assert!(matches!(error.end.usage, Usage::ProviderReported(_)));
     // What the provider said is returned, not recorded.
     assert_eq!(error.provider_metadata["error_message"], json!("boom api"));
@@ -624,10 +926,7 @@ fn results_must_satisfy_the_schema() {
         "properties": {"n": {"type": "integer"}},
         "required": ["n"]
     });
-    for (provider, scenario) in [
-        (Provider::Claude, "wrong-shape"),
-        (Provider::Codex, "codex-wrong-shape"),
-    ] {
+    for (provider, scenario) in [(claude(), "wrong-shape"), (codex(), "codex-wrong-shape")] {
         let launch = Launch {
             output_schema: schema.clone(),
             ..f.launch(provider, scenario)
@@ -643,7 +942,7 @@ fn results_must_satisfy_the_schema() {
         assert_eq!(outcome.payload, None, "{scenario}");
     }
     // A conforming result still succeeds under the same schema.
-    for (provider, scenario) in [(Provider::Claude, "ok"), (Provider::Codex, "codex-ok")] {
+    for (provider, scenario) in [(claude(), "ok"), (codex(), "codex-ok")] {
         let launch = Launch {
             output_schema: schema.clone(),
             ..f.launch(provider, scenario)
@@ -656,7 +955,7 @@ fn results_must_satisfy_the_schema() {
 
 fn a_failed_codex_turn_is_final() {
     let mut f = Fixture::new();
-    let outcome = f.run(&f.launch(Provider::Codex, "codex-contradiction"));
+    let outcome = f.run(&f.launch(codex(), "codex-contradiction"));
     assert_eq!(outcome.end.state, InvocationState::Failed);
     assert_eq!(outcome.end.failure, Some(FailureKind::ProviderError));
     assert_eq!(outcome.payload, None);
@@ -665,28 +964,16 @@ fn a_failed_codex_turn_is_final() {
 fn provider_text_is_never_recorded() {
     let mut f = Fixture::new();
     for (provider, scenario, kind) in [
-        (Provider::Claude, "leak-stderr", FailureKind::ExitStatus),
+        (claude(), "leak-stderr", FailureKind::ExitStatus),
+        (claude(), "leak-stdout", FailureKind::MalformedOutput),
         (
-            Provider::Claude,
-            "leak-stdout",
-            FailureKind::MalformedOutput,
-        ),
-        (
-            Provider::Claude,
+            claude(),
             "leak-invalid-result",
             FailureKind::MalformedOutput,
         ),
-        (Provider::Claude, "leak-error", FailureKind::ProviderError),
-        (
-            Provider::Codex,
-            "codex-leak-fail",
-            FailureKind::ProviderError,
-        ),
-        (
-            Provider::Codex,
-            "codex-leak-prose",
-            FailureKind::MalformedOutput,
-        ),
+        (claude(), "leak-error", FailureKind::ProviderError),
+        (codex(), "codex-leak-fail", FailureKind::ProviderError),
+        (codex(), "codex-leak-prose", FailureKind::MalformedOutput),
     ] {
         let launch = Launch {
             agent: f.agent(),
@@ -721,7 +1008,7 @@ fn provider_text_is_never_recorded() {
 
 fn unreported_usage_is_unavailable() {
     let mut f = Fixture::new();
-    let outcome = f.run(&f.launch(Provider::Claude, "no-usage"));
+    let outcome = f.run(&f.launch(claude(), "no-usage"));
     assert_eq!(outcome.end.state, InvocationState::Succeeded);
     assert_eq!(outcome.end.usage, Usage::Unavailable);
 }
@@ -730,11 +1017,11 @@ fn unlaunchable_providers_fail_durably() {
     let mut f = Fixture::new();
     let missing = Launch {
         executable: Some(f.dir.path().join("absent")),
-        ..f.launch(Provider::Claude, "ok")
+        ..f.launch(claude(), "ok")
     };
     let nowhere = Launch {
         cwd: f.dir.path().join("no such directory"),
-        ..f.launch(Provider::Codex, "ok")
+        ..f.launch(codex(), "ok")
     };
     for (launch, kind) in [
         (missing, FailureKind::ExecutableMissing),
@@ -758,23 +1045,23 @@ fn invalid_launches_record_nothing() {
     let mut f = Fixture::new();
     let relative = Launch {
         cwd: "relative".into(),
-        ..f.launch(Provider::Claude, "ok")
+        ..f.launch(claude(), "ok")
     };
     let minimal = Launch {
         effort: Some(ReasoningEffort::Minimal),
-        ..f.launch(Provider::Claude, "ok")
+        ..f.launch(claude(), "ok")
     };
     let unschematic = Launch {
         output_schema: json!(true),
-        ..f.launch(Provider::Codex, "ok")
+        ..f.launch(codex(), "ok")
     };
     let invalid = Launch {
         output_schema: json!({"type": 5}),
-        ..f.launch(Provider::Claude, "ok")
+        ..f.launch(claude(), "ok")
     };
     let remote = Launch {
         output_schema: json!({"$ref": "https://example.com/schema.json"}),
-        ..f.launch(Provider::Codex, "codex-ok")
+        ..f.launch(codex(), "codex-ok")
     };
     for launch in [relative, minimal, unschematic, invalid, remote] {
         assert!(runtime::spawn(&mut f.store, &launch).is_err());
@@ -786,7 +1073,7 @@ fn providers_get_input_and_a_scrubbed_environment() {
     let mut f = Fixture::new();
     let launch = Launch {
         input: "multi\nline task with \"quotes\" and $HOME".into(),
-        ..f.launch(Provider::Claude, "report-env")
+        ..f.launch(claude(), "report-env")
     };
     let report = f.run(&launch).payload.unwrap();
     assert_eq!(report["input"], json!(launch.input));
@@ -819,7 +1106,7 @@ fn undelivered_input_fails_closed() {
     // The provider answers without reading, so most of this never arrives.
     let launch = Launch {
         input: "x".repeat(8 << 20),
-        ..f.launch(Provider::Claude, "ignore-input")
+        ..f.launch(claude(), "ignore-input")
     };
     let outcome = f.run(&launch);
     assert_eq!(outcome.end.failure, Some(FailureKind::InputFailed));
@@ -894,7 +1181,7 @@ fn host_enforces() -> bool {
 
 fn lifecycle_is_owned_before_execution() {
     let mut f = Fixture::new();
-    let launch = f.launch(Provider::Claude, "mark");
+    let launch = f.launch(claude(), "mark");
     let ran = f.dir.path().join("ran");
     let seen = std::cell::Cell::new(false);
     let invocation = runtime::spawn_after(&mut f.store, &launch, |store, id| {
@@ -925,7 +1212,7 @@ fn required_enforcement_is_never_downgraded() {
     let mut f = Fixture::new();
     let launch = Launch {
         lifecycle: Need::RequireEnforced,
-        ..f.launch(Provider::Claude, "mark")
+        ..f.launch(claude(), "mark")
     };
     let result = runtime::spawn(&mut f.store, &launch);
     if host_enforces() {
@@ -955,7 +1242,7 @@ fn cancellation_terminates_the_whole_tree() {
 
 fn an_ordinary_end_leaves_no_descendants() {
     let mut f = Fixture::new();
-    let outcome = f.run(&f.launch(Provider::Claude, "orphaning"));
+    let outcome = f.run(&f.launch(claude(), "orphaning"));
     assert_succeeded(&outcome, "orphaning");
     // Nothing relies on the provider's death, or agentctl's: the domain is
     // terminated whatever the provider did.
@@ -1004,7 +1291,7 @@ fn a_result_with_output_held_by_a_descendant_settles_cleanly() {
     // Where procd can prove emptiness, its own evidence settles this; the
     // test double stands in only where the backend cannot.
     let _real = host_enforces().then(|| runtime::testing::evidence(runtime::testing::Mode::Real));
-    let outcome = f.run(&f.launch(Provider::Claude, "holding"));
+    let outcome = f.run(&f.launch(claude(), "holding"));
     assert_succeeded(&outcome, "holding");
     let diagnostic = outcome.end.diagnostic.as_deref().unwrap_or_default();
     assert!(
@@ -1053,7 +1340,7 @@ fn a_lost_domain_is_never_taken_for_gone_without_proof() {
 /// An invocation id to name in a settlement, which never consults it.
 fn runtime_invocation_id() -> agentctl::state::InvocationId {
     let mut f = Fixture::new();
-    let launch = f.launch(Provider::Claude, "ok");
+    let launch = f.launch(claude(), "ok");
     f.run(&launch).invocation
 }
 
@@ -1194,7 +1481,7 @@ fn an_abandoned_launch_with_an_unproven_lifecycle_stays_unresolved() {
     let _unproven = runtime::testing::evidence(runtime::testing::Mode::Unproven);
     // The provider cannot be started in a directory that is not there: the
     // shim reports it, and the launch is abandoned by terminating the domain.
-    let mut launch = f.launch(Provider::Claude, "ok");
+    let mut launch = f.launch(claude(), "ok");
     launch.cwd = f.dir.path().join("no such directory");
     let error = runtime::spawn(&mut f.store, &launch).err().unwrap();
     assert!(
@@ -1273,7 +1560,7 @@ fn abandoned_invocations_stay_unresolved() {
         usage: Usage::Unavailable,
     };
     f.store.finish_invocation(id, &resolved).unwrap();
-    let outcome = f.run(&f.launch(Provider::Claude, "ok"));
+    let outcome = f.run(&f.launch(claude(), "ok"));
     assert_eq!(outcome.end.state, InvocationState::Succeeded);
 }
 
@@ -1302,7 +1589,7 @@ fn journaled_attempts_outlive_abandoned_invocations() {
         usage: Usage::Unavailable,
     };
     f.store.finish_invocation(id, &interrupted).unwrap();
-    let later = f.run(&f.launch(Provider::Claude, "ok"));
+    let later = f.run(&f.launch(claude(), "ok"));
     assert_eq!(later.end.state, InvocationState::Succeeded);
     let continuation = f.reopen().continuation(f.agent).unwrap();
     assert_eq!(continuation.len(), 1);
@@ -1318,7 +1605,7 @@ fn independent_invocations_run_concurrently() {
     let launches: Vec<Launch> = (0..4)
         .map(|_| Launch {
             agent: f.agent(),
-            ..f.launch(Provider::Codex, "codex-ok")
+            ..f.launch(codex(), "codex-ok")
         })
         .collect();
     let path = f.dir.path().join("state.db");
@@ -1349,7 +1636,7 @@ fn independent_invocations_run_concurrently() {
 
 fn live(provider: Provider, model: &str) {
     let enabled = env::var("AGENTCTL_LIVE").unwrap_or_default();
-    if !enabled.split(',').any(|p| p.trim() == provider.name()) {
+    if !enabled.split(',').any(|p| p.trim() == provider.name) {
         println!("  skipped: AGENTCTL_LIVE does not name {provider}");
         return;
     }
@@ -1377,11 +1664,11 @@ fn live(provider: Provider, model: &str) {
 }
 
 fn live_claude() {
-    live(Provider::Claude, "haiku");
+    live(claude(), "haiku");
 }
 
 fn live_codex() {
-    live(Provider::Codex, "gpt-5.6-luna");
+    live(codex(), "gpt-5.6-luna");
 }
 
 const OBSERVED_CONFIG: &str = r#"[project]
@@ -1470,10 +1757,10 @@ fn observation_keeps_provenance_of_real_invocations() {
     let root = dir.path();
     let plan = store.create_plan(&intent("observe")).unwrap();
     let scenarios = [
-        (Provider::Claude, "ok"),
-        (Provider::Codex, "codex-ok"),
-        (Provider::Claude, "no-usage"),
-        (Provider::Codex, "codex-leak-prose"),
+        (claude(), "ok"),
+        (codex(), "codex-ok"),
+        (claude(), "no-usage"),
+        (codex(), "codex-leak-prose"),
     ];
     for (provider, scenario) in scenarios {
         let agent = store
@@ -1578,9 +1865,9 @@ fn observation_counts_concurrent_invocations_once() {
                 .create_agent(Role::Planner, AgentScope::Plan(plan))
                 .unwrap();
             let launch = if k == 0 {
-                observed_launch(root, agent, Provider::Codex, "codex-ok")
+                observed_launch(root, agent, codex(), "codex-ok")
             } else {
-                observed_launch(root, agent, Provider::Claude, "ok")
+                observed_launch(root, agent, claude(), "ok")
             };
             launches.push(launch);
         }

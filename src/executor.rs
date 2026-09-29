@@ -289,7 +289,7 @@ pub fn start(
 ) -> Result<Executor> {
     let authority = store.execution_authority(task, generation)?;
     let role = &project.config.agents.executor;
-    let provider = role.provider.as_str().parse::<Provider>()?;
+    let provider = Provider::resolve(&project.config, role.provider.as_str())?;
     let input = serde_json::to_string_pretty(&input(project, store, task, &authority)?)?;
     let since = crate::state::now();
     // Paths the executor may create are observed even where Git ignores

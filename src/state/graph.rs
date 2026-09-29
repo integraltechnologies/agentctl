@@ -31,6 +31,21 @@ impl Store {
         })
     }
 
+    /// Replaces the graphs of validated contributions' sources, each as
+    /// [`Store::replace_graph`] does, all or none.
+    pub(crate) fn replace_graphs(&mut self, contributions: &[Contribution]) -> Result<()> {
+        if contributions.is_empty() {
+            return Ok(());
+        }
+        self.write(|tx| {
+            for c in contributions {
+                replace(tx, c)?;
+            }
+            let detail = format!("{} sources", contributions.len());
+            event(tx, "graph.indexed", None, None, None, &detail)
+        })
+    }
+
     /// Removes the graph of a source accepted as absent, returning whether
     /// it had one. Other sources' relations to its entities become stale.
     pub fn remove_absent_graph(&mut self, path: &str) -> Result<bool> {

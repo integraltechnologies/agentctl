@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use tempfile::TempDir;
 
-use super::{POLL, Passthrough, Provider, claude, codex};
+use super::{POLL, Passthrough};
 
 const SPEC: &str = "spec";
 /// How long the shim's connections may take to arrive.
@@ -75,7 +75,8 @@ impl Channel {
 
 /// What the shim is to start.
 pub(super) struct Spec {
-    pub provider: Provider,
+    /// The environment variables the provider may see, beyond none else.
+    pub env: Passthrough,
     pub exe: PathBuf,
     pub cwd: PathBuf,
     pub args: Vec<OsString>,
@@ -126,15 +127,18 @@ impl Rendezvous {
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("listening on loopback")?;
         let port = listener.local_addr()?.port();
         let token = random_token()?;
-        let mut file = format!(
-            "port {port}\ntoken {token}\nprovider {}\n",
-            spec.provider.name()
-        );
+        let mut file = format!("port {port}\ntoken {token}\n");
         file += &format!(
             "exe {}\ncwd {}\n",
             encode(spec.exe.as_os_str()),
             encode(spec.cwd.as_os_str())
         );
+        for name in &spec.env.names {
+            file += &format!("env {}\n", encode(name.as_ref()));
+        }
+        for prefix in &spec.env.prefixes {
+            file += &format!("env-prefix {}\n", encode(prefix.as_ref()));
+        }
         for arg in &spec.args {
             file += &format!("arg {}\n", encode(arg));
         }
@@ -405,14 +409,20 @@ struct Loaded {
 
 fn load(dir: &Path) -> Result<Loaded> {
     let text = fs::read_to_string(dir.join(SPEC)).context("reading the spec")?;
-    let (mut port, mut token, mut provider, mut exe, mut cwd) = (None, None, None, None, None);
-    let mut args = Vec::new();
+    let (mut port, mut token, mut exe, mut cwd) = (None, None, None, None);
+    let (mut args, mut env) = (Vec::new(), Passthrough::default());
+    let text_of = |value| {
+        decode(value)?
+            .into_string()
+            .map_err(|_| anyhow!("an environment name is not text"))
+    };
     for line in text.lines() {
         let (key, value) = line.split_once(' ').unwrap_or((line, ""));
         match key {
             "port" => port = Some(value.parse().context("the port")?),
             "token" => token = Some(value.to_owned()),
-            "provider" => provider = Some(value.parse::<Provider>()?),
+            "env" => env.names.push(text_of(value)?),
+            "env-prefix" => env.prefixes.push(text_of(value)?),
             "exe" => exe = Some(decode(value)?),
             "cwd" => cwd = Some(decode(value)?),
             "arg" => args.push(decode(value)?),
@@ -424,7 +434,7 @@ fn load(dir: &Path) -> Result<Loaded> {
         port: port.ok_or_else(missing)?,
         token: token.ok_or_else(missing)?,
         spec: Spec {
-            provider: provider.ok_or_else(missing)?,
+            env,
             exe: exe.ok_or_else(missing)?.into(),
             cwd: cwd.ok_or_else(missing)?.into(),
             args,
@@ -464,10 +474,7 @@ fn run(dir: &Path) -> Result<()> {
     // Held apart from the relays, so the shim can end their channels itself.
     let ends = [output.try_clone()?, error.try_clone()?];
 
-    let passthrough: &Passthrough = match loaded.spec.provider {
-        Provider::Claude => &claude::ENV,
-        Provider::Codex => &codex::ENV,
-    };
+    let passthrough = &loaded.spec.env;
     let spawned = Command::new(&loaded.spec.exe)
         .args(&loaded.spec.args)
         .current_dir(&loaded.spec.cwd)
@@ -617,7 +624,7 @@ mod tests {
     #[test]
     fn only_the_launchs_token_opens_a_channel() {
         let spec = Spec {
-            provider: Provider::Claude,
+            env: Passthrough::new(&["MY_HOME"], &["PFX_"]),
             exe: "provider".into(),
             cwd: ".".into(),
             args: vec!["a".into()],
@@ -645,6 +652,8 @@ mod tests {
             (port, rendezvous.token.clone())
         );
         assert_eq!(loaded.spec.args, [OsString::from("a")]);
+        assert_eq!(loaded.spec.env.names, ["MY_HOME"]);
+        assert_eq!(loaded.spec.env.prefixes, ["PFX_"]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

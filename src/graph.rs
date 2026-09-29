@@ -23,7 +23,10 @@
 //! Only direct relations are stored. Impact is derived by traversal, each
 //! hop keeping the relation it followed.
 
+pub mod python;
 pub mod rust;
+pub mod script;
+mod syntax;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -229,17 +232,27 @@ pub(crate) enum Derivation {
     Declined,
 }
 
+/// The frontend deriving the graphs of `path`, by its extension: Rust for
+/// `.rs`, Python for `.py` and `.pyi`, JavaScript or TypeScript for those of
+/// [`script::grammar`].
+fn frontend(path: &str) -> Option<fn(&str, &source::AcceptedContent) -> Result<Contribution>> {
+    match path.rsplit_once('.')?.1 {
+        "rs" => Some(rust::contribution),
+        "py" | "pyi" => Some(python::contribution),
+        _ => script::grammar(path).map(|_| script::contribution as _),
+    }
+}
+
 /// Derives the graph of the tracked source `path` from its accepted
 /// content, read from its recovery object and verified, never from the
-/// working tree, with the frontend of its language: Rust for `.rs`. Fails
-/// only when that content cannot be read or the frontend's graph is
-/// invalid.
+/// working tree, with the frontend of its language. Fails only when that
+/// content cannot be read or the frontend's graph is invalid.
 pub(crate) fn derive(project: &Project, store: &Store, path: &str) -> Result<Derivation> {
-    if !path.ends_with(".rs") {
+    let Some(frontend) = frontend(path) else {
         return Ok(Derivation::Unsupported);
-    }
+    };
     let content = source::read_accepted(project, store, path)?;
-    let c = match rust::contribution(path, &content) {
+    let c = match frontend(path, &content) {
         Ok(c) => c,
         Err(_) => return Ok(Derivation::Declined),
     };
@@ -254,6 +267,32 @@ pub(crate) fn derive(project: &Project, store: &Store, path: &str) -> Result<Der
     };
     check().with_context(|| format!("invalid graph contribution for `{path}`"))?;
     Ok(Derivation::Indexed(c))
+}
+
+/// Establishes the accepted source of a fresh project and derives the graph
+/// of every accepted source that has content but no graph yet, in one
+/// transaction, returning the paths indexed in order.
+///
+/// The accepted source is [`source::baseline`]'s: what Git considers
+/// repository content within the configured roots, captured once, never
+/// again for a path that has accepted state. Sources whose graph is current
+/// or stale are left alone, stale ones being indexed again when their next
+/// accepted change is; sources of unsupported languages, and of supported
+/// ones the frontend declined, stay without a graph. So it is idempotent, and
+/// makes an interrupted run whole when repeated.
+pub fn index_baseline(project: &Project, store: &mut Store) -> Result<Vec<String>> {
+    source::baseline(project, store)?;
+    let mut contributions = Vec::new();
+    for path in store.accepted_paths()? {
+        if store.graph_status(&path)? != Freshness::Unindexed {
+            continue;
+        }
+        if let Derivation::Indexed(c) = derive(project, store, &path)? {
+            contributions.push(c);
+        }
+    }
+    store.replace_graphs(&contributions)?;
+    Ok(contributions.into_iter().map(|c| c.path).collect())
 }
 
 /// Checks everything about a contribution that does not depend on canonical
@@ -622,6 +661,151 @@ pub(crate) mod tests {
     const A: &str = "src/a.rs";
     const B: &str = "src/b.rs";
     const C: &str = "src/c.rs";
+
+    /// A project of `files` written to the working tree, none accepted yet.
+    fn repository(roots: &str, files: &[(&str, &str)]) -> Fixture {
+        let fx = Fixture::new(roots);
+        for (path, content) in files {
+            let file = fx.project.root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, content).unwrap();
+        }
+        fx
+    }
+
+    fn symbols(fx: &Fixture, path: &str) -> Vec<String> {
+        let mut symbols: Vec<String> = current(fx.store.entities(path).unwrap())
+            .into_iter()
+            .map(|e| format!("{} {}", e.id.kind, e.id.symbol))
+            .collect();
+        symbols.sort();
+        symbols
+    }
+
+    #[test]
+    fn baseline_indexing_gives_existing_source_a_current_graph() {
+        let mut fx = repository(
+            "src",
+            &[
+                (".gitignore", "target/\n"),
+                ("src/lib.rs", "pub fn f() { g() }\n"),
+                ("src/tool.py", "def run(): pass\n"),
+                ("src/app.ts", "export const x = 1;\n"),
+                ("src/page.jsx", "export default () => <p/>;\n"),
+                ("src/notes.txt", "not source\n"),
+                ("src/bad.py", "def (:\n"),
+                ("src/target/generated.rs", "pub fn generated() {}\n"),
+                ("other/out.rs", "pub fn outside() {}\n"),
+                ("src/[id].rs", "pub fn id() {}\n"),
+                (GLOB_STAR_PATH, "pub fn star() {}\n"),
+                ("src/ab.rs", "pub fn ab() {}\n"),
+            ],
+        );
+        let indexed = index_baseline(&fx.project, &mut fx.store).unwrap();
+        let expected = [
+            GLOB_STAR_PATH,
+            "src/[id].rs",
+            "src/ab.rs",
+            "src/app.ts",
+            "src/lib.rs",
+            "src/page.jsx",
+            "src/tool.py",
+        ];
+        let mut expected = expected.map(String::from).to_vec();
+        expected.sort();
+        assert_eq!(indexed, expected);
+        assert_eq!(fx.store.accepted_paths().unwrap().len(), expected.len() + 2);
+        for path in &expected {
+            assert_eq!(fx.status(path), Current(()), "{path}");
+            let hash = fx
+                .store
+                .accepted_source(path)
+                .unwrap()
+                .unwrap()
+                .hash
+                .unwrap();
+            for e in current(fx.store.entities(path).unwrap()) {
+                assert_eq!((&e.id.path, &e.location.hash), (path, &hash), "{path}");
+            }
+        }
+        assert_eq!(symbols(&fx, "src/lib.rs"), ["function f", "module self"]);
+        assert_eq!(symbols(&fx, "src/tool.py"), ["function run", "module self"]);
+        assert_eq!(symbols(&fx, "src/app.ts"), ["module self", "variable x"]);
+        assert_eq!(
+            symbols(&fx, "src/page.jsx"),
+            ["function default", "module self"]
+        );
+        // Paths full of pattern syntax are themselves, not patterns.
+        assert_eq!(
+            symbols(&fx, GLOB_STAR_PATH),
+            ["function star", "module self"]
+        );
+        assert_eq!(symbols(&fx, "src/ab.rs"), ["function ab", "module self"]);
+        assert_eq!(symbols(&fx, "src/[id].rs"), ["function id", "module self"]);
+        // Unsupported and declined sources are accepted, without a graph;
+        // ignored and out-of-root ones are not source at all.
+        for path in ["src/notes.txt", "src/bad.py"] {
+            assert!(fx.store.accepted_source(path).unwrap().is_some(), "{path}");
+            assert_eq!(fx.status(path), Unindexed, "{path}");
+        }
+        for path in ["src/target/generated.rs", "other/out.rs"] {
+            assert_eq!(fx.store.accepted_source(path).unwrap(), None, "{path}");
+        }
+
+        // Again, even after reopening, nothing changes.
+        let tables = [
+            "graph_sources",
+            "graph_entities",
+            "graph_relations",
+            "graph_sites",
+        ];
+        let before = tables.map(|t| fx.rows(t));
+        let mut fx = fx.reopen();
+        assert_eq!(
+            index_baseline(&fx.project, &mut fx.store).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(tables.map(|t| fx.rows(t)), before);
+
+        // A source accepted anew is stale, and only its own next indexing
+        // makes it current again; the baseline never claims it.
+        fx.accept("src/lib.rs", Some("pub fn changed() {}\n"));
+        assert_eq!(fx.status("src/lib.rs"), Stale);
+        assert!(
+            index_baseline(&fx.project, &mut fx.store)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fx.status("src/lib.rs"), Stale);
+    }
+
+    #[test]
+    fn baseline_indexing_completes_an_interrupted_one() {
+        let mut fx = repository(
+            "src",
+            &[("src/a.rs", "fn a() {}\n"), ("src/b.py", "def b(): pass\n")],
+        );
+        // Accepted, but the process ended before any graph was stored.
+        source::baseline(&fx.project, &mut fx.store).unwrap();
+        assert_eq!(fx.status("src/a.rs"), Unindexed);
+        assert_eq!(
+            index_baseline(&fx.project, &mut fx.store).unwrap(),
+            ["src/a.rs", "src/b.py"]
+        );
+        assert_eq!(fx.status("src/b.py"), Current(()));
+    }
+
+    #[test]
+    fn baseline_indexing_reads_accepted_content_not_the_working_tree() {
+        let mut fx = repository("src", &[("src/a.rs", "fn accepted() {}\n")]);
+        source::baseline(&fx.project, &mut fx.store).unwrap();
+        fs::write(fx.project.root.join("src/a.rs"), "fn edited() {}\n").unwrap();
+        index_baseline(&fx.project, &mut fx.store).unwrap();
+        assert_eq!(
+            symbols(&fx, "src/a.rs"),
+            ["function accepted", "module self"]
+        );
+    }
 
     #[test]
     fn sources_are_unindexed_until_a_contribution_makes_them_current() {
