@@ -104,6 +104,10 @@ fn main() -> ExitCode {
             an_ordinary_end_leaves_no_descendants,
         ),
         (
+            "a_result_with_output_held_by_a_descendant_settles_cleanly",
+            a_result_with_output_held_by_a_descendant_settles_cleanly,
+        ),
+        (
             "a_lost_domain_is_never_taken_for_gone_without_proof",
             a_lost_domain_is_never_taken_for_gone_without_proof,
         ),
@@ -264,6 +268,12 @@ fn fake() -> ExitCode {
         // Answers and exits at once, leaving its descendant behind.
         "orphaning" => {
             start_descendant();
+            say(&result(json!({"n": 7})));
+        }
+        // Answers and exits at once, leaving a descendant that holds the
+        // provider's own output (and error) streams open.
+        "holding" => {
+            start_holding_descendant();
             say(&result(json!({"n": 7})));
         }
         // Answers and exits at once, leaving behind a descendant that has
@@ -779,11 +789,20 @@ fn undelivered_input_fails_closed() {
 /// Starts a descendant that ends on its own within 20 seconds, and records
 /// its process id beside the working directory for the test to check.
 fn start_descendant() {
+    spawn_descendant(std::process::Stdio::null, std::process::Stdio::null);
+}
+
+/// A descendant that keeps this provider's stdout and stderr open.
+fn start_holding_descendant() {
+    spawn_descendant(std::process::Stdio::inherit, std::process::Stdio::inherit);
+}
+
+fn spawn_descendant(stdout: fn() -> std::process::Stdio, stderr: fn() -> std::process::Stdio) {
     let child = std::process::Command::new(env::current_exe().unwrap())
         .arg("--model=sleeper:20")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(stdout())
+        .stderr(stderr())
         .spawn()
         .unwrap();
     std::fs::write("descendant.tmp", child.id().to_string()).unwrap();
@@ -930,6 +949,30 @@ fn assert_succeeded(outcome: &Outcome, scenario: &str) {
         outcome.stderr,
         procd::capabilities(),
     );
+}
+
+/// The provider answers completely and exits 0, and a descendant it started
+/// keeps its output streams open. The shim ends the channels on purpose
+/// (`held`), so the reader sees a clean end of stream rather than whatever
+/// the host does to a socket when the shim and domain are destroyed under
+/// it; with the domain's emptiness proven, the invocation settles, its
+/// output noted as held. This is the settlement the leftover descendant
+/// must not be able to turn into a failure, nor a success into more than it
+/// is: the note stays.
+fn a_result_with_output_held_by_a_descendant_settles_cleanly() {
+    let mut f = Fixture::new();
+    // Where procd can prove emptiness, its own evidence settles this; the
+    // test double stands in only where the backend cannot.
+    let _real = host_enforces().then(|| runtime::testing::evidence(runtime::testing::Mode::Real));
+    let outcome = f.run(&f.launch(Provider::Claude, "holding"));
+    assert_succeeded(&outcome, "holding");
+    let diagnostic = outcome.end.diagnostic.as_deref().unwrap_or_default();
+    assert!(
+        diagnostic.contains("stayed open after it exited"),
+        "held output is reported: {diagnostic:?}"
+    );
+    assert_eq!(outcome.payload, Some(json!({"n": 7})));
+    assert_gone_soon(descendant(f.dir.path()));
 }
 
 fn a_lost_domain_is_never_taken_for_gone_without_proof() {

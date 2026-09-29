@@ -461,6 +461,8 @@ fn run(dir: &Path) -> Result<()> {
     let input = open(&loaded, Channel::Input)?;
     let output = open(&loaded, Channel::Output)?;
     let error = open(&loaded, Channel::Error)?;
+    // Held apart from the relays, so the shim can end their channels itself.
+    let ends = [output.try_clone()?, error.try_clone()?];
 
     let passthrough: &Passthrough = match loaded.spec.provider {
         Provider::Claude => &claude::ENV,
@@ -531,6 +533,9 @@ fn run(dir: &Path) -> Result<()> {
         thread::sleep(POLL);
     }
     let held = !streams.iter().all(JoinHandle::is_finished);
+    if held {
+        finish_channels(&ends);
+    }
     if !feed.is_finished() && !reported.swap(true, Ordering::SeqCst) {
         control.say("input failed the provider ended before all input was delivered");
     }
@@ -538,9 +543,45 @@ fn run(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Ends the output channels on purpose, when a process the provider started
+/// still holds its output open after the provider exited.
+///
+/// Everything the relays had read is already delivered; the stream is over
+/// as far as the provider goes. Left to itself, the shim's exit (or the
+/// domain's termination) would tear the sockets down while the relays are
+/// still blocked, which some hosts (Windows) report to the reader as a
+/// connection reset instead of the end of the stream. Shutting down the
+/// write side sends a clean end of stream, and a relay that later wakes can
+/// no longer write through the channel. The reader still learns of the
+/// condition from the `held` in the `exit` report, and the descendants are
+/// still ended only by terminating the domain.
+fn finish_channels(ends: &[TcpStream]) {
+    for end in ends {
+        let _ = end.shutdown(Shutdown::Write);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finishing_a_channel_is_a_clean_end_and_stops_later_writes() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let shim_side = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut reader, _) = listener.accept().unwrap();
+        // What a relay owns, and what the shim kept.
+        let mut relay = shim_side.try_clone().unwrap();
+        relay.write_all(b"result\n").unwrap();
+        finish_channels(&[shim_side]);
+        // A relay woken later by the descendant cannot add to the stream.
+        assert!(relay.write_all(b"late\n").is_err());
+        let mut got = Vec::new();
+        reader
+            .read_to_end(&mut got)
+            .expect("a clean end, not a reset");
+        assert_eq!(got, b"result\n");
+    }
 
     #[test]
     fn text_survives_the_spec_exactly() {

@@ -1126,7 +1126,7 @@ fn read_control(mut control: BufReader<TcpStream>, shared: &Shared) {
     shared.progress().control_closed = true;
 }
 
-fn read_events(stdout: TcpStream, shared: &Shared) {
+fn read_events(stdout: impl Read, shared: &Shared) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
     loop {
@@ -1364,6 +1364,128 @@ mod tests {
             abandoned(Err(anyhow!("procd refused")), why()),
             Launched::Unconfirmed(_)
         ));
+    }
+
+    /// What a shim's output channel says, then how it ends.
+    enum Channel {
+        /// The shim ended it deliberately: a clean end of stream.
+        Finished,
+        /// The transport failed underneath the reader.
+        Reset,
+    }
+
+    struct Scripted {
+        bytes: std::io::Cursor<Vec<u8>>,
+        end: Channel,
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.bytes.read(buf)? {
+                0 => match self.end {
+                    Channel::Finished => Ok(0),
+                    Channel::Reset => Err(std::io::ErrorKind::ConnectionReset.into()),
+                },
+                n => Ok(n),
+            }
+        }
+    }
+
+    fn claude_result() -> String {
+        format!(
+            "{}\n",
+            json!({
+                "type": "result", "subtype": "success", "is_error": false,
+                "session_id": "s-1", "structured_output": {"n": 7},
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })
+        )
+    }
+
+    /// Reads `text` from a channel that then ends as `end`, and concludes
+    /// the invocation as a provider that exited 0 with `held` output.
+    fn heard(text: &str, end: Channel, held: bool, proven: bool) -> Result<Outcome, Unresolved> {
+        let shared = Shared {
+            cancel: AtomicBool::new(false),
+            progress: Mutex::new(Progress::new(Decoder::Claude(claude::Decoder::default()))),
+            schema: schema(),
+        };
+        shared.progress().input_delivered = true;
+        let bytes = std::io::Cursor::new(text.as_bytes().to_vec());
+        read_events(Scripted { bytes, end }, &shared);
+        let p = shared.progress();
+        conclude(
+            "1".parse().unwrap(),
+            Ok(End::Exited {
+                status: status(0),
+                held,
+            }),
+            Ok(evidence(proven)),
+            || true,
+            &p,
+            &schema(),
+        )
+    }
+
+    #[test]
+    fn a_complete_result_with_held_output_settles_when_the_stream_ended_cleanly() {
+        // The shim finishes the channel on purpose when a descendant holds
+        // the provider's output; the domain is then proven empty.
+        let outcome = heard(&claude_result(), Channel::Finished, true, true).unwrap();
+        assert_eq!(outcome.end.state, InvocationState::Succeeded);
+        assert_eq!(outcome.payload, Some(json!({"n": 7})));
+        // Held output is reported, never taken for success by itself.
+        assert!(
+            outcome
+                .end
+                .diagnostic
+                .unwrap()
+                .contains("stayed open after it exited")
+        );
+    }
+
+    #[test]
+    fn held_output_alone_is_not_success() {
+        let outcome = heard("", Channel::Finished, true, true).unwrap();
+        assert_eq!(outcome.end.state, InvocationState::Failed);
+        assert_eq!(outcome.end.failure, Some(FailureKind::NoResult));
+    }
+
+    #[test]
+    fn a_reset_is_not_an_end_of_stream_before_or_after_a_result() {
+        // No blanket rule: a transport failure is a failure, complete
+        // result or not. Only the shim's deliberate end is a clean one.
+        for text in [String::new(), claude_result()] {
+            let outcome = heard(&text, Channel::Reset, true, true).unwrap();
+            assert_eq!(outcome.end.state, InvocationState::Failed, "{text:?}");
+            assert_eq!(outcome.end.failure, Some(FailureKind::MalformedOutput));
+            assert!(
+                outcome
+                    .end
+                    .diagnostic
+                    .unwrap()
+                    .contains("could not be read (ConnectionReset")
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_or_malformed_results_stay_failures_on_a_clean_end() {
+        let whole = claude_result();
+        let truncated = &whole[..whole.len() / 2];
+        for text in [truncated.to_owned(), "not json\n".to_owned()] {
+            let outcome = heard(&text, Channel::Finished, true, true).unwrap();
+            assert_eq!(outcome.end.state, InvocationState::Failed, "{text:?}");
+            assert_eq!(outcome.payload, None);
+        }
+    }
+
+    #[test]
+    fn a_complete_result_never_settles_an_unproven_domain() {
+        for end in [Channel::Finished, Channel::Reset] {
+            let unresolved = heard(&claude_result(), end, true, false).unwrap_err();
+            assert!(unresolved.why.contains("not proven empty"), "{unresolved}");
+        }
     }
 
     #[test]
