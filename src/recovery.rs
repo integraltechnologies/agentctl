@@ -47,7 +47,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::TryLockError;
+use std::fs::{File, TryLockError};
 use std::thread;
 use std::time::Duration;
 
@@ -174,13 +174,13 @@ pub fn recover_store(project: &Project, store: &mut Store) -> Result<Report> {
 /// [`recover_store`], with `settle` deciding whether an interrupted
 /// invocation's lifecycle is settled.
 pub fn recover_with(project: &Project, store: &mut Store, settle: Settle) -> Result<Report> {
-    let lock = store.recovery_lock()?;
+    let lock = Held(store.recovery_lock()?);
     // Asked a few times over when found held: a process that only checked
     // it shares its hold with any process it was starting meanwhile, until
     // that one executes (see `liveness`).
     let mut asked = 0;
     loop {
-        match lock.try_lock() {
+        match lock.0.try_lock() {
             Ok(()) => break,
             Err(TryLockError::WouldBlock) if asked < 25 => {
                 asked += 1;
@@ -230,6 +230,19 @@ pub fn recover_with(project: &Project, store: &mut Store, settle: Settle) -> Res
         }
     }
     Ok(report)
+}
+
+/// The recovery lock, given up when recovery ends, whatever else still holds
+/// the open file: a process forked meanwhile, by any thread of this one,
+/// carries a copy of the descriptor until it executes, and closing ours
+/// would not release the lock while that copy lives. Unlocking does, so
+/// `Store::recovery_required` never sees a recovery that ended as running.
+struct Held(File);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// The liveness of `session`, asked a few times over when its lock is
@@ -1393,6 +1406,60 @@ esac
                 Decided::AlreadyRecorded
             );
             assert!(h.fx.store.recovery_required(h.plan).unwrap().is_none());
+        }
+
+        /// A process forked while recovery runs carries a copy of its lock
+        /// until it executes. Once recovery has returned, the barrier must
+        /// not see it as running, however long that copy lives.
+        #[test]
+        fn a_finished_recovery_is_not_held_by_a_process_forked_meanwhile() {
+            use std::io::{Read, Write};
+            use std::os::unix::process::CommandExt;
+
+            /// Lets the forked process go on, even if the test panics: it
+            /// holds a copy of this write end itself, so closing is no signal.
+            struct Release(std::io::PipeWriter);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    let _ = self.0.write_all(b"r");
+                }
+            }
+
+            let mut h = Harness::one();
+            h.mode("planner", "hang");
+            h.crash("replan", "replan.spawned");
+            let (forked_rx, forked_tx) = std::io::pipe().unwrap();
+            let (release_rx, release_tx) = std::io::pipe().unwrap();
+            let release = Release(release_tx);
+            let forking = std::sync::Mutex::new(None);
+            let settle = |_: InvocationId, _: Option<&str>| {
+                let (mut forked_tx, mut release_rx) = (
+                    forked_tx.try_clone().unwrap(),
+                    release_rx.try_clone().unwrap(),
+                );
+                // Another thread of this process forks, and stays between
+                // `fork` and `exec` until released: the window, made to last.
+                *forking.lock().unwrap() = Some(thread::spawn(move || {
+                    let mut command = Command::new("true");
+                    // SAFETY: the closure only writes to and reads from pipes.
+                    unsafe {
+                        command.pre_exec(move || {
+                            forked_tx.write_all(b"f")?;
+                            release_rx.read(&mut [0u8; 1]).map(drop)
+                        });
+                    }
+                    command.status().unwrap();
+                }));
+                // Settled only once the fork holds its copy of the lock.
+                (&forked_rx).read_exact(&mut [0u8; 1]).unwrap();
+                Lifecycle::Gone
+            };
+            let report = h.recover_with(&settle);
+            assert!(report.settled(), "{report:?}");
+            assert_eq!(h.fx.store.recovery_required(h.plan).unwrap(), None);
+            h.fx.store.planner(h.plan).unwrap();
+            drop(release);
+            forking.lock().unwrap().take().unwrap().join().unwrap();
         }
 
         #[test]

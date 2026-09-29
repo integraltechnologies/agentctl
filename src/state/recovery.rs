@@ -125,13 +125,19 @@ impl Store {
                  of plan {plan} unresolved; run `agentctl recover`"
             )));
         }
-        if let Err(TryLockError::WouldBlock) = self.recovery_lock()?.try_lock_shared() {
-            return Ok(Some(format!(
+        let lock = self.recovery_lock()?;
+        match lock.try_lock_shared() {
+            Ok(()) => {
+                // Given up now, not with the descriptor: see `recovery::Held`.
+                let _ = lock.unlock();
+                Ok(None)
+            }
+            Err(TryLockError::WouldBlock) => Ok(Some(format!(
                 "recovery required: `agentctl recover` is settling interrupted work, \
                  plan {plan}'s included"
-            )));
+            ))),
+            Err(TryLockError::Error(_)) => Ok(None),
         }
-        Ok(None)
     }
 
     /// Refuses new work on `plan` while [`Store::recovery_required`] says
