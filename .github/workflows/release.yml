@@ -1,0 +1,106 @@
+name: release
+
+# A pushed version tag builds agentctl natively on each host CI qualifies
+# and attaches the archives to a DRAFT GitHub release, which a maintainer
+# reviews and publishes. procd is built from the third_party/procd submodule
+# and linked statically by build.rs, so the binaries need no procd on the
+# machine they run on.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: macos-15, target: aarch64-apple-darwin } # Apple Silicon
+          - { os: macos-15-intel, target: x86_64-apple-darwin } # Intel
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          # Native builds only: the runner must be the target.
+          rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.target }}"
+      - name: cargo build --release
+        run: cargo build --locked --release --bins
+      # This runner never had procd installed: the binaries run, carry
+      # procd's code, and load no procd library.
+      - name: self-contained with respect to procd
+        run: |
+          set -euo pipefail
+          exe=""
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          agentctl="target/release/agentctl$exe"
+          "$agentctl" --version
+          # A string only procd's own code holds (procd_status_name).
+          grep -aq PREREQUISITE_MISSING "$agentctl"
+          case "$RUNNER_OS" in
+            Linux) libraries="$(readelf -d "$agentctl" | grep NEEDED)" ;;
+            macOS) libraries="$(otool -L "$agentctl")" ;;
+            *) libraries="" ;; # procd.lib is a static library; there is no DLL to load
+          esac
+          echo "$libraries"
+          if grep -qi procd <<<"$libraries"; then
+            echo "agentctl loads a procd library" >&2
+            exit 1
+          fi
+      - name: package
+        run: |
+          set -euo pipefail
+          name="agentctl-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          # agentctl starts providers through agentctl-shim, found beside it.
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/{agentctl,agentctl-shim,agenttop}.exe "dist/$name/"
+            (cd dist && 7z a -tzip "$name.zip" "$name" >/dev/null)
+            archive="$name.zip"
+          else
+            cp target/release/{agentctl,agentctl-shim,agenttop} "dist/$name/"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+            archive="$name.tar.gz"
+          fi
+          (cd dist && { sha256sum "$archive" 2>/dev/null || shasum -a 256 "$archive"; } > "$archive.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "agentctl $GITHUB_REF_NAME"

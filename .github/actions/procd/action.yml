@@ -1,43 +1,24 @@
-name: procd v0.1.0 (external dependency)
+name: procd command-line exerciser
 description: >-
-  Fetches procd from its published tag (commit-pinned so a moved tag cannot
-  change it), builds it with its own CMake and stages it into a runner-local
-  prefix. procd is an immutable external dependency: nothing here patches it.
-
-inputs:
-  cli:
-    description: Also build and stage the procd command-line exerciser.
-    default: "false"
+  Builds procd's own command-line exerciser from the procd agentctl builds
+  against (the third_party/procd submodule), with procd's own CMake, into a
+  runner-local directory, and exports its path as PROCD_CLI. agentctl itself
+  needs none of this: its build script builds and statically links the
+  library. Nothing here patches procd.
 
 runs:
   using: composite
   steps:
-    # procd v0.1.0 has no install rules, so the public header, the static
-    # library and (optionally) the CLI are copied explicitly. autocrlf is off
-    # so procd.h keeps the bytes build.rs hashes.
-    - name: build and stage procd
+    - name: build procd CLI
       shell: bash
-      env:
-        WITH_CLI: ${{ inputs.cli }}
       run: |
         set -euo pipefail
-        src="$RUNNER_TEMP/procd-src"
-        prefix="$RUNNER_TEMP/procd-prefix"
-        git -c core.autocrlf=false clone --quiet --depth 1 --branch v0.1.0 \
-          https://github.com/integraltechnologies/procd "$src"
-        test "$(git -C "$src" rev-parse HEAD)" = 2e3bb6e86156a8863dde52940f0020eb6d7d18e7
-        cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release
-        targets=(procd)
-        if [ "$WITH_CLI" = true ]; then targets+=(procd-cli); fi
-        cmake --build "$src/build" --config Release --target "${targets[@]}"
-        mkdir -p "$prefix/include" "$prefix/lib" "$prefix/bin"
-        cp "$src/include/procd.h" "$prefix/include/procd.h"
+        src="$GITHUB_WORKSPACE/third_party/procd"
+        build="$RUNNER_TEMP/procd-build"
+        cmake -S "$src" -B "$build" -DCMAKE_BUILD_TYPE=Release
+        cmake --build "$build" --config Release --target procd-cli
         if [ "$RUNNER_OS" = Windows ]; then
-          cp "$src/build/Release/procd.lib" "$prefix/lib/procd.lib"
-          if [ "$WITH_CLI" = true ]; then cp "$src/build/Release/procd.exe" "$prefix/bin/procd.exe"; fi
+          echo "PROCD_CLI=$build/Release/procd.exe" >> "$GITHUB_ENV"
         else
-          cp "$src/build/libprocd.a" "$prefix/lib/libprocd.a"
-          if [ "$WITH_CLI" = true ]; then cp "$src/build/procd" "$prefix/bin/procd"; fi
+          echo "PROCD_CLI=$build/procd" >> "$GITHUB_ENV"
         fi
-        echo "PROCD_PREFIX=$prefix" >> "$GITHUB_ENV"
-        if [ "$WITH_CLI" = true ]; then echo "PROCD_CLI=$prefix/bin/procd" >> "$GITHUB_ENV"; fi

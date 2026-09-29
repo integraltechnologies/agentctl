@@ -8,8 +8,9 @@
 //! ids, ancestry, process groups or environment markers ever stand in for a
 //! domain here.
 //!
-//! This module mirrors the installed v0.1.0 `procd.h` (the build script
-//! checks the header's digest) behind a safe API. It validates everything
+//! This module mirrors `procd.h` behind a safe API; the tests check the
+//! mirror against the header this build compiles against (see
+//! `procd_layout.c`). It validates everything
 //! procd returns before the rest of agentctl can rely on it: an unrecognized
 //! code or level is an error, never a guess, and uncertainty stays
 //! uncertainty ([`Recovery::Unresolved`], [`Settlement::Uncertain`]).
@@ -27,7 +28,7 @@ use crate::platform::{Level, Need};
 /// How long terminating or recovering a domain may take, at most.
 pub const TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The C ABI of `procd.h`, exactly as installed.
+/// The C ABI of `procd.h`.
 mod ffi {
     use std::ffi::{c_char, c_int};
 
@@ -39,6 +40,14 @@ mod ffi {
     pub const ALLOW_BEST_EFFORT: c_int = 1;
 
     pub const IDENTITY_MAX: usize = 512;
+
+    pub const CRASH_AUTOMATIC_DESTRUCTION: c_int = 0;
+    pub const CRASH_DURABLE_REACQUISITION: c_int = 1;
+    pub const CRASH_UNRESOLVED_ON_AUTHORITY_LOSS: c_int = 2;
+
+    pub const RECOVERED: c_int = 0;
+    pub const CONFIRMED_DESTROYED: c_int = 1;
+    pub const UNRESOLVED: c_int = 2;
 
     /// `procd_domain`: opaque.
     #[repr(C)]
@@ -193,9 +202,9 @@ fn probe() -> Result<Capabilities> {
         );
     }
     let crash = match raw.crash_behavior {
-        0 => Crash::AutomaticDestruction,
-        1 => Crash::DurableReacquisition,
-        2 => Crash::Unresolved,
+        ffi::CRASH_AUTOMATIC_DESTRUCTION => Crash::AutomaticDestruction,
+        ffi::CRASH_DURABLE_REACQUISITION => Crash::DurableReacquisition,
+        ffi::CRASH_UNRESOLVED_ON_AUTHORITY_LOSS => Crash::Unresolved,
         other => bail!("procd reported an unrecognized crash behavior ({other})"),
     };
     Ok(Capabilities {
@@ -515,10 +524,12 @@ pub fn recover(identity: &str) -> Recovery {
         ));
     }
     match (outcome, handle) {
-        (0, Some(domain)) => Recovery::Recovered(domain),
-        (0, None) => Recovery::Unresolved("procd recovered no domain".into()),
-        (1, _) => Recovery::Destroyed,
-        (2, _) => Recovery::Unresolved("procd cannot establish the domain's fate".into()),
+        (ffi::RECOVERED, Some(domain)) => Recovery::Recovered(domain),
+        (ffi::RECOVERED, None) => Recovery::Unresolved("procd recovered no domain".into()),
+        (ffi::CONFIRMED_DESTROYED, _) => Recovery::Destroyed,
+        (ffi::UNRESOLVED, _) => {
+            Recovery::Unresolved("procd cannot establish the domain's fate".into())
+        }
         (other, _) => {
             Recovery::Unresolved(format!("procd reported an unrecognized outcome ({other})"))
         }
@@ -709,6 +720,134 @@ mod tests {
         assert!(level(3).is_err() && level(-1).is_err());
         assert_eq!(State::from_code(6), None);
         assert_eq!(State::from_code(-1), None);
+    }
+
+    /// `procd_layout.c`'s report of the header this build compiled against.
+    fn header(name: &str) -> i64 {
+        unsafe extern "C" {
+            fn agentctl_procd_fact(name: *const c_char, out: *mut i64) -> c_int;
+        }
+        let key = CString::new(name).unwrap();
+        let mut value = 0;
+        // SAFETY: `key` is NUL-terminated and `value` is writable.
+        let known = unsafe { agentctl_procd_fact(key.as_ptr(), &mut value) };
+        assert_eq!(known, 1, "procd_layout.c does not report {name}");
+        value
+    }
+
+    fn size_of_field<T, F>(_: fn(&T) -> &F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    #[test]
+    fn the_mirror_matches_the_header_it_is_built_against() {
+        use std::mem::{align_of, offset_of, size_of};
+        let mut mismatches = Vec::new();
+        let mut check = |name: &str, mirror: usize| {
+            let header = header(name);
+            if i64::try_from(mirror) != Ok(header) {
+                mismatches.push(format!("{name}: procd.h {header}, src/procd.rs {mirror}"));
+            }
+        };
+        check("PROCD_IDENTITY_MAX", ffi::IDENTITY_MAX);
+        for name in [
+            "procd_status",
+            "procd_capability",
+            "procd_crash_behavior",
+            "procd_enforcement",
+            "procd_lifecycle_state",
+            "procd_population",
+            "procd_recovery_outcome",
+        ] {
+            check(&format!("sizeof {name}"), size_of::<c_int>());
+            check(&format!("alignof {name}"), align_of::<c_int>());
+        }
+        macro_rules! layout {
+            ($rust:ty, $c:literal { $($field:ident),+ $(,)? }) => {
+                check(concat!("sizeof ", $c), size_of::<$rust>());
+                check(concat!("alignof ", $c), align_of::<$rust>());
+                $(
+                    check(concat!($c, ".", stringify!($field), " offset"), offset_of!($rust, $field));
+                    check(
+                        concat!($c, ".", stringify!($field), " size"),
+                        size_of_field(|s: &$rust| &s.$field),
+                    );
+                )+
+            };
+        }
+        layout!(ffi::Policy, "procd_policy" { enforcement, label, drop_uid, drop_gid });
+        layout!(ffi::Capabilities, "procd_capabilities" {
+            process_tree_termination,
+            pre_execution_containment,
+            descendant_containment,
+            topology_escape_resistance,
+            domain_emptiness_proof,
+            safe_recovery,
+            crash_behavior,
+            backend,
+            detail,
+        });
+        layout!(ffi::DomainStatus, "procd_domain_status" {
+            state,
+            population,
+            process_tree_termination,
+            population_is_authoritative,
+        });
+        layout!(ffi::TerminationEvidence, "procd_termination_evidence" {
+            admission_closed,
+            authority_directed,
+            emptiness_proven,
+            enforced,
+            final_state,
+            detail,
+        });
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+
+        let code = |name| c_int::try_from(header(name)).unwrap();
+        for (name, mirror) in [
+            ("PROCD_OK", ffi::OK),
+            (
+                "PROCD_E_UNSUPPORTED_ENFORCEMENT",
+                ffi::E_UNSUPPORTED_ENFORCEMENT,
+            ),
+            ("PROCD_E_PREREQUISITE", ffi::E_PREREQUISITE),
+            ("PROCD_REQUIRE_ENFORCED", ffi::REQUIRE_ENFORCED),
+            ("PROCD_ALLOW_BEST_EFFORT", ffi::ALLOW_BEST_EFFORT),
+            (
+                "PROCD_CRASH_AUTOMATIC_DESTRUCTION",
+                ffi::CRASH_AUTOMATIC_DESTRUCTION,
+            ),
+            (
+                "PROCD_CRASH_DURABLE_REACQUISITION",
+                ffi::CRASH_DURABLE_REACQUISITION,
+            ),
+            (
+                "PROCD_CRASH_UNRESOLVED_ON_AUTHORITY_LOSS",
+                ffi::CRASH_UNRESOLVED_ON_AUTHORITY_LOSS,
+            ),
+            ("PROCD_RECOVERED", ffi::RECOVERED),
+            ("PROCD_CONFIRMED_DESTROYED", ffi::CONFIRMED_DESTROYED),
+            ("PROCD_UNRESOLVED", ffi::UNRESOLVED),
+        ] {
+            assert_eq!(code(name), mirror, "{name}");
+        }
+        for (name, mirror) in [
+            ("PROCD_CAP_UNSUPPORTED", Level::Unsupported),
+            ("PROCD_CAP_BEST_EFFORT", Level::BestEffort),
+            ("PROCD_CAP_ENFORCED", Level::Enforced),
+        ] {
+            assert_eq!(level(code(name)).unwrap(), mirror, "{name}");
+        }
+        for (name, mirror) in [
+            ("PROCD_STATE_CREATED", State::Created),
+            ("PROCD_STATE_ACTIVE", State::Active),
+            ("PROCD_STATE_TERMINATING", State::Terminating),
+            ("PROCD_STATE_EMPTY", State::Empty),
+            ("PROCD_STATE_RELEASED", State::Released),
+            ("PROCD_STATE_UNRESOLVED", State::Unresolved),
+        ] {
+            assert_eq!(State::from_code(code(name)), Some(mirror), "{name}");
+        }
     }
 
     #[test]

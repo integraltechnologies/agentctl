@@ -23,8 +23,9 @@ env:
 jobs:
   # FORMATTING / STATIC ANALYSIS, on the same four supported hosts the tests
   # run on. Each host compiles its own cfg(unix)/cfg(windows)/cfg(target_os)
-  # code and its own procd backend binding, so none of it is linted only by
-  # proxy from another host.
+  # code and its own procd backend (built from the third_party/procd
+  # submodule by build.rs), so none of it is linted only by proxy from
+  # another host.
   static:
     name: static (${{ matrix.os }})
     strategy:
@@ -42,6 +43,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: toolchain
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
@@ -50,8 +53,6 @@ jobs:
           rustc --version
           # The runner label must actually provide the intended architecture.
           rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.host }}"
-      # procd is an immutable external dependency (see the action).
-      - uses: ./.github/actions/procd
       - uses: Swatinem/rust-cache@v2
         with:
           key: static
@@ -83,6 +84,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: toolchain
         run: |
           rustup toolchain install stable --profile minimal
@@ -91,13 +94,11 @@ jobs:
           rustc --version
           # The runner label must actually provide the intended architecture.
           rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.host }}"
-      # procd is an immutable external dependency (see the action); the CLI is
-      # staged too, for the capability report and the Linux qualification gate.
+      # procd's CLI, from the same submodule agentctl builds against, for the
+      # capability report and the Linux qualification gate.
       - uses: ./.github/actions/procd
-        with:
-          cli: "true"
       # DIAGNOSTIC AND QUALIFICATION OUTPUT ONLY. This prints what the
-      # installed procd reports on this runner; nothing parses it or feeds it
+      # procd reports on this runner; nothing parses it or feeds it
       # back, and no capability level is set by it. agentctl's own tests
       # decide from procd's answers at run time.
       - name: procd capability report

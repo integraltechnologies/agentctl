@@ -1,0 +1,3 @@
+[submodule "third_party/procd"]
+	path = third_party/procd
+	url = https://github.com/integraltechnologies/procd.git

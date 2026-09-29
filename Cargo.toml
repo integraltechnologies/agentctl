@@ -29,7 +29,8 @@ which = "8.0.6"
 lifecycle-double = []
 
 [build-dependencies]
-sha2 = "0.11.0"
+cc = "1.4.7"
+cmake = "0.1.58"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
