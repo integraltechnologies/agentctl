@@ -19,9 +19,22 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
+# systemd-run resolves a bare command name itself, against the PATH of the
+# sudo-reset environment it is started in (no ~/.cargo/bin), and fails with
+# "Failed to find executable". Resolve it here, in the caller's own PATH, so
+# the already-installed toolchain is what runs. The service then gets the
+# caller's PATH (below), so the rustup proxy finds rustc, linkers and helpers
+# exactly as an ordinary step would.
+command_path="$(command -v -- "$1" || true)"
+if [ -z "$command_path" ]; then
+  echo "delegated-cgroup: '$1' not found in PATH=$PATH" >&2
+  exit 127
+fi
+shift
+
 # Environment the workload needs; forwarded by value, if set.
 forward=(PATH HOME CARGO_HOME RUSTUP_HOME CARGO_TERM_COLOR CARGO_INCREMENTAL
-  RUST_BACKTRACE RUSTFLAGS PROCD_PREFIX PROCD_CLI RUNNER_TEMP CI TMPDIR)
+  RUST_BACKTRACE RUSTFLAGS RUSTUP_TOOLCHAIN PROCD_PREFIX PROCD_CLI RUNNER_TEMP CI TMPDIR)
 setenv=()
 for name in "${forward[@]}"; do
   if [ -n "${!name+x}" ]; then
@@ -35,4 +48,4 @@ exec sudo systemd-run \
   --property=Delegate=yes \
   --working-directory="$PWD" \
   "${setenv[@]}" \
-  -- "$@"
+  -- "$command_path" "$@"

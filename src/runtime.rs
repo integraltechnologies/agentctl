@@ -762,13 +762,13 @@ struct Stream {
     error: Option<&'static str>,
     /// Why the output cannot be trusted, once it cannot. agentctl's words
     /// only: the offending output is never quoted.
-    malformed: Option<&'static str>,
+    malformed: Option<String>,
     metadata: Map<String, Value>,
 }
 
 impl Stream {
-    fn malformed(&mut self, why: &'static str) {
-        self.malformed.get_or_insert(why);
+    fn malformed(&mut self, why: impl Into<String>) {
+        self.malformed.get_or_insert_with(|| why.into());
     }
 
     fn session(&mut self, id: Option<&str>) {
@@ -1085,8 +1085,8 @@ fn classify(
     if let Some(error) = stream.error {
         return failed(ProviderError, error.to_owned());
     }
-    if let Some(why) = stream.malformed {
-        return failed(MalformedOutput, why.to_owned());
+    if let Some(why) = &stream.malformed {
+        return failed(MalformedOutput, why.clone());
     }
     match (&stream.result, status.success()) {
         (Some(result), true) if schema.is_valid(result) => (InvocationState::Succeeded, None, None),
@@ -1139,7 +1139,15 @@ fn read_events(stdout: TcpStream, shared: &Shared) {
                 p.last_output = Some(Instant::now());
                 p.observe(line.trim_ascii());
             }
-            Err(_) => return p.stream.malformed("provider output could not be read"),
+            // The OS error is kept: an abortive close (reset) is not an end
+            // of stream, and which of them ended the read is diagnostic.
+            Err(e) => {
+                let seen = p.stream.result.is_some();
+                return p.stream.malformed(format!(
+                    "provider output could not be read ({:?}: {e}; result already seen: {seen})",
+                    e.kind()
+                ));
+            }
         }
     }
 }

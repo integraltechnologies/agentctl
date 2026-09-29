@@ -116,7 +116,7 @@ jobs:
           ls -ld "$own" "$own/cgroup.procs" || true
           systemd-run --version | head -1 || true
           echo "--- procd capabilities (delegated cgroup, same user)"
-          .github/scripts/delegated-cgroup.sh sh -c 'cat /proc/self/cgroup; "$PROCD_CLI" capabilities'
+          .github/scripts/delegated-cgroup.sh sh -c 'echo "user: $(id -un) uid=$(id -u)"; command -v cargo rustc; cargo --version; cat /proc/self/cgroup; "$PROCD_CLI" capabilities'
       # Linux qualification gate: procd must really create and supervise an
       # ENFORCED lifecycle domain for the user the tests run as. procd itself
       # refuses (non-zero exit) otherwise; a weaker level is never accepted.

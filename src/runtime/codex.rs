@@ -310,7 +310,7 @@ mod tests {
             lines.extend(ends);
             let stream = decode(&lines);
             assert_eq!(
-                stream.malformed,
+                stream.malformed.as_deref(),
                 Some("more than one end of a codex turn"),
                 "{lines:?}"
             );
