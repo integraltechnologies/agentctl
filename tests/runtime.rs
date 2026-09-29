@@ -169,6 +169,21 @@ fn main() -> ExitCode {
     }
 }
 
+/// The most a fixture meant to hang stays alive by itself. Tests end it far
+/// sooner, through cancellation or process-tree termination; this only
+/// bounds it when its supervisor is lost outright (killed, crashed), since
+/// nothing may rely on a parent's death to end its descendants.
+const HANG_BOUND: Duration = Duration::from_secs(60);
+
+/// Hangs for [`HANG_BOUND`] at most, then exits.
+fn hang_bounded() -> ! {
+    let deadline = Instant::now() + HANG_BOUND;
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_secs(1));
+    }
+    std::process::exit(2)
+}
+
 /// Acts as a provider CLI, following the scenario named by `--model=`.
 fn fake() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -206,9 +221,7 @@ fn fake() -> ExitCode {
     let say = |line: &Value| println!("{line}");
     let hang = || -> ! {
         eprintln!("working");
-        loop {
-            thread::sleep(Duration::from_secs(1));
-        }
+        hang_bounded()
     };
     match scenario.as_str() {
         "ok" | "ignore-input" => {

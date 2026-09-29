@@ -333,9 +333,7 @@ fn verify(scenario: &str) -> ExitCode {
         }
         "hang" => {
             fs::write(marker(STARTED), "").unwrap();
-            loop {
-                thread::sleep(Duration::from_secs(1));
-            }
+            hang_bounded()
         }
         other => panic!("unknown verifier scenario `{other}`"),
     };
@@ -367,6 +365,21 @@ fn fake_agent() -> PathBuf {
         })
         .1
         .clone()
+}
+
+/// The most a fixture meant to hang stays alive by itself. Tests end it far
+/// sooner, through cancellation or process-tree termination; this only
+/// bounds it when its supervisor is lost outright (killed, crashed), since
+/// nothing may rely on a parent's death to end its descendants.
+const HANG_BOUND: Duration = Duration::from_secs(60);
+
+/// Hangs for [`HANG_BOUND`] at most, then exits.
+fn hang_bounded() -> ! {
+    let deadline = Instant::now() + HANG_BOUND;
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_secs(1));
+    }
+    std::process::exit(2)
 }
 
 /// A Git repository holding a project whose accepted source is indexed.

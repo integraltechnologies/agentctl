@@ -354,9 +354,7 @@ fn fake() -> ExitCode {
         "hang" => {
             write("src/a.rs", "in progress\n");
             fs::write(marker(STARTED), "").unwrap();
-            loop {
-                thread::sleep(Duration::from_secs(1));
-            }
+            hang_bounded()
         }
         other => panic!("unknown scenario `{other}`"),
     };
@@ -375,6 +373,21 @@ fn respond(output: Value) -> ExitCode {
     println!("{init}\n{result}");
     std::io::stdout().flush().unwrap();
     ExitCode::SUCCESS
+}
+
+/// The most a fixture meant to hang stays alive by itself. Tests end it far
+/// sooner, through cancellation or process-tree termination; this only
+/// bounds it when its supervisor is lost outright (killed, crashed), since
+/// nothing may rely on a parent's death to end its descendants.
+const HANG_BOUND: Duration = Duration::from_secs(60);
+
+/// Hangs for [`HANG_BOUND`] at most, then exits.
+fn hang_bounded() -> ! {
+    let deadline = Instant::now() + HANG_BOUND;
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_secs(1));
+    }
+    std::process::exit(2)
 }
 
 /// Keeps rewriting `path` for a while, until it cannot.
