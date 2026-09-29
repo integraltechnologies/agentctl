@@ -1,40 +1,66 @@
 [package]
 name = "agentctl"
-version = "0.1.0-alpha.2"
+version = "0.3.0-alpha"
 edition = "2024"
-rust-version = "1.88"
-description = "Local, provider-agnostic engineering control plane for coding agents"
-license = "MPL-2.0"
-repository = "https://github.com/integraltechnologies/agentctl"
-publish = false
-default-run = "agentctl"
 
 [dependencies]
-schemars = "1.2"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "1.0"
-rusqlite = { version = "0.37", features = ["bundled", "functions"] }
-toml = "0.8"
-sha2 = "0.10"
-blake3 = "1.8"
-ignore = "0.4"
-tree-sitter = "=0.25.10"
-tree-sitter-rust = "=0.24.2"
-tree-sitter-python = "=0.25.0"
-tree-sitter-typescript = "=0.23.2"
-tree-sitter-javascript = "=0.25.0"
-ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
-crossterm = "0.28"
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+jsonschema = { version = "0.57.0", default-features = false }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+toml = "1.1.6"
+tree-sitter = "0.27.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
+which = "8.0.6"
+
+[features]
+# Test builds only (the integration tests turn it on for themselves): lets
+# a test make a domain's termination settle nothing, to exercise what an
+# unsettled invocation leaves (`runtime::testing`). procd's own evidence
+# stands otherwise.
+lifecycle-double = []
+
+[build-dependencies]
+sha2 = "0.11.0"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.189"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_Security_Cryptography", "Win32_System_Console"] }
+
+[dev-dependencies]
+agentctl = { path = ".", features = ["lifecycle-double"] }
+
+# Its own `main`, so the test binary can also act as a fake provider.
+[[test]]
+name = "runtime"
+harness = false
+
+[[test]]
+name = "planner"
+harness = false
+
+[[test]]
+name = "executor"
+harness = false
+
+[[test]]
+name = "verifier"
+harness = false
+
+[[test]]
+name = "scheduler"
+harness = false
+
+[[test]]
+name = "cli"
+harness = false

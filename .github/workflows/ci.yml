@@ -1,53 +1,145 @@
-name: CI
+name: ci
 
 on:
   push:
+    branches: [main, "v0.3-alpha"]
   pull_request:
 
+# Read-only token; no secrets are referenced anywhere in this workflow.
+permissions:
+  contents: read
+
+# Superseded runs of the same ref are cancelled. CI keeps no external mutable
+# state, so cancellation cannot corrupt anything.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
 jobs:
-  macos:
-    name: macOS
-    runs-on: macos-latest
+  # FORMATTING / STATIC ANALYSIS, on the same four supported hosts the tests
+  # run on. Each host compiles its own cfg(unix)/cfg(windows)/cfg(target_os)
+  # code and its own procd backend binding, so none of it is linted only by
+  # proxy from another host.
+  static:
+    name: static (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, host: x86_64-unknown-linux-gnu }
+          - { os: macos-15, host: aarch64-apple-darwin } # Apple Silicon
+          - { os: macos-15-intel, host: x86_64-apple-darwin } # Intel
+          - { os: windows-latest, host: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          cargo --version
+          rustc --version
+          # The runner label must actually provide the intended architecture.
+          rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.host }}"
+      # procd is an immutable external dependency (see the action).
+      - uses: ./.github/actions/procd
+      - uses: Swatinem/rust-cache@v2
         with:
-          components: rustfmt, clippy
-      - name: Build
-        run: cargo build --locked
-      - name: Test
-        run: cargo test --locked
-      - name: Format check
+          key: static
+      - name: cargo fmt --check
         run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo check --all-targets
+        run: cargo check --locked --all-targets
+      - name: cargo clippy --all-targets -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-  linux:
-    name: Linux
-    runs-on: ubuntu-latest
+  # NATIVE TEST SUITE, per OS. Includes the orchestration recovery tests
+  # (session liveness, journal withdrawal, interrupted outcomes, recovery
+  # barriers, install/verifier/acceptance recovery). Some of those use bounded
+  # `sleep 30` fixtures; the per-job timeout is the backstop.
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, host: x86_64-unknown-linux-gnu }
+          - { os: macos-15, host: aarch64-apple-darwin } # Apple Silicon
+          - { os: macos-15-intel, host: x86_64-apple-darwin } # Intel
+          - { os: windows-latest, host: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo --version
+          rustc --version
+          # The runner label must actually provide the intended architecture.
+          rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.host }}"
+      # procd is an immutable external dependency (see the action); the CLI is
+      # staged too, for the capability report and the Linux qualification gate.
+      - uses: ./.github/actions/procd
         with:
-          components: rustfmt, clippy
-      - name: Build
-        run: cargo build --locked
-      - name: Test
-        run: cargo test --locked
-      - name: Format check
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-  windows:
-    name: Windows
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+          cli: "true"
+      # DIAGNOSTIC AND QUALIFICATION OUTPUT ONLY. This prints what the
+      # installed procd reports on this runner; nothing parses it or feeds it
+      # back, and no capability level is set by it. agentctl's own tests
+      # decide from procd's answers at run time.
+      - name: procd capability report
+        run: |
+          echo "runner: $RUNNER_OS $RUNNER_ARCH"
+          uname -a || true
+          echo "--- procd capabilities (this process)"
+          "$PROCD_CLI" capabilities
+      - name: linux cgroup environment
+        if: runner.os == 'Linux'
+        run: |
+          echo "--- /proc/self/cgroup"; cat /proc/self/cgroup
+          echo "--- cgroup mount"; findmnt -T /sys/fs/cgroup || true
+          echo "--- own cgroup writable by this user?"
+          own="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          ls -ld "$own" "$own/cgroup.procs" || true
+          systemd-run --version | head -1 || true
+          echo "--- procd capabilities (delegated cgroup, same user)"
+          .github/scripts/delegated-cgroup.sh sh -c 'echo "user: $(id -un) uid=$(id -u)"; command -v cargo rustc; cargo --version; cat /proc/self/cgroup; "$PROCD_CLI" capabilities'
+      # Linux qualification gate: procd must really create and supervise an
+      # ENFORCED lifecycle domain for the user the tests run as. procd itself
+      # refuses (non-zero exit) otherwise; a weaker level is never accepted.
+      - name: linux real-backend gate (procd --require-enforced)
+        if: runner.os == 'Linux'
+        run: .github/scripts/delegated-cgroup.sh "$PROCD_CLI" run --require-enforced -- true
+      - uses: Swatinem/rust-cache@v2
         with:
-          components: clippy
-      - name: Check
-        run: cargo check --locked --all-targets --all-features
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+          key: test
+      - name: cargo test --no-fail-fast
+        if: runner.os != 'Linux'
+        run: cargo test --locked --no-fail-fast
+      # Linux runs the tests against the real procd backend, as this same
+      # unprivileged user, inside a delegated cgroup v2 subtree (procd's
+      # documented prerequisite). Building happens outside it. The command-line
+      # suite (tests/cli.rs) is the production lifecycle qualification there:
+      # it builds agentctl without the lifecycle test double and drives it
+      # end to end, cancellation, interruption and controller death included,
+      # with procd's own evidence; it is required never to fall back.
+      - name: cargo test --no-fail-fast (delegated cgroup)
+        if: runner.os == 'Linux'
+        env:
+          AGENTCTL_REQUIRE_PRODUCTION: "1"
+        run: |
+          cargo test --locked --no-run
+          .github/scripts/delegated-cgroup.sh cargo test --locked --no-fail-fast

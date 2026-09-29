@@ -1,14 +1,1 @@
-# Build output
-/target/
-**/*.rs.bk
-*.profraw
-
-# OS and editor files
-.DS_Store
-.idea/
-.vscode/
-*.swp
-*~
-
-# Local tool settings
-.claude/settings.local.json
+/target
