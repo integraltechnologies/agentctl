@@ -21,14 +21,20 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  # FORMATTING / STATIC ANALYSIS. Windows is included because cfg(windows)
-  # code is otherwise never linted on the Unix runner.
+  # FORMATTING / STATIC ANALYSIS, on the same four supported hosts the tests
+  # run on. Each host compiles its own cfg(unix)/cfg(windows)/cfg(target_os)
+  # code and its own procd backend binding, so none of it is linted only by
+  # proxy from another host.
   static:
     name: static (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - { os: ubuntu-latest, host: x86_64-unknown-linux-gnu }
+          - { os: macos-15, host: aarch64-apple-darwin } # Apple Silicon
+          - { os: macos-15-intel, host: x86_64-apple-darwin } # Intel
+          - { os: windows-latest, host: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     defaults:
@@ -42,29 +48,10 @@ jobs:
           rustup default stable
           cargo --version
           rustc --version
-      # procd is an immutable external dependency: fetched from its published
-      # tag (commit-pinned so a moved tag cannot change it), built with its own
-      # CMake, and staged into a runner-local prefix. procd v0.1.0 has no
-      # install rules, so the public header and static library are copied
-      # explicitly. autocrlf is off so procd.h keeps the bytes build.rs hashes.
-      - name: procd v0.1.0 (external dependency)
-        run: |
-          set -euo pipefail
-          src="$RUNNER_TEMP/procd-src"
-          prefix="$RUNNER_TEMP/procd-prefix"
-          git -c core.autocrlf=false clone --quiet --depth 1 --branch v0.1.0 \
-            https://github.com/integraltechnologies/procd "$src"
-          test "$(git -C "$src" rev-parse HEAD)" = 2e3bb6e86156a8863dde52940f0020eb6d7d18e7
-          cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release
-          cmake --build "$src/build" --config Release --target procd
-          mkdir -p "$prefix/include" "$prefix/lib"
-          cp "$src/include/procd.h" "$prefix/include/procd.h"
-          if [ "$RUNNER_OS" = Windows ]; then
-            cp "$src/build/Release/procd.lib" "$prefix/lib/procd.lib"
-          else
-            cp "$src/build/libprocd.a" "$prefix/lib/libprocd.a"
-          fi
-          echo "PROCD_PREFIX=$prefix" >> "$GITHUB_ENV"
+          # The runner label must actually provide the intended architecture.
+          rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.host }}"
+      # procd is an immutable external dependency (see the action).
+      - uses: ./.github/actions/procd
       - uses: Swatinem/rust-cache@v2
         with:
           key: static
@@ -104,31 +91,49 @@ jobs:
           rustc --version
           # The runner label must actually provide the intended architecture.
           rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.host }}"
-      # procd is an immutable external dependency: fetched from its published
-      # tag (commit-pinned so a moved tag cannot change it), built with its own
-      # CMake, and staged into a runner-local prefix. procd v0.1.0 has no
-      # install rules, so the public header and static library are copied
-      # explicitly. autocrlf is off so procd.h keeps the bytes build.rs hashes.
-      - name: procd v0.1.0 (external dependency)
+      # procd is an immutable external dependency (see the action); the CLI is
+      # staged too, for the capability report and the Linux qualification gate.
+      - uses: ./.github/actions/procd
+        with:
+          cli: "true"
+      # DIAGNOSTIC AND QUALIFICATION OUTPUT ONLY. This prints what the
+      # installed procd reports on this runner; nothing parses it or feeds it
+      # back, and no capability level is set by it. agentctl's own tests
+      # decide from procd's answers at run time.
+      - name: procd capability report
         run: |
-          set -euo pipefail
-          src="$RUNNER_TEMP/procd-src"
-          prefix="$RUNNER_TEMP/procd-prefix"
-          git -c core.autocrlf=false clone --quiet --depth 1 --branch v0.1.0 \
-            https://github.com/integraltechnologies/procd "$src"
-          test "$(git -C "$src" rev-parse HEAD)" = 2e3bb6e86156a8863dde52940f0020eb6d7d18e7
-          cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release
-          cmake --build "$src/build" --config Release --target procd
-          mkdir -p "$prefix/include" "$prefix/lib"
-          cp "$src/include/procd.h" "$prefix/include/procd.h"
-          if [ "$RUNNER_OS" = Windows ]; then
-            cp "$src/build/Release/procd.lib" "$prefix/lib/procd.lib"
-          else
-            cp "$src/build/libprocd.a" "$prefix/lib/libprocd.a"
-          fi
-          echo "PROCD_PREFIX=$prefix" >> "$GITHUB_ENV"
+          echo "runner: $RUNNER_OS $RUNNER_ARCH"
+          uname -a || true
+          echo "--- procd capabilities (this process)"
+          "$PROCD_CLI" capabilities
+      - name: linux cgroup environment
+        if: runner.os == 'Linux'
+        run: |
+          echo "--- /proc/self/cgroup"; cat /proc/self/cgroup
+          echo "--- cgroup mount"; findmnt -T /sys/fs/cgroup || true
+          echo "--- own cgroup writable by this user?"
+          own="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          ls -ld "$own" "$own/cgroup.procs" || true
+          systemd-run --version | head -1 || true
+          echo "--- procd capabilities (delegated cgroup, same user)"
+          .github/scripts/delegated-cgroup.sh sh -c 'cat /proc/self/cgroup; "$PROCD_CLI" capabilities'
+      # Linux qualification gate: procd must really create and supervise an
+      # ENFORCED lifecycle domain for the user the tests run as. procd itself
+      # refuses (non-zero exit) otherwise; a weaker level is never accepted.
+      - name: linux real-backend gate (procd --require-enforced)
+        if: runner.os == 'Linux'
+        run: .github/scripts/delegated-cgroup.sh "$PROCD_CLI" run --require-enforced -- true
       - uses: Swatinem/rust-cache@v2
         with:
           key: test
       - name: cargo test --no-fail-fast
+        if: runner.os != 'Linux'
         run: cargo test --locked --no-fail-fast
+      # Linux runs the tests against the real procd backend, as this same
+      # unprivileged user, inside a delegated cgroup v2 subtree (procd's
+      # documented prerequisite). Building happens outside it.
+      - name: cargo test --no-fail-fast (delegated cgroup)
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --locked --no-run
+          .github/scripts/delegated-cgroup.sh cargo test --locked --no-fail-fast

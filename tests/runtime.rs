@@ -538,7 +538,9 @@ fn failures_are_classified_and_recorded() {
         ),
         (Provider::Claude, "garbage", MalformedOutput, "not JSON"),
         (Provider::Claude, "eof", NoResult, "without a result"),
-        (Provider::Claude, "crash", ExitStatus, "exit status: 3"),
+        // The status text is the host's (`exit status: 3` / `exit code: 3`);
+        // the code itself is asserted structurally below.
+        (Provider::Claude, "crash", ExitStatus, "the provider"),
         (
             Provider::Claude,
             "late-exit",
@@ -556,6 +558,7 @@ fn failures_are_classified_and_recorded() {
     }
     let crash = f.run(&f.launch(Provider::Claude, "crash"));
     assert_eq!(crash.end.exit_code, Some(3));
+    assert_eq!(crash.end.failure, Some(FailureKind::ExitStatus));
     assert!(crash.stderr.contains("disk on fire"));
     // A provider error keeps the usage the provider reported.
     let error = f.run(&f.launch(Provider::Claude, "error"));
@@ -894,10 +897,39 @@ fn cancellation_terminates_the_whole_tree() {
 fn an_ordinary_end_leaves_no_descendants() {
     let mut f = Fixture::new();
     let outcome = f.run(&f.launch(Provider::Claude, "orphaning"));
-    assert_eq!(outcome.end.state, InvocationState::Succeeded);
+    assert_succeeded(&outcome, "orphaning");
     // Nothing relies on the provider's death, or agentctl's: the domain is
     // terminated whatever the provider did.
     assert_gone_soon(descendant(f.dir.path()));
+}
+
+/// Asserts `outcome` succeeded, and if it did not, prints everything the
+/// outcome structurally says. Settlement is only ever reached with the
+/// domain proven empty (an unproven one is an `Unresolved` error, never an
+/// `Outcome`), so an `Outcome` here already carries that proof: what
+/// differs is how the provider's own end classified.
+fn assert_succeeded(outcome: &Outcome, scenario: &str) {
+    if outcome.end.state == InvocationState::Succeeded {
+        return;
+    }
+    panic!(
+        "{scenario}: expected Succeeded (lifecycle emptiness was proven: an \
+         unproven domain returns Unresolved, not an Outcome)\n\
+         state: {:?}\nfailure kind: {:?}\nexit code: {:?}\n\
+         diagnostic: {:?}\nresult payload present: {}\n\
+         provider session: {:?}\nusage: {:?}\nstderr: {:?}\n\
+         procd capabilities: {:?}\n\
+         full outcome: {outcome:#?}",
+        outcome.end.state,
+        outcome.end.failure,
+        outcome.end.exit_code,
+        outcome.end.diagnostic,
+        outcome.payload.is_some(),
+        outcome.end.provider_session,
+        outcome.end.usage,
+        outcome.stderr,
+        procd::capabilities(),
+    );
 }
 
 fn a_lost_domain_is_never_taken_for_gone_without_proof() {
@@ -1115,7 +1147,7 @@ fn an_escaped_writer_never_becomes_settled_success() {
     let outcome = match result {
         Ok(outcome) => {
             assert!(host_enforces(), "a best-effort host settled an escapee");
-            assert_eq!(outcome.end.state, InvocationState::Succeeded);
+            assert_succeeded(&outcome, "escaping");
             assert_gone_soon(pid);
             None
         }

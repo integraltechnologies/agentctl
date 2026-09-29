@@ -1227,7 +1227,8 @@ fn platform() {}
             "src/[id].rs",
             "src/with space+(x).rs",
             "src/ünïcødé/文件.rs",
-            "src/%_*.rs",
+            "src/%_@,{}.rs",
+            crate::graph::tests::GLOB_STAR_PATH,
         ];
         let decoys = ["src/app/(customer)/s/page.rs", "src/i.rs", "src/ab.rs"];
         for path in paths.iter().chain(&decoys) {

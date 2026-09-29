@@ -887,6 +887,53 @@ pub(crate) mod tests {
         assert_eq!(entities[0].location.span, Span { start: 1, end: 3 });
     }
 
+    /// A path made of glob metacharacters. Windows cannot create a file
+    /// named with `*`, so there the filesystem fixtures use the brace and
+    /// caret forms it can; `literal_lookups_never_match_as_patterns` covers
+    /// `*` itself on every host without a file.
+    #[cfg(not(windows))]
+    pub(crate) const GLOB_STAR_PATH: &str = "src/*.rs";
+    #[cfg(windows)]
+    pub(crate) const GLOB_STAR_PATH: &str = "src/{a,b}^@!.rs";
+
+    /// Literal strings full of pattern metacharacters, as store keys: no
+    /// file is created, so this holds on hosts that cannot name them.
+    #[test]
+    fn literal_lookups_never_match_as_patterns() {
+        let mut fx = Fixture::new("src");
+        for accepted in ["src/a.rs", "src/ab.rs", "src/x.ts", "src/i.ts"] {
+            fx.accept(accepted, Some(&content(accepted)));
+        }
+        for literal in [
+            "src/*.rs",
+            "src/?.rs",
+            "src/**",
+            "src/[a-z].rs",
+            "src/{a,b}.rs",
+            "src/%.ts",
+            "src/_.ts",
+            "src/.*",
+            "src/a.rs|src/ab.rs",
+        ] {
+            // Never accepted: a lookup that treated it as a pattern would
+            // find one of the accepted neighbours instead of refusing.
+            assert_eq!(
+                fx.store.accepted_source(literal).unwrap(),
+                None,
+                "{literal}"
+            );
+            for error in [
+                fx.store.graph_status(literal).unwrap_err(),
+                fx.store.entities(literal).unwrap_err(),
+            ] {
+                assert!(
+                    format!("{error:#}").contains("no accepted state"),
+                    "{literal}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn literal_paths_round_trip() {
         let mut fx = Fixture::new("src, app/(customer)/s/[slug]");
@@ -897,7 +944,7 @@ pub(crate) mod tests {
             "src/with space.rs",
             "src/a+b.rs",
             "src/ünïcødé/文件.rs",
-            "src/*.rs",
+            GLOB_STAR_PATH,
             "src/%.ts",
             "src/_.ts",
         ];
