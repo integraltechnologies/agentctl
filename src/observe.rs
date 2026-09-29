@@ -521,6 +521,7 @@ pub fn overview(store: &Store, limit: NonZeroU32) -> Result<Overview> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::tests::UNCHECKED;
     use crate::state::tests::{ended, objective, ready_plan, store, succeeded};
     use crate::state::{AgentScope, InvocationEnd, InvocationState, UnresolvedKind};
 
@@ -875,7 +876,9 @@ mod tests {
         let (running, tasks) =
             ready_plan(&mut store, &[("a", &["a.txt"], &[]), ("b", &[], &["a"])]);
         store.start_plan(running).unwrap();
-        let crate::state::Claim::Claimed(generation) = store.claim(tasks[0], LIMIT).unwrap() else {
+        let crate::state::Claim::Claimed(generation) =
+            store.claim(tasks[0], LIMIT, UNCHECKED).unwrap()
+        else {
             panic!("not claimed");
         };
         let (attention, _) = ready_plan(&mut store, &[("k", &[], &[])]);

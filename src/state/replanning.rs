@@ -784,6 +784,7 @@ pub(super) fn basis(conn: &Connection, plan: PlanId) -> Result<Basis> {
 
 #[cfg(test)]
 mod tests {
+    use crate::state::tests::UNCHECKED;
     use std::num::NonZeroU32;
     use std::path::PathBuf;
     use std::sync::Barrier;
@@ -845,7 +846,7 @@ mod tests {
     }
 
     fn claimed(store: &mut Store, task: TaskId) -> GenerationId {
-        match store.claim(task, LIMIT).unwrap() {
+        match store.claim(task, LIMIT, UNCHECKED).unwrap() {
             Claim::Claimed(generation) => generation,
             other => panic!("not claimed: {other:?}"),
         }
@@ -938,7 +939,7 @@ mod tests {
             outcome: PipelineOutcome::NotExecuted,
         };
         assert_eq!(
-            store.claim(a, LIMIT).unwrap(),
+            store.claim(a, LIMIT, UNCHECKED).unwrap(),
             Claim::Ineligible(stop.clone())
         );
         assert_eq!(
@@ -952,7 +953,10 @@ mod tests {
 
         // Revising it runs nothing either.
         applied(&mut store, plan, &[update("a", "Do a better")]);
-        assert_eq!(store.claim(a, LIMIT).unwrap(), Claim::Ineligible(stop));
+        assert_eq!(
+            store.claim(a, LIMIT, UNCHECKED).unwrap(),
+            Claim::Ineligible(stop)
+        );
         let generations = store.generations(a).unwrap();
         assert_eq!(generations.len(), 1);
 
@@ -993,7 +997,7 @@ mod tests {
 
         // Used once, and never again.
         assert_eq!(
-            store.claim(a, LIMIT).unwrap(),
+            store.claim(a, LIMIT, UNCHECKED).unwrap(),
             Claim::Ineligible(TaskStatus::Scheduled(second))
         );
         forged(
@@ -1013,7 +1017,7 @@ mod tests {
             Release::Released(PipelineOutcome::NotExecuted)
         );
         assert!(matches!(
-            store.claim(a, LIMIT).unwrap(),
+            store.claim(a, LIMIT, UNCHECKED).unwrap(),
             Claim::Ineligible(TaskStatus::Stopped { generation, .. }) if generation == second
         ));
         assert_eq!(store.generations(a).unwrap().len(), 2);
@@ -1233,7 +1237,10 @@ mod tests {
                 generation,
                 outcome: PipelineOutcome::NotExecuted,
             };
-            assert_eq!(store.claim(task, LIMIT).unwrap(), Claim::Ineligible(stop));
+            assert_eq!(
+                store.claim(task, LIMIT, UNCHECKED).unwrap(),
+                Claim::Ineligible(stop)
+            );
             assert_eq!(
                 store.standing(task).unwrap(),
                 Standing::Stopped {
@@ -1256,7 +1263,7 @@ mod tests {
         let second = claimed(&mut store, a);
         assert_eq!(store.generation_revision(second).unwrap(), Some(2));
         assert_eq!(
-            store.claim(a, LIMIT).unwrap(),
+            store.claim(a, LIMIT, UNCHECKED).unwrap(),
             Claim::Ineligible(TaskStatus::Scheduled(second))
         );
         let authorizations = store.retry_authorizations(a).unwrap();
@@ -1320,7 +1327,7 @@ mod tests {
                 let claiming = scope.spawn(|| {
                     let mut store = Store::open(&path(&dir)).unwrap();
                     barrier.wait();
-                    store.claim(ids[0], LIMIT).unwrap()
+                    store.claim(ids[0], LIMIT, UNCHECKED).unwrap()
                 });
                 let revising = scope.spawn(|| {
                     let mut store = Store::open(&path(&dir)).unwrap();
@@ -1398,7 +1405,7 @@ mod tests {
                         scope.spawn(|| {
                             let mut store = Store::open(&path(&dir)).unwrap();
                             barrier.wait();
-                            store.claim(ids[0], LIMIT).unwrap()
+                            store.claim(ids[0], LIMIT, UNCHECKED).unwrap()
                         })
                     })
                     .collect();
@@ -1679,7 +1686,7 @@ mod tests {
         for task in [old, unrun] {
             assert_eq!(store.cancellation(task).unwrap(), Some(replan));
             assert_eq!(
-                store.claim(task, LIMIT).unwrap(),
+                store.claim(task, LIMIT, UNCHECKED).unwrap(),
                 Claim::Ineligible(TaskStatus::Cancelled)
             );
             for command in [
@@ -1703,7 +1710,7 @@ mod tests {
         // Its path is free for the replacement, which `next` now awaits.
         claimed(&mut store, replacement);
         assert_eq!(
-            store.claim(next, LIMIT).unwrap(),
+            store.claim(next, LIMIT, UNCHECKED).unwrap(),
             Claim::Ineligible(TaskStatus::WaitingForDependencies(vec![replacement]))
         );
         refused(&mut store, plan, &[on("next", &["old"])], "cancelled");

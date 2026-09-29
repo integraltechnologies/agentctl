@@ -286,6 +286,7 @@ mod tests {
             cwd: "/".into(),
             workspace: super::super::Workspace::ReadOnly,
             lifecycle: super::super::ROLE_LIFECYCLE,
+            timeout: super::super::ROLE_TIMEOUT,
         };
         let args = prepare(&launch(Some(ReasoningEffort::High))).unwrap().args;
         assert!(args.contains(&"--model=--dangerously-skip-permissions".into()));
@@ -316,6 +317,7 @@ mod tests {
             cwd: "/work".into(),
             workspace,
             lifecycle: super::super::ROLE_LIFECYCLE,
+            timeout: super::super::ROLE_TIMEOUT,
         };
         for (workspace, mode) in [
             (Workspace::ReadOnly, "--permission-mode=default"),

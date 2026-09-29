@@ -22,10 +22,10 @@ tree-sitter-typescript = "0.23.2"
 which = "8.0.6"
 
 [features]
-# Test builds only (the integration tests turn it on for themselves): a
-# termination procd reported as successful is taken for proof, so that the
-# suites can complete runs on hosts whose backend cannot prove emptiness.
-# Tests of the unproven path opt out with `runtime::testing::real_evidence`.
+# Test builds only (the integration tests turn it on for themselves): lets
+# a test make a domain's termination settle nothing, to exercise what an
+# unsettled invocation leaves (`runtime::testing`). procd's own evidence
+# stands otherwise.
 lifecycle-double = []
 
 [build-dependencies]
@@ -35,7 +35,7 @@ sha2 = "0.11.0"
 libc = "0.2.189"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_Security_Cryptography", "Win32_System_Console"] }
 
 [dev-dependencies]
 agentctl = { path = ".", features = ["lifecycle-double"] }
@@ -59,4 +59,8 @@ harness = false
 
 [[test]]
 name = "scheduler"
+harness = false
+
+[[test]]
+name = "cli"
 harness = false

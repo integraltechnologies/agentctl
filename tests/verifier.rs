@@ -474,7 +474,9 @@ impl Fixture {
         assert!(planner::apply(&project, &mut store, plan, &[add, Plan::Finalize {}]).unwrap());
         let task = store.tasks(plan).unwrap()[0].id;
         let generation = store.start_generation(task).unwrap();
-        let acquired = store.acquire_ownership(generation, scope).unwrap();
+        let acquired = store
+            .acquire_ownership(generation, scope, &|p, e| source::holds(&project, p, e))
+            .unwrap();
         assert_eq!(acquired, Acquisition::Acquired);
         let executed = executor::start(&project, &mut store, task, generation, Some(fake_agent()))
             .unwrap()

@@ -89,7 +89,7 @@ pub(crate) enum Publication {
 
 impl Store {
     /// The candidate of `generation`, of `task`, if it may be accepted now,
-    /// or why not: the generation active in a ready or running plan and
+    /// or why not: the generation active in a ready, running or paused plan and
     /// owning its task's whole scope and its execution's authority; its
     /// execution captured a candidate of authorized changes to regular
     /// files, which was installed; and the latest verification of that
@@ -432,9 +432,14 @@ fn acceptable(
     );
     let (plan, ..) = generation_info(conn, generation)?;
     let plan_state = plan_state(conn, plan)?;
+    // A paused plan claims nothing new, while the pipelines it already
+    // runs settle, their verified work accepted as ever.
     require!(
-        matches!(plan_state, PlanState::Ready | PlanState::Running),
-        "plan {plan} is {plan_state}; only a ready or running plan accepts work"
+        matches!(
+            plan_state,
+            PlanState::Ready | PlanState::Running | PlanState::Paused
+        ),
+        "plan {plan} is {plan_state}; only a ready, running or paused plan accepts work"
     );
 
     type Installed = (

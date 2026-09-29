@@ -356,6 +356,7 @@ fn state_event(tx: &Transaction, plan: PlanId, from: PlanState, to: PlanState) -
 
 #[cfg(test)]
 mod tests {
+    use crate::state::tests::UNCHECKED;
     use std::num::NonZeroU32;
     use std::sync::Barrier;
     use std::thread;
@@ -505,7 +506,7 @@ mod tests {
 
         // No new work of it is claimed, beneath `Store` too.
         assert_eq!(
-            store.claim(ids[1], LIMIT).unwrap(),
+            store.claim(ids[1], LIMIT, UNCHECKED).unwrap(),
             Claim::PlanNotRunning(PlanState::NeedsAttention)
         );
         store.raw().execute_batch("BEGIN").unwrap();
@@ -538,7 +539,7 @@ mod tests {
         // Another plan runs on.
         assert_eq!(state(&store, other), PlanState::Running);
         assert!(matches!(
-            store.claim(others[0], LIMIT).unwrap(),
+            store.claim(others[0], LIMIT, UNCHECKED).unwrap(),
             Claim::Claimed(_)
         ));
         // Nor does `set_plan_state` enter or leave attention.
@@ -565,7 +566,7 @@ mod tests {
             &mut store,
             &[("a", &["src/a.rs"], &[]), ("b", &["src/b.rs"], &[])],
         );
-        let Claim::Claimed(generation) = store.claim(ids[0], LIMIT).unwrap() else {
+        let Claim::Claimed(generation) = store.claim(ids[0], LIMIT, UNCHECKED).unwrap() else {
             panic!("not claimed");
         };
         let before = work(&store);
@@ -592,7 +593,7 @@ mod tests {
             Release::Released(PipelineOutcome::NotExecuted)
         );
         assert_eq!(
-            store.claim(ids[1], LIMIT).unwrap(),
+            store.claim(ids[1], LIMIT, UNCHECKED).unwrap(),
             Claim::PlanNotRunning(PlanState::NeedsAttention)
         );
     }
@@ -638,7 +639,7 @@ mod tests {
         assert_eq!(events(&store, "attention.decided").len(), 2);
         assert_eq!(events(&store, "attention.resolved").len(), 1);
         assert!(matches!(
-            store.claim(ids[0], LIMIT).unwrap(),
+            store.claim(ids[0], LIMIT, UNCHECKED).unwrap(),
             Claim::Claimed(_)
         ));
 
@@ -681,7 +682,7 @@ mod tests {
         );
         assert_eq!(state(&store, plan), PlanState::NeedsAttention);
         assert_eq!(
-            store.claim(ids[0], LIMIT).unwrap(),
+            store.claim(ids[0], LIMIT, UNCHECKED).unwrap(),
             Claim::PlanNotRunning(PlanState::NeedsAttention)
         );
         forged(
@@ -1027,12 +1028,12 @@ mod tests {
         assert!(concern(&store, plan, "risk").blocks());
         // No new work of it is claimed; the other plan runs and claims on.
         assert_eq!(
-            store.claim(ids[1], LIMIT).unwrap(),
+            store.claim(ids[1], LIMIT, UNCHECKED).unwrap(),
             Claim::PlanNotRunning(PlanState::NeedsAttention)
         );
         assert_eq!(state(&store, other), PlanState::Running);
         assert!(matches!(
-            store.claim(others[0], LIMIT).unwrap(),
+            store.claim(others[0], LIMIT, UNCHECKED).unwrap(),
             Claim::Claimed(_)
         ));
         assert_eq!(concerns(&store, other), 0);

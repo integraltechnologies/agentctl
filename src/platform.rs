@@ -10,6 +10,7 @@
 //! identity. Mechanism names are diagnostic evidence, not policy.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::procd;
 
@@ -26,9 +27,20 @@ mod windows;
 use windows as backend;
 
 pub(crate) use backend::{
-    literal_name, open_regular, publish_new, replace, runs_directly, stage, symlink, sync_dir,
-    write_back,
+    literal_name, open_regular, publish_new, replace, runs_directly, shield, stage, symlink,
+    sync_dir, watch_interrupts, write_back,
 };
+
+/// Set, once [`watch_interrupts`] is watching, when the operator asked this
+/// process to stop.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the operator asked this process to stop: an interrupt (Ctrl-C),
+/// a termination request or a closed terminal, once [`watch_interrupts`]
+/// made the process take note of those instead of ending at once.
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {

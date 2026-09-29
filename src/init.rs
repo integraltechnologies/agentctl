@@ -127,6 +127,7 @@ fn ask_config<R: BufRead, W: Write>(prompt: &mut Prompter<R, W>, root: &Path) ->
         codegraph,
         agents: Agents {
             max_concurrency,
+            invocation_timeout_minutes: None,
             planner,
             executor,
             verifier,

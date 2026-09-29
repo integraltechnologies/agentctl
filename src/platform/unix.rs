@@ -4,7 +4,10 @@ use std::fs::{File, OpenOptions, Permissions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::Ordering;
 
 use tempfile::NamedTempFile;
 
@@ -14,6 +17,28 @@ pub(super) const DURABLE_PUBLICATION: &str = if cfg!(target_vendor = "apple") {
 } else {
     "rename_fsync_directory"
 };
+
+/// Makes an interrupt, a termination request or a hangup (SIGINT, SIGTERM,
+/// SIGHUP) set [`super::interrupted`] instead of ending the process, so that
+/// it ends what it runs itself. Children start with the default dispositions
+/// again once they exec.
+pub(crate) fn watch_interrupts() -> io::Result<()> {
+    extern "C" fn record(_: libc::c_int) {
+        super::INTERRUPTED.store(true, Ordering::SeqCst);
+    }
+    let handler: extern "C" fn(libc::c_int) = record;
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: a zeroed `sigaction` is valid; the handler only stores to
+        // an atomic, which is async-signal-safe.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        // SAFETY: `action` and its mask are valid for these calls.
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        check(|| unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) })?;
+    }
+    Ok(())
+}
 
 /// Whether a repository path component names exactly one directory entry
 /// here: on Unix, every name without `/` or NUL does.
@@ -91,6 +116,14 @@ fn full_sync(file: &File) -> io::Result<()> {
 /// where the kernel runs even an interpreter script's `#!` line directly.
 pub(crate) fn runs_directly(_path: &Path) -> bool {
     true
+}
+
+/// Keeps a terminal's interrupt meant for agentctl from reaching a short
+/// helper it runs and waits for (Git), which then ends its bounded work
+/// however agentctl was interrupted: in a process group of its own, the
+/// terminal's foreground group does not include it.
+pub(crate) fn shield(command: &mut Command) {
+    command.process_group(0);
 }
 
 /// Creates a symlink at `link` whose target is exactly `target`, never

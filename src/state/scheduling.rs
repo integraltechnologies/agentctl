@@ -15,7 +15,10 @@
 //! eligible again, as if never run (see `crate::planner`).
 //!
 //! Claiming is one transaction: the task is found eligible, fewer claims
-//! than the ceiling are held, and then its generation is started, bound to
+//! than the ceiling are held, the working tree is found holding exactly the
+//! accepted state of every path of its scope (see `ownership`: the bytes an
+//! executor starts from, and restoring its work returns to, are then the
+//! accepted ones), and then its generation is started, bound to
 //! the task's current definition, owns the task's whole scope, uses the
 //! retry authorization it was eligible by, if any, which authorized that
 //! very definition, and is claimed, all of it or nothing. Transactions of
@@ -36,7 +39,7 @@ use std::num::NonZeroU32;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::ownership::{acquire, owner};
+use super::ownership::{Holds, acquire, drifted, owner};
 use super::replanning::{cancelled, record_revision, retry_pending};
 use super::{
     Acquisition, Conflict, GenerationId, GenerationState, PipelineOutcome, PlanId, PlanState,
@@ -121,6 +124,10 @@ pub enum Claim {
     Ineligible(TaskStatus),
     /// `held` claims already use up the ceiling.
     CapacityFull { held: u32, limit: u32 },
+    /// The working tree does not hold the accepted state of these paths of
+    /// the task's scope, in path order: bytes agentctl did not accept, which
+    /// no generation is given authority over until a human reconciles them.
+    Drifted(Vec<String>),
 }
 
 /// What a request to release a claim established.
@@ -229,9 +236,10 @@ impl Store {
     }
 
     /// Claims `task` under the concurrency ceiling `limit`, in one
-    /// transaction: see the module documentation. Anything but a claim
+    /// transaction, with `holds` telling whether the working tree holds
+    /// accepted state: see the module documentation. Anything but a claim
     /// changes nothing.
-    pub fn claim(&mut self, task: TaskId, limit: NonZeroU32) -> Result<Claim> {
+    pub fn claim(&mut self, task: TaskId, limit: NonZeroU32, holds: &Holds<'_>) -> Result<Claim> {
         self.barrier_of(task)?;
         self.write(|tx| {
             let plan: PlanId = tx
@@ -259,6 +267,12 @@ impl Store {
                     limit: limit.get(),
                 });
             }
+            let scope = scope(tx, task)?;
+            let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
+            let drifted = drifted(tx, &scope, holds)?;
+            if !drifted.is_empty() {
+                return Ok(Claim::Drifted(drifted));
+            }
             let retry = retry_pending(tx, task)?;
             let (_, generation, number) = insert_generation(tx, task)?;
             let revision = record_revision(tx, task, None)?;
@@ -267,11 +281,11 @@ impl Store {
                  VALUES (?1, ?2, ?3)",
                 params![generation, task, revision],
             )?;
-            let scope = scope(tx, task)?;
-            let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
-            if let Acquisition::Conflicted(conflicts) = acquire(tx, generation, &scope)? {
-                // Found free within this transaction; rolls everything back.
-                bail!("ownership of task {task}'s scope changed while claiming: {conflicts:?}");
+            match acquire(tx, generation, &scope, holds)? {
+                Acquisition::Acquired => {}
+                // Found free, and clean, within this transaction; rolls
+                // everything back.
+                refused => bail!("task {task}'s scope changed while claiming: {refused:?}"),
             }
             if let Some(authorization) = retry {
                 // The schema refuses it unless it authorized the revision
@@ -552,6 +566,7 @@ pub(super) fn dag_defects(conn: &Connection, plan: PlanId) -> Result<Vec<DagDefe
 
 #[cfg(test)]
 mod tests {
+    use crate::state::tests::UNCHECKED;
     use std::path::Path;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -624,7 +639,7 @@ mod tests {
         let (plan, tasks) = running_plan(&mut store, &[("task", scope, &[])]);
         let before = store.events_after(0, 1000).unwrap().len();
 
-        let generation = claimed(store.claim(tasks[0], limit(2)).unwrap());
+        let generation = claimed(store.claim(tasks[0], limit(2), UNCHECKED).unwrap());
         let mut owned: Vec<&str> = scope.to_vec();
         owned.sort_unstable();
         // Exactly these literal paths, never what they would match.
@@ -684,7 +699,7 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            store.claim(first, limit(4)).unwrap(),
+            store.claim(first, limit(4), UNCHECKED).unwrap(),
             Claim::PlanNotRunning(PlanState::Ready)
         );
         // Work started before, or beside, scheduling is never scheduled over.
@@ -698,20 +713,20 @@ mod tests {
         );
         assert_eq!(events(&store, "plan.state"), started);
         assert_eq!(
-            store.claim(legacy, limit(4)).unwrap(),
+            store.claim(legacy, limit(4), UNCHECKED).unwrap(),
             Claim::Ineligible(TaskStatus::Unscheduled {
                 generation: old,
                 state: GenerationState::Active
             })
         );
         assert_eq!(
-            store.claim(second, limit(4)).unwrap(),
+            store.claim(second, limit(4), UNCHECKED).unwrap(),
             Claim::Ineligible(TaskStatus::WaitingForDependencies(vec![first]))
         );
-        let generation = claimed(store.claim(first, limit(4)).unwrap());
+        let generation = claimed(store.claim(first, limit(4), UNCHECKED).unwrap());
         // Re-entry never duplicates an active generation.
         assert_eq!(
-            store.claim(first, limit(4)).unwrap(),
+            store.claim(first, limit(4), UNCHECKED).unwrap(),
             Claim::Ineligible(TaskStatus::Scheduled(generation))
         );
         assert_eq!(
@@ -729,21 +744,21 @@ mod tests {
             outcome: PipelineOutcome::NotExecuted,
         };
         assert_eq!(
-            store.claim(first, limit(4)).unwrap(),
+            store.claim(first, limit(4), UNCHECKED).unwrap(),
             Claim::Ineligible(stopped)
         );
         assert_eq!(store.generations(first).unwrap().len(), 1);
         assert_eq!(
-            store.claim(second, limit(4)).unwrap(),
+            store.claim(second, limit(4), UNCHECKED).unwrap(),
             Claim::Ineligible(TaskStatus::WaitingForDependencies(vec![first]))
         );
         assert_eq!(events(&store, "scheduler.claimed"), 1);
         store.set_plan_state(plan, PlanState::Paused).unwrap();
         assert!(matches!(
-            store.claim(second, limit(4)).unwrap(),
+            store.claim(second, limit(4), UNCHECKED).unwrap(),
             Claim::PlanNotRunning(_)
         ));
-        assert!(err(store.claim(TaskId(99), limit(4))).contains("does not exist"));
+        assert!(err(store.claim(TaskId(99), limit(4), UNCHECKED)).contains("does not exist"));
         assert!(err(store.release_claim(old)).contains("never claimed"));
     }
 
@@ -757,9 +772,9 @@ mod tests {
         ];
         let (plan, ids) = running_plan(&mut store, &tasks);
         let edges = count(&store, "SELECT count(*) FROM task_dependencies");
-        let x = claimed(store.claim(ids[0], limit(3)).unwrap());
+        let x = claimed(store.claim(ids[0], limit(3), UNCHECKED).unwrap());
         let Claim::Ineligible(TaskStatus::WaitingForOwnership(conflicts)) =
-            store.claim(ids[1], limit(3)).unwrap()
+            store.claim(ids[1], limit(3), UNCHECKED).unwrap()
         else {
             panic!()
         };
@@ -771,7 +786,7 @@ mod tests {
         // All or nothing: y got no generation, and `src/c.rs` stayed free.
         assert!(store.generations(ids[1]).unwrap().is_empty());
         assert_eq!(store.owner("src/c.rs").unwrap(), None);
-        let z = claimed(store.claim(ids[2], limit(3)).unwrap());
+        let z = claimed(store.claim(ids[2], limit(3), UNCHECKED).unwrap());
         assert_eq!(store.owned_paths(z).unwrap(), ["src/c.rs"]);
         // A runtime constraint, never a planned dependency.
         assert_eq!(
@@ -795,19 +810,19 @@ mod tests {
             [("c", &["src/c.rs"], &[]), ("d", &["src/d.rs"], &[])];
         let (p1, first) = running_plan(&mut store, &one);
         let (p2, second) = running_plan(&mut store, &two);
-        let a = claimed(store.claim(first[0], limit(1)).unwrap());
+        let a = claimed(store.claim(first[0], limit(1), UNCHECKED).unwrap());
         let mut other = Store::open(&path(&dir)).unwrap();
         // Another plan, another connection: the same ceiling.
         assert_eq!(
-            other.claim(second[0], limit(1)).unwrap(),
+            other.claim(second[0], limit(1), UNCHECKED).unwrap(),
             Claim::CapacityFull { held: 1, limit: 1 }
         );
         assert!(store.generations(second[0]).unwrap().is_empty());
         // Raising the ceiling allows more on the next claim.
-        let c = claimed(other.claim(second[0], limit(2)).unwrap());
+        let c = claimed(other.claim(second[0], limit(2), UNCHECKED).unwrap());
         // Lowering it below what is held stops nothing, and starts nothing.
         assert_eq!(
-            store.claim(first[1], limit(1)).unwrap(),
+            store.claim(first[1], limit(1), UNCHECKED).unwrap(),
             Claim::CapacityFull { held: 2, limit: 1 }
         );
         assert_eq!(
@@ -819,14 +834,14 @@ mod tests {
             Release::Released(PipelineOutcome::NotExecuted)
         );
         assert_eq!(
-            store.claim(first[1], limit(1)).unwrap(),
+            store.claim(first[1], limit(1), UNCHECKED).unwrap(),
             Claim::CapacityFull { held: 1, limit: 1 }
         );
         assert_eq!(
             other.release_claim(c).unwrap(),
             Release::Released(PipelineOutcome::NotExecuted)
         );
-        claimed(store.claim(first[1], limit(1)).unwrap());
+        claimed(store.claim(first[1], limit(1), UNCHECKED).unwrap());
         assert_eq!(
             store.snapshot(p2, limit(1)).unwrap().capacity,
             Capacity { held: 1, limit: 1 }
@@ -840,7 +855,7 @@ mod tests {
         let (dir, mut store) = store();
         let (_, ids) = running_plan(&mut store, &[("task", &["src/a.rs", "src/b.rs"], &[])]);
         let results = race(&path(&dir), 8, |store, _| {
-            store.claim(ids[0], limit(8)).unwrap()
+            store.claim(ids[0], limit(8), UNCHECKED).unwrap()
         });
         let winners: Vec<GenerationId> = results
             .iter()
@@ -882,9 +897,9 @@ mod tests {
                 ("b", &["src/b.rs"], &[]),
             ];
             let (_, ids) = running_plan(&mut store, &tasks);
-            claimed(store.claim(ids[0], limit(2)).unwrap());
+            claimed(store.claim(ids[0], limit(2), UNCHECKED).unwrap());
             let results = race(&path(&dir), 2, |store, i| {
-                store.claim(ids[1 + i], limit(2)).unwrap()
+                store.claim(ids[1 + i], limit(2), UNCHECKED).unwrap()
             });
             let won = results
                 .iter()
@@ -909,7 +924,7 @@ mod tests {
             [("a", &["src/a.rs"], &[]), ("b", &["src/b.rs"], &[])];
         let (_, ids) = running_plan(&mut first, &tasks);
         let results = race(&path(&_dir), 2, |store, i| {
-            store.claim(ids[i], limit(2)).unwrap()
+            store.claim(ids[i], limit(2), UNCHECKED).unwrap()
         });
         assert!(
             results.iter().all(|c| matches!(c, Claim::Claimed(_))),
@@ -926,7 +941,7 @@ mod tests {
             ];
             let (_, ids) = running_plan(&mut store, &tasks);
             let results = race(&path(&dir), 2, |store, i| {
-                store.claim(ids[i], limit(2)).unwrap()
+                store.claim(ids[i], limit(2), UNCHECKED).unwrap()
             });
             let winner = results
                 .iter()
@@ -958,7 +973,10 @@ mod tests {
 
     fn waiting(case: &mut Case) {
         let blocked = Claim::Ineligible(TaskStatus::WaitingForDependencies(vec![case.task]));
-        assert_eq!(case.fx.store.claim(case.next, limit(4)).unwrap(), blocked);
+        assert_eq!(
+            case.fx.store.claim(case.next, limit(4), UNCHECKED).unwrap(),
+            blocked
+        );
         assert!(!case.fx.store.dependencies_satisfied(case.next).unwrap());
         assert!(case.fx.store.generations(case.next).unwrap().is_empty());
     }
@@ -1013,10 +1031,10 @@ mod tests {
                 .status(case.task),
             Some(&TaskStatus::Completed)
         );
-        claimed(case.fx.store.claim(case.next, limit(4)).unwrap());
+        claimed(case.fx.store.claim(case.next, limit(4), UNCHECKED).unwrap());
         // A completed task is never claimed again.
         assert_eq!(
-            case.fx.store.claim(case.task, limit(4)).unwrap(),
+            case.fx.store.claim(case.task, limit(4), UNCHECKED).unwrap(),
             Claim::Ineligible(TaskStatus::Completed)
         );
 
@@ -1055,7 +1073,7 @@ mod tests {
                     case.accept()
                 });
                 barrier.wait();
-                let claim = scheduler.claim(next, limit(4)).unwrap();
+                let claim = scheduler.claim(next, limit(4), UNCHECKED).unwrap();
                 assert!(matches!(accepting.join().unwrap(), Outcome::Completed(_)));
                 claim
             });
@@ -1072,7 +1090,7 @@ mod tests {
                     assert!(completed < seq("scheduler.claimed", next).unwrap());
                 }
                 Claim::Ineligible(TaskStatus::WaitingForDependencies(_)) => {
-                    claimed(scheduler.claim(next, limit(4)).unwrap());
+                    claimed(scheduler.claim(next, limit(4), UNCHECKED).unwrap());
                 }
                 other => panic!("{other:?}"),
             }
@@ -1141,7 +1159,7 @@ mod tests {
             assert_eq!(defects, [expected], "{name}");
             // Not even the task no defect touches is claimed.
             assert_eq!(
-                store.claim(ids[2], limit(4)).unwrap(),
+                store.claim(ids[2], limit(4), UNCHECKED).unwrap(),
                 Claim::InvalidDag(defects),
                 "{name}"
             );
@@ -1153,7 +1171,7 @@ mod tests {
                 "{name}"
             );
             // The other plan is unaffected.
-            claimed(store.claim(other[0], limit(4)).unwrap());
+            claimed(store.claim(other[0], limit(4), UNCHECKED).unwrap());
         }
     }
 
@@ -1167,7 +1185,7 @@ mod tests {
         ];
         let (plan, ids) = running_plan(&mut store, &tasks);
         let [a, b, c] = ids[..] else { panic!() };
-        let held = claimed(store.claim(c, limit(1)).unwrap());
+        let held = claimed(store.claim(c, limit(1), UNCHECKED).unwrap());
         let refused = |store: &Store, sql: &str| {
             let message = store.raw().execute_batch(sql).unwrap_err().to_string();
             assert!(

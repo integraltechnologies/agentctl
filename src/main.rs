@@ -1,15 +1,15 @@
 use std::io::{self, Write as _};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agentctl::planner::{self, Planned};
 use agentctl::project::Project;
 use agentctl::recovery::{self, Outcome};
 use agentctl::state::EventQuery;
 use agentctl::state::{
-    AgentId, ConcernId, Decided, HumanDecision, IntegrationOutcome, IntegrationStatus, PlanId,
-    PlanState, Store, TaskId,
+    AgentId, ConcernId, Decided, HumanDecision, HumanIntent, IntegrationOutcome, IntegrationStatus,
+    PlanId, PlanState, Store, TaskId,
 };
-use agentctl::{init, integration, observe, report, scheduler};
+use agentctl::{init, integration, observe, report, runtime, scheduler};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -28,11 +28,13 @@ enum Command {
     /// Run an existing ready or running plan's tasks, as far as they can
     /// go now: each eligible task through its executor, an independent
     /// verifier and acceptance, within the configured concurrency.
+    /// Interrupting it (Ctrl-C) ends the agents it runs, and records how
+    /// they ended, before it exits.
     Run {
         /// The plan to run.
         plan: PlanId,
     },
-    /// Work on existing plans.
+    /// Create and plan work, and control existing plans.
     Plan {
         #[command(subcommand)]
         command: PlanCommand,
@@ -78,13 +80,27 @@ enum Command {
 
 #[derive(Subcommand)]
 enum PlanCommand {
-    /// Replan an existing ready, running or paused plan, or one whose
-    /// planner awaits your decisions: its planner is given canonical
-    /// feedback on how the plan's work went, and what it proposes is
-    /// applied as one change, or not at all. Nothing runs: `agentctl run`
-    /// runs whatever the replan made eligible. When the planner proposes
-    /// that the plan's objective is met, its final integration verification
-    /// runs at once.
+    /// Create a plan of your intent and plan it: its planner decomposes the
+    /// intent into tasks, and what it proposes is validated and applied as
+    /// one change, or not at all. Nothing runs: `agentctl run` runs the plan
+    /// once planning made it ready. `agentctl status` lists every plan.
+    Create {
+        /// What the plan is to achieve, exactly as its planner is given it.
+        objective: String,
+        /// A constraint or invariant the work must respect (repeatable).
+        #[arg(long = "constraint", value_name = "TEXT")]
+        constraints: Vec<String>,
+        /// A criterion by which the plan is complete (repeatable).
+        #[arg(long = "criterion", value_name = "TEXT")]
+        criteria: Vec<String>,
+    },
+    /// Plan a plan still being planned again, or replan an existing ready,
+    /// running or paused plan, or one whose planner awaits your decisions:
+    /// its planner is given canonical feedback on how the plan's work went,
+    /// and what it proposes is applied as one change, or not at all.
+    /// Nothing runs: `agentctl run` runs whatever the replan made eligible.
+    /// When the planner proposes that the plan's objective is met, its final
+    /// integration verification runs at once.
     Update {
         /// The plan to replan.
         plan: PlanId,
@@ -95,6 +111,26 @@ enum PlanCommand {
     /// (`plan update`); nothing is retried.
     Verify {
         /// The plan to verify.
+        plan: PlanId,
+    },
+    /// Pause a running plan: nothing more of it is claimed, while pipelines
+    /// already running end as they would. `plan cancel` ends them instead.
+    Pause {
+        /// The plan to pause.
+        plan: PlanId,
+    },
+    /// Resume a paused plan, as it stands: `agentctl run` then runs it.
+    Resume {
+        /// The plan to resume.
+        plan: PlanId,
+    },
+    /// Cancel a plan's live agent work: pause it if it is running, and have
+    /// each agentctl process running its providers end them, then wait for
+    /// them to be proven gone. What their attempts own stays owned, and
+    /// what was accepted stays accepted: its planner decides what follows
+    /// (`plan update`).
+    Cancel {
+        /// The plan whose work to cancel.
         plan: PlanId,
     },
     /// Show a plan's state and every concern its planner raised for your
@@ -125,8 +161,37 @@ enum Decision {
     Stop,
 }
 
+/// How long `plan cancel` waits for the work it cancelled to end.
+const CANCEL_WAIT: Duration = Duration::from_secs(60);
+
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    // Commands that launch providers stop in order when interrupted: what
+    // they launched is ended by procd's authority and recorded first.
+    if matches!(
+        command,
+        Command::Run { .. }
+            | Command::Plan {
+                command: PlanCommand::Create { .. }
+                    | PlanCommand::Update { .. }
+                    | PlanCommand::Verify { .. }
+            }
+    ) {
+        runtime::stop_on_interrupt()?;
+    }
+    let result = dispatch(command);
+    if runtime::interrupted() {
+        let why = result.err().map(|e| format!(": {e:#}")).unwrap_or_default();
+        bail!(
+            "interrupted: what this process launched was ended and recorded, and nothing more \
+             was started{why}"
+        );
+    }
+    result
+}
+
+fn dispatch(command: Command) -> Result<()> {
+    match command {
         Command::Init => {
             let mut prompt = init::Prompter::new(io::stdin().lock(), io::stdout().lock());
             init::run(&std::env::current_dir()?, &mut prompt, |provider| {
@@ -137,6 +202,13 @@ fn main() -> Result<()> {
             let cwd = std::env::current_dir()?;
             let project = Project::discover(&cwd)?.context("no agentctl project here")?;
             let report = scheduler::run(&project, plan, None)?;
+            for (task, paths) in &report.drifted {
+                println!(
+                    "task {task}: not claimed: the working tree does not hold agentctl's accepted \
+                     source at {paths:?}; that work is not agentctl's, so it is neither \
+                     overwritten nor taken as the task's starting point until you reconcile it"
+                );
+            }
             for end in &report.finished {
                 let work = &end.work;
                 println!(
@@ -268,11 +340,78 @@ fn main() -> Result<()> {
             verify(&project, &mut store, plan)
         }
         Command::Plan {
+            command:
+                PlanCommand::Create {
+                    objective,
+                    constraints,
+                    criteria,
+                },
+        } => {
+            let cwd = std::env::current_dir()?;
+            let project = Project::discover(&cwd)?.context("no agentctl project here")?;
+            let mut store = project.hydrate()?;
+            let intent = HumanIntent {
+                objective,
+                constraints,
+                completion_criteria: criteria,
+            };
+            let plan = store.create_plan(&intent)?;
+            println!("plan {plan} created");
+            plan_initially(&project, &mut store, plan)
+        }
+        Command::Plan {
+            command: PlanCommand::Pause { plan },
+        } => {
+            let cwd = std::env::current_dir()?;
+            let project = Project::discover(&cwd)?.context("no agentctl project here")?;
+            let mut store = project.hydrate()?;
+            store.set_plan_state(plan, PlanState::Paused)?;
+            let snapshot = store.snapshot(plan, project.config.agents.max_concurrency)?;
+            let running = snapshot
+                .tasks
+                .iter()
+                .filter(|(_, s)| matches!(s, agentctl::state::TaskStatus::Scheduled(_)))
+                .count();
+            println!("plan {plan}: paused; nothing more of it is claimed");
+            if running > 0 {
+                println!(
+                    "{running} pipelines already running end as they would; \
+                     `agentctl plan cancel {plan}` ends them instead"
+                );
+            }
+            Ok(())
+        }
+        Command::Plan {
+            command: PlanCommand::Resume { plan },
+        } => {
+            let cwd = std::env::current_dir()?;
+            let project = Project::discover(&cwd)?.context("no agentctl project here")?;
+            let mut store = project.hydrate()?;
+            let state = store.plan(plan)?.state;
+            if state != PlanState::Paused {
+                bail!("plan {plan} is {state}; only a paused plan is resumed");
+            }
+            store.set_plan_state(plan, PlanState::Running)?;
+            println!("plan {plan}: running; `agentctl run {plan}` runs it");
+            Ok(())
+        }
+        Command::Plan {
+            command: PlanCommand::Cancel { plan },
+        } => {
+            let cwd = std::env::current_dir()?;
+            let project = Project::discover(&cwd)?.context("no agentctl project here")?;
+            let mut store = project.hydrate()?;
+            cancel(&mut store, plan)
+        }
+        Command::Plan {
             command: PlanCommand::Update { plan },
         } => {
             let cwd = std::env::current_dir()?;
             let project = Project::discover(&cwd)?.context("no agentctl project here")?;
             let mut store = project.hydrate()?;
+            if store.plan(plan)?.state == PlanState::Planning {
+                return plan_initially(&project, &mut store, plan);
+            }
             let planning = planner::replan(&project, &mut store, plan, None)?;
             match planning.finish(&project, &mut store)? {
                 Planned::Replanned {
@@ -319,6 +458,103 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Invokes `plan`'s planner on the plan, still being planned, and prints
+/// what came of it.
+fn plan_initially(project: &Project, store: &mut Store, plan: PlanId) -> Result<()> {
+    let planning = planner::start(project, store, plan, None)?;
+    match planning.finish(project, store)? {
+        Planned::Applied {
+            ready, explanation, ..
+        } => {
+            if let Some(explanation) = explanation {
+                println!("{}", observe::untrusted(&explanation));
+            }
+            for task in store.tasks(plan)? {
+                let depends: Vec<String> =
+                    task.depends_on.iter().map(ToString::to_string).collect();
+                println!(
+                    "task {} ({}): {:?}{}",
+                    task.id,
+                    observe::untrusted(&task.key),
+                    task.scope,
+                    match depends.is_empty() {
+                        true => String::new(),
+                        false => format!(" after {}", depends.join(", ")),
+                    }
+                );
+            }
+            match ready {
+                true => println!("plan {plan}: ready; `agentctl run {plan}` runs it"),
+                false => println!(
+                    "plan {plan}: still planning, as its planner did not finalize it; \
+                     `agentctl plan update {plan}` plans it again"
+                ),
+            }
+            Ok(())
+        }
+        Planned::Refused { invocation, reason } => bail!(
+            "what planner invocation {invocation} proposed was refused, so plan {plan} is \
+             still planning, unchanged: {reason:#}; `agentctl plan update {plan}` plans it again"
+        ),
+        Planned::NoResult(outcome) => bail!(
+            "planner invocation {} ended {} without a result, so plan {plan} is still \
+             planning, unchanged; `agentctl plan update {plan}` plans it again",
+            outcome.invocation,
+            outcome.end.state
+        ),
+        Planned::Replanned { .. } | Planned::Stale { .. } => {
+            bail!("plan {plan} was replanned, not planned")
+        }
+    }
+}
+
+/// Requests that `plan`'s live work end, and waits a bounded time for each
+/// invocation it covers to be recorded ended, printing how each stands.
+fn cancel(store: &mut Store, plan: PlanId) -> Result<()> {
+    let request = store.request_cancellation(plan)?;
+    if request.paused {
+        println!("plan {plan}: paused; nothing more of it is claimed");
+    }
+    let deadline = Instant::now() + CANCEL_WAIT;
+    let covered = loop {
+        let covered = store.covered(request.id)?;
+        let settled = covered
+            .iter()
+            .all(|c| c.state.is_terminal() || !c.controlled);
+        if settled || Instant::now() >= deadline {
+            break covered;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if covered.is_empty() {
+        println!("plan {plan}: no agent was running");
+    }
+    let mut unsettled = 0;
+    for c in &covered {
+        let how = if c.state.is_terminal() {
+            c.state.to_string()
+        } else if c.controlled {
+            unsettled += 1;
+            "still running: its agentctl process has not ended it yet".to_owned()
+        } else {
+            unsettled += 1;
+            "left by an agentctl process that no longer runs, with its end unknown: \
+             `agentctl recover` settles it wherever procd can establish its fate"
+                .to_owned()
+        };
+        println!("invocation {}: {how}", c.invocation);
+    }
+    println!(
+        "plan {plan}: {}; what its stopped attempts own stays owned until its planner \
+         decides what follows (`agentctl plan update {plan}`)",
+        store.plan(plan)?.state
+    );
+    if unsettled > 0 {
+        bail!("{unsettled} cancelled invocations are not proven ended");
+    }
+    Ok(())
 }
 
 /// Runs `plan`'s final integration verification and prints how it ended.

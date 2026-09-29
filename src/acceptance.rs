@@ -198,6 +198,7 @@ fn synchronize(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::state::tests::UNCHECKED;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::thread;
@@ -954,7 +955,7 @@ pub(crate) mod tests {
             let conflicted = case
                 .fx
                 .store
-                .acquire_ownership(rival, &["src/lib.rs"])
+                .acquire_ownership(rival, &["src/lib.rs"], UNCHECKED)
                 .unwrap();
             assert!(matches!(conflicted, Acquisition::Conflicted(_)));
         };

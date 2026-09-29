@@ -24,6 +24,7 @@
 
 mod acceptance;
 mod attention;
+mod cancellation;
 mod execution;
 mod graph;
 mod integration;
@@ -39,12 +40,13 @@ mod verification;
 pub(crate) use acceptance::Publication;
 pub use acceptance::{Acceptance, AcceptedChange};
 pub use attention::{Concern, Decided, HumanDecision};
+pub use cancellation::{CancellationRequest, Covered};
 pub use execution::{Capture, Change, ChangeKind, Content, Execution, ExecutionStatus, Install};
 pub(crate) use execution::{ExecutorResult, Observed};
 pub(crate) use integration::IntegrationObserved;
 pub use integration::{Integration, IntegrationResult, IntegrationStatus};
 pub use observation::{EventQuery, UsageRecord};
-pub use ownership::{Acquisition, Conflict, Owner};
+pub use ownership::{Acquisition, Conflict, Holds, Owner};
 pub(crate) use recovery::ActedOn;
 pub use recovery::{Unresolved, UnresolvedKind};
 pub(crate) use replanning::Restoration;
@@ -215,6 +217,19 @@ impl PlanState {
         )
     }
 }
+
+text_enum!(
+    /// How the end of an invocation's processes was established by the
+    /// agentctl process holding its lifecycle domain.
+    Termination {
+        /// procd proved the domain empty: no process of it remains.
+        Enforced = "enforced",
+        /// procd's backend tracks the domain's processes only best effort:
+        /// it killed every one it found, and a final scan found none. A
+        /// process it never found is not excluded.
+        BestEffort = "best_effort",
+    }
+);
 
 text_enum!(
     /// Derived from the task's generations.
@@ -620,6 +635,8 @@ pub struct Invocation {
     pub ended_at: Option<i64>,
     /// How it ended, once recorded.
     pub end: Option<InvocationEnd>,
+    /// How the end of its processes was established, where agentctl did.
+    pub termination: Option<Termination>,
 }
 
 /// An engineering-control action a logical agent intends: an
@@ -1023,6 +1040,13 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// What the working tree holds at `path` when it holds exactly its
+    /// accepted state: its accepted content, or nothing, for accepted
+    /// absence as for a path never accepted.
+    pub fn accepted_entry(&self, path: &str) -> Result<Content> {
+        ownership::accepted_entry(&self.conn, path)
+    }
+
     pub fn accepted_source(&self, path: &str) -> Result<Option<AcceptedSource>> {
         self.conn
             .query_row(
@@ -1165,6 +1189,17 @@ impl Store {
         invocation: InvocationId,
         end: &InvocationEnd,
     ) -> Result<()> {
+        self.finish_terminated(invocation, end, None)
+    }
+
+    /// [`Store::finish_invocation`], recording with it how the end of its
+    /// processes was established (see [`Termination`]).
+    pub(crate) fn finish_terminated(
+        &mut self,
+        invocation: InvocationId,
+        end: &InvocationEnd,
+        termination: Option<Termination>,
+    ) -> Result<()> {
         ensure!(
             end.state.is_terminal(),
             "an invocation cannot end as {}",
@@ -1204,7 +1239,7 @@ impl Store {
                     "UPDATE invocations SET state = ?2, failure = ?3, diagnostic = ?4,
                        exit_code = ?5, provider_session = ?6, usage = ?7, input_tokens = ?8,
                        output_tokens = ?9, cached_input_tokens = ?10, cache_write_tokens = ?11,
-                       reasoning_tokens = ?12, ended_at = ?13
+                       reasoning_tokens = ?12, ended_at = ?13, termination = ?15
                      WHERE id = ?1 AND state = ?14
                      RETURNING agent_id",
                     params![
@@ -1221,7 +1256,8 @@ impl Store {
                         written,
                         reasoning,
                         now(),
-                        from
+                        from,
+                        termination
                     ],
                     |r| r.get(0),
                 )
@@ -1246,6 +1282,9 @@ impl Store {
                 }
                 Usage::Unavailable => "; usage unavailable".to_string(),
             });
+            if let Some(termination) = termination {
+                detail.push_str(&format!("; termination {termination}"));
+            }
             event(
                 tx,
                 "invocation.ended",
@@ -1396,7 +1435,8 @@ fn plan_row(r: &rusqlite::Row) -> rusqlite::Result<Plan> {
 
 const INVOCATION_COLUMNS: &str = "SELECT id, agent_id, provider, model, effort, state,
     started_at, ended_at, failure, diagnostic, exit_code, provider_session, usage,
-    input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, reasoning_tokens
+    input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, reasoning_tokens,
+    termination
     FROM invocations";
 
 fn invocation_row(r: &rusqlite::Row) -> rusqlite::Result<Invocation> {
@@ -1439,6 +1479,7 @@ fn invocation_row(r: &rusqlite::Row) -> rusqlite::Result<Invocation> {
             }),
             None => None,
         },
+        termination: r.get(18)?,
     })
 }
 
@@ -2151,9 +2192,15 @@ pub(crate) mod tests {
         (plan, ids)
     }
 
+    /// Takes the working tree for holding accepted state everywhere: for
+    /// tests of a store that has no working tree.
+    pub(crate) const UNCHECKED: &Holds<'static> = &|_, _| Ok(true);
+
     /// Acquires `paths` for `generation`, which must succeed.
     pub(crate) fn acquire(store: &mut Store, generation: GenerationId, paths: &[&str]) {
-        let acquired = store.acquire_ownership(generation, paths).unwrap();
+        let acquired = store
+            .acquire_ownership(generation, paths, UNCHECKED)
+            .unwrap();
         assert_eq!(acquired, Acquisition::Acquired, "{paths:?}");
     }
 
@@ -2226,7 +2273,7 @@ pub(crate) mod tests {
     /// Every object of the canonical schema, as `(type, name)`, in
     /// `schema_objects` order: what a fresh store must hold, whatever
     /// `SCHEMA` itself says.
-    const CANONICAL_OBJECTS: [(&str, &str); 181] = [
+    const CANONICAL_OBJECTS: [(&str, &str); 186] = [
         ("index", "agents_one_executor"),
         ("index", "generations_live"),
         ("index", "generations_state"),
@@ -2236,6 +2283,7 @@ pub(crate) mod tests {
         ("index", "invocations_live"),
         ("index", "journal_by_agent"),
         ("index", "ownership_by_generation"),
+        ("index", "plan_cancellations_by_plan"),
         ("index", "plans_state"),
         ("table", "acceptance_completions"),
         ("table", "acceptance_phases"),
@@ -2268,6 +2316,7 @@ pub(crate) mod tests {
         ("table", "journal"),
         ("table", "journal_withdrawals"),
         ("table", "ownership"),
+        ("table", "plan_cancellations"),
         ("table", "plan_completions"),
         ("table", "plans"),
         ("table", "replans"),
@@ -2365,6 +2414,9 @@ pub(crate) mod tests {
         ("trigger", "ownership_held_through_acceptance"),
         ("trigger", "ownership_held_until_abandoned"),
         ("trigger", "ownership_not_transferred"),
+        ("trigger", "plan_cancellations_immutable"),
+        ("trigger", "plan_cancellations_no_delete"),
+        ("trigger", "plan_cancellations_not_replaced"),
         ("trigger", "plan_completions_granted"),
         ("trigger", "plan_completions_immutable"),
         ("trigger", "plan_completions_no_delete"),
@@ -3484,7 +3536,9 @@ pub(crate) mod tests {
         // Not even the task's own next generation takes them implicitly.
         let task = tasks[1];
         let retry = store.start_generation(task).unwrap();
-        let conflicted = store.acquire_ownership(retry, &["src/a.rs"]).unwrap();
+        let conflicted = store
+            .acquire_ownership(retry, &["src/a.rs"], UNCHECKED)
+            .unwrap();
         let Acquisition::Conflicted(conflicts) = conflicted else {
             panic!("{conflicted:?}")
         };

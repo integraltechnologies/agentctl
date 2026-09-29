@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,10 @@ pub struct CodeGraph {
 #[serde(deny_unknown_fields)]
 pub struct Agents {
     pub max_concurrency: NonZeroU32,
+    /// How many minutes one invocation of any role may run before agentctl
+    /// ends it; two hours when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_timeout_minutes: Option<NonZeroU32>,
     pub planner: Role,
     pub executor: Role,
     pub verifier: Role,
@@ -76,6 +81,14 @@ pub struct Agents {
 impl Agents {
     pub fn roles(&self) -> [&Role; 3] {
         [&self.planner, &self.executor, &self.verifier]
+    }
+
+    /// How long one invocation of any role may run.
+    pub fn invocation_timeout(&self) -> Duration {
+        match self.invocation_timeout_minutes {
+            Some(minutes) => Duration::from_secs(u64::from(minutes.get()) * 60),
+            None => crate::runtime::ROLE_TIMEOUT,
+        }
     }
 }
 
@@ -369,6 +382,7 @@ pub(crate) mod tests {
             },
             agents: Agents {
                 max_concurrency: NonZeroU32::new(4).unwrap(),
+                invocation_timeout_minutes: None,
                 planner: role(ReasoningEffort::High),
                 executor: role(ReasoningEffort::Medium),
                 verifier: role(ReasoningEffort::Xhigh),

@@ -10,6 +10,15 @@
 //! it contains, is contained by or would match as a pattern. Reading is
 //! never restricted.
 //!
+//! Ownership of an existing path is granted only while the working tree
+//! holds exactly that path's accepted state: its accepted bytes, or nothing
+//! where it is accepted as absent or has no accepted state at all. Bytes
+//! that differ are someone's work agentctl did not accept, a human's or an
+//! unauthorized writer's, so a set holding any such path is not acquired at
+//! all: nothing grants authority to overwrite them, and nothing takes them
+//! for the generation's starting point. Whoever owns the difference
+//! reconciles it; agentctl never blesses or discards it.
+//!
 //! Ownership is canonical state. Nothing but an explicit release ends it,
 //! not a generation's end, not a change of scope and not reopening the
 //! store: stale ownership is safe, and deciding when to release is for the
@@ -22,9 +31,13 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::scheduling::scheduled;
 use super::{
-    GenerationId, GenerationState, PlanId, PlanState, Store, TaskId, active_generation, check_path,
-    event, generation_info, plan_state,
+    Content, GenerationId, GenerationState, PlanId, PlanState, Store, TaskId, active_generation,
+    check_path, event, generation_info, plan_state,
 };
+
+/// Whether the working tree holds exactly the entry given at a path: how
+/// the store, which never reads the working tree itself, is told.
+pub type Holds<'a> = dyn Fn(&str, &Content) -> Result<bool> + 'a;
 
 /// The generation owning a path, with the task and plan it works for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,20 +63,26 @@ pub enum Acquisition {
     /// Other generations own these requested paths, in path order, so the
     /// generation acquired none of them.
     Conflicted(Vec<Conflict>),
+    /// The working tree does not hold the accepted state of these requested
+    /// paths, in path order, so the generation acquired none of them.
+    Drifted(Vec<String>),
 }
 
 impl Store {
     /// Acquires ownership of `paths` for an active generation: every one of
-    /// them, or, if another generation owns any, none. Paths the generation
-    /// already owns, or requests twice, are acquired once.
+    /// them, or, if another generation owns any or `holds` finds the
+    /// working tree not holding the accepted state of any it does not own
+    /// yet, none. Paths the generation already owns, or requests twice, are
+    /// acquired once.
     ///
     /// Each path must be in the current scope of the generation's task, and
     /// scopes authorize nothing while their plan is being planned. A refused
-    /// request, like a conflicted one, changes nothing.
+    /// request, like a conflicted or drifted one, changes nothing.
     pub fn acquire_ownership(
         &mut self,
         generation: GenerationId,
         paths: &[&str],
+        holds: &Holds<'_>,
     ) -> Result<Acquisition> {
         let plan: Option<PlanId> = self
             .conn
@@ -77,7 +96,7 @@ impl Store {
         if let Some(plan) = plan {
             self.barrier(plan)?;
         }
-        self.write(|tx| acquire(tx, generation, paths))
+        self.write(|tx| acquire(tx, generation, paths, holds))
     }
 
     /// Releases every path an ended generation owns, and only those. When
@@ -139,12 +158,13 @@ pub(super) fn release(tx: &Transaction, generation: GenerationId) -> Result<()> 
 }
 
 /// Acquires `paths` for `generation` within `tx`; see
-/// [`Store::acquire_ownership`]. A conflicted or refused request writes
-/// nothing.
+/// [`Store::acquire_ownership`]. A conflicted, drifted or refused request
+/// writes nothing.
 pub(super) fn acquire(
     tx: &Transaction,
     generation: GenerationId,
     paths: &[&str],
+    holds: &Holds<'_>,
 ) -> Result<Acquisition> {
     let (plan, task, number) = active_generation(tx, generation)?;
     let state = plan_state(tx, plan)?;
@@ -174,6 +194,10 @@ pub(super) fn acquire(
     if !conflicts.is_empty() {
         return Ok(Acquisition::Conflicted(conflicts));
     }
+    let drifted = drifted(tx, &free, holds)?;
+    if !drifted.is_empty() {
+        return Ok(Acquisition::Drifted(drifted));
+    }
     if free.is_empty() {
         return Ok(Acquisition::Acquired);
     }
@@ -190,6 +214,35 @@ pub(super) fn acquire(
     let detail = format!("generation {number}: {} paths", free.len());
     event(tx, kind, Some(plan), Some(task), None, &detail)?;
     Ok(Acquisition::Acquired)
+}
+
+/// Those of `paths` at which `holds` finds the working tree not holding
+/// exactly their accepted state, in the order given.
+pub(super) fn drifted(conn: &Connection, paths: &[&str], holds: &Holds<'_>) -> Result<Vec<String>> {
+    let mut drifted = Vec::new();
+    for &path in paths {
+        if !holds(path, &accepted_entry(conn, path)?)? {
+            drifted.push(path.to_owned());
+        }
+    }
+    Ok(drifted)
+}
+
+/// What the working tree holds at `path` when it holds exactly its
+/// accepted state: its accepted content, or nothing, for accepted absence
+/// as for a path never accepted, which a generation may only create.
+pub(super) fn accepted_entry(conn: &Connection, path: &str) -> Result<Content> {
+    let hash: Option<Option<String>> = conn
+        .query_row(
+            "SELECT hash FROM accepted_sources WHERE path = ?1",
+            [path],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match hash.flatten() {
+        Some(hash) => Content::File(hash),
+        None => Content::Absent,
+    })
 }
 
 pub(super) fn owner(conn: &Connection, path: &str) -> Result<Option<Owner>> {
@@ -220,6 +273,7 @@ fn owns_any(conn: &Connection, generation: GenerationId) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use crate::state::tests::UNCHECKED;
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -235,7 +289,7 @@ mod tests {
                 .into_iter()
                 .map(|c| (c.path, c.owner.generation))
                 .collect(),
-            Acquisition::Acquired => panic!("acquired"),
+            other => panic!("{other:?}"),
         }
     }
 
@@ -332,7 +386,7 @@ mod tests {
         acquire(&mut store, a, &["src/a.rs", "src/shared.rs"]);
         let before = events(&store);
         let conflicted = store
-            .acquire_ownership(b, &["src/b.rs", "src/shared.rs"])
+            .acquire_ownership(b, &["src/b.rs", "src/shared.rs"], UNCHECKED)
             .unwrap();
         let Acquisition::Conflicted(found) = conflicted else {
             panic!("{conflicted:?}")
@@ -355,7 +409,7 @@ mod tests {
         // conflict is reported.
         acquire(&mut store, c, &["src/c.rs"]);
         let requested = ["src/x.rs", "src/shared.rs", "src/a.rs"];
-        let found = conflicts(store.acquire_ownership(x, &requested).unwrap());
+        let found = conflicts(store.acquire_ownership(x, &requested, UNCHECKED).unwrap());
         let expected = [("src/a.rs".into(), a), ("src/shared.rs".into(), a)];
         assert_eq!(found, expected);
         assert_eq!(store.owner("src/x.rs").unwrap(), None);
@@ -404,7 +458,7 @@ mod tests {
         owned.sort();
         assert_eq!(store.owned_paths(special).unwrap(), owned);
         for path in specials {
-            let found = conflicts(store.acquire_ownership(again, &[path]).unwrap());
+            let found = conflicts(store.acquire_ownership(again, &[path], UNCHECKED).unwrap());
             assert_eq!(found, [(path.into(), special)], "{path}");
         }
         for path in lookalikes {
@@ -426,7 +480,7 @@ mod tests {
         let before = events(&store);
 
         for request in [&["src/a.rs", "src/b.rs"][..], &["src"], &["src/a"]] {
-            let message = err(store.acquire_ownership(a, request));
+            let message = err(store.acquire_ownership(a, request, UNCHECKED));
             assert!(message.contains("not in the scope of task"), "{message}");
         }
         for bad in [
@@ -438,23 +492,23 @@ mod tests {
             "src/a.rs/",
             "a\0b",
         ] {
-            let message = err(store.acquire_ownership(a, &["src/a.rs", bad]));
+            let message = err(store.acquire_ownership(a, &["src/a.rs", bad], UNCHECKED));
             assert!(message.contains("not a canonical"), "{bad:?}: {message}");
         }
         assert!(store.owned_paths(a).unwrap().is_empty());
         assert_eq!(events(&store), before);
 
-        let message = err(store.acquire_ownership(GenerationId(999), &[]));
+        let message = err(store.acquire_ownership(GenerationId(999), &[], UNCHECKED));
         assert!(message.contains("does not exist"), "{message}");
         store.finish_generation(a, GenerationEnd::Failed).unwrap();
-        let message = err(store.acquire_ownership(a, &["src/a.rs"]));
+        let message = err(store.acquire_ownership(a, &["src/a.rs"], UNCHECKED));
         assert!(message.contains("already ended"), "{message}");
 
         // Scopes a planner has not finalized authorize nothing.
         let plan = store.create_plan(&objective("draft")).unwrap();
         let draft = store.add_task(plan, "draft", &[]).unwrap();
         let generation = store.start_generation(draft).unwrap();
-        let message = err(store.acquire_ownership(generation, &[]));
+        let message = err(store.acquire_ownership(generation, &[], UNCHECKED));
         assert!(message.contains("is being planned"), "{message}");
     }
 
@@ -475,7 +529,7 @@ mod tests {
         let before = events(&store);
         let found = conflicts(
             store
-                .acquire_ownership(a, &["src/a2.rs", "src/shared.rs"])
+                .acquire_ownership(a, &["src/a2.rs", "src/shared.rs"], UNCHECKED)
                 .unwrap(),
         );
         assert_eq!(found, [("src/shared.rs".into(), b)]);
@@ -495,7 +549,7 @@ mod tests {
             depends_on: Vec::new(),
         };
         replan(&mut store, plan, &[set_paths("a", &["src/a1.rs"]), add]);
-        let message = err(store.acquire_ownership(a, &["src/a1.rs"]));
+        let message = err(store.acquire_ownership(a, &["src/a1.rs"], UNCHECKED));
         assert!(message.contains("is being planned"), "{message}");
         store
             .revise_plan(plan, &[Command::Finalize {}], &|_| Ok(()))
@@ -503,9 +557,13 @@ mod tests {
         assert_eq!(store.owned_paths(a).unwrap(), ["src/a1.rs", "src/a2.rs"]);
         let c = store.tasks(plan).unwrap()[2].id;
         let c = store.start_generation(c).unwrap();
-        let found = conflicts(store.acquire_ownership(c, &["src/a2.rs"]).unwrap());
+        let found = conflicts(
+            store
+                .acquire_ownership(c, &["src/a2.rs"], UNCHECKED)
+                .unwrap(),
+        );
         assert_eq!(found, [("src/a2.rs".into(), a)]);
-        let message = err(store.acquire_ownership(a, &["src/a2.rs"]));
+        let message = err(store.acquire_ownership(a, &["src/a2.rs"], UNCHECKED));
         assert!(message.contains("not in the scope"), "{message}");
 
         // Once planning authorizes a new path, the generation may expand to it.
@@ -542,7 +600,7 @@ mod tests {
 
         // A released generation has ended, so never acquires again; the
         // task's next generation may.
-        let message = err(store.acquire_ownership(a, &["src/a.rs"]));
+        let message = err(store.acquire_ownership(a, &["src/a.rs"], UNCHECKED));
         assert!(message.contains("already ended"), "{message}");
         let retry = store.start_generation(tasks[0]).unwrap();
         acquire(&mut store, retry, &["src/a.rs"]);
@@ -568,7 +626,11 @@ mod tests {
 
         let mut store = Store::open(&path).unwrap();
         assert_eq!(store.owned_paths(a).unwrap(), ["src/a.rs", "src/shared.rs"]);
-        let found = conflicts(store.acquire_ownership(b, &["src/shared.rs"]).unwrap());
+        let found = conflicts(
+            store
+                .acquire_ownership(b, &["src/shared.rs"], UNCHECKED)
+                .unwrap(),
+        );
         assert_eq!(found, [("src/shared.rs".into(), a)]);
     }
 
@@ -611,7 +673,9 @@ mod tests {
                         let mut store = Store::open(&path).unwrap();
                         barrier.wait();
                         let paths = paths.each_ref().map(String::as_str);
-                        store.acquire_ownership(generation, &paths).unwrap()
+                        store
+                            .acquire_ownership(generation, &paths, UNCHECKED)
+                            .unwrap()
                     })
                 })
                 .collect::<Vec<_>>()

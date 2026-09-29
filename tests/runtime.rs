@@ -30,7 +30,7 @@ use agentctl::runtime::{
 };
 use agentctl::state::{
     ActionStatus, AgentId, AgentScope, Attempt, EventQuery, HumanIntent, Intent, InvocationId,
-    Role, Store, UnresolvedKind,
+    PlanId, Role, Store, Termination, UnresolvedKind,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -130,6 +130,14 @@ fn main() -> ExitCode {
         (
             "an_ordinary_end_leaves_no_descendants",
             an_ordinary_end_leaves_no_descendants,
+        ),
+        (
+            "a_timeout_ends_the_whole_tree",
+            a_timeout_ends_the_whole_tree,
+        ),
+        (
+            "a_human_request_reaches_the_live_invocation",
+            a_human_request_reaches_the_live_invocation,
         ),
         (
             "a_result_with_output_held_by_a_descendant_settles_cleanly",
@@ -520,6 +528,8 @@ fn intent(objective: &str) -> HumanIntent {
 struct Fixture {
     dir: TempDir,
     store: Store,
+    /// The plan `agent` plans.
+    plan: PlanId,
     agent: AgentId,
 }
 
@@ -531,7 +541,12 @@ impl Fixture {
         let agent = store
             .create_agent(Role::Planner, AgentScope::Plan(plan))
             .unwrap();
-        Self { dir, store, agent }
+        Self {
+            dir,
+            store,
+            plan,
+            agent,
+        }
     }
 
     fn agent(&mut self) -> AgentId {
@@ -559,6 +574,7 @@ impl Fixture {
             cwd: self.dir.path().to_owned(),
             workspace: Workspace::ReadOnly,
             lifecycle: runtime::ROLE_LIFECYCLE,
+            timeout: runtime::ROLE_TIMEOUT,
         }
     }
 
@@ -640,7 +656,11 @@ fn claude_success_is_recorded() {
             ("invocation.running".into(), format!("invocation {id}")),
             (
                 "invocation.ended".into(),
-                format!("invocation {id}: succeeded; usage provider_reported: 8 in, 2 out")
+                format!(
+                    "invocation {id}: succeeded; usage provider_reported: 8 in, 2 out; \
+                     termination {}",
+                    host_termination()
+                )
             ),
         ]
     );
@@ -1171,6 +1191,15 @@ fn assert_gone_soon(pid: u32) {
 #[cfg(not(unix))]
 fn assert_gone_soon(_pid: u32) {}
 
+/// How every settled end is recorded on this host: never stronger than
+/// procd establishes here.
+fn host_termination() -> Termination {
+    match host_enforces() {
+        true => Termination::Enforced,
+        false => Termination::BestEffort,
+    }
+}
+
 /// Whether procd can enforce process-tree termination on this host.
 fn host_enforces() -> bool {
     platform::capabilities()
@@ -1209,6 +1238,8 @@ fn lifecycle_is_owned_before_execution() {
 }
 
 fn required_enforcement_is_never_downgraded() {
+    // agentctl's roles take best effort where procd offers no more.
+    assert_eq!(runtime::ROLE_LIFECYCLE, Need::AllowBestEffort);
     let mut f = Fixture::new();
     let launch = Launch {
         lifecycle: Need::RequireEnforced,
@@ -1238,6 +1269,62 @@ fn cancellation_terminates_the_whole_tree() {
     assert!(started.elapsed() < Duration::from_secs(10));
     assert_eq!(outcome.end.state, InvocationState::Cancelled);
     assert_gone_soon(pid);
+}
+
+fn a_timeout_ends_the_whole_tree() {
+    let mut f = Fixture::new();
+    let launch = Launch {
+        timeout: Duration::from_secs(1),
+        ..f.launch(claude(), "tree")
+    };
+    let invocation = runtime::spawn(&mut f.store, &launch).unwrap();
+    let pid = descendant(f.dir.path());
+    let started = Instant::now();
+    let outcome = invocation.wait(&mut f.store).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(outcome.end.state, InvocationState::Cancelled);
+    let diagnostic = outcome.end.diagnostic.unwrap();
+    assert!(diagnostic.contains("timeout of 1s"), "{diagnostic}");
+    let recorded = f.store.invocation(outcome.invocation).unwrap();
+    assert_eq!(recorded.termination, Some(host_termination()));
+    assert_gone_soon(pid);
+}
+
+/// A human's request, recorded by another process, ends the invocation
+/// its plan's agent runs, through the process running it.
+fn a_human_request_reaches_the_live_invocation() {
+    let mut f = Fixture::new();
+    let invocation = f.spawn("tree").unwrap();
+    let pid = descendant(f.dir.path());
+    // Another plan's request reaches nothing of this one.
+    let other = f.store.create_plan(&intent("unrelated")).unwrap();
+    f.reopen().request_cancellation(other).unwrap();
+    let control = invocation.control();
+    thread::sleep(Duration::from_millis(600));
+    assert!(control.observe().alive());
+    let request = f.reopen().request_cancellation(f.plan).unwrap();
+    // Planning, so there was nothing to pause.
+    assert!(!request.paused);
+    let started = Instant::now();
+    let id = invocation.id();
+    let outcome = invocation.wait(&mut f.store).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(outcome.end.state, InvocationState::Cancelled);
+    let diagnostic = outcome.end.diagnostic.unwrap();
+    assert!(diagnostic.contains("human's request"), "{diagnostic}");
+    let recorded = f.store.invocation(id).unwrap();
+    assert_eq!(recorded.termination, Some(host_termination()));
+    assert_gone_soon(pid);
+    let covered = f.reopen().covered(request.id).unwrap();
+    assert_eq!(covered.len(), 1);
+    assert_eq!(covered[0].invocation, id);
+    assert_eq!(covered[0].state, InvocationState::Cancelled);
+    // A later invocation of the plan is not covered by the earlier request.
+    let later = f.spawn("tree").unwrap();
+    let later_id = later.id();
+    assert!(!f.store.cancellation_requested(later_id).unwrap());
+    later.control().cancel();
+    later.wait(&mut f.store).unwrap();
 }
 
 fn an_ordinary_end_leaves_no_descendants() {
@@ -1399,11 +1486,17 @@ fn cancellation_is_observed_and_reaped() {
     );
     assert_eq!(outcome.end.state, InvocationState::Cancelled);
     assert_eq!(outcome.end.failure, None);
-    // Recorded as cancelled only because the domain was proven empty.
+    // Recorded as cancelled only because terminating the domain settled
+    // it, at exactly the strength this host has.
     let diagnostic = outcome.end.diagnostic.as_ref().unwrap();
-    assert!(
-        diagnostic.contains("terminated and proven empty"),
-        "{diagnostic}"
+    let settled = match host_termination() {
+        Termination::Enforced => "terminated and proven empty",
+        Termination::BestEffort => "terminated best effort",
+    };
+    assert!(diagnostic.contains(settled), "{diagnostic}");
+    assert_eq!(
+        f.store.invocation(outcome.invocation).unwrap().termination,
+        Some(host_termination())
     );
     assert_eq!(outcome.payload, None);
     assert!(outcome.stderr.contains("working"));
@@ -1501,13 +1594,13 @@ fn an_abandoned_launch_with_an_unproven_lifecycle_stays_unresolved() {
     );
 }
 
-/// A descendant that escaped its domain is the case emptiness proofs exist
-/// for. With procd's own evidence, an enforcing host contains it and the
-/// invocation settles; a best-effort one cannot prove it gone, and the
-/// invocation is never recorded as a success.
+/// A descendant that escapes its domain's topology is the case emptiness
+/// proofs exist for. An enforcing host contains it, and the invocation
+/// settles as enforced. A best-effort host settles it only as best effort,
+/// its tracking having found the escapee or not, never as proven; should
+/// terminating settle nothing, the invocation stays unresolved.
 fn an_escaped_writer_never_becomes_settled_success() {
     let mut f = Fixture::new();
-    let _real = runtime::testing::evidence(runtime::testing::Mode::Real);
     let invocation = f.spawn("escaping").unwrap();
     let id = invocation.id();
     let result = invocation.wait(&mut f.store);
@@ -1516,9 +1609,12 @@ fn an_escaped_writer_never_becomes_settled_success() {
     // is ended here, not by anyone's death.
     let outcome = match result {
         Ok(outcome) => {
-            assert!(host_enforces(), "a best-effort host settled an escapee");
             assert_succeeded(&outcome, "escaping");
-            assert_gone_soon(pid);
+            let recorded = f.store.invocation(id).unwrap().termination;
+            assert_eq!(recorded, Some(host_termination()));
+            if host_enforces() {
+                assert_gone_soon(pid);
+            }
             None
         }
         Err(error) => Some(error),
@@ -1720,6 +1816,7 @@ fn observed_launch(root: &Path, agent: AgentId, provider: Provider, scenario: &s
         cwd: root.to_path_buf(),
         workspace: Workspace::ReadOnly,
         lifecycle: runtime::ROLE_LIFECYCLE,
+        timeout: runtime::ROLE_TIMEOUT,
     }
 }
 
@@ -1847,7 +1944,8 @@ fn observation_keeps_provenance_of_real_invocations() {
                     .starts_with(&format!("invocation {}: ", malformed.invocation))
         })
         .unwrap();
-    assert!(ended.detail.ends_with("; usage unavailable"), "{ended:?}");
+    let settled = format!("; usage unavailable; termination {}", host_termination());
+    assert!(ended.detail.ends_with(&settled), "{ended:?}");
     assert!(events.iter().all(|e| !e.detail.contains(LEAK)));
 }
 

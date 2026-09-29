@@ -879,6 +879,7 @@ pub fn start(
     plan: PlanId,
     executable: Option<PathBuf>,
 ) -> Result<Planner> {
+    runtime::admit()?;
     let state = store.plan(plan)?.state;
     ensure!(
         state == PlanState::Planning,
@@ -899,6 +900,7 @@ pub fn start(
         cwd: project.root.clone(),
         workspace: Workspace::ReadOnly,
         lifecycle: runtime::ROLE_LIFECYCLE,
+        timeout: project.config.agents.invocation_timeout(),
     };
     let invocation = runtime::spawn(store, &launch)?;
     Ok(Planner {
@@ -919,6 +921,7 @@ pub fn replan(
     plan: PlanId,
     executable: Option<PathBuf>,
 ) -> Result<Planner> {
+    runtime::admit()?;
     let state = store.plan(plan)?.state;
     ensure!(
         matches!(
@@ -953,6 +956,7 @@ pub fn replan(
         cwd: project.root.clone(),
         workspace: Workspace::ReadOnly,
         lifecycle: runtime::ROLE_LIFECYCLE,
+        timeout: project.config.agents.invocation_timeout(),
     };
     let invocation = runtime::spawn_after(store, &launch, |store, invocation| {
         store.act(entry, Some(invocation))
@@ -1045,6 +1049,7 @@ impl Planner {
 mod tests {
     use super::*;
     use crate::graph::tests::Fixture;
+    use crate::state::tests::UNCHECKED;
     use crate::state::{Claim, Event, HumanIntent, Task};
 
     fn intent() -> HumanIntent {
@@ -1583,7 +1588,8 @@ mod tests {
         apply(&fx.project, &mut fx.store, plan, &commands).unwrap();
         fx.store.start_plan(plan).unwrap();
         let parse = fx.store.tasks(plan).unwrap()[0].id;
-        let Claim::Claimed(generation) = fx.store.claim(parse, NonZeroU32::MIN).unwrap() else {
+        let Claim::Claimed(generation) = fx.store.claim(parse, NonZeroU32::MIN, UNCHECKED).unwrap()
+        else {
             panic!("not claimed");
         };
         let released = fx.store.release_claim(generation).unwrap();

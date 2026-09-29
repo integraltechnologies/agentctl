@@ -265,7 +265,9 @@ impl Drop for Domain {
 impl Domain {
     /// Creates a domain as `need` requires. Under `RequireEnforced` this
     /// refuses, creating nothing, unless procd establishes enforced
-    /// lifecycle termination; a weaker level is never taken for it.
+    /// lifecycle termination; a weaker level is never taken for it. Under
+    /// `AllowBestEffort` it refuses a domain whose termination procd does
+    /// not support at all: nothing could end what ran in it.
     pub fn create(need: Need, label: &str) -> Result<Self, CreateError> {
         let label = CString::new(label.replace('\0', "")).unwrap_or_default();
         let policy = ffi::Policy {
@@ -301,16 +303,14 @@ impl Domain {
         domain.identity = domain
             .read_identity()
             .map_err(|e| CreateError::Failed(format!("{e:#}")))?;
-        if need == Need::RequireEnforced {
-            let established = domain
-                .level()
-                .map_err(|e| CreateError::Failed(format!("{e:#}")))?;
-            if established != Level::Enforced {
-                return Err(CreateError::Refused(format!(
-                    "procd established only {established:?} lifecycle termination where \
-                     enforced was required"
-                )));
-            }
+        let established = domain
+            .level()
+            .map_err(|e| CreateError::Failed(format!("{e:#}")))?;
+        if !need.accepts(established) {
+            return Err(CreateError::Refused(format!(
+                "procd established only {established:?} lifecycle termination where {need:?} \
+                 was required"
+            )));
         }
         Ok(domain)
     }

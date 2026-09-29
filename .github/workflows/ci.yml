@@ -131,9 +131,15 @@ jobs:
         run: cargo test --locked --no-fail-fast
       # Linux runs the tests against the real procd backend, as this same
       # unprivileged user, inside a delegated cgroup v2 subtree (procd's
-      # documented prerequisite). Building happens outside it.
+      # documented prerequisite). Building happens outside it. The command-line
+      # suite (tests/cli.rs) is the production lifecycle qualification there:
+      # it builds agentctl without the lifecycle test double and drives it
+      # end to end, cancellation, interruption and controller death included,
+      # with procd's own evidence; it is required never to fall back.
       - name: cargo test --no-fail-fast (delegated cgroup)
         if: runner.os == 'Linux'
+        env:
+          AGENTCTL_REQUIRE_PRODUCTION: "1"
         run: |
           cargo test --locked --no-run
           .github/scripts/delegated-cgroup.sh cargo test --locked --no-fail-fast

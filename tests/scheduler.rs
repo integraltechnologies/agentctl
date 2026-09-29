@@ -112,6 +112,14 @@ fn main() -> ExitCode {
             "a_plan_verifies_while_another_process_works_on_another",
             a_plan_verifies_while_another_process_works_on_another,
         ),
+        (
+            "working_tree_drift_is_never_claimed_or_absorbed",
+            working_tree_drift_is_never_claimed_or_absorbed,
+        ),
+        (
+            "unauthorized_writes_are_never_laundered_into_accepted_work",
+            unauthorized_writes_are_never_laundered_into_accepted_work,
+        ),
     ];
     let filters: Vec<String> = env::args()
         .skip(1)
@@ -204,6 +212,11 @@ fn fake() -> ExitCode {
             while !marker(&format!("release-{key}")).exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
+        }
+        if says("rogue") {
+            // Past its workspace, straight into the project.
+            let target = fs::read_to_string(marker("rogue-target")).unwrap();
+            fs::write(target, "// written outside the workspace\n").unwrap();
         }
         let paths = packet["authority"]["mutable_paths"].as_array().unwrap();
         for path in paths {
@@ -769,6 +782,99 @@ fn one_task_runs_through_blocks_11_to_13() {
     assert!(store.owned_paths(generation).unwrap().is_empty());
     assert_eq!(report.snapshot.condition(), Condition::AllCompleted);
     assert_eq!(store.plan(fx.plan).unwrap().state, PlanState::Running);
+}
+
+fn working_tree_drift_is_never_claimed_or_absorbed() {
+    // Human work in progress at an accepted path, a stray file where a task
+    // would create one, and one edited path of a pair: none of those tasks
+    // is claimed, while a clean one runs.
+    let fx = Fixture::new(
+        4,
+        &[
+            ("wip", "Change a", &["src/a.rs"], &[]),
+            ("stray", "Create new", &["src/new.rs"], &[]),
+            ("pair", "Change c and d", &["src/c.rs", "src/d.rs"], &[]),
+            ("clean", "Change b", &["src/b.rs"], &[]),
+        ],
+    );
+    let write = |path: &str, text: &str| fs::write(fx.project.root.join(path), text).unwrap();
+    write("src/a.rs", "// human work in progress\n");
+    write("src/new.rs", "// someone's untracked file\n");
+    write("src/d.rs", "// edited\n");
+    let report = fx.run();
+    assert_eq!(launched(), ["clean"]);
+    let drifted = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        report.drifted,
+        [
+            (fx.tasks[0], drifted(&["src/a.rs"])),
+            (fx.tasks[1], drifted(&["src/new.rs"])),
+            (fx.tasks[2], drifted(&["src/d.rs"])),
+        ]
+    );
+    // Nothing was acquired or started for them, not even the clean path of
+    // the pair, and nothing they hold was touched or accepted.
+    let store = fx.store();
+    for &task in &fx.tasks[..3] {
+        assert!(store.generations(task).unwrap().is_empty());
+        assert_eq!(fx.status(task), TaskStatus::Eligible);
+    }
+    for path in ["src/a.rs", "src/new.rs", "src/c.rs", "src/d.rs"] {
+        assert_eq!(store.owner(path).unwrap(), None, "{path}");
+    }
+    assert_eq!(fx.read("src/a.rs"), "// human work in progress\n");
+    assert_eq!(fx.read("src/new.rs"), "// someone's untracked file\n");
+    assert_eq!(fx.read("src/c.rs"), "// accepted\n");
+    assert_eq!(fx.read("src/d.rs"), "// edited\n");
+    let baseline = store.accepted_source("src/c.rs").unwrap().unwrap();
+    assert_eq!(
+        store.accepted_source("src/a.rs").unwrap().unwrap(),
+        baseline
+    );
+    assert_eq!(store.accepted_source("src/new.rs").unwrap(), None);
+    drop(store);
+
+    // Once their human reconciled the working tree, they run as ever.
+    write("src/a.rs", "// accepted\n");
+    write("src/d.rs", "// accepted\n");
+    fs::remove_file(fx.project.root.join("src/new.rs")).unwrap();
+    let report = fx.run();
+    assert!(report.drifted.is_empty());
+    assert_eq!(report.snapshot.condition(), Condition::AllCompleted);
+    assert_eq!(fx.read("src/a.rs"), "// wip was here\n");
+    assert_eq!(fx.read("src/new.rs"), "// stray was here\n");
+}
+
+fn unauthorized_writes_are_never_laundered_into_accepted_work() {
+    // The first task's executor writes into the project itself, past its
+    // workspace, at a path only the second task's scope names.
+    let fx = Fixture::new(
+        1,
+        &[
+            ("first", "Change a rogue", &["src/a.rs"], &[]),
+            ("second", "Change b", &["src/b.rs"], &["first"]),
+        ],
+    );
+    let target = fx.project.root.join("src/b.rs");
+    fs::write(marker("rogue-target"), target.to_str().unwrap()).unwrap();
+    let report = fx.run();
+    // The second task, which would start from those bytes, is never
+    // claimed, so they never become anyone's accepted work.
+    assert_eq!(launched(), ["first"]);
+    assert_eq!(report.drifted, [(fx.tasks[1], vec!["src/b.rs".to_owned()])]);
+    let store = fx.store();
+    assert!(store.generations(fx.tasks[1]).unwrap().is_empty());
+    assert_eq!(fx.read("src/b.rs"), "// written outside the workspace\n");
+    let accepted = store.accepted_source("src/b.rs").unwrap().unwrap();
+    assert_eq!(accepted.generation, None);
+    assert_eq!(
+        store
+            .accepted_source("src/a.rs")
+            .unwrap()
+            .unwrap()
+            .generation,
+        Some(report.finished[0].work.generation)
+    );
 }
 
 fn dependents_run_only_after_completed_acceptance() {

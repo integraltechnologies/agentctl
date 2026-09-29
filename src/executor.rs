@@ -16,9 +16,11 @@
 //! mode; agentctl adds no sandbox, and relies on none.
 //!
 //! Authority precedes action. The generation must already own its task's
-//! whole scope; agentctl then observes the repository, stages the
-//! workspace, and journals the attempt as intended together with that
-//! baseline. The attempt is recorded as acted on before any executor
+//! whole scope, at every path of which the working tree holds accepted
+//! state (see `Store::claim`), as observing the repository confirms;
+//! agentctl then stages the workspace, and journals the attempt as intended
+//! together with that baseline. The attempt is recorded as acted on before
+//! any executor
 //! process exists. Once the invocation ends, agentctl observes the
 //! workspace, and the store derives what changed there, whether every
 //! change stayed within authority, and so the outcome, reconciling the
@@ -287,6 +289,7 @@ pub fn start(
     generation: GenerationId,
     executable: Option<PathBuf>,
 ) -> Result<Executor> {
+    runtime::admit()?;
     let authority = store.execution_authority(task, generation)?;
     let role = &project.config.agents.executor;
     let provider = Provider::resolve(&project.config, role.provider.as_str())?;
@@ -298,6 +301,24 @@ pub fn start(
     ensure!(
         settled,
         "the repository kept changing, so no baseline could be established"
+    );
+    // At every path it may change, the executor starts from accepted state,
+    // which restoring its work returns to: anything else there is work
+    // agentctl never accepted, not the executor's to build on or discard.
+    let mut drifted = Vec::new();
+    for path in &authority {
+        let found = baseline
+            .entries
+            .binary_search_by(|(p, _)| p.as_str().cmp(path))
+            .map(|i| &baseline.entries[i].1);
+        if found != Ok(&store.accepted_entry(path)?) {
+            drifted.push(path.as_str());
+        }
+    }
+    ensure!(
+        drifted.is_empty(),
+        "the working tree does not hold the accepted state of {drifted:?}, so no executor \
+         starts from it; whoever changed it reconciles it"
     );
     // Staging writes nothing in the project, so it may precede the intent.
     let workspace = Workspace::stage(project, &baseline)?;
@@ -322,6 +343,7 @@ pub fn start(
         cwd: workspace.root().to_path_buf(),
         workspace: runtime::Workspace::Editable,
         lifecycle: runtime::ROLE_LIFECYCLE,
+        timeout: project.config.agents.invocation_timeout(),
     };
     let invocation = runtime::spawn_after(store, &launch, |store, invocation| {
         store.act(entry, Some(invocation))?;

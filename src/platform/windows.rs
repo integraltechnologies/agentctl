@@ -6,15 +6,41 @@ use std::iter;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, Prefix};
+use std::process::Command;
+
+use std::sync::atomic::Ordering;
 
 use tempfile::NamedTempFile;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     MOVE_FILE_FLAGS, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
+use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+use windows_sys::core::BOOL;
 
 pub(super) const NO_FOLLOW_OPEN: &str = "open_reparse_point";
 pub(super) const DURABLE_PUBLICATION: &str = "movefile_write_through";
+
+/// Nothing: a console's Ctrl-C reaches every process attached to it, and a
+/// short helper agentctl runs and waits for (Git) is left to it.
+pub(crate) fn shield(_command: &mut Command) {}
+
+/// Makes Ctrl-C, Ctrl-Break and a closing console set
+/// [`super::interrupted`] instead of ending the process, so that it ends
+/// what it runs itself. Windows ends a process whose console closes once
+/// this returns, whatever it answers; procd's Job Objects end its domains
+/// with it.
+pub(crate) fn watch_interrupts() -> io::Result<()> {
+    unsafe extern "system" fn record(_: u32) -> BOOL {
+        super::INTERRUPTED.store(true, Ordering::SeqCst);
+        1
+    }
+    // SAFETY: registers a handler that only stores to an atomic.
+    match unsafe { SetConsoleCtrlHandler(Some(record), 1) } {
+        0 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
 
 /// Whether a repository path component names exactly one directory entry
 /// here. Windows reads separators, drive and stream designators and

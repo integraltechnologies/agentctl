@@ -357,6 +357,7 @@ pub fn start(
     generation: GenerationId,
     executable: Option<PathBuf>,
 ) -> Result<Verifier> {
+    runtime::admit()?;
     let role = &project.config.agents.verifier;
     let provider = Provider::resolve(&project.config, role.provider.as_str())?;
     let candidate = store.verification_candidate(task, generation)?;
@@ -392,6 +393,7 @@ pub fn start(
         cwd: workspace.root().to_path_buf(),
         workspace: runtime::Workspace::Disposable,
         lifecycle: runtime::ROLE_LIFECYCLE,
+        timeout: project.config.agents.invocation_timeout(),
     };
     let invocation = runtime::spawn_after(store, &launch, |store, invocation| {
         store.act(entry, Some(invocation))

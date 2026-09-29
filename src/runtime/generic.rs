@@ -148,6 +148,7 @@ mod tests {
             cwd: "/work".into(),
             workspace: Workspace::Editable,
             lifecycle: ROLE_LIFECYCLE,
+            timeout: super::super::ROLE_TIMEOUT,
         };
         let prepared = prepare(&launch).unwrap();
         assert!(prepared.args.is_empty());

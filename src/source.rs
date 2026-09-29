@@ -39,7 +39,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::platform;
 use crate::project::{CONFIG_FILE, Project, STATE_DIR};
-use crate::state::{GenerationId, Store, check_path};
+use crate::state::{Content, GenerationId, Store, check_path};
 use objects::Objects;
 pub(crate) use snapshot::{Snapshot, head, observe_paths, snapshot, snapshot_paths};
 pub(crate) use workspace::{
@@ -146,6 +146,14 @@ pub fn accept_generation(
         .map(|(&path, hash)| (path, hash.as_deref()))
         .collect();
     store.accept_generation(generation, &sources)
+}
+
+/// Whether the working tree holds exactly `expected` at `path`, read
+/// literally, never through a symlink: what `Store::claim` and
+/// `Store::acquire_ownership` are told of the project's working tree.
+pub fn holds(project: &Project, path: &str, expected: &Content) -> Result<bool> {
+    check_path(path)?;
+    Ok(snapshot::identify(&project.root, path)? == *expected)
 }
 
 /// Compares one path's working state with its accepted state by content.
@@ -405,6 +413,7 @@ fn ignored_among(project: &Project, paths: &[&str]) -> Result<Vec<String>> {
 /// input, isolated from environment that could redirect it to another
 /// repository or read paths as patterns.
 fn git(project: &Project, command: &mut Command, input: &[u8]) -> Result<Output> {
+    platform::shield(command);
     command
         .current_dir(&project.root)
         .stdin(Stdio::piped())

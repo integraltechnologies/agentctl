@@ -695,7 +695,8 @@ impl Store {
 /// The literal paths an executor of `generation` is authorized to mutate:
 /// the whole current scope of `task`, every path of which the generation
 /// must own. Only an active generation of a task whose dependencies are
-/// complete, in a ready or running plan, gets an executor, and only once.
+/// complete, in a ready, running or paused plan (which claims nothing new,
+/// while what it already started runs on), gets an executor, and only once.
 fn authority(conn: &Connection, task: TaskId, generation: GenerationId) -> Result<Vec<String>> {
     let (plan, of, _, state) = generation_info(conn, generation)?;
     ensure!(
@@ -708,8 +709,11 @@ fn authority(conn: &Connection, task: TaskId, generation: GenerationId) -> Resul
     );
     let plan_state = plan_state(conn, plan)?;
     ensure!(
-        matches!(plan_state, PlanState::Ready | PlanState::Running),
-        "plan {plan} is {plan_state}; only a ready or running plan executes tasks"
+        matches!(
+            plan_state,
+            PlanState::Ready | PlanState::Running | PlanState::Paused
+        ),
+        "plan {plan} is {plan_state}; only a ready, running or paused plan executes tasks"
     );
     ensure!(
         unsatisfied_dependencies(conn, task)?.is_empty(),
@@ -976,7 +980,7 @@ mod tests {
         let task = store.add_task(draft, "draft", &[]).unwrap();
         let drafting = store.start_generation(task).unwrap();
         let refused = begin(&mut store, task, drafting, &[]);
-        assert!(err(refused).contains("only a ready or running plan"));
+        assert!(err(refused).contains("only a ready, running or paused plan"));
     }
 
     #[test]

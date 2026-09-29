@@ -500,7 +500,9 @@ impl Fixture {
     fn task(&self, key: &str, scope: &[&str]) -> (TaskId, GenerationId) {
         let (project, mut store) = self.open("nothing");
         let (task, generation) = self.planned(&project, &mut store, key, scope);
-        let acquired = store.acquire_ownership(generation, scope).unwrap();
+        let acquired = store
+            .acquire_ownership(generation, scope, &|p, e| source::holds(&project, p, e))
+            .unwrap();
         assert_eq!(acquired, Acquisition::Acquired);
         (task, generation)
     }
@@ -981,16 +983,43 @@ fn preexisting_drift_is_not_attributed() {
     assert_eq!(fx.read("README.md").unwrap(), b"# edited by a human\n");
     assert!(fx.read("src/untracked.rs").is_some() && fx.read("src/b.rs").is_none());
 
-    // An owned file already dirty is staged, attributed and installed from
-    // its dirty state, not from its accepted content.
+    // A file to be owned that is already dirty holds work agentctl never
+    // accepted: no generation acquires any of the set it is in, and its
+    // bytes stay exactly as they are.
     let fx = Fixture::new();
     fx.write("src/a.rs", "dirty before\n");
-    let (_, executed) = fx.run("touch-a", &["src/a.rs"]);
-    assert_eq!(executed.capture.outcome, ExecutionOutcome::Candidate);
-    let change = &executed.capture.changes[0];
-    assert_eq!(change.before, Content::File(sha256(b"dirty before\n")));
-    assert_eq!(change.after, fx.content("src/a.rs"));
-    assert_eq!(fx.read("src/a.rs").unwrap(), b"dirty before\n// executor\n");
+    let (project, mut store) = fx.open("touch-a");
+    let scope = ["src/a.rs", "src/b.rs"];
+    let (task, generation) = fx.planned(&project, &mut store, "touch-a", &scope);
+    let holds = |path: &str, expected: &Content| source::holds(&project, path, expected);
+    assert_eq!(
+        store.acquire_ownership(generation, &scope, &holds).unwrap(),
+        Acquisition::Drifted(vec!["src/a.rs".into()])
+    );
+    assert!(store.owned_paths(generation).unwrap().is_empty());
+    // Should a generation own it anyway, as when the human writes once
+    // ownership was granted, its executor refuses to start from those
+    // bytes, recording nothing.
+    let unchecked = store
+        .acquire_ownership(generation, &scope, &|_, _| Ok(true))
+        .unwrap();
+    assert_eq!(unchecked, Acquisition::Acquired);
+    let refused = executor::start(
+        &project,
+        &mut store,
+        task,
+        generation,
+        Some(fake_executor()),
+    )
+    .err()
+    .expect("the executor is refused")
+    .to_string();
+    assert!(
+        refused.contains("does not hold the accepted state"),
+        "{refused}"
+    );
+    assert_eq!(store.execution(generation).unwrap(), None);
+    assert_eq!(fx.read("src/a.rs").unwrap(), b"dirty before\n");
 
     // An unowned dirty file the executor changes further is its mutation.
     let fx = Fixture::new();
@@ -1265,7 +1294,11 @@ fn executors_need_their_whole_scope_owned() {
     let fx = Fixture::new();
     let (project, mut store) = fx.open("modify");
     let (task, generation) = fx.planned(&project, &mut store, "pair", &["src/a.rs", "src/b.rs"]);
-    let partial = store.acquire_ownership(generation, &["src/a.rs"]).unwrap();
+    let partial = store
+        .acquire_ownership(generation, &["src/a.rs"], &|p, e| {
+            source::holds(&project, p, e)
+        })
+        .unwrap();
     assert_eq!(partial, Acquisition::Acquired);
     let refused = executor::start(
         &project,

@@ -27,7 +27,12 @@
 //! Each pipeline runs on a thread of its own, with a store connection of
 //! its own, and releases its claim once it ends. One pipeline's failure
 //! never stops another. Should the scheduler itself fail to read or claim,
-//! it launches nothing more, and waits for the pipelines it launched.
+//! or its process be interrupted, it launches nothing more, and waits for
+//! the pipelines it launched, whose live invocations the interruption ends
+//! (see `crate::runtime`). A pipeline whose work its human cancelled starts
+//! no further invocation. An eligible task is not claimed while the working
+//! tree does not hold the accepted state of its scope (see `Store::claim`):
+//! the scheduler reports it, and leaves the difference to its human.
 //!
 //! The ceiling is read once, when scheduling starts; changing the
 //! configuration affects the next run only. Every claim, of every plan and
@@ -56,9 +61,11 @@ use anyhow::Result;
 use crate::acceptance;
 use crate::executor;
 use crate::project::Project;
+use crate::runtime;
+use crate::source;
 use crate::state::{
-    Claim, ExecutionOutcome, GenerationId, Install, InstallOutcome, PlanId, Release, Snapshot,
-    Store, TaskId, TaskStatus, VerificationOutcome, VerificationStatus,
+    Claim, Content, ExecutionOutcome, GenerationId, Holds, Install, InstallOutcome, PlanId,
+    Release, Snapshot, Store, TaskId, TaskStatus, VerificationOutcome, VerificationStatus,
 };
 use crate::verifier;
 
@@ -112,6 +119,14 @@ impl<'a> Blocks<'a> {
 impl Pipeline for Blocks<'_> {
     fn run(&self, store: &mut Store, work: &Work, gate: &Gate) -> Result<()> {
         let (project, task, generation) = (self.project, work.task, work.generation);
+        // Once its human cancelled its work, or its process is stopping, a
+        // pipeline starts no further invocation: it ends as far as it got.
+        let stopping = |store: &Store| -> Result<bool> {
+            Ok(runtime::interrupted() || store.generation_cancelled(generation)?)
+        };
+        if stopping(store)? {
+            return Ok(());
+        }
         let executor = {
             let _held = gate.hold();
             executor::start(project, store, task, generation, self.executable.clone())?
@@ -124,7 +139,8 @@ impl Pipeline for Blocks<'_> {
                 ..
             }
         );
-        if executed.capture.outcome != ExecutionOutcome::Candidate || !installed {
+        if executed.capture.outcome != ExecutionOutcome::Candidate || !installed || stopping(store)?
+        {
             return Ok(());
         }
         let verifier = {
@@ -156,11 +172,17 @@ pub struct Finished {
     pub release: std::result::Result<Release, String>,
 }
 
+/// Tasks left unclaimed because the working tree did not hold the accepted
+/// state of these paths of their scope.
+pub type Drifted = Vec<(TaskId, Vec<String>)>;
+
 /// What one scheduling run did and where it left the plan.
 #[derive(Debug)]
 pub struct Report {
     /// Every pipeline launched, in the order they ended.
     pub finished: Vec<Finished>,
+    /// Eligible tasks left unclaimed for drift, as last found.
+    pub drifted: Drifted,
     /// Why scheduling stopped launching early, if it did.
     pub stopped: Option<String>,
     /// The plan's scheduling state once every launched pipeline ended.
@@ -170,30 +192,38 @@ pub struct Report {
 /// Runs `plan`, starting it if it is ready, with Blocks 11 to 13 through
 /// `executable` or else each provider's CLI on `PATH`, under the project's
 /// configured concurrency ceiling. Returns once nothing more can be
-/// launched and every pipeline launched has ended.
+/// launched and every pipeline launched has ended. Nothing is started on a
+/// host where agents cannot run (see `runtime::admit`).
 pub fn run(project: &Project, plan: PlanId, executable: Option<PathBuf>) -> Result<Report> {
+    runtime::admit()?;
     let blocks = Blocks::new(project, executable);
     let limit = project.config.agents.max_concurrency;
-    schedule(&project.state_path(), plan, limit, &blocks)
+    schedule(project, plan, limit, &blocks)
 }
 
-/// Runs `plan`, starting it if it is ready, with `pipeline` under the
-/// concurrency ceiling `limit`, on the store at `state`; see [`run`].
+/// Runs `plan` of `project`, starting it if it is ready, with `pipeline`
+/// under the concurrency ceiling `limit`; see [`run`].
 pub fn schedule(
-    state: &Path,
+    project: &Project,
     plan: PlanId,
     limit: NonZeroU32,
     pipeline: &impl Pipeline,
 ) -> Result<Report> {
+    let state = &project.state_path();
+    let holds = |path: &str, expected: &Content| source::holds(project, path, expected);
     let mut store = Store::open(state)?;
     store.barrier(plan)?;
     store.start_plan(plan)?;
     let (done, ended) = mpsc::channel::<Finished>();
     let mut finished = Vec::new();
+    let mut drifted = Vec::new();
     let mut stopped = None;
     thread::scope(|scope| {
         let mut running = 0usize;
         loop {
+            if stopped.is_none() && runtime::interrupted() {
+                stopped = Some("agentctl was interrupted".to_owned());
+            }
             if stopped.is_none() {
                 let launch = |work: Work| {
                     let done = done.clone();
@@ -201,8 +231,11 @@ pub fn schedule(
                         let _ = done.send(pipe(state, work, pipeline));
                     });
                 };
-                match claim_eligible(&mut store, plan, limit, launch) {
-                    Ok(launched) => running += launched,
+                match claim_eligible(&mut store, plan, limit, &holds, launch) {
+                    Ok((launched, found)) => {
+                        running += launched;
+                        drifted = found;
+                    }
                     Err(e) => stopped = Some(format!("{e:#}")),
                 }
             }
@@ -223,26 +256,30 @@ pub fn schedule(
     let snapshot = store.snapshot(plan, limit)?;
     Ok(Report {
         finished,
+        drifted,
         stopped,
         snapshot,
     })
 }
 
 /// Claims every eligible task of `plan` it can, in planner order,
-/// launching each claimed pipeline at once. Returns how many it launched.
+/// launching each claimed pipeline at once. Returns how many it launched,
+/// and the tasks it found the working tree drifted for.
 fn claim_eligible(
     store: &mut Store,
     plan: PlanId,
     limit: NonZeroU32,
+    holds: &Holds<'_>,
     mut launch: impl FnMut(Work),
-) -> Result<usize> {
+) -> Result<(usize, Drifted)> {
     let snapshot = store.snapshot(plan, limit)?;
     let mut launched = 0;
+    let mut drifted = Vec::new();
     for (task, status) in &snapshot.tasks {
         if *status != TaskStatus::Eligible {
             continue;
         }
-        match store.claim(*task, limit)? {
+        match store.claim(*task, limit, holds)? {
             Claim::Claimed(generation) => {
                 launch(Work {
                     plan,
@@ -255,9 +292,11 @@ fn claim_eligible(
             Claim::CapacityFull { .. } | Claim::PlanNotRunning(_) | Claim::InvalidDag(_) => break,
             // Claimed by another scheduler, or blocked meanwhile.
             Claim::Ineligible(_) => {}
+            // Its human reconciles the working tree; later tasks may run.
+            Claim::Drifted(paths) => drifted.push((*task, paths)),
         }
     }
-    Ok(launched)
+    Ok((launched, drifted))
 }
 
 /// Runs one claimed pipeline to its end, then releases its claim if
@@ -284,6 +323,7 @@ fn pipe(state: &Path, work: Work, pipeline: &impl Pipeline) -> Finished {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::state::tests::UNCHECKED;
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -696,7 +736,7 @@ pub(crate) mod tests {
         n: u32,
         pipeline: &impl Pipeline,
     ) -> Report {
-        let report = schedule(&project.state_path(), plan, limit(n), pipeline).unwrap();
+        let report = schedule(project, plan, limit(n), pipeline).unwrap();
         assert_eq!(report.stopped, None);
         for end in &report.finished {
             assert_eq!(end.error, None, "{end:?}");
@@ -1004,7 +1044,7 @@ pub(crate) mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         barrier.wait();
-                        schedule(&fx.project.state_path(), plan, limit(2), &sim).unwrap()
+                        schedule(&fx.project, plan, limit(2), &sim).unwrap()
                     })
                 })
                 .collect();
@@ -1041,7 +1081,7 @@ pub(crate) mod tests {
                     .map(|_| {
                         scope.spawn(|| {
                             barrier.wait();
-                            schedule(&fx.project.state_path(), plan, limit(4), &sim).unwrap()
+                            schedule(&fx.project, plan, limit(4), &sim).unwrap()
                         })
                     })
                     .collect();
@@ -1654,7 +1694,8 @@ pub(crate) mod tests {
                     barrier.wait();
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     loop {
-                        if let Claim::Claimed(g) = store.claim(ids[0], limit(4)).unwrap() {
+                        if let Claim::Claimed(g) = store.claim(ids[0], limit(4), UNCHECKED).unwrap()
+                        {
                             let seen = fs::read_to_string(project.root.join("src/a.rs")).unwrap();
                             return (g, seen);
                         }

@@ -230,6 +230,7 @@ pub fn event_line(event: &Event) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::state::tests::UNCHECKED;
     use std::num::NonZeroU32;
 
     use super::*;
@@ -282,7 +283,7 @@ mod tests {
         let (running, tasks) =
             ready_plan(&mut store, &[("a", &["a.txt"], &[]), ("b", &[], &["a"])]);
         store.start_plan(running).unwrap();
-        let Claim::Claimed(_) = store.claim(tasks[0], LIMIT).unwrap() else {
+        let Claim::Claimed(_) = store.claim(tasks[0], LIMIT, UNCHECKED).unwrap() else {
             panic!("not claimed");
         };
         let (attention, _) = ready_plan(&mut store, &[("k", &[], &[])]);

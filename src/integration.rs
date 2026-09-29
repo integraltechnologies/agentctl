@@ -247,6 +247,7 @@ pub fn start(
     plan: PlanId,
     executable: Option<PathBuf>,
 ) -> Result<Integrator> {
+    runtime::admit()?;
     let role = &project.config.agents.verifier;
     let provider = Provider::resolve(&project.config, role.provider.as_str())?;
     let intended = intend(project, store, plan)?;
@@ -262,6 +263,7 @@ pub fn start(
         cwd: intended.workspace.root().to_path_buf(),
         workspace: runtime::Workspace::Disposable,
         lifecycle: runtime::ROLE_LIFECYCLE,
+        timeout: project.config.agents.invocation_timeout(),
     };
     let entry = intended.entry;
     let invocation = runtime::spawn_after(store, &launch, |store, invocation| {
@@ -419,6 +421,7 @@ fn configured(project: &Project, workspace: &source::Workspace) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::state::tests::UNCHECKED;
     use std::num::NonZeroU32;
     use std::sync::{Arc, Barrier};
 
@@ -657,7 +660,7 @@ mod tests {
             [("a", &["src/a.rs"], &[]), ("open", &["src/o.rs"], &[])];
         let (mut fx, plan, _) = project(&tasks);
         let sim = Simulated::new(&fx.project, &scripts);
-        let report = schedule(&fx.project.state_path(), plan, NonZeroU32::MIN, &sim).unwrap();
+        let report = schedule(&fx.project, plan, NonZeroU32::MIN, &sim).unwrap();
         assert_eq!(report.snapshot.condition(), Condition::Waiting);
         // Work of it is live: its generation is active, owns its scope and
         // holds a claim, and its verifier's end is unknown.
@@ -734,7 +737,7 @@ mod tests {
 
         // Nothing autonomous continues a completed plan.
         assert!(matches!(
-            fx.store.claim(ids[0], NonZeroU32::MIN).unwrap(),
+            fx.store.claim(ids[0], NonZeroU32::MIN, UNCHECKED).unwrap(),
             Claim::PlanNotRunning(PlanState::Completed)
         ));
         assert!(err(fx.store.start_plan(plan)).contains("completed"));
@@ -1317,7 +1320,7 @@ mod tests {
             ..PASS
         };
         let sim = Simulated::new(&fx.project, &[("b", unfinished)]);
-        schedule(&fx.project.state_path(), two, NonZeroU32::MIN, &sim).unwrap();
+        schedule(&fx.project, two, NonZeroU32::MIN, &sim).unwrap();
         let acceptances = count(
             &fx.store,
             "SELECT count(*) FROM acceptances a WHERE NOT EXISTS (SELECT 1 FROM acceptance_phases
@@ -1361,13 +1364,7 @@ mod tests {
             ..PASS
         };
         let sim = Simulated::new(&fx.project, &[("d", pending)]);
-        schedule(
-            &fx.project.state_path(),
-            four,
-            NonZeroU32::new(3).unwrap(),
-            &sim,
-        )
-        .unwrap();
+        schedule(&fx.project, four, NonZeroU32::new(3).unwrap(), &sim).unwrap();
         assert_eq!(sim.launches(), ["d"]);
         assert!(fx.project.root.join("src/d.rs").exists());
         assert!(!paths(&inputs_now(&fx.project, &fx.store)).contains(&"src/d.rs"));
@@ -1390,7 +1387,7 @@ mod tests {
         )];
         let (mut fx, plan, _) = project(&[("a", &["src/a.rs"], &[])]);
         let sim = Simulated::new(&fx.project, &scripts);
-        schedule(&fx.project.state_path(), plan, NonZeroU32::MIN, &sim).unwrap();
+        schedule(&fx.project, plan, NonZeroU32::MIN, &sim).unwrap();
         is_rejection(
             replan(&mut fx, plan, &[Command::ProposeCompletion {}]),
             "not settled",

@@ -367,6 +367,7 @@ mod tests {
             cwd: "/work dir".into(),
             workspace: Workspace::ReadOnly,
             lifecycle: super::super::ROLE_LIFECYCLE,
+            timeout: super::super::ROLE_TIMEOUT,
         };
         let prepared = prepare(&launch).unwrap();
         let args: Vec<String> = prepared
@@ -409,6 +410,7 @@ mod tests {
             cwd: "/work".into(),
             workspace,
             lifecycle: super::super::ROLE_LIFECYCLE,
+            timeout: super::super::ROLE_TIMEOUT,
         };
         let args = |workspace| -> Vec<String> {
             let prepared = prepare(&launch(workspace)).unwrap();

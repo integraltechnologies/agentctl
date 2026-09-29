@@ -166,6 +166,14 @@ BEGIN SELECT RAISE(ABORT, 'sessions are immutable'); END;
 -- `process` what identifies that process to the kernel: never another's
 -- after it. A pid alone is never taken for the process.
 --
+-- `termination` is how the end of its processes was established, recorded
+-- with its end by the agentctl process that held its domain throughout:
+-- 'enforced' when procd proved the domain empty, 'best_effort' when procd,
+-- whose backend here tracks a domain's processes only best effort, killed
+-- every one it found and found none after, which proves nothing about one
+-- it missed. NULL for an end established otherwise (no process ever ran,
+-- or recovery settled it).
+--
 -- `usage` is the provenance of the token counts. Input counts every input
 -- token the provider processed, cached or not; cached input, cache writes
 -- and reasoning are reported subsets where a provider distinguishes them.
@@ -193,9 +201,11 @@ CREATE TABLE invocations (
     cache_write_tokens  INTEGER CHECK (cache_write_tokens >= 0),
     output_tokens       INTEGER CHECK (output_tokens >= 0),
     reasoning_tokens    INTEGER CHECK (reasoning_tokens >= 0),
+    termination         TEXT    CHECK (termination IN ('enforced', 'best_effort')),
     started_at          INTEGER NOT NULL,
     ended_at            INTEGER,
     CHECK ((state IN ('starting', 'running')) = (ended_at IS NULL)),
+    CHECK (termination IS NULL OR (ended_at IS NOT NULL AND containment IS NOT NULL)),
     CHECK ((state = 'failed') = (failure IS NOT NULL)),
     CHECK (state <> 'succeeded' OR exit_code = 0),
     CHECK (state NOT IN ('failed', 'interrupted') OR diagnostic IS NOT NULL),
@@ -849,7 +859,8 @@ CREATE TABLE graph_sites (
 -- An acceptance binds a generation to its execution and to the one
 -- verification whose pass it acts on: the latest of the installed
 -- candidate, while the generation is active, owns its task's whole scope
--- and the execution's authority, and its plan is ready or running. It is
+-- and the execution's authority, and its plan is ready, running or paused
+-- (which claims nothing new, while what it already runs settles). It is
 -- recorded together with the identities it publishes and the phase
 -- 'published', in the transaction that makes them accepted source, so a
 -- candidate is never accepted in part. `session` is the agentctl process
@@ -923,7 +934,7 @@ WHEN EXISTS (SELECT 1 FROM acceptances WHERE generation_id = NEW.generation_id
             AND vj.state = 'reconciled' AND vr.outcome = 'passed'
             AND NOT EXISTS (SELECT 1 FROM verifications l
                 WHERE l.execution_id = e.id AND l.number > v.number)
-            AND g.state = 'active' AND p.state IN ('ready', 'running')
+            AND g.state = 'active' AND p.state IN ('ready', 'running', 'paused')
             AND NOT EXISTS (SELECT 1 FROM execution_changes x WHERE x.execution_id = e.id
                 AND (NOT x.authorized OR x.after_kind NOT IN ('file', 'absent')))
             AND NOT EXISTS (SELECT 1 FROM json_each(e.authority) a
@@ -1367,6 +1378,29 @@ CREATE TRIGGER task_cancellations_immutable BEFORE UPDATE ON task_cancellations
 BEGIN SELECT RAISE(ABORT, 'cancellations are immutable'); END;
 CREATE TRIGGER task_cancellations_no_delete BEFORE DELETE ON task_cancellations
 BEGIN SELECT RAISE(ABORT, 'cancellations are immutable'); END;
+
+-- A human's request that a plan's live provider work end: every invocation
+-- serving its generations up to `through_generation`, whenever launched, and
+-- every other invocation of it up to `through_invocation`. The agentctl
+-- process running each ends it by procd's authority and records how it
+-- ended; this records the request alone, never that anything ended. Never
+-- changed after.
+CREATE TABLE plan_cancellations (
+    id                 INTEGER PRIMARY KEY,
+    plan_id            INTEGER NOT NULL REFERENCES plans (id),
+    through_generation INTEGER NOT NULL CHECK (through_generation >= 0),
+    through_invocation INTEGER NOT NULL CHECK (through_invocation >= 0),
+    requested_at       INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX plan_cancellations_by_plan ON plan_cancellations (plan_id);
+CREATE TRIGGER plan_cancellations_not_replaced BEFORE INSERT ON plan_cancellations
+WHEN EXISTS (SELECT 1 FROM plan_cancellations WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'cancellation requests are immutable'); END;
+CREATE TRIGGER plan_cancellations_immutable BEFORE UPDATE ON plan_cancellations
+BEGIN SELECT RAISE(ABORT, 'cancellation requests are immutable'); END;
+CREATE TRIGGER plan_cancellations_no_delete BEFORE DELETE ON plan_cancellations
+BEGIN SELECT RAISE(ABORT, 'cancellation requests are immutable'); END;
 
 -- A replan's abandonment of a scheduled generation whose pipeline
 -- conclusively stopped short of acceptance, as its released claim and
