@@ -1,4 +1,5 @@
-/* The procd.h this build compiles against, as src/procd.rs relies on it.
+/* The installed procd.h this build compiles against (build.rs selects it),
+ * as src/procd.rs relies on it.
  *
  * Its function signatures are checked here, at compile time: each is
  * assigned to a pointer of the type src/procd.rs declares, which does not
@@ -10,7 +11,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#include "procd.h"
+#include <procd.h>
 
 const struct {
     procd_status (*capabilities_probe)(procd_capabilities *);

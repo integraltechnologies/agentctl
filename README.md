@@ -62,31 +62,68 @@ Details: [docs/architecture.md](docs/architecture.md).
   (`codex`), or your own runtime implementing the
   [generic protocol](docs/providers.md#generic-provider-adapter-adapter--generic).
 - Process lifecycle support from [procd](https://github.com/integraltechnologies/procd),
-  which agentctl links statically (see below). On Linux, agents run with
+  an external library agentctl links statically (see below). On Linux, agents run with
   enforced lifecycle only as root or as a user that owns a delegated cgroup v2
   subtree (for example inside a systemd unit with `Delegate=yes`); on macOS
   the lifecycle guarantee is best effort. See [docs/security.md](docs/security.md).
 
-## Building from source
+## Installing
 
-procd is a separate project, pinned as the `third_party/procd` Git submodule
-(currently procd v0.1.0). The build compiles that pinned source with procd's
-own CMake into Cargo's build directory and links it statically, so procd is
-never installed separately. You need a stable Rust toolchain (edition 2024),
-CMake 3.16 or later, and a C11 compiler.
+agentctl is installed from source. procd is its external prerequisite, a
+C library installed system-wide that agentctl links statically. The installer
+installs procd first if it is not already installed, then agentctl:
 
 ```bash
-git clone --recurse-submodules https://github.com/integraltechnologies/agentctl.git
+git clone https://github.com/integraltechnologies/agentctl.git
 cd agentctl
-cargo install --locked --path .
+scripts/install.sh
 ```
 
-In an existing clone, run `git submodule update --init` first. Alternatively,
-`cargo install --locked --git https://github.com/integraltechnologies/agentctl`
-fetches the submodule itself and has the same build prerequisites.
+When procd is missing, `scripts/install.sh` fetches procd's published release
+(v0.1.0) into a temporary directory, builds it with procd's own CMake, and
+installs its header `procd.h`, its static library (`libprocd.a`; `procd.lib`
+with MSVC) and its `procd` command under `/usr/local` (`--prefix DIR` to
+choose another; on Windows, `%ProgramFiles%/procd`, which builds find through
+`PROCD_INCLUDE_DIR` and `PROCD_LIB_DIR` as below), using sudo if needed.
+The temporary directory is removed; nothing of procd is placed in agentctl's
+repository. An installed procd is never reinstalled. Installing procd needs
+Git, CMake 3.16 or later and a C11 compiler; installing agentctl needs a
+stable Rust toolchain (edition 2024). `scripts/install.sh --deps-only`
+installs only procd.
 
-Either way this installs three binaries into the same directory: `agentctl`,
-`agenttop` and `agentctl-shim`. agentctl starts providers through
+## Building from source
+
+procd is an external dependency that agentctl consumes as installed, like
+any C library: its public header and its static library. agentctl's build
+never builds, fetches or modifies procd, and it can use any procd install,
+not only the installer's. The header must come from the same procd as the
+library (procd.h carries no version, and its structures change between
+versions).
+
+agentctl's build finds procd where the target's C toolchain finds it by
+itself: the header where the C compiler finds `<procd.h>`, and the library
+where the linker finds `-lprocd` (for MSVC, the `LIB` path). On macOS, and
+on most Linux systems with the default GNU linker, `/usr/local/include` and
+`/usr/local/lib` are among those. To use an install anywhere else, name both
+directories; setting only one of them is an error:
+
+```bash
+export PROCD_INCLUDE_DIR=/path/to/procd/include   # holds procd.h
+export PROCD_LIB_DIR=/path/to/procd/lib           # holds libprocd.a
+```
+
+Either may be scoped to one target, for example
+`PROCD_LIB_DIR_x86_64_unknown_linux_gnu`. `cargo build -vv` prints the
+`procd header:` and `procd library:` the build used. No header digest or
+version is pinned. Instead, the build checks that header's function
+signatures against the ones agentctl declares, and `cargo test procd::`
+checks agentctl's bindings against its structure layouts and constants.
+
+With procd installed, `cargo install --locked --path .` (what the installer
+runs) or
+`cargo install --locked --git https://github.com/integraltechnologies/agentctl`
+installs agentctl directly. Either way this installs three binaries into the
+same directory: `agentctl`, `agenttop` and `agentctl-shim`. agentctl starts providers through
 `agentctl-shim` and looks for it beside its own executable, so keep the three
 together if you move them.
 

@@ -225,6 +225,12 @@ agentctl does not implement process containment. It delegates it to
 `agentctl-shim`) in it before it runs, tracks descendants, terminates the domain
 by its own authority, and reports evidence.
 
+procd is linked statically into agentctl from the installed procd the build
+found (see the [README](../README.md#building-from-source)), so whoever builds
+agentctl chooses which procd it trusts. The build prints the header and
+library it used; procd.h carries no version, so they must come from the same
+procd.
+
 procd reports each capability at one of three levels. agentctl uses them
 exactly as reported, never raising them:
 

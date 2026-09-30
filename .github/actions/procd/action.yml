@@ -1,24 +1,26 @@
-name: procd command-line exerciser
+name: procd (agentctl's external prerequisite)
 description: >-
-  Builds procd's own command-line exerciser from the procd agentctl builds
-  against (the third_party/procd submodule), with procd's own CMake, into a
-  runner-local directory, and exports its path as PROCD_CLI. agentctl itself
-  needs none of this: its build script builds and statically links the
-  library. Nothing here patches procd.
+  Installs procd system-wide with agentctl's own installer
+  (scripts/install.sh --deps-only), exactly as on a fresh user's machine:
+  skipped if procd is already installed, otherwise procd's published release
+  is built with its own CMake outside the repository and its header, static
+  library and `procd` command are installed under the system prefix.
+  agentctl's build then finds that installation like any user's. Nothing here
+  patches procd or places it in the repository.
 
 runs:
   using: composite
   steps:
-    - name: build procd CLI
+    - name: install procd
       shell: bash
       run: |
         set -euo pipefail
-        src="$GITHUB_WORKSPACE/third_party/procd"
-        build="$RUNNER_TEMP/procd-build"
-        cmake -S "$src" -B "$build" -DCMAKE_BUILD_TYPE=Release
-        cmake --build "$build" --config Release --target procd-cli
+        scripts/install.sh --deps-only
+        # MSVC has no system-wide library path; the installer's prefix is
+        # named to the build as a user would name it.
         if [ "$RUNNER_OS" = Windows ]; then
-          echo "PROCD_CLI=$build/Release/procd.exe" >> "$GITHUB_ENV"
-        else
-          echo "PROCD_CLI=$build/procd" >> "$GITHUB_ENV"
+          prefix="$(cygpath -m "$PROGRAMFILES")/procd"
+          echo "PROCD_INCLUDE_DIR=$prefix/include" >> "$GITHUB_ENV"
+          echo "PROCD_LIB_DIR=$prefix/lib" >> "$GITHUB_ENV"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
         fi

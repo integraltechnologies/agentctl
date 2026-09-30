@@ -517,7 +517,13 @@ runs the verification at once when its planner proposes completion;
 agentctl does not implement process containment itself. Every invocation's
 processes run in a **lifecycle domain** created by
 [procd](https://github.com/integraltechnologies/procd), an external lifecycle
-authority:
+authority. agentctl links procd statically and consumes it only as installed:
+the build takes `procd.h` and procd's static library from where the target's
+C toolchain finds them, or from `PROCD_INCLUDE_DIR` and `PROCD_LIB_DIR` set
+together (see the [README](../README.md#building-from-source)), and never builds or
+fetches procd. agentctl's bindings (`src/procd.rs`) are checked against that
+same header: the signatures of the functions it calls when it compiles, and
+the structure layouts and constants by its tests.
 
 - The domain is created, at the strength the launch requires, before anything
   is recorded or run, and its durable identity is recorded with the invocation

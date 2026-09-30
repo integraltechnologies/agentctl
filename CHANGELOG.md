@@ -109,6 +109,17 @@ local state and the command line are all new. Re-initialize projects with `agent
   such; on Linux with a delegated cgroup v2 subtree (or as root) it is
   enforced.
 - Windows builds and runs its test suites; it is not yet qualified for use.
+- procd is an installed external dependency, linked statically. The build
+  takes `procd.h` and procd's static library from where the target's C
+  toolchain finds them, or from `PROCD_INCLUDE_DIR` and `PROCD_LIB_DIR` (set
+  together), and prints which it used. agentctl's bindings are checked against that header:
+  function signatures at compile time, structure layouts and constants by the
+  tests. No pinned header digest or version is required. CI installs procd
+  with the same installer before building, as on a fresh machine.
+- A pushed `v*` tag runs the full CI on the tagged commit, then builds,
+  packages and qualifies an archive for each of the four CI hosts (procd
+  installed first with the same installer). Only when all of that passes is a
+  draft GitHub release created, holding exactly the qualified archives.
 - The code graph is rebuilt from scratch as CodeGraph over accepted source.
 
 ### Removed

@@ -1,10 +1,16 @@
 name: release
 
-# A pushed version tag builds agentctl natively on each host CI qualifies
-# and attaches the archives to a DRAFT GitHub release, which a maintainer
-# reviews and publishes. procd is built from the third_party/procd submodule
-# and linked statically by build.rs, so the binaries need no procd on the
-# machine they run on.
+# A pushed version tag qualifies the tagged commit with the full CI workflow,
+# builds agentctl natively on each host CI qualifies, packages and qualifies
+# each archive, and only when every one of them passed creates a DRAFT GitHub
+# release holding exactly those archives, which a maintainer reviews and
+# publishes. No step before `publish` creates, edits or uploads to a release,
+# and `publish` refuses a tag that already has one: a release is never made
+# to find out whether agentctl can be built and packaged.
+#
+# procd is agentctl's external prerequisite, installed on each runner with
+# agentctl's own installer before the build (see .github/actions/procd), and
+# linked statically, so the archives need no procd where they run.
 on:
   push:
     tags: ["v*"]
@@ -17,8 +23,14 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # The same qualification every push and pull request gets, on the tagged
+  # commit itself.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: build (${{ matrix.target }})
+    needs: ci
     strategy:
       fail-fast: true
       matrix:
@@ -34,37 +46,15 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
       - name: toolchain
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
           # Native builds only: the runner must be the target.
           rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.target }}"
+      - uses: ./.github/actions/procd
       - name: cargo build --release
         run: cargo build --locked --release --bins
-      # This runner never had procd installed: the binaries run, carry
-      # procd's code, and load no procd library.
-      - name: self-contained with respect to procd
-        run: |
-          set -euo pipefail
-          exe=""
-          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
-          agentctl="target/release/agentctl$exe"
-          "$agentctl" --version
-          # A string only procd's own code holds (procd_status_name).
-          grep -aq PREREQUISITE_MISSING "$agentctl"
-          case "$RUNNER_OS" in
-            Linux) libraries="$(readelf -d "$agentctl" | grep NEEDED)" ;;
-            macOS) libraries="$(otool -L "$agentctl")" ;;
-            *) libraries="" ;; # procd.lib is a static library; there is no DLL to load
-          esac
-          echo "$libraries"
-          if grep -qi procd <<<"$libraries"; then
-            echo "agentctl loads a procd library" >&2
-            exit 1
-          fi
       - name: package
         run: |
           set -euo pipefail
@@ -80,7 +70,66 @@ jobs:
             tar -C dist -czf "dist/$name.tar.gz" "$name"
             archive="$name.tar.gz"
           fi
+          rm -rf "dist/$name"
           (cd dist && { sha256sum "$archive" 2>/dev/null || shasum -a 256 "$archive"; } > "$archive.sha256")
+      # Qualifies the archive exactly as uploaded below, unpacked afresh
+      # outside the build tree: its checksum, its layout (one directory
+      # holding the three executables and nothing else), and each executable
+      # run. agentctl must carry procd's code and load no procd library.
+      - name: qualify archive
+        run: |
+          set -euo pipefail
+          name="agentctl-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          exe=""
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; archive="$name.zip"; else archive="$name.tar.gz"; fi
+          [ "$(ls dist)" = "$(printf '%s\n' "$archive" "$archive.sha256")" ]
+          (cd dist && { sha256sum -c "$archive.sha256" 2>/dev/null || shasum -a 256 -c "$archive.sha256"; })
+          unpacked="$RUNNER_TEMP/qualify"
+          rm -rf "$unpacked" && mkdir -p "$unpacked"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z x -o"$unpacked" "dist/$archive" >/dev/null
+          else
+            tar -C "$unpacked" -xzf "dist/$archive"
+          fi
+          expected="$(printf '%s\n' "$name" "$name/agentctl$exe" "$name/agentctl-shim$exe" "$name/agenttop$exe" | LC_ALL=C sort)"
+          actual="$(cd "$unpacked" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort)"
+          if [ "$actual" != "$expected" ]; then
+            printf 'archive layout is wrong:\n%s\nexpected:\n%s\n' "$actual" "$expected" >&2
+            exit 1
+          fi
+          bin="$unpacked/$name"
+          for program in agentctl agentctl-shim agenttop; do
+            if [ ! -f "$bin/$program$exe" ] || [ ! -x "$bin/$program$exe" ]; then
+              echo "$program$exe is not an executable file" >&2
+              exit 1
+            fi
+          done
+          version="$("$bin/agentctl$exe" --version)"
+          echo "$version"
+          grep -q '^agentctl ' <<<"$version"
+          "$bin/agentctl$exe" --help >/dev/null
+          version="$("$bin/agenttop$exe" --version)"
+          echo "$version"
+          grep -q '^agenttop ' <<<"$version"
+          # Run by anything but agentctl, the shim refuses with exit 2.
+          status=0
+          refusal="$("$bin/agentctl-shim$exe" 2>&1)" || status=$?
+          if [ "$status" -ne 2 ] || ! grep -q 'started by agentctl only' <<<"$refusal"; then
+            echo "agentctl-shim: unexpected exit $status: $refusal" >&2
+            exit 1
+          fi
+          # A string only procd's own code holds (procd_status_name).
+          grep -aq PREREQUISITE_MISSING "$bin/agentctl$exe"
+          case "$RUNNER_OS" in
+            Linux) libraries="$(readelf -d "$bin/agentctl" | grep NEEDED)" ;;
+            macOS) libraries="$(otool -L "$bin/agentctl")" ;;
+            *) libraries="" ;; # procd.lib is a static library; there is no DLL to load
+          esac
+          echo "$libraries"
+          if grep -qi procd <<<"$libraries"; then
+            echo "agentctl loads a procd library" >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
@@ -90,9 +139,12 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
-  release:
-    needs: build
+  # Runs only when CI and every build above succeeded, and publishes the
+  # archives those builds qualified; it builds nothing.
+  publish:
+    needs: [ci, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -100,7 +152,29 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # Exactly one qualified archive per target, each matching the checksum
+      # its build recorded, and nothing else.
+      - name: verify handoff
+        run: |
+          set -euo pipefail
+          cd dist
+          expected=""
+          for archive in \
+            "agentctl-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" \
+            "agentctl-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" \
+            "agentctl-${GITHUB_REF_NAME}-x86_64-apple-darwin.tar.gz" \
+            "agentctl-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip"; do
+            sha256sum -c "$archive.sha256"
+            expected+="$archive"$'\n'"$archive.sha256"$'\n'
+          done
+          [ "$(ls | LC_ALL=C sort)" = "$(printf '%s' "$expected" | LC_ALL=C sort)" ]
       - name: draft release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "agentctl $GITHUB_REF_NAME"
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "a release for $GITHUB_REF_NAME already exists; releases are created only by this workflow, after qualification" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "agentctl $GITHUB_REF_NAME"

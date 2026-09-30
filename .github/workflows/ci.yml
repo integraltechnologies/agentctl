@@ -4,6 +4,9 @@ on:
   push:
     branches: [main, "v0.3-alpha"]
   pull_request:
+  # The release workflow runs this same qualification on the tagged commit
+  # before it builds anything.
+  workflow_call:
 
 # Read-only token; no secrets are referenced anywhere in this workflow.
 permissions:
@@ -23,9 +26,8 @@ env:
 jobs:
   # FORMATTING / STATIC ANALYSIS, on the same four supported hosts the tests
   # run on. Each host compiles its own cfg(unix)/cfg(windows)/cfg(target_os)
-  # code and its own procd backend (built from the third_party/procd
-  # submodule by build.rs), so none of it is linted only by proxy from
-  # another host.
+  # code and its own procd backend binding, so none of it is linted only by
+  # proxy from another host.
   static:
     name: static (${{ matrix.os }})
     strategy:
@@ -43,8 +45,6 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
       - name: toolchain
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
@@ -53,6 +53,9 @@ jobs:
           rustc --version
           # The runner label must actually provide the intended architecture.
           rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.host }}"
+      # procd is agentctl's external prerequisite, installed system-wide
+      # first, as on a fresh user's machine (see the action).
+      - uses: ./.github/actions/procd
       - uses: Swatinem/rust-cache@v2
         with:
           key: static
@@ -84,8 +87,6 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
       - name: toolchain
         run: |
           rustup toolchain install stable --profile minimal
@@ -94,11 +95,12 @@ jobs:
           rustc --version
           # The runner label must actually provide the intended architecture.
           rustc -vV | tr -d '\r' | grep -Fx "host: ${{ matrix.host }}"
-      # procd's CLI, from the same submodule agentctl builds against, for the
-      # capability report and the Linux qualification gate.
+      # procd is agentctl's external prerequisite, installed system-wide
+      # first, as on a fresh user's machine (see the action); its `procd`
+      # command serves the capability report and the Linux qualification gate.
       - uses: ./.github/actions/procd
       # DIAGNOSTIC AND QUALIFICATION OUTPUT ONLY. This prints what the
-      # procd reports on this runner; nothing parses it or feeds it
+      # installed procd reports on this runner; nothing parses it or feeds it
       # back, and no capability level is set by it. agentctl's own tests
       # decide from procd's answers at run time.
       - name: procd capability report
@@ -106,7 +108,7 @@ jobs:
           echo "runner: $RUNNER_OS $RUNNER_ARCH"
           uname -a || true
           echo "--- procd capabilities (this process)"
-          "$PROCD_CLI" capabilities
+          procd capabilities
       - name: linux cgroup environment
         if: runner.os == 'Linux'
         run: |
@@ -117,13 +119,13 @@ jobs:
           ls -ld "$own" "$own/cgroup.procs" || true
           systemd-run --version | head -1 || true
           echo "--- procd capabilities (delegated cgroup, same user)"
-          .github/scripts/delegated-cgroup.sh sh -c 'echo "user: $(id -un) uid=$(id -u)"; command -v cargo rustc; cargo --version; cat /proc/self/cgroup; "$PROCD_CLI" capabilities'
+          .github/scripts/delegated-cgroup.sh sh -c 'echo "user: $(id -un) uid=$(id -u)"; command -v cargo rustc; cargo --version; cat /proc/self/cgroup; procd capabilities'
       # Linux qualification gate: procd must really create and supervise an
       # ENFORCED lifecycle domain for the user the tests run as. procd itself
       # refuses (non-zero exit) otherwise; a weaker level is never accepted.
       - name: linux real-backend gate (procd --require-enforced)
         if: runner.os == 'Linux'
-        run: .github/scripts/delegated-cgroup.sh "$PROCD_CLI" run --require-enforced -- true
+        run: .github/scripts/delegated-cgroup.sh procd run --require-enforced -- true
       - uses: Swatinem/rust-cache@v2
         with:
           key: test

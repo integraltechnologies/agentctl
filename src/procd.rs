@@ -9,8 +9,8 @@
 //! domain here.
 //!
 //! This module mirrors `procd.h` behind a safe API; the tests check the
-//! mirror against the header this build compiles against (see
-//! `procd_layout.c`). It validates everything
+//! mirror against the installed header this build compiles against (see
+//! `build.rs` and `procd_layout.c`). It validates everything
 //! procd returns before the rest of agentctl can rely on it: an unrecognized
 //! code or level is an error, never a guess, and uncertainty stays
 //! uncertainty ([`Recovery::Unresolved`], [`Settlement::Uncertain`]).
@@ -737,6 +737,17 @@ mod tests {
 
     fn size_of_field<T, F>(_: fn(&T) -> &F) -> usize {
         std::mem::size_of::<F>()
+    }
+
+    #[test]
+    fn the_build_used_one_installed_procd() {
+        let header = std::path::Path::new(env!("AGENTCTL_PROCD_HEADER"));
+        let library = std::path::Path::new(env!("AGENTCTL_PROCD_LIBRARY"));
+        assert!(
+            header.is_file() && header.ends_with("procd.h"),
+            "{header:?}"
+        );
+        assert!(library.is_file(), "{library:?}");
     }
 
     #[test]
